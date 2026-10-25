@@ -1,5 +1,5 @@
-/**
- * Hunter routine — patrols a system hunting pirate NPCs for bounties and loot.
+﻿/**
+ * Hunter routine â€” patrols a system hunting pirate NPCs for bounties and loot.
  *
  * Modes:
  *   - roam_systems: Navigate to configured patrol system, or find nearest huntable system
@@ -8,6 +8,20 @@
  *   - patrol_systems: Cycle through a configured list of systems
  *   - cycle_patrols: Cycle through named patrol profiles
  *   - patrol_radius: Patrol all systems within X jumps of a pirate base system
+ *   - creature_farm: Farm creatures across a Hunter Patrol Profile's systems
+ *   - creature_farm_random: Farm creatures across randomly selected systems
+ *   - hunt_big_creatures: Hunt known large creatures (Cloudwhale, Molt Leviathan,
+ *     Rainbow Leviathan) using explorer wildlife data. Targets the closest known
+ *     big creature, falls back to random creature farm when none are known.
+ *   - fleet_arena: Stay in the current POI and do nothing until the fleet enters battle
+ *   - pvp: Camp a single system POI (never move) and send an attack command every
+ *          tick at a configured target player (hunter.targetPlayer / per-bot override)
+ *
+ * Modes:
+ *   - boarding: Hunt pirates as usual, but when a target's shields drop below
+ *          boardingShieldThreshold and the ship has boarding capability + marines,
+ *          enter the board stance (committing boardingMarines) instead of firing
+ *          to destruction. Monitors the boarding operation to completion.
  *
  * Loop:
  *   1. Navigate to configured patrol system
@@ -18,31 +32,48 @@
  *      insure ship, refuel, repair
  *
  * Combat stances:
- *   - Fire   (default): 100% damage dealt — ALWAYS used
+ *   - Fire   (default): 100% damage dealt â€” ALWAYS used
  *   - No Brace: Never blocks firing to recover shields (missile ships would use this)
  *   - No Retreat: Stay at engaged range, never move to inner/mid/outer (moving costs damage ticks)
- *   - Flee   (hull critical): auto-retreat — triggers when hull <= fleeThreshold
+ *   - Flee   (hull critical): auto-retreat â€” triggers when hull <= fleeThreshold
  *
  * Settings (data/settings.json under "hunter"):
- *   system          — system ID to patrol (default: current system)
- *   refuelThreshold — fuel % to trigger refuel stop (default: 40)
- *   repairThreshold — hull % to abort patrol and dock (default: 30)
- *   fleeThreshold   — hull % to flee an active fight (default: 20)
- *   shieldRechargePct — post-battle shield % to top up to with shield_charge items (default: 80)
-  *   desiredShieldCharges — how many shield_charge the bot tries to keep stocked (default: 20)
-  *   desiredRepairKits    — how many repair kits (advanced + regular) the bot tries to keep stocked (default: 12)
-  *   desiredFuelCells     — how many fuel cells the bot tries to keep stocked (-1 = fill cargo, default: -1)
+ *   system          â€” system ID to patrol (default: current system)
+ *   refuelThreshold â€” fuel % to trigger refuel stop (default: 40)
+ *   repairThreshold â€” hull % to abort patrol and dock (default: 30)
+ *   fleeThreshold   â€” hull % to flee an active fight (default: 20)
+ *   shieldRechargePct â€” post-battle shield % to top up to with shield_charge items (default: 80)
+  *   desiredShieldCharges â€” how many shield_charge the bot tries to keep stocked (default: 20)
+  *   desiredRepairKits    â€” how many repair kits (advanced + regular) the bot tries to keep stocked (default: 12)
+  *   desiredFuelCells     â€” how many fuel cells the bot tries to keep stocked (-1 = fill cargo, default: -1)
   *   Auto-uses repair kits (advanced_repair_kit preferred, then repair_kit) from cargo after fights when hull deficit > 100
- *   onlyNPCs        — only attack NPC pirates, never players (default: true)
- *   ammoReloadAbsoluteThreshold — ammo count to reload when weapon has ≤50 total ammo (default: 1)
- *   ammoReloadPercentThreshold — % of max ammo to reload when weapon has >50 total ammo (default: 25)
- *   pirateBaseSystem — system ID for patrol_radius mode (default: "" - currently configured base)
- *   patrolRadius    — max jumps from pirate base for patrol_radius mode (default: 5)
- *   cloakOnStart    — stay cloaked until attack command, then re-cloak after battle (default: false)
- *   meatShield      — enter/continue battles even with no weapons/ammo instead of aborting to resupply (default: false)
- *   stopOnDeath     — stop the routine on death instead of respawning into a new hunt (default: false)
- *   combatDebug     — log all raw battle JSON to data/logs/combat_debug/{botName}_combat_debug.log (default: false)
- *   targetRandomly  — shuffle target order each scan (default: false)
+ *   onlyNPCs        â€” only attack NPC pirates, never players (default: true)
+ *   ignorePirates    â€” never attack pirates (creatures only); intended for
+ *                     creature-farm hunter bots that operate in pirate strongholds
+ *                     and must avoid station reputation penalties (default: false)
+ *   ammoReloadAbsoluteThreshold â€” ammo count to reload when weapon has â‰¤50 total ammo (default: 1)
+ *   ammoReloadPercentThreshold â€” % of max ammo to reload when weapon has >50 total ammo (default: 25)
+ *   pirateBaseSystem â€” system ID for patrol_radius mode (default: "" - currently configured base)
+ *   patrolRadius    â€” max jumps from pirate base for patrol_radius mode (default: 5)
+ *   cloakOnStart    â€” stay cloaked until attack command, then re-cloak after battle (default: false)
+ *   meatShield      â€” enter/continue battles even with no weapons/ammo instead of aborting to resupply (default: false)
+ *   stopOnDeath     â€” stop the routine on death instead of respawning into a new hunt (default: false)
+ *   combatDebug     â€” log all raw battle JSON to data/logs/combat_debug/{botName}_combat_debug.log (default: false)
+ *   targetRandomly  â€” shuffle target order each scan (default: false)
+ *
+ * Fleet/Arena mode settings (mode = "fleet_arena"; legacy "fleet" is accepted):
+ *   fleetIdlePollSeconds      â€” standby tick length in seconds (default: 2)
+ *   fleetBattleConfirmSeconds â€” get_battle_status fallback poll interval, in case a
+ *                               battle push event is missed (default: 10, 0 = push only)
+ *   fleetFightPlayers         â€” fight players too, since the fleet leader picked the
+ *                               target (default: true; false = honour onlyNPCs and flee players)
+ *   fleetUndockToFight        â€” undock when a battle starts while docked (default: true)
+ *   boardingEnabled          â€” when true, the hunter switches to boarding stance on eligible targets with low shields instead of killing them (default: false)
+ *   boardingShieldThreshold   â€” shield % at or below which to attempt boarding (default: 5)
+ *   boardingMarines           â€” marines to commit to the board stance (0 = all fit marines on board; default: 0)
+ *   boardingShieldChargePct   â€” when in boarding mode, reserve this % of cargo capacity for shield_charge items (default: 0 = use normal desiredShieldCharges logic)
+ *   boardingBraceOnRetreat    â€” switch to brace stance while retreating from a stronghold after clearing all pirates (default: false)
+ *   boardingPrizeDestination  â€” optional per-profile prize destination for boarding mode
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -50,8 +81,11 @@ import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import { getSystemBlacklist } from "../web/server.js";
-import { writeSettings, isCombatDebugEnabled } from "./common.js";
+import { writeSettings, isCombatDebugEnabled, getGlobalHomeBase } from "./common.js";
 import { combatDebugLog } from "../debug.js";
+import { boardingClaims, BOARDING_CLAIM_TTL_MS, pickUnclaimedBoardingTarget } from "../boardingCooperation.js";
+import { creatureKillStore } from "../creaturekillstore.js";
+import { wildlifeStore, type WildlifeDetail, normalizeCreatureName } from "../wildlivestore.js";
 import {
   findStation,
   isStationPoi,
@@ -61,7 +95,10 @@ import {
   ensureUndocked,
   tryRefuel,
   repairShip,
-  ensureFueled,
+  treatPersonnel,
+  recruitPersonnel,
+  ensureFueledEx,
+  type FuelCheckOutcome,
   navigateToSystem,
   fetchSecurityLevel,
   scavengeWrecks,
@@ -75,16 +112,20 @@ import {
   getBattleStatus,
   type BattleState,
   handleBattleNotifications,
-  fleeFromBattle,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
   getItemSize,
   topUpShields,
   useRepairKits,
+  acquireFuelCellsAndRefuel,
+  getFuelCellFuelValue,
+  parseWrecks,
 } from "./common.js";
 
 import type { Bot } from "../bot.js";
+import { fleetStatus } from "./fleet.js";
 import type { PirateTier, NearbyEntity } from "./battle.js";
+import type { PrizeInfo } from "../types/game.js";
 import {
   parseNearby,
   isPirateTarget,
@@ -92,11 +133,13 @@ import {
   isCreatureName,
   ensureAmmoLoaded,
   engageTarget,
-  emergencyFleeSpam,
   analyzeExistingBattle,
   fightFreshBattle,
   fightJoinedBattle,
   getWeaponModules,
+  emergencyFleeSpam,
+  recloakAfterBattle,
+  ensureCloakedIfNeeded,
 } from "./battle.js";
 
 
@@ -114,62 +157,312 @@ function isStationEntity(e: NearbyEntity): boolean {
 }
 
 async function getObservationOrNearby(bot: Bot): Promise<{ result: unknown; isObservation: boolean }> {
-     const resp = await bot.exec("get_nearby");
-     return { result: resp.result, isObservation: false };
-   }
+      const resp = await bot.exec("get_nearby");
+      if (resp.result) {
+        const r = resp.result as Record<string, unknown>;
+        const prizesFromPrizes = Array.isArray(r.prizes) ? r.prizes : [];
+        const prizesFromNearby = Array.isArray(r.nearby_prizes) ? r.nearby_prizes : [];
+        const allPrizes = prizesFromPrizes.length > 0 ? prizesFromPrizes : prizesFromNearby;
+        const prizeSummary = allPrizes.map(p => `prize_id=${p.prize_id} ship_id=${p.ship_id} status=${p.status} ship=${p.ship_name || p.ship_class}`).join(" | ") || "no prizes";
+        bot.log("debug", `[get_nearby] poi=${r.poi_id || bot.poi} prizes=${allPrizes.length}: ${prizeSummary}`);
+      }
+      return { result: resp.result, isObservation: false };
+    }
 
 function getObservationDebugLine(bot: Bot): string {
      return "observation: disabled (using polling)";
    }
 
-const RAINBOW_LEVIATHAN_NAME = "Rainbow Leviathan";
 
-function prioritizeRainbowLeviathan(creatures: NearbyEntity[]): NearbyEntity[] {
+function prioritizeLeviathans(creatures: NearbyEntity[]): NearbyEntity[] {
   if (!creatures.length) return creatures;
-  const prioritized = creatures.filter(e => e.name === RAINBOW_LEVIATHAN_NAME);
-  const rest = creatures.filter(e => e.name !== RAINBOW_LEVIATHAN_NAME);
+  const prioritized = creatures.filter(e => isLeviathanCreature(e.name, e.species));
+  const rest = creatures.filter(e => !isLeviathanCreature(e.name, e.species));
   return [...prioritized, ...rest];
 }
 
-async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier, repairThreshold: number = 0, onlyNPCs: boolean = false): Promise<void> {
+function prioritizeBigCreatures(creatures: NearbyEntity[]): NearbyEntity[] {
+  if (!creatures.length) return creatures;
+  const big = creatures.filter(e => isBigCreature(e.name));
+  const leviathans = creatures.filter(e => !isBigCreature(e.name) && isLeviathanCreature(e.name, e.species));
+  const rest = creatures.filter(e => !isBigCreature(e.name) && !isLeviathanCreature(e.name, e.species));
+  return [...big, ...leviathans, ...rest];
+}
+
+/**
+ * Returns true if a creature is a leviathan (worth a coordinated multi-hunter
+ * assist). Everything else dies to a single hunter shot, so pulling in extra
+ * hunters just splits the loot at the choke-point bottlenecks.
+ *
+ * Currently only Rainbow Leviathan spawns, but the match is generic so any
+ * future leviathan variant is still coordinated.
+ */
+function isLeviathanCreature(name: string | undefined, species?: string): boolean {
+  if (name && name.toLowerCase().includes("leviathan")) return true;
+  if (species && species.toLowerCase().includes("leviathan")) return true;
+  return false;
+}
+
+/**
+ * Returns true if a creature is one of the big creatures that require care to
+ * engage: Cloudwhale, Molt Leviathan, Rainbow Leviathan. They are prioritised
+ * as targets rather than avoided — the ship-tier based avoid/flee detection was
+ * removed because it misdetected high-tier ships and made hunters flee from
+ * creatures they could easily kill.
+ */
+function isBigCreature(name: string | undefined): boolean {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  return lower.includes("cloudwhale") || lower.includes("leviathan");
+}
+
+/**
+ * Returns true if a creature has been branded by another faction/ranch.
+ * Branded creatures must NEVER be attacked — the branding marker lives in the
+ * creature's display name (not the hex id), so we check the name before picking
+ * the id to attack. Future game updates may impose penalties for killing branded
+ * livestock, so we skip them everywhere today.
+ *
+ * Detection covers two name formats:
+ *   1. The word "BRANDED" in the name — e.g. "[RNC] BRANDED Belt-Grazer"
+ *   2. A faction-tag prefix like "[RNC] " where the stripped name is a known
+ *      creature species — e.g. "[RNC] Belt-Grazer" (only true when the
+ *      de-tagged name is a known creature, so player ships with faction tags
+ *      like "[POLICE]" are not false-positives).
+ */
+function isBrandedCreature(name: string | undefined): boolean {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  // Format 1: "BRANDED" keyword in the name
+  if (lower.includes("branded")) return true;
+  // Format 2: faction-tag prefix "[TAG] SpeciesName" — only branded if the
+  // stripped name is a known creature (avoids false positives on players).
+  const tagMatch = name.match(/^\[[^\]]+\]\s*(.*)/);
+  if (tagMatch) {
+    const stripped = tagMatch[1].trim();
+    if (stripped && isCreatureName(stripped)) return true;
+  }
+  return false;
+}
+
+/**
+ * Returns true if a creature is protected and must NEVER be attacked.
+ *
+ * Any creature whose name contains "hatchling", "calf", "young", or "juvenile"
+ * is protected — this blanket rule covers Cloudwhale Calves,
+ * Molt/Rainbow/Hoarfrost Leviathan Hatchlings, young and juvenile variants of
+ * any species, and any future young-of-species names. Killing young/juvenile
+ * creatures prevents the adult from ever spawning, and they drop poor loot.
+ * This is checked at target-selection time (pickCreatureTargets / big creature
+ * hunt) so the hunter simply skips over them and engages other targets instead.
+ */
+function isProtectedCreature(name: string | undefined): boolean {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  return lower.includes("hatchling") || lower.includes("calf") || lower.includes("young") || lower.includes("juvenile");
+}
+
+/**
+ * Returns true if a creature is an adult Cloud Whale (not a calf or hatchling,
+ * not a leviathan). Cloud Whales hunt in packs and should only be engaged when
+ * enough are present to leave breeding pairs behind.
+ */
+function isCloudWhale(name: string | undefined): boolean {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  return lower.includes("cloudwhale") && !lower.includes("calf") && !lower.includes("hatchling") && !lower.includes("young") && !lower.includes("juvenile");
+}
+
+/**
+ * Apply the Cloud Whale pack rule to a list of creature entities.
+ *
+ * Cloud Whales attack in packs. We only engage them when at least 3 are present,
+ * and when we do, we kill only 1 and leave the remaining 2+ to breed. With 2 or
+ * fewer, we remove all of them so they can breed undisturbed.
+ */
+function applyCloudWhalePackRule(entities: NearbyEntity[]): NearbyEntity[] {
+  const cloudWhales = entities.filter(e => isCloudWhale(e.name));
+  const others = entities.filter(e => !isCloudWhale(e.name));
+  if (cloudWhales.length < 3) {
+    return others;
+  }
+  return [...others, cloudWhales[0]];
+}
+
+/**
+ * Record a creature kill to the historical data store for later system scoring.
+ * Only records when creatureFarmRecordKills is enabled and the target is actually
+ * a creature (not a pirate).
+ */
+function recordCreatureKill(bot: Bot, target: NearbyEntity): void {
+  const settings = getHunterSettings(bot.username);
+  if (!settings.creatureFarmRecordKills) return;
+  if (!bot.system || !bot.poi) return;
+  const isCreature = !!(target as any).isCreature || (target as any).type === "creature" || isCreatureName(target.name) || isCreatureName((target as any).species);
+  if (!isCreature) return;
+  const species = (target as any).species || normalizeCreatureName(target.name) || "unknown";
+  creatureKillStore.recordKill(bot.system, bot.poi, species);
+}
+
+/**
+ * Sort combat targets so the hunter always engages the most valuable pirate
+ * first. Ordering (highest priority first):
+ *
+ *   1. Non-station pirates sorted by tier (desc) â†’ shield% (desc) â†’ hull% (desc)
+ *      Higher-tier ships and those with more shields/hull remaining are engaged
+ *      first so the hunter focuses fire on the biggest threat before it can
+ *      damage us.
+ *   2. Stations are ALWAYS deprioritised to the end of the list. Boarding is not
+ *      currently supported on stations, and auto-targeting stations while active
+ *      pirates are still firing on us is wasteful. A station is only ever
+ *      auto-targeted when it is the very last NPC/pirate entity in the fight.
+ */
+function sortTargetsByPriority(targets: NearbyEntity[]): NearbyEntity[] {
+  const TIER_ORDER: Record<string, number> = {
+    small: 1,
+    medium: 2,
+    large: 3,
+    capitol: 4,
+    boss: 5,
+  };
+
+  function tierScore(e: NearbyEntity): number {
+    return TIER_ORDER[(e.tier || "").toLowerCase()] || 0;
+  }
+  function shieldPct(e: NearbyEntity): number {
+    if (!e.shield || !e.maxShield || e.maxShield <= 0) return 0;
+    return e.shield / e.maxShield;
+  }
+  function hullPct(e: NearbyEntity): number {
+    if (!e.hull || !e.maxHull || e.maxHull <= 0) return 0;
+    return e.hull / e.maxHull;
+  }
+
+  const stations: NearbyEntity[] = [];
+  const pirates: NearbyEntity[] = [];
+
+  for (const e of targets) {
+    if (isStationEntity(e)) {
+      stations.push(e);
+    } else {
+      pirates.push(e);
+    }
+  }
+
+  pirates.sort((a, b) => {
+    const td = tierScore(b) - tierScore(a);
+    if (td !== 0) return td;
+    const sd = shieldPct(b) - shieldPct(a);
+    if (sd !== 0) return sd;
+    return hullPct(b) - hullPct(a);
+  });
+
+  return [...pirates, ...stations];
+}
+
+/**
+ * Used by the reactive battle-join paths (API battle detection while scanning /
+ * navigating). If a battle we are NOT already part of contains a NON-leviathan
+ * creature that another hunter is already fighting, we skip it â€” that creature is
+ * already being solo'd (and likely claimed), so piling in just splits loot at the
+ * shared choke-point bottlenecks.
+ * Leviathan battles still pass through so the wing can assist as intended.
+ */
+function isWeakCreatureBattleAlreadyHandled(ctx: RoutineContext, battleStatus: { is_participant?: boolean; participants?: Array<{ username?: string }> }, coordinationMode: HunterCoordinationMode): boolean {
+  if (coordinationMode !== "avoid") return false;
+  if (battleStatus.is_participant) return false; // we're already in it â€” fight
+  const participants = battleStatus.participants || [];
+  const creatures = participants.filter(p => isCreatureName(p.username));
+  if (creatures.length === 0) return false;
+  if (creatures.some(p => isLeviathanCreature(p.username))) return false; // leviathans: group assist
+  const allies = participants.filter(p => {
+    const u = p.username || "";
+    if (isCreatureName(u)) return false;
+    if (u === ctx.bot.username) return false;
+    if (u.startsWith("[POLICE]")) return false;
+    if (u.toLowerCase().includes("pirate") || u.toLowerCase().includes("drifter")) return false;
+    return true;
+  });
+  return allies.length > 0;
+}
+
+async function handleUnexpectedBattle(
+  ctx: RoutineContext,
+  maxAttackTier: PirateTier,
+  minPiratesToFlee: number,
+  fleeThreshold: number,
+  fleeFromTier: PirateTier,
+  repairThreshold: number = 0,
+  onlyNPCs: boolean = false,
+  boardingEnabled: boolean = false,
+  boardingShieldThreshold: number = 5,
+  boardingMarines: number = 0,
+  shieldRechargePct: number = 80,
+  cloakOnStart: boolean = false,
+): Promise<void> {
   const battleStatus = await getBattleStatus(ctx);
   if (!battleStatus) return;
 
-  ctx.log("combat", `⚠️ Unexpectedly in battle (ID: ${battleStatus.battle_id}) during scanning`);
-
-  const analysis = await analyzeExistingBattle(ctx, maxAttackTier, minPiratesToFlee);
-  if (!analysis.shouldJoin) {
-    ctx.log("combat", `⏭️ Skipping unexpected battle: ${analysis.reason}`);
+  const hsettings = getHunterSettings(ctx.bot.username);
+  if (isWeakCreatureBattleAlreadyHandled(ctx, battleStatus, hsettings.coordinationMode)) {
+    ctx.log("combat", `â­ï¸ Skipping battle (ID: ${battleStatus.battle_id}) â€” non-leviathan creature already handled by an ally`);
     return;
   }
 
-  // Get hunter settings for shield recharge
-  const hsettings = getHunterSettings(ctx.bot.username);
-  const shieldRechargePct = (hsettings.shieldRechargePct ?? 80) / 100;
+  ctx.log("combat", `âš ï¸ Unexpectedly in battle (ID: ${battleStatus.battle_id}) during scanning`);
 
-  if (analysis.reason.includes("Already in battle")) {
-    ctx.log("combat", `Already participating on side ${analysis.sideId} — continuing fight`);
-  } else {
-    ctx.log("combat", `✅ Joining unexpected battle on side ${analysis.sideId}: ${analysis.reason}`);
-    const engageResp = await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId!.toString() });
-    if (engageResp.error) {
-      const errMsg = engageResp.error.message.toLowerCase();
-      if (errMsg.includes("already in a battle") || errMsg.includes("already_in_battle")) {
-        ctx.log("combat", `Already in battle — proceeding to fight`);
-      } else {
-        ctx.log("error", `Failed to join unexpected battle: ${engageResp.error.message}`);
-        return;
+  const analysis = await analyzeExistingBattle(ctx, maxAttackTier, minPiratesToFlee);
+  if (!analysis.shouldJoin) {
+    ctx.log("combat", `â­ï¸ Skipping unexpected battle: ${analysis.reason}`);
+    return;
+  }
+
+  const effectiveShieldRechargePct = shieldRechargePct > 0 ? shieldRechargePct : (hsettings.shieldRechargePct ?? 80);
+
+  ctx.log("combat", `âœ… Engaging unexpected battle on side ${analysis.sideId}: ${analysis.reason} â€” holding and fighting`);
+
+  const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
+  const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
+  const fakeTargetIsCreature = fakeTarget ? isCreatureName(fakeTarget.name) : false;
+
+  if (boardingEnabled && fakeTarget) {
+    // NEVER attempt boarding on creatures - they are not capturable ships
+    const boardingTargetName = fakeTarget.name || "";
+    if (isCreatureName(boardingTargetName)) {
+      ctx.log("combat", `âš ï¸ ${boardingTargetName} is a creature - cannot board, engaging with fire stance`);
+    } else {
+      const canBoard = await checkBoardingCapability(ctx);
+      if (canBoard) {
+        const fitMarines = await getFitMarineCount(ctx);
+        const marineRequirement = boardingMarines > 0 ? boardingMarines : 1;
+        if (fitMarines < marineRequirement) {
+          ctx.log("combat", `Boarding: insufficient fit marines (${fitMarines} aboard, need ${marineRequirement}) â€” cannot board`);
+        } else {
+          const boardingTarget = pickLowestShieldsEnemy(battleStatus, analysis.sideId) || fakeTarget;
+          // Double-check the actual target isn't a creature
+          if (isCreatureName(boardingTarget.name)) {
+            ctx.log("combat", `âš ï¸ ${boardingTarget.name} is a creature - cannot board, engaging with fire stance`);
+          } else {
+            ctx.log("combat", `ðŸ›¸ Boarding: engaging unexpected battle with ${boardingTarget.name} (shields â‰¤ ${boardingShieldThreshold}% â†’ board)`);
+            broadcastHunterAssist(ctx, boardingTarget, isCreatureName(boardingTarget.name));
+            broadcastBoardingClaim(ctx, boardingTarget);
+            const result = await boardingSubroutine(ctx, boardingTarget, boardingShieldThreshold, boardingMarines, fleeThreshold, effectiveShieldRechargePct, cloakOnStart);
+            if (result === "failed") {
+              ctx.log("combat", `Boarding failed for ${boardingTarget.name} â€” switching to fire stance to finish`);
+              // âš ï¸ CRITICAL: Pass cloakOnStart through â€” re-cloak must happen immediately after battle
+              await fightJoinedBattle(ctx, boardingTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs,     cloakOnStart, true);
+            }
+            return;
+          }
+        }
       }
     }
   }
 
-  // Pick a real target from battle participants so we get the full combat loop
-  const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
-  const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
   if (fakeTarget) {
-    broadcastHunterAssist(ctx, fakeTarget, isCreatureName(fakeTarget.name));
+    broadcastHunterAssist(ctx, fakeTarget, fakeTargetIsCreature);
   }
-  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, shieldRechargePct, hsettings.onlyNPCs);
+  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs, cloakOnStart, fakeTargetIsCreature);
 }
 
 async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
@@ -183,8 +476,8 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
     const battleStatus = await getBattleStatus(ctx);
     apiChecked = true;
     if (battleStatus) {
-      ctx.log("combat", `⚠️ Battle detected via API (ID: ${battleStatus.battle_id}) - engaging instead of navigating`);
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
+      ctx.log("combat", `âš ï¸ Battle detected via API (ID: ${battleStatus.battle_id}) - engaging instead of navigating`);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
       return true;
     }
     // API returned no battle - clear stale WebSocket state if present
@@ -204,23 +497,98 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
   
   // API failed, check WebSocket state as fallback
   if (ctx.bot.isInBattle()) {
-    ctx.log("combat", `⚠️ WebSocket battle state detected (ID: ${ctx.bot.currentBattle.battleId}) - engaging instead of navigating`);
-    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
+    ctx.log("combat", `âš ï¸ WebSocket battle state detected (ID: ${ctx.bot.currentBattle.battleId}) - engaging instead of navigating`);
+     await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
     return true;
   }
   
   return false;
 }
 
-// ── Settings ─────────────────────────────────────────────────
+/**
+ * Handle a fuel check that did not come back "fueled".
+ *
+ * A non-"fueled" outcome is NOT always a fuel problem:
+ *
+ *   "in_battle" â€” the fuel subsystem deliberately skipped itself because a
+ *                 battle is live. Fuel is not consumed in combat, so there is
+ *                 nothing to fix. GO FIGHT, immediately.
+ *   "failed"    â€” genuinely could not secure fuel. But a battle may still have
+ *                 started part-way through the fuel run, so check for that
+ *                 before deciding to idle.
+ *
+ * Blindly sleeping 30s here is exactly the wrong move: the hunter sits there
+ * absorbing hits while the battle-handling code further down the loop is never
+ * reached, and the next iteration hits the same guard â€” forever. That is how a
+ * hunter with a 95% tank and a hold full of military_fuel_cells ended up
+ * logging "Cannot secure fuel â€” waiting 30s..." for 40 minutes straight while
+ * being shot at.
+ *
+ * So: if a battle is live, FIGHT IT. Only wait when fuel is genuinely the problem.
+ */
+async function handleFuelCheckFailure(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+  outcome: FuelCheckOutcome,
+): Promise<void> {
+  // Straight into the fighting functions â€” no fuel logic, no sleep, no delay.
+  if (await checkAndHandleExistingBattle(ctx, settings)) {
+    ctx.log("combat", "Fuel check yielded to combat â€” battle handled, resuming patrol");
+    return;
+  }
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection";
+  if (outcome === "in_battle") {
+    // Battle flag was set but has already resolved (or was stale). Loop straight
+    // back around and re-check fuel rather than burning 30s for nothing.
+    ctx.log("combat", "Battle already resolved â€” re-checking fuel immediately");
+    return;
+  }
+
+  await ctx.bot.refreshShip();
+  const fuelPct = ctx.bot.maxFuel > 0 ? Math.round((ctx.bot.fuel / ctx.bot.maxFuel) * 100) : 100;
+  ctx.log("error", `Cannot secure fuel (at ${fuelPct}%, threshold ${settings.refuelThreshold}%) â€” waiting 30s...`);
+  await ctx.sleep(30000);
+}
+
+// â”€â”€ Settings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+export type HunterCoordinationMode = "off" | "assist" | "avoid";
+
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "creature_farm_random" | "hunt_big_creatures" | "fleet_arena" | "fleet" | "pvp" | "boarding";
+
+/**
+ * A Creature Farm "route" is just a Hunter Patrol Profile (hunter.hunterPatrols).
+ * Each bot is assigned (per-bot) to one named profile via
+ * hunter.botHunterPatrolAssignments. The profile's `patrolSystems` is the list of
+ * systems the creature-farm bot routes across, farming `creatureFarmLoopsPerSystem`
+ * loops in each before advancing to the next system (cycling back to the first).
+ *
+ * The home base used to bank loot and restock ammo comes from the hunter
+ * homeSystem / homeStation settings (same as every other hunter mode). Optional
+ * per-profile `targetPois` restrict farming to specific POIs.
+ */
 
 export type PatrolCycleMode = "random" | "sequential";
 
 export interface HunterPatrolProfile {
   name: string;
   patrolSystems: string[];
+  /** Optional per-profile POI filter. When set, only these POIs are farmed /
+   *  patrolled (matched by POI id or name). Used by the creature_farm sub-routine
+   *  to restrict a profile to specific creature spawns. */
+  targetPois?: string[];
+  /** Optional per-profile prize destination for boarding mode. When set,
+   *  captured prize ships are sent to this station instead of the global
+   *  homeStation. Accepts the same format as homeStation (POI id, base id,
+   *  base name, or "system|poi"). */
+  boardingPrizeDestination?: string;
+  /** Optional creature farm radius mode: when set, the profile generates its
+   *  patrol system list dynamically from `creatureFarmCenterSystem` rather than
+   *  using the static `patrolSystems` array. The center system is resolved by ID
+   *  or name, and all systems within `creatureFarmPatrolRadius` jumps are
+   *  collected, shuffled, and farmed in random order. */
+  creatureFarmCenterSystem?: string;
+  creatureFarmPatrolRadius?: number;
 }
 
 function seededRandom(seed: number): () => number {
@@ -231,17 +599,37 @@ function seededRandom(seed: number): () => number {
   };
 }
 
-function getHunterSettings(username?: string): {
+export function normalizeHunterMode(mode: HunterMode | string): HunterMode {
+  return mode === "fleet" ? "fleet_arena" : (mode as HunterMode);
+}
+
+export function isFleetArenaMode(mode: HunterMode | string): boolean {
+  return normalizeHunterMode(mode) === "fleet_arena";
+}
+
+function resolveCoordinationMode(
+  rawMode: unknown,
+  legacyCoordinateHunts: boolean,
+): HunterCoordinationMode {
+  const mode = typeof rawMode === "string" ? rawMode.toLowerCase().trim() : "";
+  if (mode === "assist" || mode === "avoid" || mode === "off") return mode;
+  return legacyCoordinateHunts ? "avoid" : "off";
+}
+
+export function getHunterSettings(username?: string): {
   mode: HunterMode;
   patrolCycleMode: PatrolCycleMode;
   system: string;
   refuelThreshold: number;
+  returnHomeOnFuelCellsRemaining: number;
   repairThreshold: number;
   fleeThreshold: number;
   shieldRechargePct: number;
-  onlyNPCs: boolean;
-  huntCreatures: boolean;
+   onlyNPCs: boolean;
+   ignorePirates: boolean;
+   huntCreatures: boolean;
   coordinateHunts: boolean;
+  coordinationMode: HunterCoordinationMode;
   autoCloak: boolean;
   cloakOnStart: boolean;
   ammoThreshold: number;
@@ -256,6 +644,7 @@ function getHunterSettings(username?: string): {
   disableWreckSalvaging: boolean;
   patrolSystems: string[];
   singleLoop: boolean;
+  stayInPoi: boolean;
   homeSystem: string;
   homeStation: string;
   desiredShieldCharges: number;
@@ -263,6 +652,7 @@ function getHunterSettings(username?: string): {
   desiredFuelCells: number;
   desiredEmergencyWarpDevices: number;
   desiredAmmoBoxes: number;
+  desiredMedicalSupplies: number;
   disableResupply: boolean;
   pirateBaseSystem: string;
   patrolRadius: number;
@@ -270,7 +660,26 @@ function getHunterSettings(username?: string): {
   stopOnDeath: boolean;
   targetRandomly: boolean;
   combatDebug: boolean;
+  targetPlayer: string;
   maxCreaturesPerScan: number;
+  creatureFarmLoopsPerSystem: number;
+  creatureFarmCargoFullPct: number;
+  creatureFarmMaxPassesPerPoi: number;
+  creatureFarmMaxSystemSweeps: number;
+   fleetIdlePollSeconds: number;
+  fleetBattleConfirmSeconds: number;
+  fleetFightPlayers: boolean;
+  fleetUndockToFight: boolean;
+    boardingEnabled: boolean;
+  boardingShieldThreshold: number;
+  boardingMarines: number;
+  boardingPrizeDestination: string;
+  boardingShieldChargePct: number;
+  boardingBraceOnRetreat: boolean;
+   creatureFarmSystems: string[];
+  creatureFarmRoamJumps: number;
+  creatureFarmRecordKills: boolean;
+  creatureFarmUseHistoricalData: boolean;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -281,30 +690,37 @@ function getHunterSettings(username?: string): {
   const botHunterPatrolAssignments: Record<string, string> = (h.botHunterPatrolAssignments as Record<string, string>) || {};
 
   let resolvedPatrolSystems: string[] = [];
+  let assignedProfile: HunterPatrolProfile | undefined;
 
   if (hunterPatrols.length > 0 && username) {
     const assignedProfileName = botHunterPatrolAssignments[username] || hunterPatrols[0]?.name || "Default Patrol";
-    const assignedProfile = hunterPatrols.find(p => p.name === assignedProfileName) || hunterPatrols[0];
+    assignedProfile = hunterPatrols.find(p => p.name === assignedProfileName) || hunterPatrols[0];
     resolvedPatrolSystems = assignedProfile?.patrolSystems || [];
   } else if (Array.isArray(h.patrolSystems)) {
     // Legacy single list
     resolvedPatrolSystems = h.patrolSystems;
   }
 
+  const rawMode = ((botOverrides.hunterMode as HunterMode) || (h.mode as HunterMode) || "roam_systems") as HunterMode;
+  const mode = normalizeHunterMode(rawMode);
+
   return {
-    mode: ((botOverrides.hunterMode as HunterMode) || (h.mode as HunterMode) || "roam_systems") as HunterMode,
+    mode,
     patrolCycleMode: ((botOverrides.patrolCycleMode as PatrolCycleMode) || (h.patrolCycleMode as PatrolCycleMode) || "sequential") as PatrolCycleMode,
     system: (botOverrides.system as string) || (h.system as string) || "",
     refuelThreshold: (h.refuelThreshold as number) || 40,
     repairThreshold: (h.repairThreshold as number) || 30,
+    returnHomeOnFuelCellsRemaining: (h.returnHomeOnFuelCellsRemaining as number) || 2,
     fleeThreshold: (h.fleeThreshold as number) || 20,
     shieldRechargePct: (h.shieldRechargePct as number) || 80,
-onlyNPCs: (h.onlyNPCs as boolean) !== false,
-  huntCreatures: (botOverrides.huntCreatures ?? h.huntCreatures) !== false,
-  coordinateHunts: (h.coordinateHunts as boolean) !== false,
-  autoCloak: (h.autoCloak as boolean) ?? false,
-  cloakOnStart: (h.cloakOnStart as boolean) ?? false,
-  ammoThreshold: (h.ammoThreshold as number) || 5,
+     onlyNPCs: h.onlyNPCs !== false && h.onlyNPCs !== "false",
+    ignorePirates: (botOverrides.ignorePirates as boolean) ?? (h.ignorePirates as boolean) ?? false,
+    huntCreatures: (botOverrides.huntCreatures ?? h.huntCreatures) !== false,
+    coordinateHunts: (h.coordinateHunts as boolean) !== false,
+    coordinationMode: resolveCoordinationMode(h.coordinationMode, (h.coordinateHunts as boolean) !== false),
+    autoCloak: (h.autoCloak as boolean) ?? false,
+    cloakOnStart: (h.cloakOnStart as boolean) ?? false,
+    ammoThreshold: (h.ammoThreshold as number) || 5,
     ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) || 1,
     ammoReloadPercentThreshold: (h.ammoReloadPercentThreshold as number) || 25,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
@@ -313,25 +729,50 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     fleeFromTier: ((h.fleeFromTier as PirateTier) || "boss") as PirateTier,
     minPiratesToFlee: (h.minPiratesToFlee as number) || 3,
     disableScanCommandForPirates: (h.disableScanCommandForPirates as boolean) ?? false,
-    disableWreckSalvaging: (h.disableWreckSalvaging as boolean) ?? false,
+    disableWreckSalvaging: (botOverrides.disableWreckSalvaging as boolean) ?? (h.disableWreckSalvaging as boolean) ?? false,
     patrolSystems: resolvedPatrolSystems,
     singleLoop: (h.singleLoop as boolean) ?? false,
-    homeSystem: (botOverrides.homeSystem as string) || (botOverrides.hunterHomeSystem as string) || (h.homeSystem as string) || (all.return_home?.homeSystem as string) || "",
-    homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || "",
+    stayInPoi: (botOverrides.stayInPoi as boolean) ?? (h.stayInPoi as boolean) ?? false,
+    homeSystem: (botOverrides.homeSystem as string) || (botOverrides.hunterHomeSystem as string) || (h.homeSystem as string) || (all.return_home?.homeSystem as string) || (getGlobalHomeBase().system as string) || "",
+    homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || (getGlobalHomeBase().station as string) || "",
     desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
     desiredRepairKits: (h.desiredRepairKits as number) ?? 12,
     desiredFuelCells: (h.desiredFuelCells as number) ?? -1,
     desiredEmergencyWarpDevices: (h.desiredEmergencyWarpDevices as number) ?? 3,
     desiredAmmoBoxes: (h.desiredAmmoBoxes as number) ?? -1,
+    desiredMedicalSupplies: (h.desiredMedicalSupplies as number) ?? 0,
     disableResupply: (h.disableResupply as boolean) ?? false,
     pirateBaseSystem: (botOverrides.pirateBaseSystem as string) || (h.pirateBaseSystem as string) || "",
     patrolRadius: (botOverrides.patrolRadius as number) || (h.patrolRadius as number) || 5,
-  meatShield: (h.meatShield as boolean) ?? false,
-  stopOnDeath: (h.stopOnDeath as boolean) ?? false,
-  targetRandomly: (h.targetRandomly as boolean) ?? false,
-  combatDebug: (h.combatDebug as boolean) ?? false,
-  maxCreaturesPerScan: (h.maxCreaturesPerScan as number) ?? 10,
-};
+    meatShield: (h.meatShield as boolean) ?? false,
+    stopOnDeath: (h.stopOnDeath as boolean) ?? false,
+    targetRandomly: (h.targetRandomly as boolean) ?? false,
+    combatDebug: (h.combatDebug as boolean) ?? false,
+    targetPlayer: (botOverrides.targetPlayer as string) || (h.targetPlayer as string) || "",
+    maxCreaturesPerScan: (h.maxCreaturesPerScan as number) ?? 10,
+    creatureFarmLoopsPerSystem: ((botOverrides.creatureFarmLoopsPerSystem as number) || (h.creatureFarmLoopsPerSystem as number) || 3),
+    creatureFarmCargoFullPct: ((h.creatureFarmCargoFullPct as number) > 0 ? (h.creatureFarmCargoFullPct as number) : 95) / 100,
+    creatureFarmMaxPassesPerPoi: (h.creatureFarmMaxPassesPerPoi as number) ?? 6,
+    creatureFarmMaxSystemSweeps: (h.creatureFarmMaxSystemSweeps as number) ?? 40,
+    fleetIdlePollSeconds: (botOverrides.fleetIdlePollSeconds as number) ?? (h.fleetIdlePollSeconds as number) ?? 2,
+    fleetBattleConfirmSeconds: (botOverrides.fleetBattleConfirmSeconds as number) ?? (h.fleetBattleConfirmSeconds as number) ?? 10,
+    fleetFightPlayers: (botOverrides.fleetFightPlayers as boolean) ?? (h.fleetFightPlayers as boolean) ?? true,
+    fleetUndockToFight: (botOverrides.fleetUndockToFight as boolean) ?? (h.fleetUndockToFight as boolean) ?? true,
+    boardingEnabled: (botOverrides.boardingEnabled as boolean) ?? (mode === "boarding"),
+    boardingShieldThreshold: (botOverrides.boardingShieldThreshold as number) ?? (h.boardingShieldThreshold as number) ?? 5,
+    boardingMarines: (botOverrides.boardingMarines as number) ?? (h.boardingMarines as number) ?? 0,
+    boardingPrizeDestination:
+      (assignedProfile?.boardingPrizeDestination as string) ||
+      (botOverrides.boardingPrizeDestination as string) ||
+      (h.boardingPrizeDestination as string) ||
+      "",
+    boardingShieldChargePct: (botOverrides.boardingShieldChargePct as number) ?? (h.boardingShieldChargePct as number) ?? 0,
+    boardingBraceOnRetreat: (botOverrides.boardingBraceOnRetreat as boolean) ?? (h.boardingBraceOnRetreat as boolean) ?? false,
+    creatureFarmSystems: Array.isArray(h.creatureFarmSystems) ? h.creatureFarmSystems : [],
+    creatureFarmRoamJumps: (botOverrides.creatureFarmRoamJumps as number) ?? (h.creatureFarmRoamJumps as number) ?? 1,
+    creatureFarmRecordKills: (h.creatureFarmRecordKills as boolean) ?? true,
+    creatureFarmUseHistoricalData: (h.creatureFarmUseHistoricalData as boolean) ?? false,
+  };
 }
 
 /** Persist hunter mode setting for a specific bot. */
@@ -371,15 +812,237 @@ export function assignBotToHunterPatrol(username: string, patrolProfileName: str
   writeSettings({ hunter: h });
 }
 
+/**
+ * Resolve the Hunter Patrol Profile assigned to a bot (falls back to the first
+ * profile). The creature_farm sub-routine reuses this structure as its route:
+ * `patrolSystems` is the ordered list of systems to farm across, and optional
+ * `targetPois` restricts which POIs are visited.
+ */
+export function getHunterPatrolProfile(username: string): HunterPatrolProfile | null {
+  const all = readSettings();
+  const h = (all.hunter || {}) as any;
+  const profiles: HunterPatrolProfile[] = Array.isArray(h.hunterPatrols) ? h.hunterPatrols : [];
+  if (profiles.length === 0) return null;
+  const assignments: Record<string, string> = (h.botHunterPatrolAssignments as Record<string, string>) || {};
+  const name = assignments[username] || profiles[0].name;
+  return profiles.find(p => p.name === name) || profiles[0] || null;
+}
+
 /** Returns true if the bot is low on field repair consumables and should return to resupply. */
 function isLowOnFieldConsumables(inventory: any[] | undefined, minRepairKits = 5, minShieldCharges = 5): boolean {
   const repair = (inventory || [])
-    .filter(i => (i.itemId || "").toLowerCase().includes("repair_kit"))
+    .filter(i => i.itemId.toLowerCase().includes("repair_kit"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
   const shields = (inventory || [])
-    .filter(i => (i.itemId || "").toLowerCase().includes("shield_charge"))
+    .filter(i => i.itemId.toLowerCase().includes("shield_charge"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
   return repair < minRepairKits || shields < minShieldCharges;
+}
+
+function countFuelCellsInInventory(inventory: any[] | undefined): number {
+  return (inventory || [])
+    .filter(i => {
+      const id = (i.itemId || "").toLowerCase();
+      return id === "fuel_cell" || id === "premium_fuel_cell" || id === "military_fuel_cell";
+    })
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+}
+
+/**
+ * Check if the bot can reach its home base with current tank fuel + cargo
+ * fuel cells. Returns true if we can make it home (even arriving empty).
+ * Used to decide whether to return home now while we still can, rather than
+ * stranding mid-route.
+ *
+ * Considers cloak fuel consumption (1 fuel per tick while cloaked) and
+ * slow hunter ship speeds. Conservative per-jump estimate.
+ */
+async function canReachHomeWithFuel(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<boolean> {
+  const { bot } = ctx;
+  if (!settings.homeSystem) return false;
+
+  await bot.refreshShip();
+  await bot.refreshCargo();
+  await bot.refreshLocation();
+
+  const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+  if (normalizeSystemName(bot.system) === normalizeSystemName(settings.homeSystem)) {
+    return true; // Already at home
+  }
+
+  // Route to home (no blacklist — hunters use skipBlacklist)
+  const route = mapStore.findRoute(bot.system, settings.homeSystem, []);
+  if (!route || route.length <= 1) return false;
+  const jumpsNeeded = route.length - 1;
+
+  // Total available fuel: tank + cargo cells
+  const tankFuel = bot.fuel || 0;
+  const cellFuel = (bot.inventory || [])
+    .filter(i => getFuelCellFuelValue(i.itemId) > 0)
+    .reduce((s, i) => s + (getFuelCellFuelValue(i.itemId) * (i.quantity || 0)), 0);
+  const totalAvailable = tankFuel + cellFuel;
+
+  // Conservative per-jump fuel estimate: ~26/jump base + cloak overhead
+  // (1 fuel/tick, slow ships take multiple ticks per jump)
+  const perJumpFuel = settings.cloakOnStart ? 35 : 30;
+  const estimatedFuelNeeded = jumpsNeeded * perJumpFuel;
+
+  return totalAvailable >= estimatedFuelNeeded;
+}
+
+/**
+ * Split a configured home station into its system and POI parts. The setting
+ * may be a bare POI id ("grand_exchange_station") or a "system|poi" pair
+ * ("diphda|2574b16e0e18d90b98354bcae963854e").
+ */
+function splitHomeStation(homeStation: string): { system: string; poi: string } {
+  if (!homeStation) return { system: "", poi: "" };
+  if (homeStation.includes("|")) {
+    const [sys, poi] = homeStation.split("|");
+    return { system: (sys || "").trim(), poi: (poi || "").trim() };
+  }
+  return { system: "", poi: homeStation.trim() };
+}
+
+/**
+ * Navigate to the configured home base and dock there. Returns true only when
+ * the bot is docked at a station in the home system (at the exact home station
+ * when one is configured).
+ *
+ * HARD RULE — loot is NEVER dumped at a random station. If the home system
+ * cannot be reached, no home base is configured, or the routine is stopping,
+ * this returns false and the caller keeps the cargo aboard and retries later.
+ * "Docking wherever possible" and depositing everything strands loot at a
+ * random station halfway across the galaxy — the bot claims it is going home
+ * and then dumps the hold in whatever system it happened to get stuck in.
+ *
+ * @param navOpts Passed through to navigateToSystem (fuel/cloak/blacklist opts).
+ */
+export async function navigateToHomeBaseAndDock(
+  ctx: RoutineContext,
+  homeSystem: string,
+  homeStation: string,
+  navOpts: { fuelThresholdPct: number; hullThresholdPct: number; autoCloak?: boolean; skipBlacklist?: boolean; isCombatBot?: boolean; joinBattles?: boolean },
+): Promise<boolean> {
+  const { bot } = ctx;
+
+  const parts = splitHomeStation(homeStation);
+  // A "system|poi" home station names the system its station actually lives in
+  // — that is authoritative and overrides a stale/mismatched homeSystem.
+  const effHomeSystem = parts.system || homeSystem;
+  if (parts.system && homeSystem && homeSystem.toLowerCase() !== parts.system.toLowerCase()) {
+    ctx.log("warn", `Home station "${homeStation}" lives in ${parts.system} — overriding stale homeSystem "${homeSystem}"`);
+  }
+  const homeLabel = homeStation || effHomeSystem || "(unconfigured)";
+
+  // A stop request must never trigger a "helpful" dock-and-dump on the way out.
+  if (bot.state !== "running") {
+    ctx.log("warn", `Routine stopping — aborting return to home base ${homeLabel} (loot kept aboard)`);
+    return false;
+  }
+
+  if (!effHomeSystem && !parts.poi) {
+    ctx.log("error", `No home base configured — refusing to dock/dump loot at a random station (cargo kept aboard)`);
+    await ctx.sleep(30000);
+    return false;
+  }
+
+  // No home system configured: the configured station POI must exist in the
+  // system we are already in — otherwise docking "anywhere" here would dump the
+  // loot at a random station in a random system.
+  if (!effHomeSystem && parts.poi) {
+    const { pois } = await getSystemInfo(ctx);
+    const stationHere = pois.some(p => p.id === parts.poi && isStationPoi(p));
+    if (!stationHere) {
+      ctx.log("error", `Home station ${parts.poi} is not in ${bot.system} and no home system is configured — loot kept aboard (will retry next cycle)`);
+      await ctx.sleep(30000);
+      return false;
+    }
+  }
+
+  await bot.refreshLocation();
+
+  const inHomeSystem = !!effHomeSystem && (bot.system || "").toLowerCase() === effHomeSystem.toLowerCase();
+  const atHomeStation = !!parts.poi && bot.poi === parts.poi;
+
+  if (atHomeStation && bot.docked) return true;
+
+  // Docked anywhere that is not the intended destination — undock so we can travel.
+  if (bot.docked && (!inHomeSystem || (parts.poi && bot.poi !== parts.poi))) {
+    await ensureUndocked(ctx);
+  }
+
+  // Navigate to the home system when we are not already there.
+  if (effHomeSystem && !inHomeSystem) {
+    const arrived = await navigateToSystem(ctx, effHomeSystem, { ...navOpts, homeSystem: effHomeSystem, homeStation });
+    await bot.refreshLocation();
+    const nowInHome = (bot.system || "").toLowerCase() === effHomeSystem.toLowerCase();
+    if (!arrived || !nowInHome) {
+      ctx.log("error", `Could not reach home system ${effHomeSystem} — loot kept aboard (${bot.cargo}/${bot.cargoMax} cargo), will retry next cycle`);
+      await ctx.sleep(30000);
+      return false;
+    }
+  }
+
+  if (bot.state !== "running") {
+    ctx.log("warn", `Routine stopping — aborting return to home base ${homeLabel} (loot kept aboard)`);
+    return false;
+  }
+
+  // Strict dock: at the configured home station only, or (when none is
+  // configured) at a station in the verified home system. Never wander to
+  // another system to dock, never dump loot at a random station.
+  const docked = parts.poi
+    ? await ensureDocked(ctx, true, 0, { targetStationId: parts.poi, strictTarget: true })
+    : await ensureDocked(ctx, true, 0, { strictTarget: true });
+  if (!docked) {
+    ctx.log("error", `Could not dock at home base ${homeLabel} — loot kept aboard (${bot.cargo}/${bot.cargoMax} cargo), will retry next cycle`);
+    await ctx.sleep(30000);
+    return false;
+  }
+  return true;
+}
+
+async function returnToHomeAndResupply(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+  const homeSystem = settings.homeSystem || "";
+  const homeStation = settings.homeStation || "";
+  // Use a low fuel threshold (10%) when navigating home — we only need enough
+  // fuel for the next jump, not the entire trip. The ensureFueled logic will
+  // consume cargo fuel cells as needed during the journey.
+  const safetyOpts = {
+    fuelThresholdPct: 10,
+    hullThresholdPct: settings.repairThreshold,
+    autoCloak: settings.autoCloak,
+    skipBlacklist: true,
+    isCombatBot: true,
+    joinBattles: true,
+  };
+
+  ctx.log("system", `Returning to home base ${homeStation || homeSystem || "(default)"} — depositing loot + restocking...`);
+  try {
+    const docked = await navigateToHomeBaseAndDock(ctx, homeSystem, homeStation, safetyOpts);
+    if (!docked) {
+      ctx.log("error", "Could not dock at home base — loot not deposited");
+      return;
+    }
+
+    await ensureHunterResupply(ctx);
+    await collectFromStorage(ctx);
+    await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    await ensureInsured(ctx);
+    await bot.checkSkills();
+    await ensureUndocked(ctx);
+    ctx.log("info", "Resupplied at home base — resuming patrol");
+  } catch (e) {
+    ctx.log("error", `Error returning to home base: ${e}`);
+  }
 }
 
 async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<void> {
@@ -417,7 +1080,14 @@ async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: Re
   
   if (!battleStatus) return;
 
-  ctx.log("combat", `⚠️ Navigation interrupted by battle (ID: ${battleStatus.battle_id}) - hunter fights, not flees!`);
+  // Don't get pulled into a one-shot creature battle another hunter is already solo'ing
+  // (and likely claimed). Leviathans still pass through for the group assist.
+  if (isWeakCreatureBattleAlreadyHandled(ctx, battleStatus, settings.coordinationMode)) {
+    ctx.log("combat", `â­ï¸ Navigation battle (ID: ${battleStatus.battle_id}) skipped â€” non-leviathan creature already handled by an ally`);
+    return;
+  }
+
+  ctx.log("combat", `âš ï¸ Navigation interrupted by battle (ID: ${battleStatus.battle_id}) - hunter fights, not flees!`);
 
   const analysis = await analyzeExistingBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee);
   if (!analysis.shouldJoin) {
@@ -431,20 +1101,20 @@ async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: Re
     if (engageResp.error) {
       const errMsg = engageResp.error.message.toLowerCase();
       if (errMsg.includes("already in a battle") || errMsg.includes("already_in_battle")) {
-        ctx.log("combat", "Already in battle — proceeding to fight");
+        ctx.log("combat", "Already in battle â€” proceeding to fight");
       } else {
         ctx.log("error", `Failed to join battle: ${engageResp.error.message}`);
         return;
       }
     }
 
-const enemy = (battleStatus?.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed);
+const enemy = (battleStatus?.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
     const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
-    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs);
+    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true);
   }
 }
 
-// ── Security level helpers ────────────────────────────────────
+// â”€â”€ Security level helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function isHuntableSystem(securityLevel: string | undefined): boolean {
   if (!securityLevel) return false;
@@ -531,7 +1201,7 @@ function findNearestSafeSystem(fromSystemId: string): string | null {
   return null;
 }
 
-// ── Mission helpers ───────────────────────────────────────────
+// â”€â”€ Mission helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const COMBAT_MISSION_KEYWORDS = [
   "bounty", "pirate", "hunt", "kill", "eliminate", "destroy", "drifter",
@@ -580,7 +1250,6 @@ async function checkAndAcceptMissions(ctx: RoutineContext): Promise<void> {
     }
   }
 }
-
 async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   if (!bot.docked) return;
@@ -607,8 +1276,7 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
     }
   }
 }
-
-// ── Safe-system docking ───────────────────────────────────────
+// â”€â”€ Safe-system docking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function navigateToSafeStation(ctx: RoutineContext, safetyOpts: { fuelThresholdPct: number; hullThresholdPct: number }): Promise<boolean> {
   const { bot } = ctx;
@@ -621,10 +1289,10 @@ async function navigateToSafeStation(ctx: RoutineContext, safetyOpts: { fuelThre
       ctx.log("travel", `Heading to safe system ${sys?.name || safeSystem} (${sys?.security_level}) for repairs...`);
       const arrived = await navigateToSystem(ctx, safeSystem, { ...safetyOpts, skipBlacklist: true, joinBattles: true });
       if (!arrived) {
-        ctx.log("error", "Could not reach safe system — attempting local dock");
+        ctx.log("error", "Could not reach safe system â€” attempting local dock");
       }
     } else {
-      ctx.log("info", "No safe system mapped yet — docking locally");
+      ctx.log("info", "No safe system mapped yet â€” docking locally");
     }
   }
 
@@ -723,19 +1391,35 @@ function findSystemsWithinRadius(fromSystemId: string, maxJumps: number): string
   return result;
 }
 
-// ── Ammo management ──────────────────────────────────────────
+/**
+ * Resolve a system reference (ID or name) to a canonical system ID from the
+ * map store. Returns null if the system cannot be found.
+ */
+function resolveSystemId(ref: string): string | null {
+  const normalized = ref.toLowerCase().replace(/_/g, ' ');
+  if (mapStore.getSystem(ref)) return ref;
+  for (const sysId of mapStore.getAllSystemIds()) {
+    const sys = mapStore.getSystem(sysId);
+    if (!sys) continue;
+    const sysName = (sys.name || sysId).toLowerCase().replace(/_/g, ' ');
+    if (sysName === normalized) return sysId;
+  }
+  return null;
+}
 
-// ── Faction alert response ────────────────────────────────────
+// â”€â”€ Ammo management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+// â”€â”€ Faction alert response â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /** Cooldown per system so we don't divert repeatedly (5 minutes). */
 const ALERT_RESPONSE_COOLDOWN_MS = 5 * 60 * 1000;
 /** Ignore faction alerts older than this (seconds, if API returns Unix time). */
 const ALERT_STALENESS_SECS = 5 * 60;
 
-/** Map<systemId, lastRespondedTimestamp> — persists across loop iterations. */
+/** Map<systemId, lastRespondedTimestamp> â€” persists across loop iterations. */
 const respondedAlerts = new Map<string, number>();
 
-// ── Hunter-to-Hunter coordination (non-API bot chat channel) ──
+// â”€â”€ Hunter-to-Hunter coordination (non-API bot chat channel) â”€â”€
 //
 // When a hunter engages a creature (or pirate) it broadcasts an "assist" message
 // on the in-memory bot chat channel. Other hunters in the SAME POI pick it up and
@@ -758,9 +1442,231 @@ const coordRequests = new Map<string, HunterCoordRequest[]>();
 const coordHandled = new Map<string, Set<string>>();
 /** Bots that already have a message handler registered. */
 const coordListeners = new Set<string>();
-/** True while we are engaging a target as a coordination *response* — suppresses
+/** True while we are engaging a target as a coordination *response* â€” suppresses
  *  our own broadcast so responders don't echo the assist request back. */
 let coordResponding = false;
+
+// â”€â”€ Creature "claim" lock (non-API bot chat channel) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// Because we no longer want multiple hunters piling onto a weak one-shot creature
+// (it only splits loot at the crowded choke-point POIs all the tour bots share),
+// the first hunter to start attacking a non-leviathan creature "claims" it over the
+// in-memory bot chat channel. Other hunters in the same process honour the claim and
+// skip that creatureId so they pick a different target instead.
+//
+// Leviathans are explicitly NOT claimed â€” they still get the full assist broadcast
+// (see isLeviathanCreature / broadcastHunterAssist) so the whole wing lands on them.
+
+/** How long a claim stays valid before it is treated as stale (ms). Covers the case
+ *  where the claiming bot dies mid-fight and never releases the lock. */
+const CREATURE_CLAIM_TTL_MS = 5 * 60 * 1000;
+/** Map<creatureId, { claimer, expires }> â€” shared across all bots in this process. */
+const creatureClaims = new Map<string, { claimer: string; expires: number }>();
+
+function releaseExpiredCreatureClaims(): void {
+  const now = Date.now();
+  for (const [id, claim] of creatureClaims) {
+    if (claim.expires <= now) creatureClaims.delete(id);
+  }
+}
+
+import { writeFileSync, existsSync, readFileSync, mkdirSync } from "fs";
+import { join } from "path";
+
+const DATA_DIR = join(process.cwd(), "data");
+const BIG_CREATURE_CLAIMS_FILE = join(DATA_DIR, "big_creature_claims.json");
+
+function ensureDataDir(): void {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+function loadBigCreatureClaimsFromFile(): Record<string, { claimer: string; expires: number }> {
+  try {
+    if (!existsSync(BIG_CREATURE_CLAIMS_FILE)) return {};
+    const parsed = JSON.parse(readFileSync(BIG_CREATURE_CLAIMS_FILE, "utf-8")) as Record<string, { claimer: string; expires: number }>;
+    return parsed || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveBigCreatureClaimsToFile(claims: Record<string, { claimer: string; expires: number }>): void {
+  try {
+    ensureDataDir();
+    writeFileSync(BIG_CREATURE_CLAIMS_FILE, JSON.stringify(claims, null, 2), "utf-8");
+  } catch {
+    // best-effort persistence
+  }
+}
+
+function syncBigCreatureClaimsToFile(): void {
+  const now = Date.now();
+  const claims: Record<string, { claimer: string; expires: number }> = {};
+  for (const [key, claim] of bigCreatureHuntAnnouncements) {
+    if (claim.expires > now) {
+      claims[key] = claim;
+    }
+  }
+  saveBigCreatureClaimsToFile(claims);
+}
+
+function loadPersistedBigCreatureClaims(): void {
+  const claims = loadBigCreatureClaimsFromFile();
+  const now = Date.now();
+  for (const [key, claim] of Object.entries(claims)) {
+    if (claim.expires > now) {
+      bigCreatureHuntAnnouncements.set(key, claim);
+    }
+  }
+}
+
+// â”€â”€ Big creature hunt coordination (non-API bot chat channel + file) â”€
+//
+// Multiple big-creature hunters can pick the same known target without
+// coordination. We avoid that by broadcasting our chosen target system/POI
+// and ignoring recently announced targets from other hunters when choosing
+// ours. Claims are persisted to disk so newly started bots honour existing
+// claims even if they missed the in-memory broadcast.
+
+const BIG_CREATURE_HUNT_TTL_MS = 10 * 60 * 1000;
+const bigCreatureHuntAnnouncements = new Map<string, { claimer: string; expires: number }>();
+const bigCreatureHuntInFlight = new Map<string, string>();
+
+function releaseExpiredBigCreatureHunts(): void {
+  const now = Date.now();
+  for (const [key, claim] of bigCreatureHuntAnnouncements) {
+    if (claim.expires <= now) bigCreatureHuntAnnouncements.delete(key);
+  }
+  for (const [key, claimer] of bigCreatureHuntInFlight) {
+    const persisted = bigCreatureHuntAnnouncements.get(key);
+    if (!persisted || persisted.claimer !== claimer) bigCreatureHuntInFlight.delete(key);
+  }
+  syncBigCreatureClaimsToFile();
+}
+
+function announceBigCreatureHunt(bot: Bot, system: string, poi: string, targetName: string): void {
+  if (!system || !poi) return;
+  const settings = getHunterSettings(bot.username);
+  if (settings.coordinationMode === "off") return;
+  const key = `${system}|${poi}`;
+  const existing = bigCreatureHuntAnnouncements.get(key);
+  if (existing && existing.claimer === bot.username) return;
+  bigCreatureHuntAnnouncements.set(key, { claimer: bot.username, expires: Date.now() + BIG_CREATURE_HUNT_TTL_MS });
+  botChatChannel.send({
+    sender: bot.username,
+    recipients: [],
+    channel: "coordination",
+    content: `[BIG CREATURE HUNT] ${bot.username} heading to ${targetName} at ${system}/${poi}`,
+    metadata: {
+      type: "big_creature_hunt",
+      system,
+      poi,
+      targetName,
+    },
+  });
+  const syncLight = (globalThis as any).syncLight as { queueBigCreatureClaim?: (claim: any) => void } | undefined;
+  if (syncLight?.queueBigCreatureClaim) {
+    syncLight.queueBigCreatureClaim({
+      claimer: bot.username,
+      system,
+      poi,
+      targetName,
+      expiresAt: Date.now() + BIG_CREATURE_HUNT_TTL_MS,
+    });
+  }
+  syncBigCreatureClaimsToFile();
+}
+
+function isBigCreatureHuntClaimedByOther(system: string, poi: string, username: string): boolean {
+  const key = `${system}|${poi}`;
+  const claim = bigCreatureHuntAnnouncements.get(key);
+  if (!claim) return false;
+  if (claim.expires <= Date.now()) {
+    bigCreatureHuntAnnouncements.delete(key);
+    syncBigCreatureClaimsToFile();
+    return false;
+  }
+  return claim.claimer !== username;
+}
+
+function isBigCreatureHuntInFlightOrClaimedByOther(system: string, poi: string, username: string): boolean {
+  const key = `${system}|${poi}`;
+  if (isBigCreatureHuntClaimedByOther(system, poi, username)) return true;
+  const inFlight = bigCreatureHuntInFlight.get(key);
+  if (inFlight && inFlight !== username) return true;
+  return false;
+}
+
+/** Broadcast a claim lock for a non-leviathan creature we're about to engage. */
+function claimCreature(ctx: RoutineContext, target: { id: string; name: string }): void {
+  const { bot } = ctx;
+  if (!bot.system || !bot.poi) return;
+  const settings = getHunterSettings(bot.username);
+  if (settings.coordinationMode === "off") return;
+  const isCreature = !!(target as any).isCreature || isCreatureTarget(target as any, true);
+  if (!isCreature || isLeviathanCreature(target.name) || isBrandedCreature(target.name) || isProtectedCreature(target.name)) return;
+  const existing = creatureClaims.get(target.id);
+  if (existing && existing.claimer === bot.username) return;
+  creatureClaims.set(target.id, { claimer: bot.username, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
+  botChatChannel.send({
+    sender: bot.username,
+    recipients: [],
+    channel: "coordination",
+    content: `[CREATURE CLAIM] ${bot.username} claiming ${target.name} (${target.id}) at ${bot.system}/${bot.poi}`,
+    metadata: {
+      type: "creature_claim",
+      system: bot.system,
+      poi: bot.poi,
+      targetName: target.name,
+      targetId: target.id,
+    },
+  });
+  const syncLight = (globalThis as any).syncLight as { queueCreatureClaim?: (claim: any) => void } | undefined;
+  if (syncLight?.queueCreatureClaim) {
+    syncLight.queueCreatureClaim({
+      claimer: bot.username,
+      targetId: target.id,
+      targetName: target.name,
+      system: bot.system,
+      poi: bot.poi,
+      expiresAt: Date.now() + CREATURE_CLAIM_TTL_MS,
+    });
+  }
+}
+
+/** True if a different hunter has an active claim on this creatureId. */
+function isCreatureClaimedByOther(creatureId: string, username: string): boolean {
+  const claim = creatureClaims.get(creatureId);
+  if (!claim) return false;
+  if (claim.expires <= Date.now()) {
+    creatureClaims.delete(creatureId);
+    return false;
+  }
+  return claim.claimer !== username;
+}
+
+/**
+ * Pick the creatures a hunter should engage, honouring other hunters' claim locks.
+ * Leviathans are never filtered (they want the group assist) and are prioritised
+ * first. Non-leviathan creatures already claimed by another bot are dropped so the
+ * hunter picks a different, unclaimed target instead.
+ */
+function pickCreatureTargets(entities: NearbyEntity[], bot: Bot, huntCreatures: boolean, max: number, coordinationMode: HunterCoordinationMode): NearbyEntity[] {
+  releaseExpiredCreatureClaims();
+  const creatures = applyCloudWhalePackRule(entities.filter(e => isCreatureTarget(e, huntCreatures) && !isStationEntity(e) && !isBrandedCreature(e.name) && !isProtectedCreature(e.name)));
+  const unclaimed = creatures.filter(e =>
+    isLeviathanCreature(e.name) || coordinationMode !== "avoid" || !isCreatureClaimedByOther(e.id, bot.username),
+  );
+  const result = prioritizeLeviathans(unclaimed).slice(0, Math.max(0, max));
+  for (const c of result) {
+    if (!isLeviathanCreature(c.name) && !creatureClaims.has(c.id)) {
+      creatureClaims.set(c.id, { claimer: bot.username, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
+    }
+  }
+  return result;
+}
 
 /**
  * Wrapper around engageTarget that broadcasts a hunter-assist request (so same-POI
@@ -769,7 +1675,7 @@ let coordResponding = false;
  */
 async function hunterEngage(
   ctx: RoutineContext,
-  target: { id: string; name: string; isCreature?: boolean },
+  target: { id: string; name: string; isCreature?: boolean; type?: string },
   fleeThreshold: number,
   fleeFromTier: PirateTier,
   minPiratesToFlee: number,
@@ -780,10 +1686,41 @@ async function hunterEngage(
   onlyNPCs: boolean = false,
   cloakOnStart: boolean = false,
 ): Promise<boolean> {
+  const isCreature = !!target.isCreature || target.type === "creature" || target.id.startsWith("crt_") || isCreatureName(target.name);
   if (!coordResponding) {
-    broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
+    broadcastHunterAssist(ctx, target, isCreature);
+    claimCreature(ctx, target);
   }
-  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart);
+  const hsettings = getHunterSettings(ctx.bot.username);
+  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold,     hsettings.ammoReloadPercentThreshold, true);
+}
+
+// â”€â”€ Boarding claim lock (non-API bot chat channel) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// When a hunter starts boarding a target it broadcasts a claim on the
+// in-memory bot chat channel. Other hunters in the same POI honour the
+// claim: with multiple targets they pick a different ship, and with only
+// one target they switch to brace stance so they do not damage the prize.
+
+function broadcastBoardingClaim(ctx: RoutineContext, target: { id: string; name: string }): void {
+  const { bot } = ctx;
+  if (!bot.system || !bot.poi) return;
+  const settings = getHunterSettings(bot.username);
+  if (settings.coordinationMode === "off") return;
+  boardingClaims.set(target.id, { claimer: bot.username, expires: Date.now() + BOARDING_CLAIM_TTL_MS });
+  botChatChannel.send({
+    sender: bot.username,
+    recipients: [],
+    channel: "coordination",
+    content: `[BOARDING CLAIM] ${bot.username} boarding ${target.name} (${target.id}) at ${bot.system}/${bot.poi}`,
+    metadata: {
+      type: "hunter_boarding_claim",
+      system: bot.system,
+      poi: bot.poi,
+      targetName: target.name,
+      targetId: target.id,
+    },
+  });
 }
 
 /** Register the bot's coordination listener once. */
@@ -796,21 +1733,47 @@ function ensureHunterCoordListener(username: string): void {
   botChatChannel.onMessage(username, (msg) => {
     if (msg.channel !== "coordination") return;
     if (msg.sender === username) return;
+    const settings = getHunterSettings(username);
+    if (settings.coordinationMode === "off") return;
     const meta = (msg.metadata || {}) as Record<string, unknown>;
-    if (meta.type !== "hunter_assist") return;
-    const system = (meta.system as string) || "";
-    const poi = (meta.poi as string) || "";
-    if (!system || !poi) return;
-    const req: HunterCoordRequest = {
-      sender: msg.sender,
-      system,
-      poi,
-      targetName: (meta.targetName as string) || "",
-      targetId: (meta.targetId as string) || "",
-      creature: !!(meta.creature),
-      timestamp: msg.timestamp,
-    };
-    coordRequests.get(username)!.push(req);
+    if (meta.type === "hunter_assist") {
+      const system = (meta.system as string) || "";
+      const poi = (meta.poi as string) || "";
+      if (!system || !poi) return;
+      const req: HunterCoordRequest = {
+        sender: msg.sender,
+        system,
+        poi,
+        targetName: (meta.targetName as string) || "",
+        targetId: (meta.targetId as string) || "",
+        creature: !!(meta.creature),
+        timestamp: msg.timestamp,
+      };
+      coordRequests.get(username)!.push(req);
+    } else if (meta.type === "creature_claim") {
+      const targetId = (meta.targetId as string) || "";
+      if (!targetId) return;
+      const incomingClaimer = (msg.sender || "").trim();
+      if (!incomingClaimer) return;
+      const existing = creatureClaims.get(targetId);
+      if (existing && existing.claimer === incomingClaimer) return;
+      creatureClaims.set(targetId, { claimer: incomingClaimer, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
+    } else if (meta.type === "hunter_boarding_claim") {
+      const targetId = (meta.targetId as string) || "";
+      if (targetId) {
+        boardingClaims.set(targetId, { claimer: msg.sender, expires: Date.now() + BOARDING_CLAIM_TTL_MS });
+      }
+    } else if (meta.type === "big_creature_hunt") {
+      const system = (meta.system as string) || "";
+      const poi = (meta.poi as string) || "";
+      if (!system || !poi) return;
+      const key = `${system}|${poi}`;
+      const incomingClaimer = (msg.sender || "").trim();
+      if (!incomingClaimer) return;
+      const existing = bigCreatureHuntAnnouncements.get(key);
+      if (existing && existing.claimer === incomingClaimer) return;
+      bigCreatureHuntAnnouncements.set(key, { claimer: incomingClaimer, expires: Date.now() + BIG_CREATURE_HUNT_TTL_MS });
+    }
   });
 }
 
@@ -819,7 +1782,13 @@ function broadcastHunterAssist(ctx: RoutineContext, target: { id: string; name: 
   const { bot } = ctx;
   if (!bot.system || !bot.poi) return;
   const settings = getHunterSettings(bot.username);
-  if (!settings.coordinateHunts) return;
+  if (settings.coordinationMode === "off") return;
+  // Branded creatures are NEVER broadcast â€” they belong to another faction.
+  if (creature && isBrandedCreature(target.name)) return;
+  // Protected creatures (e.g. Cloudwhale Calf) are NEVER broadcast — they must
+  // not be attacked or drawn into combat via assist requests.
+  if (creature && isProtectedCreature(target.name)) return;
+  if (creature && settings.coordinationMode === "avoid" && !isLeviathanCreature(target.name)) return;
   botChatChannel.send({
     sender: bot.username,
     recipients: [],
@@ -845,10 +1814,10 @@ async function shouldAbortPatrolAfterEngage(ctx: RoutineContext, won: boolean, t
   if (won) return false;
   const inBattle = await getBattleStatus(ctx);
   if (inBattle) {
-    ctx.log("combat", "Retreated — aborting patrol to dock and repair");
+    ctx.log("combat", "Retreated â€” aborting patrol to dock and repair");
     return true;
   }
-  ctx.log("combat", `${targetName} unavailable — skipping and continuing patrol`);
+  ctx.log("combat", `${targetName} unavailable â€” skipping and continuing patrol`);
   return false;
 }
 
@@ -859,7 +1828,7 @@ async function shouldAbortPatrolAfterEngage(ctx: RoutineContext, won: boolean, t
  */
 async function checkHunterCoordRequests(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<void> {
   const { bot } = ctx;
-  if (!settings.coordinateHunts) return;
+  if (settings.coordinationMode === "off") return;
   if (bot.docked) return;
 
   const queue = coordRequests.get(bot.username);
@@ -871,6 +1840,14 @@ async function checkHunterCoordRequests(ctx: RoutineContext, settings: ReturnTyp
     if (bot.state !== "running") break;
     const key = `${req.targetId}|${req.sender}`;
     if (req.sender === bot.username || handled.has(key)) continue;
+
+    // In avoid mode, only coordinate-assist leviathan creatures.
+    // In assist mode, coordinate ALL creatures so the wing can group-assist.
+    // Branded creatures are NEVER assisted either â€” they belong to another faction.
+    if (req.creature && settings.coordinationMode === "avoid" && (!isLeviathanCreature(req.targetName) || isBrandedCreature(req.targetName))) {
+      handled.add(key);
+      continue;
+    }
 
     // Only respond to requests from our exact POI.
     if (req.system !== bot.system || req.poi !== bot.poi) {
@@ -912,30 +1889,32 @@ continue;
       (req.targetName && e.name.toLowerCase().includes(req.targetName.toLowerCase()))
     );
     if (!match) {
-      // Target not visible here anymore — mark handled to avoid re-polling forever.
+      // Target not visible here anymore â€” mark handled to avoid re-polling forever.
       handled.add(key);
       continue;
     }
 
     const valid = req.creature
-      ? isCreatureTarget(match, true)
+      ? isCreatureTarget(match, true) && !isBrandedCreature(match.name) && !isProtectedCreature(match.name)
       : isPirateTarget(match, settings.onlyNPCs, settings.maxAttackTier);
     if (!valid) {
+      if (req.creature && isProtectedCreature(req.targetName)) {
+        ctx.log("combat", `Skipping assist: ${req.targetName} is a protected creature (hatchling/calf/young)`);
+      }
       handled.add(key);
       continue;
     }
 
     handled.add(key);
-    ctx.log("combat", `🤝 Hunter coordination: ${req.sender} requested assist vs ${req.targetName} — joining battle at ${req.poi}!`);
+    ctx.log("combat", `ðŸ¤ Hunter coordination: ${req.sender} requested assist vs ${req.targetName} â€” joining battle at ${req.poi}!`);
     coordResponding = true;
     try {
-      await hunterEngage(ctx, match, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+      await hunterEngage(ctx, match, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
     } finally {
       coordResponding = false;
     }
   }
 }
-
 /** Extract the system ID from a [COMBAT WARNING] or [HULL DAMAGE] faction message. */
 function extractAlertSystem(content: string): string | null {
   // Both alert types end with:  ...| sys_xxxx/poi_yyyy
@@ -970,7 +1949,7 @@ async function checkFactionAlerts(
   const nowSecs = Date.now() / 1000;
   const nowMs = Date.now();
 
-  // Walk from newest → oldest (slice().reverse() in case order is oldest-first)
+  // Walk from newest â†’ oldest (slice().reverse() in case order is oldest-first)
   for (const msg of [...msgs].reverse()) {
     const content = (msg.content as string) || (msg.message as string) || (msg.text as string) || "";
     if (!content.includes("[COMBAT WARNING]") && !content.includes("[HULL DAMAGE]")) continue;
@@ -982,7 +1961,7 @@ async function checkFactionAlerts(
     const alertSystem = extractAlertSystem(content);
     if (!alertSystem) continue;
 
-    // Already here — no need to divert
+    // Already here â€” no need to divert
     if (alertSystem === bot.system) continue;
 
     // Cooldown per system
@@ -1000,12 +1979,12 @@ async function checkFactionAlerts(
   return null;
 }
 
-// ── Death handling ───────────────────────────────────────────
+// â”€â”€ Death handling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // Result of a death check at the top of a routine loop iteration:
-//   "ok"   — bot is alive, routine should continue
-//   "wait" — bot is dead but still recovering/unavailable; loop should sleep + continue
-//   "stop" — stopOnDeath is enabled; routine should return (stop) immediately
+//   "ok"   â€” bot is alive, routine should continue
+//   "wait" â€” bot is dead but still recovering/unavailable; loop should sleep + continue
+//   "stop" â€” stopOnDeath is enabled; routine should return (stop) immediately
 type DeathHandleResult = "ok" | "wait" | "stop";
 
 /**
@@ -1013,7 +1992,7 @@ type DeathHandleResult = "ok" | "wait" | "stop";
  *
  * By default the routine recovers from death (claim insurance, respawn, re-dock/
  * repair) and keeps hunting from wherever it respawns. When `settings.stopOnDeath`
- * is enabled we instead STOP the routine entirely — the ship stays where it
+ * is enabled we instead STOP the routine entirely â€” the ship stays where it
  * respawned and the bot does not immediately start hunting from a random point.
  */
 async function handleDeath(
@@ -1028,7 +2007,7 @@ async function handleDeath(
   if (settings.stopOnDeath) {
     ctx.log(
       "system",
-      "💀 Death detected and stopOnDeath is enabled — stopping hunter routine instead of respawning into a hunt.",
+      "ðŸ’€ Death detected and stopOnDeath is enabled â€” stopping hunter routine instead of respawning into a hunt.",
     );
     ctx.bot.stop();
     return "stop";
@@ -1102,13 +2081,14 @@ function formatObservationUpdate(payload: any): string {
   return parts.length > 0 ? parts.join(' | ') : '(no changes)';
 }
 
-// ── Hunter routine ───────────────────────────────────────────
+// â”€â”€ Hunter routine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
   // Check per-bot mode
   const initialSettings = getHunterSettings(bot.username);
+  const isFleetArena = isFleetArenaMode(initialSettings.mode);
 
 // Observation setup removed: using polling instead of subscription
 
@@ -1123,8 +2103,13 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
     // only run while docked) still works. This prevents the ship from getting stuck
     // undocked with a stale `docked` flag, which made every withdraw fail with not_docked.
     const wasDockedAtStart = bot.docked;
-    if (initialSettings.mode !== "station_protection" && initialSettings.cloakOnStart && !bot.isCloaked) {
-      // Undock first if currently docked — the cloak command cannot enable while docked.
+    if (
+      !isFleetArena &&
+      initialSettings.mode !== "station_protection" &&
+      initialSettings.cloakOnStart &&
+      !bot.isCloaked
+    ) {
+      // Undock first if currently docked â€” the cloak command cannot enable while docked.
       if (bot.docked) {
         const undockResp = await bot.exec("undock");
         if (!undockResp.error) {
@@ -1155,19 +2140,17 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // If we started the routine while docked at home base, refuel, repair, then restock
-    if (bot.docked) {
+    // Fleet/Arena mode never performs startup logistics or leaves its current POI.
+    if (bot.docked && !isFleetArena && initialSettings.mode !== "station_protection") {
       await repairShip(ctx);
       await tryRefuel(ctx, { skipApprovedCheck: true });
       await ensureHunterResupply(ctx);
-      if (initialSettings.mode !== "station_protection") {
-        await ensureUndocked(ctx);
-      }
+      await ensureUndocked(ctx);
       await ensureAmmoLoaded(ctx, initialSettings.ammoThreshold, initialSettings.maxReloadAttempts, initialSettings.ammoReloadAbsoluteThreshold, initialSettings.ammoReloadPercentThreshold);
     }
 
     // Field repair using cargo kits on routine start (in case started with battle damage and not docked)
-    if (initialSettings.mode !== "station_protection") {
+    if (!isFleetArena && initialSettings.mode !== "station_protection") {
       await useRepairKits(ctx);
     }
 
@@ -1196,6 +2179,31 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       return;
     }
 
+    if (initialSettings.mode === "creature_farm" || initialSettings.mode === "creature_farm_random") {
+      yield* creatureFarmRoutine(ctx);
+      return;
+    }
+
+    if (initialSettings.mode === "hunt_big_creatures") {
+      yield* huntBigCreaturesRoutine(ctx);
+      return;
+    }
+
+    if (isFleetArenaMode(initialSettings.mode)) {
+      yield* fleetArenaModeRoutine(ctx);
+      return;
+    }
+
+    if (initialSettings.mode === "pvp") {
+      yield* pvpRoutine(ctx);
+      return;
+    }
+
+    if (initialSettings.mode === "boarding") {
+      yield* boardingRoutine(ctx);
+      return;
+    }
+
     // Default to roam_systems
     yield* roamSystemsRoutine(ctx);
 } finally {
@@ -1203,7 +2211,1299 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
    }
 };
 
-// ── Roam Systems Routine (original behavior) ────────────────────
+// â”€â”€ Creature Farm Routine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// Creature-SPECIFIC hunter sub-routine. Differences from the pirate-focused
+// roam modes:
+//   * It does NOT treat a POI as "empty" after engaging a single creature. It
+//     repeatedly re-scans the same POI (up to `maxPassesPerPoi` passes) to mop
+//     up respawns, then moves on. The goal is to clear as many creatures as
+//     possible for their loot (used to make food).
+//   * It farms until the cargo is full (or field consumables / ammo run low),
+//     then returns to the home base (hunter homeSystem / homeStation) to deposit
+//     loot and restock ammo.
+//   * Its route is a Hunter Patrol Profile (hunter.hunterPatrols) assigned to the
+//     bot. The profile's `patrolSystems` is the ordered list of systems farmed;
+//     the bot does `creatureFarmLoopsPerSystem` loops in each system before
+//     advancing to the next (cycling back to the first). Optional per-profile
+//     `targetPois` restricts farming to specific POIs.
+
+/** Navigate to the home base, deposit loot, and restock ammo/shields/repair. */
+async function returnToCreatureFarmHome(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+  homeSystem: string,
+  homeStation: string,
+): Promise<void> {
+  const { bot } = ctx;
+  const safetyOpts = {
+    fuelThresholdPct: settings.refuelThreshold,
+    hullThresholdPct: settings.repairThreshold,
+    autoCloak: settings.autoCloak,
+    skipBlacklist: true,
+    isCombatBot: true,
+    joinBattles: true,
+  };
+
+  ctx.log("system", `Returning to home base ${homeStation || homeSystem || "(default)"} — depositing loot + restocking ammo...`);
+  try {
+    // Strict home-base navigation: never dock/dump loot at a random station
+    // when the home base cannot be reached — keep the cargo aboard instead.
+    const docked = await navigateToHomeBaseAndDock(ctx, homeSystem, homeStation, safetyOpts);
+    if (!docked) {
+      ctx.log("error", "Could not dock at home base — loot not deposited");
+      return;
+    }
+
+    // ensureHunterResupply deposits non-protected loot to (faction) storage and
+    // withdraws ammo / repair kits / shield charges / fuel cells from storage.
+    await ensureHunterResupply(ctx);
+    await collectFromStorage(ctx);
+    await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    await ensureInsured(ctx);
+    await bot.checkSkills();
+    await ensureUndocked(ctx);
+    ctx.log("info", "Resupplied at home base — heading back to creature farm");
+  } catch (e) {
+    ctx.log("error", `Error returning to home base: ${e}`);
+  }
+}
+
+async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await ensureHunterCoordListener(bot.username);
+
+  await bot.refreshLocation();
+  let totalKills = 0;
+  // Guard against an infinite resupply loop: if the home base cannot fully
+  // restock (e.g. no shield charges in faction storage), isLowOnFieldConsumables
+  // stays true and would otherwise send us home every single loop iteration
+  // without ever farming. After a resupply we set this and skip the consumable
+  // return-home check once so the bot actually leaves for the target system.
+  let justResupplied = false;
+
+  // Routing state across the whole run: which profile system we're currently
+  // farming. A "loop" = one full sweep of every POI in the system (re-scanning
+  // each POI up to creatureFarmMaxPassesPerPoi times to mop up respawns). We do
+  // `creatureFarmLoopsPerSystem` loops in the current system, then advance to
+  // the next system in the assigned Hunter Patrol Profile, cycling back to the
+  // first when we reach the end. Whether we cycle systems forever (singleLoop =
+  // false) or return home to restock after each full profile cycle (singleLoop =
+  // true) is governed by the hunter.singleLoop setting. These persist for the
+  // lifetime of the generator (the routine run).
+  let sysIndex = 0;
+  let creatureFarmExpandedSystems: string[] = [];
+  let stayPoiAnchor: { system: string; poi: string | null } | null = null;
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+    const profile = getHunterPatrolProfile(bot.username);
+    if (
+      (settings.mode === "creature_farm" && !profile) ||
+      (settings.mode === "creature_farm_random" && (!settings.creatureFarmSystems || settings.creatureFarmSystems.length === 0))
+    ) {
+      const missing = settings.mode === "creature_farm"
+        ? "no Hunter Patrol Profile assigned (set hunter.hunterPatrols + hunter.botHunterPatrolAssignments)"
+        : "no creatureFarmSystems configured";
+      ctx.log("error", `${settings.mode} mode but ${missing}. Waiting 60s...`);
+      await ctx.sleep(60000);
+      continue;
+    }
+
+    let effectiveSystems: string[];
+    if (settings.mode === "creature_farm_random") {
+      if (creatureFarmExpandedSystems.length === 0) {
+        const basePool = settings.creatureFarmSystems;
+        const baseSystem = basePool[Math.floor(Math.random() * basePool.length)];
+        if (settings.creatureFarmRoamJumps > 0) {
+          const resolvedBase = resolveSystemId(baseSystem);
+          if (resolvedBase) {
+            const expanded = findSystemsWithinRadius(resolvedBase, settings.creatureFarmRoamJumps);
+            creatureFarmExpandedSystems = expanded.length > 0 ? expanded : [resolvedBase];
+            ctx.log("info", `Creature farm random mode: base=${baseSystem}, expanded to ${creatureFarmExpandedSystems.length} systems (roam ${settings.creatureFarmRoamJumps} jumps)`);
+          } else {
+            creatureFarmExpandedSystems = basePool;
+          }
+        } else {
+          creatureFarmExpandedSystems = [baseSystem];
+          ctx.log("info", `Creature farm random mode: base=${baseSystem}, no roaming`);
+        }
+      }
+
+      if (settings.creatureFarmUseHistoricalData) {
+        const totals = creatureKillStore.getAllSystemTotals();
+        const scored = creatureFarmExpandedSystems
+          .map(sysId => ({ system: sysId, score: totals[sysId] || 0 }))
+          .sort((a, b) => b.score - a.score);
+        effectiveSystems = scored.map(s => s.system);
+        const topScore = scored[0]?.score || 0;
+        if (topScore > 0) {
+          ctx.log("info", `Creature farm random: sorted by historical kills (top: ${topScore} in ${scored[0].system})`);
+        } else {
+          ctx.log("info", "Creature farm random: no historical data yet â€” using random order");
+        }
+      } else {
+        effectiveSystems = creatureFarmExpandedSystems;
+      }
+    } else {
+      effectiveSystems = profile!.patrolSystems;
+      if (profile!.creatureFarmCenterSystem && profile!.creatureFarmPatrolRadius) {
+        const centerId = resolveSystemId(profile!.creatureFarmCenterSystem);
+        if (centerId) {
+          const radiusSystems = findSystemsWithinRadius(centerId, profile!.creatureFarmPatrolRadius);
+          if (radiusSystems.length > 0) {
+            for (let i = radiusSystems.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [radiusSystems[i], radiusSystems[j]] = [radiusSystems[j], radiusSystems[i]];
+            }
+            effectiveSystems = radiusSystems;
+            ctx.log("info", `Creature farm radius mode: ${effectiveSystems.length} systems within ${profile!.creatureFarmPatrolRadius} jumps of ${centerId}`);
+          } else {
+            ctx.log("warn", `No systems found within ${profile!.creatureFarmPatrolRadius} jumps of ${centerId} â€” falling back to profile patrolSystems`);
+          }
+        } else {
+          ctx.log("warn", `Could not resolve creature farm center system ${profile!.creatureFarmCenterSystem} â€” falling back to profile patrolSystems`);
+        }
+      }
+    }
+
+    if (sysIndex >= effectiveSystems.length) {
+      sysIndex = 0;
+      if (settings.mode === "creature_farm_random") {
+        creatureFarmExpandedSystems = [];
+      }
+    }
+
+    const homeSystem = settings.homeSystem || "";
+    const homeStation = settings.homeStation || "";
+    let targetSystem = effectiveSystems[sysIndex];
+    const targetPois = profile?.targetPois || [];
+
+    // Stay-in-POI mode: lock the bot to its current system (and eventually its
+    // current POI) so it re-scans one location for respawns instead of roaming
+    // between POIs and systems. The anchor is captured once on first entry and
+    // then re-applied every outer-loop iteration to pin `targetSystem`.
+    if (settings.stayInPoi) {
+      if (!stayPoiAnchor) {
+        stayPoiAnchor = { system: bot.system, poi: bot.poi || null };
+        ctx.log("system", `Stay-in-POI mode: anchored at ${stayPoiAnchor.system}` +
+          (stayPoiAnchor.poi ? ` / ${stayPoiAnchor.poi}` : " â€” will lock to the first POI encountered"));
+      }
+      targetSystem = stayPoiAnchor.system;
+    }
+    // `loopsPerSystem` is the number of full POI sweeps to perform in this system
+    // before advancing to the next profile system. This is the "loops" setting
+    // the user configures (creatureFarmLoopsPerSystem); it drives the inner
+    // sweep loop directly. `maxSweeps` is a hidden, non-UI safety ceiling so the
+    // loop can never run away even if a bad loopsPerSystem value is supplied.
+    const loopsPerSystem = settings.creatureFarmLoopsPerSystem > 0 ? settings.creatureFarmLoopsPerSystem : 3;
+    const cargoFullPct = settings.creatureFarmCargoFullPct > 0 ? settings.creatureFarmCargoFullPct : 0.95;
+    const maxPasses = settings.creatureFarmMaxPassesPerPoi > 0 ? settings.creatureFarmMaxPassesPerPoi : 6;
+    const maxSweeps = settings.creatureFarmMaxSystemSweeps > 0 ? settings.creatureFarmMaxSystemSweeps : 40;
+    const loopCap = Math.min(loopsPerSystem, maxSweeps);
+
+    const safetyOpts = {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
+      skipBlacklist: true,
+      isCombatBot: true,
+      joinBattles: true,
+    };
+
+    // â”€â”€ Death recovery â”€â”€
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
+    // â”€â”€ Status â”€â”€
+    yield "get_status";
+    await bot.refreshLocation();
+    logStatus(ctx);
+
+    // â”€â”€ Fuel â”€â”€
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem, homeStation, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
+      continue;
+    }
+
+    // â”€â”€ Hull â”€â”€
+    await bot.refreshShip();
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (hullPct <= settings.repairThreshold) {
+      ctx.log("system", `Hull at ${hullPct}% â€” returning home to repair`);
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
+      continue;
+    }
+
+    // â”€â”€ Low fuel cells check â”€â”€
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      // Can we reach home with remaining tank fuel + cargo cells?
+      const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+      if (canMakeItHome) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
+        await returnToHomeAndResupply(ctx, settings);
+        justResupplied = true;
+        continue;
+      }
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home — proceeding anyway`);
+    }
+
+    // â”€â”€ Cargo full? â”€â”€
+    await bot.refreshCargo();
+    const cargoPct0 = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+    if (cargoPct0 >= cargoFullPct) {
+      ctx.log("system", `Cargo ${Math.round(cargoPct0 * 100)}% â€” returning home to deposit loot + restock ammo`);
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
+      continue;
+    }
+
+    // â”€â”€ Ammo â”€â”€
+    const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    if (!hasAmmo && !settings.meatShield) {
+      ctx.log("combat", "Out of ammo â€” returning home to restock");
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
+      continue;
+    }
+
+    // â”€â”€ Field consumables â”€â”€
+    // Gated by !justResupplied so a home base that can't fully restock (e.g. no
+    // shield charges in faction storage) doesn't trap us in a return-home loop.
+    // Only bail to resupply when we are COMPLETELY out of REPAIR KITS (0) â€” a
+    // missing shield charge is a luxury we can farm without, and repair kits are
+    // the real life-savers (and almost never used by a healthy routine). Using
+    // minRepairKits=1 means `< 1` == `=== 0`; minShieldCharges=0 disables the
+    // shield check entirely.
+    if (isLowOnFieldConsumables(bot.inventory, 1, 0) && !justResupplied) {
+      ctx.log("combat", "Low on repair kits / shield charges â€” returning home to resupply");
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
+      continue;
+    }
+
+    // â”€â”€ Navigate to target system â”€â”€
+    if (bot.system !== targetSystem) {
+      ctx.log("travel", `Creature farm: heading to target system ${targetSystem}...`);
+      const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
+      if (!arrived) {
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          await handleNavigationBattleInterrupt(ctx, settings);
+        } else {
+          ctx.log("error", `Could not reach ${targetSystem} â€” retrying next cycle`);
+          await ctx.sleep(5000);
+        }
+        continue;
+      }
+      await resubscribeObservationAfterMove(bot);
+    }
+
+    // We've left home and are committed to farming. Normally we clear the
+    // resupply guard so a genuinely depleted stash triggers a real resupply trip
+    // later. BUT if the home base could NOT actually restock us (e.g. no repair
+    // kits in faction storage) we are STILL completely out â€” bailing back would
+    // accomplish nothing and just loop forever. In that case keep the guard set
+    // so we stay out and farm with what we have. Shield charges are intentionally
+    // ignored here (luxury, not a life-saver).
+    if (isLowOnFieldConsumables(bot.inventory, 1, 0)) {
+      justResupplied = true;
+    } else {
+      justResupplied = false;
+    }
+
+    // â”€â”€ Farm: sweep the system `loopCap` times (creatureFarmLoopsPerSystem),
+    //    re-scanning each POI to catch respawns, then advance to the next
+    //    profile system. â”€â”€
+    let sweeps = 0;
+    let cargoFull = false;
+    while (bot.state === "running" && sweeps < loopCap && !cargoFull) {
+      sweeps++;
+      yield "scan_system";
+      const { pois } = await getSystemInfo(ctx);
+      let patrolPois = pois.filter(p => !isStationPoi(p));
+      if (targetPois && targetPois.length > 0) {
+        patrolPois = patrolPois.filter(p => targetPois.includes(p.id) || targetPois.includes(p.name));
+      }
+
+      // Stay-in-POI mode: once anchored to a specific POI, only ever farm that
+      // one POI each sweep so the bot re-scans it for respawns instead of
+      // roaming between POIs. The anchor's poi is null until the first sweep
+      // lands on a non-station POI (e.g. when starting from a station).
+      const anchor = stayPoiAnchor;
+      if (settings.stayInPoi && anchor) {
+        if (!anchor.poi && patrolPois.length > 0) {
+          anchor.poi = patrolPois[0].id;
+          ctx.log("system", `Stay-in-POI mode: locked to POI ${anchor.poi} in ${anchor.system}`);
+        }
+        if (anchor.poi) {
+          const anchoredPoi = patrolPois.find(p => p.id === anchor.poi || p.name === anchor.poi);
+          patrolPois = anchoredPoi ? [anchoredPoi] : [];
+        }
+      }
+
+      if (patrolPois.length === 0) {
+        ctx.log("info", "No non-station POIs in target system â€” waiting 30s");
+        await ctx.sleep(30000);
+        break;
+      }
+
+      ctx.log("info", `Creature farm sweep ${sweeps}/${loopCap} â€” ${patrolPois.length} POI(s) in ${targetSystem}`);
+      let sweepKills = 0;
+
+      for (const poi of patrolPois) {
+        if (bot.state !== "running") break;
+
+        // Mid-loop safety checks
+        await bot.refreshShip();
+        const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        if (midHull <= settings.repairThreshold) {
+          ctx.log("system", "Hull low â€” aborting sweep to return home");
+          break;
+        }
+        await bot.refreshCargo();
+        const midCargo = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+        if (midCargo >= cargoFullPct) { cargoFull = true; break; }
+        const midAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+        if (!midAmmo && !settings.meatShield) {
+          ctx.log("combat", "Out of ammo mid-farm â€” aborting sweep to home");
+          break;
+        }
+
+        if (await checkAndHandleExistingBattle(ctx, settings)) {
+          // Got pulled into a battle â€” re-evaluate next iteration
+        }
+
+        // Travel to POI
+        yield "travel_to_poi";
+        ctx.log("travel", `Farming ${poi.name}...`);
+        const travelResp = await bot.exec("travel", { target_poi: poi.id });
+        if (travelResp.error && !travelResp.error.message.includes("already")) {
+          ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
+          continue;
+        }
+        bot.poi = poi.id;
+        bot.clearObservationState();
+        await ctx.sleep(1000);
+
+        // Repeatedly scan + engage ALL creatures here to mop up respawns.
+        let passes = 0;
+        while (bot.state === "running" && passes < maxPasses && !cargoFull) {
+          passes++;
+          yield "scan_for_targets";
+          const obsResult = await getObservationOrNearby(bot);
+          const nearbyData = obsResult.result;
+          if (!nearbyData) {
+            ctx.log("error", `No nearby data at ${poi.name}`);
+            break;
+          }
+          bot.trackNearbyPlayers(nearbyData);
+          bot.trackWildlife(nearbyData);
+
+          await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
+
+          // Re-fetch after potential battle â€” the old snapshot is now stale
+          const afterBattleResp = await getObservationOrNearby(bot);
+          const afterBattleData = afterBattleResp.result;
+          if (!afterBattleData) {
+            ctx.log("error", `No nearby data at ${poi.name} after battle check`);
+            break;
+          }
+          bot.trackNearbyPlayers(afterBattleData);
+          bot.trackWildlife(afterBattleData);
+
+          const entities = parseNearby(afterBattleData);
+          const creatures = pickCreatureTargets(entities, bot, true, settings.maxCreaturesPerScan, settings.coordinationMode);
+          const pirates = settings.ignorePirates ? [] : entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+          let targets = [...creatures, ...pirates];
+          targets = pickUnclaimedBoardingTarget(targets, bot.username);
+
+          const targetsToEngage = sortTargetsByPriority(targets);
+
+          if (targetsToEngage.length === 0) {
+            // POI currently clear â€” stop re-scanning this POI for now
+            break;
+          }
+
+          ctx.log("combat", `Found ${pirates.length} pirate(s), ${creatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses})${settings.ignorePirates ? " â€” ignoring pirates" : ""}`);
+
+          for (const target of targetsToEngage) {
+            if (bot.state !== "running") break;
+
+            await bot.refreshShip();
+            const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+            if (preHull <= settings.repairThreshold) break;
+
+            await useRepairKits(ctx);
+            const ammo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+            if (!ammo && !settings.meatShield) {
+              ctx.log("combat", "Out of ammo mid-farm â€” aborting");
+              break;
+            }
+
+            yield "engage";
+
+            const freshScanResp = await bot.exec("get_nearby");
+            let freshEntities: NearbyEntity[] = [];
+            if (!freshScanResp.error && freshScanResp.result) {
+              bot.trackNearbyPlayers(freshScanResp.result);
+              bot.trackWildlife(freshScanResp.result);
+              freshEntities = parseNearby(freshScanResp.result);
+            }
+            const stillPresent = freshEntities.find(e => e.id === target.id || e.name === target.name);
+            if (!stillPresent) {
+              ctx.log("combat", `âš ï¸ ${target.name} is no longer at this POI â€” skipping to next target`);
+              continue;
+            }
+
+            const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+            if (won) {
+              totalKills++;
+              sweepKills++;
+              recordCreatureKill(bot, target);
+              ctx.log("combat", `Kill #${totalKills} (${target.name}) â€” looting before next...`);
+              if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+              const cset = getHunterSettings(bot.username);
+              await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
+              await bot.refreshCargo();
+              if (isLowOnFieldConsumables(bot.inventory, 1, 0) && !justResupplied) {
+                ctx.log("combat", "Low on consumables â€” ending sweep to resupply");
+                break;
+              }
+              const cp = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+              if (cp >= cargoFullPct) { cargoFull = true; break; }
+            }
+          }
+          if (cargoFull) break;
+          // Re-scan shortly to catch respawns before moving on
+          await ctx.sleep(1500);
+        }
+        if (cargoFull) break;
+      }
+
+      // After a full sweep, loop again to catch respawns across the system
+      await bot.refreshCargo();
+      const afterCargo = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+      if (afterCargo >= cargoFullPct) break; // top of loop routes home
+      if (sweepKills === 0) {
+        ctx.log("info", "Sweep found no creatures â€” waiting for respawns...");
+        await ctx.sleep(10000);
+      }
+    }
+
+    if (cargoFull) {
+      await bot.refreshCargo();
+      const cp = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+      ctx.log("system", `Cargo full (${Math.round(cp * 100)}%) â€” returning home to deposit loot + restock ammo`);
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+    }
+
+    // â”€â”€ Routing: advance to the next profile system â”€â”€
+    // The inner loop above already performed `creatureFarmLoopsPerSystem`
+    // (loopCap) sweeps in the current system, so one "loop" of the system is
+    // complete. Advance to the next system in the profile, cycling back to the
+    // first at the end. We cycle systems forever; when singleLoop is enabled we
+    // additionally return home to restock after finishing a full profile cycle
+    // (mirrors the patrol_systems Single Loop Mode behaviour).
+    const prevSystem = targetSystem;
+    const wasLastSystem = (sysIndex + 1) >= effectiveSystems.length;
+    sysIndex = (sysIndex + 1) % effectiveSystems.length;
+    const nextSystem = effectiveSystems[sysIndex];
+    if (nextSystem !== prevSystem) {
+      ctx.log("info", `Creature farm: completed ${loopsPerSystem} loop(s) in ${prevSystem} â€” routing to ${nextSystem} (${sysIndex + 1}/${effectiveSystems.length})`);
+    } else {
+      ctx.log("debug", `Creature farm: completed ${loopsPerSystem} loop(s) in ${prevSystem} (only system in profile)`);
+    }
+
+    if (settings.singleLoop && wasLastSystem) {
+      ctx.log("system", "Single loop mode â€” returning to faction home base for resupply...");
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+    }
+  }
+}
+
+// â”€â”€ Hunt Big Creatures Routine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// Targets known large creatures (Cloudwhale, Molt Leviathan, Rainbow Leviathan)
+// using the explorer wildlife data. Selects the closest known big creature,
+// navigates there, and farms it. Falls back to random creature farm when no
+// big creatures are currently known.
+
+const BIG_CREATURE_KEYWORDS = ["cloudwhale", "leviathan"];
+
+/**
+ * Pirate stronghold systems that the big creature hunter must never travel to.
+ *
+ * Big creatures spawn inside pirate stronghold POIs. We fight pirates, so
+ * travelling to one of those POIs means shooting the stronghold's own station
+ * and its defenders. Any big creature sighted in one of these systems is
+ * ignored and the next-closest target is picked instead.
+ *
+ * This ban is consulted ONLY by the hunt_big_creatures mode (via
+ * findKnownBigCreatures / shouldAbortForBigCreatureHunt). No other hunter mode
+ * or routine reads it, and the global system blacklist is deliberately left
+ * untouched.
+ */
+const BIG_CREATURE_BANNED_SYSTEMS: ReadonlySet<string> = new Set<string>([
+  "barnard_44",
+  "gsc_0008",
+  "gliese_581",
+  "algol",
+  "xamidimura",
+  "alhena",
+  "sheratan",
+  "zaniah",
+  "bellatrix",
+]);
+
+/** True when the system is a pirate stronghold the big creature hunt must skip. */
+function isBigCreatureBannedSystem(system: string | undefined): boolean {
+  if (!system) return false;
+  return BIG_CREATURE_BANNED_SYSTEMS.has(system.trim().toLowerCase());
+}
+
+/** Human-readable id of the last banned sighting set we logged (dedupes the loop log). */
+let lastLoggedBannedBigCreatures = "";
+
+/**
+ * True when a wildlife store entry is an ADULT big creature worth travelling
+ * to. The keyword match is the same one the combat path uses, but young
+ * variants of a big species (Molt/Rainbow Leviathan Hatchling, Cloudwhale
+ * Calf, ...) carry the same species keyword ("molt_leviathan") and would
+ * otherwise be selected as hunt targets — they are protected, drop poor loot,
+ * and killing one prevents the adult from ever spawning. Without this check
+ * the hunt loop burns fuel and jumps on a system that only holds hatchlings.
+ */
+function isKnownBigCreature(creature: WildlifeDetail): boolean {
+  const name = (creature.name || "").toLowerCase();
+  const species = (creature.species || "").toLowerCase();
+  if (!BIG_CREATURE_KEYWORDS.some(kw => name.includes(kw) || species.includes(kw))) return false;
+  return !isProtectedCreature(creature.name);
+}
+
+/**
+ * Minimum number of adult Cloudwhales that must be known alive in a system
+ * before the big creature hunter will travel there. Cloud Whales hunt in
+ * packs, so the count is aggregated across the whole system — a pack split
+ * between a belt and a cloud still counts as one pack. The live engagement
+ * rule in applyCloudWhalePackRule then guarantees at least two always survive.
+ */
+const CLOUDWHALE_MIN_PACK_SIZE = 3;
+
+/**
+ * How long a system whose Cloudwhale pack could not be engaged is skipped
+ * before the hunt loop re-checks it. A pack that is split across POIs (no
+ * single POI holding CLOUDWHALE_MIN_PACK_SIZE together) can never be legally
+ * engaged, so without this cooldown the hunter would sweep the same system
+ * every loop iteration forever. Instead it leaves and does a random creature
+ * farm cycle elsewhere, then re-checks in case the pack drifted back together.
+ */
+const CLOUDWHALE_UNENGAGEABLE_TTL_MS = 15 * 60 * 1000;
+const unengageableCloudwhaleSystems = new Map<string, number>();
+
+/** True when a wildlife store entry is an ADULT Cloudwhale (name or species match). */
+function isCloudWhaleEntry(c: WildlifeDetail): boolean {
+  if (isProtectedCreature(c.name)) return false;
+  const name = (c.name || "").toLowerCase();
+  const species = (c.species || "").toLowerCase();
+  return name.includes("cloudwhale") || species.includes("cloudwhale");
+}
+
+/** Unique adult Cloudwhale ids sighted anywhere in a system (pack may be split across POIs). */
+function countSystemCloudwhales(system: string): number {
+  const ids = new Set<string>();
+  for (const c of wildlifeStore.getAll()) {
+    if (c.system !== system || c.count <= 0 || !isCloudWhaleEntry(c)) continue;
+    for (const id of c.ids) ids.add(id);
+  }
+  return ids.size;
+}
+
+/** True while a system is on cooldown because its Cloudwhale pack could not be engaged. */
+function isCloudwhaleSystemUnengageable(system: string): boolean {
+  const expires = unengageableCloudwhaleSystems.get(system);
+  if (expires === undefined) return false;
+  if (expires <= Date.now()) {
+    unengageableCloudwhaleSystems.delete(system);
+    return false;
+  }
+  return true;
+}
+
+/** Big creature sightings we are deliberately ignoring because they sit in a banned system. */
+function findBannedBigCreatureSightings(): Array<{ system: string; poi: string; name: string; count: number }> {
+  return wildlifeStore.getAll()
+    .filter(c => isKnownBigCreature(c) && c.count > 0 && isBigCreatureBannedSystem(c.system))
+    .map(c => ({ system: c.system, poi: c.poi, name: c.name, count: c.count }));
+}
+
+function findKnownBigCreatures(): Array<{ system: string; poi: string; name: string; count: number }> {
+  releaseExpiredBigCreatureHunts();
+  const all = wildlifeStore.getAll();
+  // Cloudwhale packs are gated on the SYSTEM population, not the per-POI
+  // sighting: a pack split across POIs still counts as one pack, and the
+  // hunter never travels for a system that cannot spare a single whale.
+  // Leviathans have no pack rule and are unaffected.
+  const cloudwhaleIdsBySystem = new Map<string, Set<string>>();
+  for (const c of all) {
+    if (c.count <= 0 || isBigCreatureBannedSystem(c.system) || !isCloudWhaleEntry(c)) continue;
+    let ids = cloudwhaleIdsBySystem.get(c.system);
+    if (!ids) {
+      ids = new Set<string>();
+      cloudwhaleIdsBySystem.set(c.system, ids);
+    }
+    for (const id of c.ids) ids.add(id);
+  }
+  return all
+    .filter(c => isKnownBigCreature(c) && c.count > 0 && !isBigCreatureBannedSystem(c.system))
+    .filter(c => {
+      if (!isCloudWhaleEntry(c)) return true;
+      if (isCloudwhaleSystemUnengageable(c.system)) return false;
+      return (cloudwhaleIdsBySystem.get(c.system)?.size ?? 0) >= CLOUDWHALE_MIN_PACK_SIZE;
+    })
+    .map(c => ({
+      system: c.system,
+      poi: c.poi,
+      name: c.name,
+      count: c.count,
+    }));
+}
+
+/** Log (once per change) the banned big creature sightings we are skipping. */
+function logBannedBigCreatureSightings(ctx: RoutineContext): void {
+  const banned = findBannedBigCreatureSightings();
+  const summary = banned
+    .map(t => `${t.name} @ ${t.system}/${t.poi}`)
+    .sort()
+    .join(", ");
+  if (summary === lastLoggedBannedBigCreatures) return;
+  lastLoggedBannedBigCreatures = summary;
+  if (!summary) return;
+  ctx.log("info", `Big creature hunt: ignoring ${banned.length} sighting(s) in banned pirate stronghold system(s): ${summary}`);
+}
+
+function pickClosestBigCreatureTarget(
+  fromSystem: string,
+  targets: Array<{ system: string; poi: string; name: string; count: number }>,
+  claimerUsername: string,
+  claimTarget: boolean = false,
+): { target: { system: string; poi: string; name: string; count: number }; distance: number } | null {
+  releaseExpiredBigCreatureHunts();
+  let best: { target: { system: string; poi: string; name: string; count: number }; distance: number } | null = null;
+  const seen = new Set<string>();
+  for (const t of targets) {
+    const key = `${t.system}|${t.poi}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (isBigCreatureHuntInFlightOrClaimedByOther(t.system, t.poi, claimerUsername)) continue;
+    const route = mapStore.findRoute(fromSystem, t.system);
+    const jumps = route ? Math.max(0, route.length - 1) : Infinity;
+    if (jumps === Infinity) continue;
+    if (!best || jumps < best.distance) {
+      best = { target: t, distance: jumps };
+    }
+  }
+
+  if (claimTarget && best) {
+    const targetKey = `${best.target.system}|${best.target.poi}`;
+    bigCreatureHuntAnnouncements.set(targetKey, { claimer: claimerUsername, expires: Date.now() + BIG_CREATURE_HUNT_TTL_MS });
+    bigCreatureHuntInFlight.set(targetKey, claimerUsername);
+    syncBigCreatureClaimsToFile();
+  }
+
+  return best;
+}
+
+async function shouldAbortForBigCreatureHunt(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, username: string): Promise<boolean> {
+  if (settings.mode !== "hunt_big_creatures") return false;
+  const knownTargets = findKnownBigCreatures();
+  if (knownTargets.length === 0) return false;
+
+  const currentSystem = ctx.bot.system;
+  const best = pickClosestBigCreatureTarget(currentSystem, knownTargets, username, false);
+  if (!best) return false;
+
+  if (isBigCreatureHuntClaimedByOther(best.target.system, best.target.poi, username)) return false;
+
+  ctx.log("info", `Big creature available: ${best.target.name} at ${best.target.system}/${best.target.poi} (${best.distance} jumps) â€” diverting from fallback`);
+  return true;
+}
+
+async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await ensureHunterCoordListener(bot.username);
+  loadPersistedBigCreatureClaims();
+
+  let huntLoopCount = 0;
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+    releaseExpiredBigCreatureHunts();
+
+    // Periodically reload persisted claims from other processes so we don't
+    // race against a claim that was written while we were in a long fallback.
+    if (++huntLoopCount % 5 === 0) {
+      loadPersistedBigCreatureClaims();
+    }
+
+    // â”€â”€ Death recovery â”€â”€
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
+    // â”€â”€ Refresh known big creature locations â”€â”€
+    const knownTargets = findKnownBigCreatures();
+    logBannedBigCreatureSightings(ctx);
+
+    if (knownTargets.length === 0) {
+      // Double-check right before committing to a fallback â€” a creature may
+      // have been discovered during the previous loop iteration.
+      if (await shouldAbortForBigCreatureHunt(ctx, settings, bot.username)) {
+        continue;
+      }
+      ctx.log("info", "No known big creatures â€” doing a random creature farm cycle before rechecking");
+      // Fallback: one creature_farm_random style cycle
+      yield "fallback_random_farm";
+      await creatureFarmRandomFallbackCycle(ctx, settings);
+      continue;
+    }
+
+    const currentSystem = bot.system;
+    const best = pickClosestBigCreatureTarget(currentSystem, knownTargets, bot.username, true);
+
+    if (!best) {
+      ctx.log("warn", "No reachable big creature targets â€” falling back to random farm");
+      yield "fallback_random_farm";
+      await creatureFarmRandomFallbackCycle(ctx, settings);
+      continue;
+    }
+
+    const target = best.target;
+    const targetKey = `${target.system}|${target.poi}`;
+    announceBigCreatureHunt(bot, target.system, target.poi, target.name);
+    ctx.log("info", `Big creature hunt: ${target.name} at ${target.system}/${target.poi} (${best.distance} jumps away)`);
+
+    // â”€â”€ Standard pre-hunt checks â”€â”€
+    yield "get_status";
+    await bot.refreshLocation();
+    logStatus(ctx);
+
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      bigCreatureHuntInFlight.delete(targetKey);
+      await handleFuelCheckFailure(ctx, settings, fueled);
+      continue;
+    }
+
+    await bot.refreshShip();
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (hullPct <= settings.repairThreshold) {
+      bigCreatureHuntInFlight.delete(targetKey);
+      ctx.log("system", `Hull at ${hullPct}% â€” returning home to repair`);
+      await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+      continue;
+    }
+
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      // Can we reach home with remaining tank fuel + cargo cells?
+      const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+      if (canMakeItHome) {
+        bigCreatureHuntInFlight.delete(targetKey);
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
+        await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+        continue;
+      }
+      bigCreatureHuntInFlight.delete(targetKey);
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home — proceeding anyway`);
+    }
+
+    const cargoPct = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+    if (cargoPct >= (settings.creatureFarmCargoFullPct || 0.95)) {
+      bigCreatureHuntInFlight.delete(targetKey);
+      ctx.log("system", `Cargo ${Math.round(cargoPct * 100)}% â€” returning home`);
+      await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+      continue;
+    }
+
+    const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    if (!hasAmmo && !settings.meatShield) {
+      bigCreatureHuntInFlight.delete(targetKey);
+      ctx.log("combat", "Out of ammo â€” returning home to restock");
+      await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+      continue;
+    }
+
+    if (isLowOnFieldConsumables(bot.inventory, 1, 0)) {
+      bigCreatureHuntInFlight.delete(targetKey);
+      ctx.log("combat", "Low on repair kits â€” returning home to resupply");
+      await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+      continue;
+    }
+
+    // â”€â”€ Navigate to target system â”€â”€
+    if (bot.system !== target.system) {
+      if (isBigCreatureHuntInFlightOrClaimedByOther(target.system, target.poi, bot.username)) {
+        ctx.log("warn", `Big creature hunt: ${target.name} at ${target.system}/${target.poi} was claimed by another hunter while we were preparing â€” rechecking targets`);
+        bigCreatureHuntInFlight.delete(targetKey);
+        continue;
+      }
+      ctx.log("travel", `Big creature hunt: heading to ${target.system}...`);
+      const safetyOpts = {
+        fuelThresholdPct: settings.refuelThreshold,
+        hullThresholdPct: settings.repairThreshold,
+        autoCloak: settings.autoCloak,
+        skipBlacklist: true,
+        isCombatBot: true,
+        joinBattles: true,
+      };
+      const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
+      if (!arrived) {
+        bigCreatureHuntInFlight.delete(targetKey);
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          await handleNavigationBattleInterrupt(ctx, settings);
+        } else {
+          ctx.log("error", `Could not reach ${target.system} â€” rechecking targets next cycle`);
+        }
+        continue;
+      }
+      await resubscribeObservationAfterMove(bot);
+    }
+
+    bigCreatureHuntInFlight.delete(targetKey);
+
+    // â”€â”€ Farm the target system for the big creature â”€â”€
+    yield "farm_big_creature";
+    const farmResult = await farmSystemForBigCreature(ctx, settings, target);
+    if (farmResult.kills > 0) {
+      ctx.log("combat", `Big creature hunt: ${farmResult.kills} kill(s) in ${target.system}`);
+    }
+
+    // Cloudwhale pack rule: if the system holds an engageable-by-the-numbers
+    // pack (>= CLOUDWHALE_MIN_PACK_SIZE adults alive system-wide) but not a
+    // single whale died, the pack cannot be engaged right now - it is split
+    // across POIs so no single POI holds 3+ together, or this ship is too
+    // small to fight them. Leave the system and go do a random creature farm
+    // cycle elsewhere instead of re-sweeping it every loop; the system stays
+    // skipped until the cooldown expires, then gets re-checked in case the
+    // pack drifted back together.
+    if (farmResult.cloudwhaleKills === 0) {
+      const packSize = countSystemCloudwhales(target.system);
+      if (packSize >= CLOUDWHALE_MIN_PACK_SIZE) {
+        unengageableCloudwhaleSystems.set(target.system, Date.now() + CLOUDWHALE_UNENGAGEABLE_TTL_MS);
+        ctx.log("info", `Cloudwhale pack in ${target.system} (${packSize} adults) could not be engaged - leaving for a random farm elsewhere (needs ${CLOUDWHALE_MIN_PACK_SIZE} together in one POI; re-checking in ${Math.round(CLOUDWHALE_UNENGAGEABLE_TTL_MS / 60000)}m)`);
+      }
+    }
+
+    // Brief pause before rechecking known locations
+    await ctx.sleep(5000);
+  }
+}
+
+/**
+ * True if any wreck at the current POI still holds lootable items.
+ */
+async function poiHasLootableWrecks(ctx: RoutineContext): Promise<boolean> {
+  const resp = await ctx.bot.exec("get_wrecks");
+  if (resp.error || !resp.result) return false;
+  return parseWrecks(resp.result).some(w => w.items.length > 0);
+}
+
+/**
+ * Loot EVERY wreck at the current POI, not just the one belonging to the
+ * creature we killed. Big creature fights usually also destroy player ships
+ * (expensive modules!) and other creatures, and another hunter may land the
+ * killing blow on the big creature itself — all of that loot is worth taking.
+ *
+ * Wrecks can also appear a few seconds after the battle ends, so we re-check
+ * briefly instead of doing a single loot pass and moving on.
+ */
+async function sweepWrecksAtPoi(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (bot.state !== "running") return;
+    if (bot.docked) return;
+    if (bot.isInBattle()) return; // fight first — the caller sweeps again after combat
+    await bot.refreshCargo();
+    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) return;
+
+    const looted = await scavengeWrecks(ctx);
+    if (looted > 0) {
+      // Grabbed something — a short pause, then confirm nothing else spawned.
+      if (attempt < 2) await ctx.sleep(1500);
+      continue;
+    }
+
+    // Nothing looted this pass: give late-spawning wrecks a moment, then bail
+    // out if the POI really is empty.
+    if (attempt >= 1) return;
+    await ctx.sleep(4000);
+    if (bot.state !== "running" || bot.docked || bot.isInBattle()) return;
+    if (!(await poiHasLootableWrecks(ctx))) return;
+  }
+}
+
+async function farmSystemForBigCreature(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+  target: { system: string; poi: string; name: string; count: number },
+): Promise<{ kills: number; cloudwhaleKills: number }> {
+  const { bot } = ctx;
+  const maxPasses = settings.creatureFarmMaxPassesPerPoi || 6;
+  let totalKills = 0;
+  let cloudwhaleKills = 0;
+  let targetKilled = false;
+  let engagedAtPoi = false;
+
+  // Focus on the target POI first, then sweep other non-station POIs
+  const { pois } = await getSystemInfo(ctx);
+  let patrolPois = pois.filter(p => !isStationPoi(p));
+  // Sort target POI to the front
+  patrolPois.sort((a, b) => {
+    const aIsTarget = a.id === target.poi || a.name === target.poi ? -1 : 1;
+    const bIsTarget = b.id === target.poi || b.name === target.poi ? -1 : 1;
+    return aIsTarget - bIsTarget;
+  });
+
+  for (const poi of patrolPois) {
+    if (bot.state !== "running") break;
+    if (targetKilled) break;
+    engagedAtPoi = false;
+
+    await bot.refreshShip();
+    const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (midHull <= settings.repairThreshold) break;
+
+    await bot.refreshCargo();
+    const midCargo = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+    if (midCargo >= (settings.creatureFarmCargoFullPct || 0.95)) break;
+
+    const ammo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    if (!ammo && !settings.meatShield) break;
+
+    ctx.log("travel", `Big creature hunt: scanning ${poi.name}...`);
+    const travelResp = await bot.exec("travel", { target_poi: poi.id });
+    if (travelResp.error && !travelResp.error.message.includes("already")) {
+      ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
+      continue;
+    }
+    bot.poi = poi.id;
+    bot.clearObservationState();
+    await ctx.sleep(1000);
+
+    if (bot.isInBattle()) {
+      ctx.log("combat", "Big creature hunt: already in battle â€” skipping POI scan");
+      continue;
+    }
+
+    let passes = 0;
+    while (bot.state === "running" && passes < maxPasses && !targetKilled) {
+      passes++;
+
+      if (bot.isInBattle()) {
+        ctx.log("combat", "Big creature hunt: already in battle â€” breaking pass loop");
+        break;
+      }
+
+      const obsResult = await getObservationOrNearby(bot);
+      const nearbyData = obsResult.result;
+      if (!nearbyData) break;
+
+      bot.trackNearbyPlayers(nearbyData);
+      bot.trackWildlife(nearbyData);
+
+      const afterBattleResp = await getObservationOrNearby(bot);
+      const afterBattleData = afterBattleResp.result;
+      if (!afterBattleData) break;
+      bot.trackNearbyPlayers(afterBattleData);
+      bot.trackWildlife(afterBattleData);
+
+      const entities = parseNearby(afterBattleData);
+      const allCreatures = applyCloudWhalePackRule(entities.filter(e => isCreatureTarget(e, true) && !isStationEntity(e) && !isBrandedCreature(e.name) && !isProtectedCreature(e.name)));
+      const bigCreatures = allCreatures.filter(e => isBigCreature(e.name));
+      const otherCreatures = allCreatures.filter(e => !isBigCreature(e.name));
+      const creatures = [...prioritizeBigCreatures(bigCreatures), ...prioritizeLeviathans(otherCreatures)].slice(0, settings.maxCreaturesPerScan);
+      const pirates = settings.ignorePirates ? [] : entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+      let targets = [...creatures, ...pirates];
+      targets = pickUnclaimedBoardingTarget(targets, bot.username);
+      const targetsToEngage = sortTargetsByPriority(targets);
+      const prioritizedTargets = prioritizeBigCreatures(targetsToEngage.filter(t => isCreatureTarget(t, true) || (!settings.ignorePirates && isPirateTarget(t, settings.onlyNPCs, settings.maxAttackTier))));
+
+      if (prioritizedTargets.length === 0) break;
+
+      const bigCount = prioritizedTargets.filter(t => isBigCreature(t.name)).length;
+      ctx.log("combat", `Big creature hunt: ${pirates.length} pirate(s), ${allCreatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses}, ${bigCount} big target(s))${settings.ignorePirates ? " â€” ignoring pirates" : ""}`);
+
+      for (const t of prioritizedTargets) {
+        if (bot.state !== "running") break;
+        if (targetKilled) break;
+
+        if (bot.isInBattle()) {
+          ctx.log("combat", "Big creature hunt: already in battle â€” stopping target queue");
+          break;
+        }
+
+        await bot.refreshShip();
+        const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        if (preHull <= settings.repairThreshold) break;
+
+        await useRepairKits(ctx);
+        const ammo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+        if (!ammo && !settings.meatShield) break;
+
+        const freshScanResp = await bot.exec("get_nearby");
+        let freshEntities: NearbyEntity[] = [];
+        if (!freshScanResp.error && freshScanResp.result) {
+          bot.trackNearbyPlayers(freshScanResp.result);
+          bot.trackWildlife(freshScanResp.result);
+          freshEntities = parseNearby(freshScanResp.result);
+        }
+        const stillPresent = freshEntities.find(e => e.id === t.id || e.name === t.name);
+        if (!stillPresent) {
+          ctx.log("combat", `⚠️ ${t.name} no longer at ${poi.name} — skipping`);
+          continue;
+        }
+
+        engagedAtPoi = true;
+        const won = await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+        if (won) {
+          totalKills++;
+          if (isCloudWhale(t.name)) cloudwhaleKills++;
+          recordCreatureKill(bot, t);
+          ctx.log("combat", `Kill #${totalKills} (${t.name}) â€” looting...`);
+          if (!settings.disableWreckSalvaging) {
+            if (bot.isInBattle()) {
+              ctx.log("combat", "Clearing stale battle state after big creature kill â€” looting immediately");
+              bot.currentBattle.inBattle = false;
+              bot.currentBattle.battleId = null;
+              bot.currentBattle.participants = [];
+            }
+            const battleStatusBeforeLoot = await getBattleStatus(ctx);
+            if (!battleStatusBeforeLoot && bot.isInBattle()) {
+              ctx.log("combat", "API confirms no battle — clearing stale WebSocket state before looting");
+              bot.currentBattle.inBattle = false;
+              bot.currentBattle.battleId = null;
+              bot.currentBattle.participants = [];
+            }
+            await sweepWrecksAtPoi(ctx);
+          }
+          const cset = getHunterSettings(bot.username);
+          await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
+          await useRepairKits(ctx);
+          await bot.refreshCargo();
+          const cp = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+          if (cp >= (settings.creatureFarmCargoFullPct || 0.95)) {
+            targetKilled = true;
+            break;
+          }
+          if (isBigCreature(t.name)) {
+            ctx.log("info", `Big creature hunt: killed target ${t.name} â€” done with this POI`);
+            targetKilled = true;
+            break;
+          }
+        }
+      }
+      if (totalKills > 0 && totalKills % 3 === 0) {
+        await bot.refreshCargo();
+        const cp2 = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+        if (cp2 >= (settings.creatureFarmCargoFullPct || 0.95)) {
+          targetKilled = true;
+          break;
+        }
+      }
+      await ctx.sleep(1500);
+    }
+  }
+
+  // The POI loop exited for any reason (target killed, damage/cargo/ammo limits,
+  // passes exhausted). Never leave the POI we fought at without looting EVERY
+  // wreck: big creature fights usually also destroy player ships (expensive
+  // modules!), another hunter may have landed the killing blow on the big
+  // creature, and wrecks can spawn a few seconds after the battle ends.
+  if (engagedAtPoi && !settings.disableWreckSalvaging && bot.state === "running" && !bot.docked) {
+    ctx.log("combat", "Big creature hunt: looting all remaining wrecks before leaving the POI");
+    await sweepWrecksAtPoi(ctx);
+  }
+
+  return { kills: totalKills, cloudwhaleKills };
+}
+
+async function creatureFarmRandomFallbackCycle(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+  const basePool = settings.creatureFarmSystems || [];
+  if (basePool.length === 0) {
+    ctx.log("info", "No creatureFarmSystems configured for fallback â€” waiting 30s");
+    await ctx.sleep(30000);
+    return;
+  }
+
+  // If a big creature has appeared since we last checked, abort the fallback
+  // so the hunt loop can redirect immediately.
+  if (await shouldAbortForBigCreatureHunt(ctx, settings, bot.username)) {
+    return;
+  }
+
+  const baseSystem = basePool[Math.floor(Math.random() * basePool.length)];
+  let targetSystem = baseSystem;
+  if (settings.creatureFarmRoamJumps > 0) {
+    const resolvedBase = resolveSystemId(baseSystem);
+    if (resolvedBase) {
+      const expanded = findSystemsWithinRadius(resolvedBase, settings.creatureFarmRoamJumps);
+      if (expanded.length > 0) {
+        targetSystem = expanded[Math.floor(Math.random() * expanded.length)];
+      }
+    }
+  }
+
+  const safetyOpts = {
+    fuelThresholdPct: settings.refuelThreshold,
+    hullThresholdPct: settings.repairThreshold,
+    autoCloak: settings.autoCloak,
+    skipBlacklist: true,
+    isCombatBot: true,
+    joinBattles: true,
+  };
+
+  // â”€â”€ Pre-navigation survival checks â”€â”€
+  // This fallback is reached from hunt_big_creatures when no known big
+  // creatures exist. A bot started out in the wild with 0 fuel cells cannot
+  // refuel in the field, so check the cell stash BEFORE committing to a jump â€”
+  // otherwise it strands itself on a random system hop (the reported bug).
+  // These mirror the pre-engagement checks in creatureFarmRoutine /
+  // huntBigCreaturesRoutine, adapted to return out of this one-shot cycle.
+  const homeSystem = settings.homeSystem || "";
+  const homeStation = settings.homeStation || "";
+
+  await bot.refreshCargo();
+  const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+  if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+    // Can we reach home with remaining tank fuel + cargo cells?
+    const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+    if (canMakeItHome) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      return;
+    }
+    ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home — proceeding anyway`);
+  }
+
+  const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem, homeStation, skipBlacklist: true, skipFleeCheck: true });
+  if (fueled !== "fueled") {
+    await handleFuelCheckFailure(ctx, settings, fueled);
+    return;
+  }
+
+  await bot.refreshShip();
+  const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+  if (hullPct <= settings.repairThreshold) {
+    ctx.log("system", `Hull at ${hullPct}% â€” returning home to repair`);
+    await returnToHomeAndResupply(ctx, settings);
+    return;
+  }
+
+  if (bot.system !== targetSystem) {
+    ctx.log("travel", `Fallback farm: heading to ${targetSystem}...`);
+    const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
+    if (!arrived) {
+      ctx.log("error", `Could not reach ${targetSystem} for fallback farm`);
+      return;
+    }
+    await resubscribeObservationAfterMove(bot);
+  }
+
+  const loopsPerSystem = settings.creatureFarmLoopsPerSystem || 3;
+  const cargoFullPct = settings.creatureFarmCargoFullPct || 0.95;
+  const maxPasses = settings.creatureFarmMaxPassesPerPoi || 6;
+  let sweeps = 0;
+  while (bot.state === "running" && sweeps < loopsPerSystem) {
+    sweeps++;
+
+    // Check between sweeps: a big creature may have been noticed while we
+    // were farming the previous POI.
+    if (await shouldAbortForBigCreatureHunt(ctx, settings, bot.username)) {
+      return;
+    }
+
+    const { pois } = await getSystemInfo(ctx);
+    const patrolPois = pois.filter(p => !isStationPoi(p));
+    if (patrolPois.length === 0) break;
+
+    ctx.log("info", `Fallback farm sweep ${sweeps}/${loopsPerSystem} â€” ${patrolPois.length} POI(s)`);
+    for (const poi of patrolPois) {
+      if (bot.state !== "running") break;
+      await bot.refreshShip();
+      const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      if (midHull <= settings.repairThreshold) break;
+      await bot.refreshCargo();
+      if ((bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0) >= cargoFullPct) break;
+
+      const travelResp = await bot.exec("travel", { target_poi: poi.id });
+      if (travelResp.error && !travelResp.error.message.includes("already")) continue;
+      bot.poi = poi.id;
+      bot.clearObservationState();
+      await ctx.sleep(1000);
+
+      let passes = 0;
+      while (bot.state === "running" && passes < maxPasses) {
+        passes++;
+        const obsResult = await getObservationOrNearby(bot);
+        const nearbyData = obsResult.result;
+        if (!nearbyData) break;
+        bot.trackNearbyPlayers(nearbyData);
+        bot.trackWildlife(nearbyData);
+
+        const afterBattleResp = await getObservationOrNearby(bot);
+        const afterBattleData = afterBattleResp.result;
+        if (!afterBattleData) break;
+        bot.trackNearbyPlayers(afterBattleData);
+        bot.trackWildlife(afterBattleData);
+
+        const entities = parseNearby(afterBattleData);
+        const creatures = pickCreatureTargets(entities, bot, true, settings.maxCreaturesPerScan, settings.coordinationMode);
+        if (creatures.length === 0) break;
+
+        for (const t of creatures) {
+          if (bot.state !== "running") break;
+          await useRepairKits(ctx);
+          const ammo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+          if (!ammo && !settings.meatShield) break;
+
+          const won = await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+          if (won) {
+            recordCreatureKill(bot, t);
+            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+            const cset = getHunterSettings(bot.username);
+            await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
+            await useRepairKits(ctx);
+            await bot.refreshCargo();
+            if ((bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0) >= cargoFullPct) break;
+          }
+
+          // Between fights: if a big creature has appeared, abort the fallback
+          // and let the hunt loop redirect to it.
+          if (await shouldAbortForBigCreatureHunt(ctx, settings, bot.username)) {
+            return;
+          }
+        }
+        await ctx.sleep(1500);
+      }
+    }
+  }
+}
+
+// â”€â”€ Roam Systems Routine (original behavior) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
@@ -1212,7 +3512,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
   let totalKills = 0;
 
   while (bot.state === "running") {
-    // ── Death recovery ──
+    // â”€â”€ Death recovery â”€â”€
     const settings = getHunterSettings(bot.username);
     const death = await handleDeath(ctx, settings);
     if (death === "stop") return;
@@ -1228,48 +3528,57 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     };
     const patrolSystem = settings.system || "";
 
-    // ── Status ──
+    // â”€â”€ Status â”€â”€
     yield "get_status";
     await bot.refreshLocation();
     logStatus(ctx);
 
-    // ── Position update for visual display ──
+    // â”€â”€ Position update for visual display â”€â”€
     yield "get_system";
     await bot.exec("get_system");
     yield "get_poi";
     if (bot.poi) await bot.exec("get_poi", { poi_id: bot.poi });
 
-// ── Fuel check ──
+// â”€â”€ Fuel check â”€â”€
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
-    if (!fueled) {
-      ctx.log("error", "Cannot secure fuel — waiting 30s...");
-      await ctx.sleep(30000);
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
     }
 
-// ── Hull check — retreat to a high-security system to repair ──
+// â”€â”€ Hull check â€” retreat to a high-security system to repair â”€â”€
      await bot.refreshShip();
      const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-     if (hullPct <= settings.repairThreshold) {
-       ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
-       yield "emergency_repair";
-       const docked = await navigateToSafeStation(ctx, safetyOpts);
-       if (docked) {
-         await completeActiveMissions(ctx);
-         await repairShip(ctx);
-         await tryRefuel(ctx, { skipApprovedCheck: true });
-         await checkAndAcceptMissions(ctx);
-         await ensureInsured(ctx);
-         await bot.checkSkills();
-         await ensureUndocked(ctx);
-         await resubscribeObservationAfterMove(bot);
-       }
-       continue;
-     }
+if (hullPct <= settings.repairThreshold) {
+        ctx.log("system", `Hull at ${hullPct}% â€” retreating to high-security system for repairs`);
+        yield "emergency_repair";
+        const docked = await navigateToSafeStation(ctx, safetyOpts);
+        if (docked) {
+          await completeActiveMissions(ctx);
+          await repairShip(ctx);
+          await tryRefuel(ctx, { skipApprovedCheck: true });
+          await checkAndAcceptMissions(ctx);
+          await ensureInsured(ctx);
+          await bot.checkSkills();
+          await ensureUndocked(ctx);
+          await resubscribeObservationAfterMove(bot);
+        }
+        continue;
+      }
 
-    // ── Faction alert check — divert if an ally is nearby and under attack ──
-    yield "faction_alert_check";
+    // â”€â”€ Low fuel cells check â”€â”€
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+        continue;
+      }
+  
+
+      // â”€â”€ Faction alert check â€” divert if an ally is nearby and under attack â”€â”€
+      yield "faction_alert_check";
     const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
     if (alertTarget) {
       // CRITICAL: Check for existing battle before navigating
@@ -1280,7 +3589,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const blacklist = getSystemBlacklist();
       const route = mapStore.findRoute(bot.system, alertTarget, blacklist);
       const jumps = route ? route.length : "?";
-      ctx.log("combat", `Faction alert! ${sys?.name || alertTarget} is under attack (${jumps} jump(s)) — diverting to assist`);
+      ctx.log("combat", `Faction alert! ${sys?.name || alertTarget} is under attack (${jumps} jump(s)) â€” diverting to assist`);
       respondedAlerts.set(alertTarget, Date.now());
       try {
         await bot.exec("chat", {
@@ -1299,12 +3608,12 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
            ctx.log("combat", `Battle detected after navigation attempt - hunter fights, not flees!`);
            await handleNavigationBattleInterrupt(ctx, settings);
          } else {
-           ctx.log("error", `Could not reach ${alertTarget} — resuming normal patrol`);
-         }
-       }
-    }
+            ctx.log("error", `Could not reach ${alertTarget} â€” resuming normal patrol`);
+          }
+        }
+      }
 
-    // ── Navigate to a huntable (low/unregulated) system ──
+    // â”€â”€ Navigate to a huntable (low/unregulated) system â”€â”€
     yield "find_patrol_system";
 
     // CRITICAL: Check for existing battle before navigating
@@ -1324,7 +3633,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
           await handleNavigationBattleInterrupt(ctx, settings);
         } else {
-          ctx.log("error", `Could not reach ${patrolSystem} — patrolling ${bot.system} instead`);
+          ctx.log("error", `Could not reach ${patrolSystem} â€” patrolling ${bot.system} instead`);
         }
       }
     } else {
@@ -1332,12 +3641,12 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const currentSec = mapStore.getSystem(bot.system)?.security_level;
 
         if (!isHuntableSystem(currentSec)) {
-          ctx.log("travel", `${bot.system} is ${currentSec || "unknown"} security — searching for a huntable system...`);
+          ctx.log("travel", `${bot.system} is ${currentSec || "unknown"} security â€” searching for a huntable system...`);
 
           const huntTarget = findNearestHuntableSystem(bot.system);
           if (huntTarget) {
             const sys = mapStore.getSystem(huntTarget);
-            ctx.log("travel", `Found huntable system: ${sys?.name || huntTarget} (${sys?.security_level}) — navigating...`);
+            ctx.log("travel", `Found huntable system: ${sys?.name || huntTarget} (${sys?.security_level}) â€” navigating...`);
             const huntArrived = await navigateToSystem(ctx, huntTarget, safetyOpts);
             if (huntArrived) {
               await resubscribeObservationAfterMove(bot);
@@ -1354,7 +3663,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
             const unmapped = conns.find(c => !mapStore.getSystem(c.system_id)?.security_level);
             const target = unmapped ?? conns[0];
             if (target) {
-              ctx.log("travel", `No huntable system mapped yet — scouting ${target.system_name || target.system_id}...`);
+              ctx.log("travel", `No huntable system mapped yet â€” scouting ${target.system_name || target.system_id}...`);
               const scoutArrived = await navigateToSystem(ctx, target.system_id, safetyOpts);
               if (scoutArrived) {
                 await resubscribeObservationAfterMove(bot);
@@ -1369,7 +3678,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               await getSystemInfo(ctx);
               await fetchSecurityLevel(ctx, bot.system);
             } else {
-              ctx.log("error", "No connected systems found — waiting 30s");
+              ctx.log("error", "No connected systems found â€” waiting 30s");
               await ctx.sleep(30000);
               continue;
             }
@@ -1379,16 +3688,16 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     if (bot.state !== "running") break;
 
-    // ── Confirm we're actually in a huntable system ──
+    // â”€â”€ Confirm we're actually in a huntable system â”€â”€
     await fetchSecurityLevel(ctx, bot.system);
     const confirmedSec = mapStore.getSystem(bot.system)?.security_level;
     if (!isHuntableSystem(confirmedSec)) {
-      ctx.log("info", `${bot.system} is ${confirmedSec || "unknown"} security — no pirates here. Will search again next cycle`);
+      ctx.log("info", `${bot.system} is ${confirmedSec || "unknown"} security â€” no pirates here. Will search again next cycle`);
       await ctx.sleep(3000);
       continue;
     }
 
-    // ── Get system layout ──
+    // â”€â”€ Get system layout â”€â”€
     yield "scan_system";
     await fetchSecurityLevel(ctx, bot.system);
     const { pois } = await getSystemInfo(ctx);
@@ -1396,7 +3705,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const patrolPois = pois.filter(p => !isStationPoi(p));
 
     if (patrolPois.length === 0) {
-      ctx.log("info", "No non-station POIs to patrol — docking to refuel");
+      ctx.log("info", "No non-station POIs to patrol â€” docking to refuel");
       if (station) {
         await bot.exec("travel", { target_poi: station.id });
         await bot.exec("dock");
@@ -1411,7 +3720,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     await ensureObservationSubscribed();
 
-    // ── Patrol loop — visit each non-station POI ──
+    // â”€â”€ Patrol loop â€” visit each non-station POI â”€â”€
     let patrolKills = 0;
     let abortPatrol = false;
 
@@ -1422,12 +3731,12 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (midHull <= settings.repairThreshold) {
-        ctx.log("system", `Hull at ${midHull}% — aborting patrol, heading to station`);
+        ctx.log("system", `Hull at ${midHull}% â€” aborting patrol, heading to station`);
         abortPatrol = true;
         break;
       }
       if (midFuel < settings.refuelThreshold) {
-        ctx.log("system", `Fuel at ${midFuel}% — aborting patrol, heading to refuel`);
+        ctx.log("system", `Fuel at ${midFuel}% â€” aborting patrol, heading to refuel`);
         abortPatrol = true;
         break;
       }
@@ -1448,7 +3757,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
          // Check if we're in battle - this might be why travel failed
          const battleStatus = await getBattleStatus(ctx);
          if (battleStatus) {
-           ctx.log("combat", `⚠️ Battle detected during travel failure (ID: ${battleStatus.battle_id})`);
+           ctx.log("combat", `âš ï¸ Battle detected during travel failure (ID: ${battleStatus.battle_id})`);
            ctx.log("combat", `Battle participants: ${battleStatus.participants.map(p => p.username || p.player_id).join(", ")}`);
            
          // Parse nearby entities to find the attacker
@@ -1463,10 +3772,10 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               const threats = [...nonStationThreats, ...stationThreats];
               
               if (threats.length > 0) {
-               ctx.log("combat", `🚨 Threat(s) detected: ${threats.map(t => t.name).join(", ")}`);
+               ctx.log("combat", `ðŸš¨ Threat(s) detected: ${threats.map(t => t.name).join(", ")}`);
                // Engage the threats
                 for (const threat of threats) {
-                  const won = await hunterEngage(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                  const won = await hunterEngage(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
                   if (await shouldAbortPatrolAfterEngage(ctx, won, threat.name)) {
                     abortPatrol = true;
                     break;
@@ -1511,7 +3820,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       bot.trackWildlife(nearbyData);
 
       // Check if we got pulled into battle during scanning
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
       // Immediate reaction to pirate scan notification (NPC only, not player scans)
       if ((nearbyData as any).notifications) {
@@ -1525,9 +3834,9 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               bot.trackNearbyPlayers(scanNearby.result);
               bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures))];
+                const scanTargets = sortTargetsByPriority([...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode)]);
               for (const t of scanTargets) {
-                await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
               }
               // top up shields after immediate scan-target engagements (no per-target post-battle block)
               const ssettings = getHunterSettings(bot.username);
@@ -1542,36 +3851,21 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const entities = parseNearby(nearbyData);
       ctx.log("info", `entities: ${entities}`);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-      const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
+      const creature_targets = pickCreatureTargets(entities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode);
 
-      if (pirate_targets.length === 0 && creature_targets.length === 0) {
+      let allTargets = [...pirate_targets, ...creature_targets];
+      allTargets = pickUnclaimedBoardingTarget(allTargets, bot.username);
+
+      if (allTargets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
         if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
         continue;
       }
 
-      const allTargets = [...pirate_targets, ...creature_targets];
+      const allTargets2 = allTargets;
       ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${poi.name}`);
 
-      const nonStationTargets = allTargets.filter(e => !isStationEntity(e));
-      const stationTargets = allTargets.filter(e => isStationEntity(e));
-
-      let targetsToEngage: NearbyEntity[];
-      if (settings.targetRandomly) {
-        const shuffledNonStation = [...nonStationTargets];
-        for (let i = shuffledNonStation.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [shuffledNonStation[i], shuffledNonStation[j]] = [shuffledNonStation[j], shuffledNonStation[i]];
-        }
-        const shuffledStation = [...stationTargets];
-        for (let i = shuffledStation.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [shuffledStation[i], shuffledStation[j]] = [shuffledStation[j], shuffledStation[i]];
-        }
-        targetsToEngage = [...shuffledNonStation, ...shuffledStation];
-      } else {
-        targetsToEngage = [...nonStationTargets, ...stationTargets];
-      }
+      const targetsToEngage = sortTargetsByPriority(allTargets2);
 
       if (targetsToEngage.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
@@ -1586,7 +3880,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         await bot.refreshShip();
         const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
         if (preHull <= settings.repairThreshold) {
-          ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
+          ctx.log("system", `Hull at ${preHull}% â€” too low for another fight`);
           abortPatrol = true;
           break;
         }
@@ -1597,7 +3891,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         // A pirate might have attacked us while we were doing other actions
         const existingBattle = await getBattleStatus(ctx);
         if (existingBattle) {
-          ctx.log("combat", `⚠️ Already in battle (ID: ${existingBattle.battle_id}) before engaging ${target.name}`);
+          ctx.log("combat", `âš ï¸ Already in battle (ID: ${existingBattle.battle_id}) before engaging ${target.name}`);
           ctx.log("combat", `Battle participants: ${existingBattle.participants.map(p => p.username || p.player_id).join(", ")}`);
           
           // Check if this battle is with our intended target
@@ -1617,16 +3911,16 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         // Pre-fight ammo check - use ensureAmmoLoaded since bot.ammo may not reflect module-level ammo
         const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
         if (!hasAmmo && !settings.meatShield) {
-          ctx.log("combat", "Out of ammo — aborting patrol to resupply");
+          ctx.log("combat", "Out of ammo â€” aborting patrol to resupply");
           abortPatrol = true;
           break;
         }
         if (!hasAmmo) {
-          ctx.log("combat", "Meat-shield mode — no ammo but entering battle anyway");
+          ctx.log("combat", "Meat-shield mode â€” no ammo but entering battle anyway");
         }
 
         yield "engage";
-        const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+        const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
 
         if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) {
           abortPatrol = true;
@@ -1635,7 +3929,8 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         if (won) {
           totalKills++;
           patrolKills++;
-          ctx.log("combat", `Kill #${totalKills} — checking for new threats before looting...`);
+          recordCreatureKill(bot, target);
+          ctx.log("combat", `Kill #${totalKills} â€” checking for new threats before looting...`);
 
           // CRITICAL: Check for new pirates before looting (safety first!)
           yield "safety_check";
@@ -1652,12 +3947,12 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
              );
 
             if (newThreats.length > 0) {
-              ctx.log("combat", `🚨 ${newThreats.length} new pirate(s) detected: ${newThreats.map(t => t.name).join(", ")} — engaging instead of looting!`);
+              ctx.log("combat", `ðŸš¨ ${newThreats.length} new pirate(s) detected: ${newThreats.map(t => t.name).join(", ")} â€” engaging instead of looting!`);
               // Fight the new threats first
               for (const newThreat of newThreats) {
                 if (bot.state !== "running") break;
                 
-                const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
                 if (await shouldAbortPatrolAfterEngage(ctx, newWon, newThreat.name)) {
                   abortPatrol = true;
                   break;
@@ -1671,19 +3966,21 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               
               // After fighting new threats, check again before looting
               if (abortPatrol) break;
-              ctx.log("combat", "Area clear — now looting wrecks...");
+              ctx.log("combat", "Area clear â€” now looting wrecks...");
             } else {
-              ctx.log("combat", "Area clear — no new threats detected");
+              ctx.log("combat", "Area clear â€” no new threats detected");
             }
           }
 
-          yield "loot";
-          await scavengeWrecks(ctx);
+           if (!settings.disableWreckSalvaging) {
+             yield "loot";
+             await scavengeWrecks(ctx);
+           }
 
           // Post-kill reload
           const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           if (!hasAmmo) {
-            ctx.log("combat", "No ammo after kill — aborting patrol to resupply");
+            ctx.log("combat", "No ammo after kill â€” aborting patrol to resupply");
             abortPatrol = true;
           }
 
@@ -1691,7 +3988,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           await useRepairKits(ctx);
           await bot.refreshCargo();
           if (isLowOnFieldConsumables(bot.inventory)) {
-            ctx.log("combat", "Low on repair kits or shield charges — aborting patrol to resupply");
+            ctx.log("combat", "Low on repair kits or shield charges â€” aborting patrol to resupply");
             abortPatrol = true;
           }
           await bot.refreshShip();
@@ -1700,7 +3997,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       }
     }
 
-    // ── Post-patrol decision ──
+    // â”€â”€ Post-patrol decision â”€â”€
     yield "post_patrol";
     await bot.refreshCargo();
     await bot.refreshShip();
@@ -1711,16 +4008,16 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const needsRepair = postHull <= settings.repairThreshold;
 
     // Only return home for fuel when we have ZERO fuel cells of any type in cargo
-    const hasFuelCells = bot.inventory?.some(i =>
-      i.itemId === 'fuel_cell' ||
-      i.itemId === 'premium_fuel_cell' ||
-      i.itemId === 'military_fuel_cell'
-    );
-    const needsFuel = !hasFuelCells;
-
+     // Only return home for fuel when fuel is actually low AND we have no fuel cells
+     const hasFuelCells = bot.inventory?.some(i =>
+       i.itemId.toLowerCase() === 'fuel_cell' ||
+       i.itemId.toLowerCase() === 'premium_fuel_cell' ||
+       i.itemId.toLowerCase() === 'military_fuel_cell'
+     );
+     const needsFuel = postFuel < (settings.refuelThreshold ?? 20) && !hasFuelCells;
     if (needsRepair || needsFuel) {
       const reason = needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`;
-      ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Returning to safe system (${reason})...`);
+      ctx.log("system", `Patrol sweep done â€” ${patrolKills} kill(s). Returning to safe system (${reason})...`);
 
       // When needsFuel is true, go directly to home base for full resupply
       if (needsFuel && settings.homeSystem) {
@@ -1769,7 +4066,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         yield "dock";
         const docked = await navigateToSafeStation(ctx, safetyOpts);
         if (!docked) {
-          ctx.log("error", "Could not dock anywhere — retrying next cycle");
+          ctx.log("error", "Could not dock anywhere â€” retrying next cycle");
           continue;
         }
 
@@ -1805,7 +4102,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
 
         if (settings.singleLoop) {
-          ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+          ctx.log("system", "Single loop mode â€” returning to faction home base for resupply...");
           const hs = settings.homeStation || "";
           const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
           if (hsys && hpoi) {
@@ -1820,7 +4117,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       }
 
     } else {
-      ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Hull: ${postHull}% | Fuel: ${postFuel}% — continuing hunt...`);
+      ctx.log("system", `Patrol sweep done â€” ${patrolKills} kill(s). Hull: ${postHull}% | Fuel: ${postFuel}% â€” continuing hunt...`);
 
       if (!patrolSystem) {
         const nextSystem = findNextHuntSystem(bot.system);
@@ -1831,14 +4128,13 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           await getSystemInfo(ctx);
           await fetchSecurityLevel(ctx, bot.system);
         } else {
-          ctx.log("info", "No adjacent huntable system found — will search next cycle");
+          ctx.log("info", "No adjacent huntable system found â€” will search next cycle");
         }
       }
     }
   }
 }
-
-// ── Roam System Routine (stay in current system) ────────────────
+// â”€â”€ Roam System Routine (stay in current system) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
@@ -1847,7 +4143,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
   let totalKills = 0;
 
   while (bot.state === "running") {
-    // ── Death recovery ──
+    // â”€â”€ Death recovery â”€â”€
     const settings = getHunterSettings(bot.username);
     const death = await handleDeath(ctx, settings);
     if (death === "stop") return;
@@ -1861,31 +4157,30 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       isCombatBot: true,
     };
 
-    // ── Status ──
+    // â”€â”€ Status â”€â”€
     yield "get_status";
     await bot.refreshLocation();
     logStatus(ctx);
 
-    // ── Position update for visual display ──
+    // â”€â”€ Position update for visual display â”€â”€
     yield "get_system";
     await bot.exec("get_system");
     yield "get_poi";
     if (bot.poi) await bot.exec("get_poi", { poi_id: bot.poi });
 
-// ── Fuel check ──
+// â”€â”€ Fuel check â”€â”€
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
-    if (!fueled) {
-      ctx.log("error", "Cannot secure fuel — waiting 30s...");
-      await ctx.sleep(30000);
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
     }
 
-// ── Hull check — retreat to a high-security system to repair ──
+// â”€â”€ Hull check â€” retreat to a high-security system to repair â”€â”€
      await bot.refreshShip();
      const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
      if (hullPct <= settings.repairThreshold) {
-       ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
+       ctx.log("system", `Hull at ${hullPct}% â€” retreating to high-security system for repairs`);
        yield "emergency_repair";
        const docked = await navigateToSafeStation(ctx, safetyOpts);
        if (docked) {
@@ -1897,31 +4192,41 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
          await bot.checkSkills();
          await ensureUndocked(ctx);
          await resubscribeObservationAfterMove(bot);
-       }
-       continue;
-     }
- 
-     // ── Faction alert check — divert if an ally is nearby and under attack ──
-     yield "faction_alert_check";
+        }
+        continue;
+      }
+
+
+    // â”€â”€ Low fuel cells check â”€â”€
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      continue;
+    }
+
+      // â”€â”€ Faction alert check â€” divert if an ally is nearby and under attack â”€â”€
+      yield "faction_alert_check";
      const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
      if (alertTarget && alertTarget === bot.system) {
        ctx.log("combat", `Faction alert! Responding in current system`);
        // Since we're already in the system, proceed to patrol
      } else if (alertTarget) {
        // If alert is in another system, we can't respond since we're in roam_system mode
-       ctx.log("info", `Faction alert in ${alertTarget} — ignoring (roam_system mode)`);
+       ctx.log("info", `Faction alert in ${alertTarget} â€” ignoring (roam_system mode)`);
      }
 
-    // ── Confirm we're actually in a huntable system ──
+    // â”€â”€ Confirm we're actually in a huntable system â”€â”€
     await fetchSecurityLevel(ctx, bot.system);
     const confirmedSec = mapStore.getSystem(bot.system)?.security_level;
     if (!isHuntableSystem(confirmedSec)) {
-      ctx.log("info", `${bot.system} is ${confirmedSec || "unknown"} security — no pirates here. Waiting for pirates to appear...`);
+      ctx.log("info", `${bot.system} is ${confirmedSec || "unknown"} security â€” no pirates here. Waiting for pirates to appear...`);
       await ctx.sleep(5000);
       continue;
     }
 
-    // ── Get system layout ──
+    // â”€â”€ Get system layout â”€â”€
     yield "scan_system";
     await fetchSecurityLevel(ctx, bot.system);
     const { pois } = await getSystemInfo(ctx);
@@ -1929,7 +4234,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     const patrolPois = pois.filter(p => !isStationPoi(p));
 
     if (patrolPois.length === 0) {
-      ctx.log("info", "No non-station POIs to patrol — docking to refuel");
+      ctx.log("info", "No non-station POIs to patrol â€” docking to refuel");
       if (station) {
         await bot.exec("travel", { target_poi: station.id });
         await bot.exec("dock");
@@ -1944,7 +4249,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     await ensureObservationSubscribed();
 
-    // ── Patrol loop — visit each non-station POI ──
+    // â”€â”€ Patrol loop â€” visit each non-station POI â”€â”€
     let patrolKills = 0;
     let abortPatrol = false;
 
@@ -1955,12 +4260,12 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (midHull <= settings.repairThreshold) {
-        ctx.log("system", `Hull at ${midHull}% — aborting patrol, heading to station`);
+        ctx.log("system", `Hull at ${midHull}% â€” aborting patrol, heading to station`);
         abortPatrol = true;
         break;
       }
       if (midFuel < settings.refuelThreshold) {
-        ctx.log("system", `Fuel at ${midFuel}% — aborting patrol, heading to refuel`);
+        ctx.log("system", `Fuel at ${midFuel}% â€” aborting patrol, heading to refuel`);
         abortPatrol = true;
         break;
       }
@@ -2008,7 +4313,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       bot.trackWildlife(nearbyData);
 
       // Check if we got pulled into battle during scanning
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
       // Immediate reaction to pirate scan notification (NPC only, not player scans)
       if ((nearbyData as any).notifications) {
@@ -2022,9 +4327,9 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               bot.trackNearbyPlayers(scanNearby.result);
               bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures))];
+                const scanTargets = sortTargetsByPriority([...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode)]);
               for (const t of scanTargets) {
-                await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
               }
               // top up shields after immediate scan-target engagements (no per-target post-battle block)
               const ssettings = getHunterSettings(bot.username);
@@ -2039,36 +4344,21 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       const entities = parseNearby(nearbyData);
       ctx.log("info", `entities: ${entities}`);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-      const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
+      const creature_targets = pickCreatureTargets(entities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode);
 
-      if (pirate_targets.length === 0 && creature_targets.length === 0) {
+      let allTargets = [...pirate_targets, ...creature_targets];
+      allTargets = pickUnclaimedBoardingTarget(allTargets, bot.username);
+
+      if (allTargets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
         if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
         continue;
       }
 
-      const allTargets = [...pirate_targets, ...creature_targets];
+      const allTargets2 = allTargets;
       ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${poi.name}`);
 
-      const nonStationTargets = allTargets.filter(e => !isStationEntity(e));
-      const stationTargets = allTargets.filter(e => isStationEntity(e));
-
-      let targetsToEngage: NearbyEntity[];
-      if (settings.targetRandomly) {
-        const shuffledNonStation = [...nonStationTargets];
-        for (let i = shuffledNonStation.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [shuffledNonStation[i], shuffledNonStation[j]] = [shuffledNonStation[j], shuffledNonStation[i]];
-        }
-        const shuffledStation = [...stationTargets];
-        for (let i = shuffledStation.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [shuffledStation[i], shuffledStation[j]] = [shuffledStation[j], shuffledStation[i]];
-        }
-        targetsToEngage = [...shuffledNonStation, ...shuffledStation];
-      } else {
-        targetsToEngage = [...nonStationTargets, ...stationTargets];
-      }
+      const targetsToEngage = sortTargetsByPriority(allTargets2);
 
       if (targetsToEngage.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
@@ -2083,7 +4373,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         await bot.refreshShip();
         const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
         if (preHull <= settings.repairThreshold) {
-          ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
+          ctx.log("system", `Hull at ${preHull}% â€” too low for another fight`);
           abortPatrol = true;
           break;
         }
@@ -2093,16 +4383,16 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         // Pre-fight ammo check
         const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
         if (!hasAmmo && !settings.meatShield) {
-          ctx.log("combat", "Out of ammo — aborting patrol to resupply");
+          ctx.log("combat", "Out of ammo â€” aborting patrol to resupply");
           abortPatrol = true;
           break;
         }
         if (!hasAmmo) {
-          ctx.log("combat", "Meat-shield mode — no ammo but entering battle anyway");
+          ctx.log("combat", "Meat-shield mode â€” no ammo but entering battle anyway");
         }
 
         yield "engage";
-        const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+        const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
 
         if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) {
           abortPatrol = true;
@@ -2111,7 +4401,8 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         if (won) {
           totalKills++;
           patrolKills++;
-          ctx.log("combat", `Kill #${totalKills} — checking for new threats before looting...`);
+          recordCreatureKill(bot, target);
+          ctx.log("combat", `Kill #${totalKills} â€” checking for new threats before looting...`);
 
           // Safety check for new threats
           yield "safety_check";
@@ -2128,11 +4419,11 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             );
 
             if (newThreats.length > 0) {
-              ctx.log("combat", `🚨 ${newThreats.length} new pirate(s) detected: ${newThreats.map(t => t.name).join(", ")} — engaging instead of looting!`);
+              ctx.log("combat", `ðŸš¨ ${newThreats.length} new pirate(s) detected: ${newThreats.map(t => t.name).join(", ")} â€” engaging instead of looting!`);
               for (const newThreat of newThreats) {
                 if (bot.state !== "running") break;
 
-                const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
                 if (await shouldAbortPatrolAfterEngage(ctx, newWon, newThreat.name)) {
                   abortPatrol = true;
                   break;
@@ -2145,9 +4436,9 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               }
 
               if (abortPatrol) break;
-              ctx.log("combat", "Area clear — now looting wrecks...");
+              ctx.log("combat", "Area clear â€” now looting wrecks...");
             } else {
-              ctx.log("combat", "Area clear — no new threats detected");
+              ctx.log("combat", "Area clear â€” no new threats detected");
             }
           }
 
@@ -2159,7 +4450,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           // Post-kill reload
           const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           if (!hasAmmo) {
-            ctx.log("combat", "No ammo after kill — aborting patrol to resupply");
+            ctx.log("combat", "No ammo after kill â€” aborting patrol to resupply");
             abortPatrol = true;
           }
 
@@ -2167,7 +4458,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           await useRepairKits(ctx);
           await bot.refreshCargo();
           if (isLowOnFieldConsumables(bot.inventory)) {
-            ctx.log("combat", "Low on repair kits or shield charges — aborting patrol to resupply");
+            ctx.log("combat", "Low on repair kits or shield charges â€” aborting patrol to resupply");
             abortPatrol = true;
           }
           await bot.refreshShip();
@@ -2176,7 +4467,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       }
     }
 
-    // ── Post-patrol decision ──
+    // â”€â”€ Post-patrol decision â”€â”€
     yield "post_patrol";
     await bot.refreshCargo();
     await bot.refreshShip();
@@ -2187,16 +4478,16 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     const needsRepair = postHull <= settings.repairThreshold;
 
     // Only return home for fuel when we have ZERO fuel cells of any type in cargo
-    const hasFuelCells = bot.inventory?.some(i =>
-      i.itemId === 'fuel_cell' ||
-      i.itemId === 'premium_fuel_cell' ||
-      i.itemId === 'military_fuel_cell'
-    );
-    const needsFuel = !hasFuelCells;
-
+     // Only return home for fuel when fuel is actually low AND we have no fuel cells
+     const hasFuelCells = bot.inventory?.some(i =>
+       i.itemId.toLowerCase() === 'fuel_cell' ||
+       i.itemId.toLowerCase() === 'premium_fuel_cell' ||
+       i.itemId.toLowerCase() === 'military_fuel_cell'
+     );
+     const needsFuel = postFuel < (settings.refuelThreshold ?? 20) && !hasFuelCells;
     if (needsRepair || needsFuel) {
       const reason = needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`;
-      ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Returning to safe system (${reason})...`);
+      ctx.log("system", `Patrol sweep done â€” ${patrolKills} kill(s). Returning to safe system (${reason})...`);
 
       // When needsFuel is true, go directly to home base for full resupply
       if (needsFuel && settings.homeSystem) {
@@ -2245,7 +4536,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         yield "dock";
         const docked = await navigateToSafeStation(ctx, safetyOpts);
         if (!docked) {
-          ctx.log("error", "Could not dock anywhere — retrying next cycle");
+          ctx.log("error", "Could not dock anywhere â€” retrying next cycle");
           continue;
         }
 
@@ -2282,13 +4573,12 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       }
 
     } else {
-      ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Hull: ${postHull}% | Fuel: ${postFuel}% — continuing hunt in system...`);
+      ctx.log("system", `Patrol sweep done â€” ${patrolKills} kill(s). Hull: ${postHull}% | Fuel: ${postFuel}% â€” continuing hunt in system...`);
       // In roam_system mode, we just continue the loop without moving to another system
     }
   }
 }
-
-// ── Stationary Routine (stay in one POI) ────────────────────────
+// â”€â”€ Stationary Routine (stay in one POI) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
@@ -2301,14 +4591,14 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
   const originalPoi = bot.poi;
 
   if (!originalPoi) {
-    ctx.log("error", "No current POI set — cannot operate in stationary mode");
+    ctx.log("error", "No current POI set â€” cannot operate in stationary mode");
     return;
   }
 
   ctx.log("info", `Stationary mode: staying in ${originalPoi} (${originalSystem})`);
 
   while (bot.state === "running") {
-    // ── Death recovery ──
+    // â”€â”€ Death recovery â”€â”€
     const settings = getHunterSettings(bot.username);
     const death = await handleDeath(ctx, settings);
     if (death === "stop") return;
@@ -2322,28 +4612,28 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       isCombatBot: true,
     };
 
-    // ── Status ──
+    // â”€â”€ Status â”€â”€
     yield "get_status";
     await bot.refreshLocation();
     logStatus(ctx);
 
-    // ── Position update for visual display ──
+    // â”€â”€ Position update for visual display â”€â”€
     yield "get_system";
     await bot.exec("get_system");
     yield "get_poi";
     if (bot.poi) await bot.exec("get_poi", { poi_id: bot.poi });
 
-    // ── Battle check — defend the station if under attack ──
+    // â”€â”€ Battle check â€” defend the station if under attack â”€â”€
     const battleStatus = await getBattleStatus(ctx);
     if (battleStatus && battleStatus.is_participant) {
-      ctx.log("combat", `⚠️ Station under attack (ID: ${battleStatus.battle_id}) — defending as hunter!`);
+      ctx.log("combat", `âš ï¸ Station under attack (ID: ${battleStatus.battle_id}) â€” defending as hunter!`);
       await stationProtectionFight(ctx, settings);
-      ctx.log("info", "Station defense complete — returning to protection post.");
+      ctx.log("info", "Station defense complete â€” returning to protection post.");
       if (bot.system !== originalSystem) {
         ctx.log("travel", `Returning to stationary system ${originalSystem}...`);
         const arrived = await navigateToSystem(ctx, originalSystem, safetyOpts);
         if (!arrived) {
-          ctx.log("error", `Could not return to ${originalSystem} — staying in ${bot.system}`);
+          ctx.log("error", `Could not return to ${originalSystem} â€” staying in ${bot.system}`);
         }
       }
       if (bot.poi !== originalPoi) {
@@ -2359,61 +4649,72 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       continue;
     }
 
-    // ── Fuel check ──
+    // â”€â”€ Fuel check â”€â”€
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
-    if (!fueled) {
-      ctx.log("error", "Cannot secure fuel — waiting 30s...");
-      await ctx.sleep(30000);
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
     }
 
-    // ── Hull check — retreat to a high-security system to repair ──
-    await bot.refreshShip();
-    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-    if (hullPct <= settings.repairThreshold) {
-      ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
-      yield "emergency_repair";
-      const docked = await navigateToSafeStation(ctx, safetyOpts);
-      if (docked) {
-        await completeActiveMissions(ctx);
-        await repairShip(ctx);
-        await tryRefuel(ctx, { skipApprovedCheck: true });
-        await checkAndAcceptMissions(ctx);
-        await ensureInsured(ctx);
-        await bot.checkSkills();
-        await ensureUndocked(ctx);
-        // Return to stationary position
-        if (bot.system !== originalSystem) {
-          ctx.log("travel", `Returning to stationary system ${originalSystem}...`);
-          const arrived = await navigateToSystem(ctx, originalSystem, safetyOpts);
-          if (!arrived) {
-            ctx.log("error", `Could not return to ${originalSystem} — staying in ${bot.system}`);
-          }
-        }
-        if (bot.poi !== originalPoi) {
-          ctx.log("travel", `Returning to stationary POI ${originalPoi}...`);
-          const travelResp = await bot.exec("travel", { target_poi: originalPoi });
-          if (travelResp.error && !travelResp.error.message.includes("already")) {
-            ctx.log("error", `Failed to return to POI ${originalPoi}: ${travelResp.error.message}`);
-          } else {
-            bot.poi = originalPoi;
-          }
-        }
+    // â”€â”€ Can we make it home with remaining fuel? â”€â”€
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+      if (canMakeItHome) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
+        await returnToHomeAndResupply(ctx, settings);
+        continue;
       }
-      continue;
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home — proceeding anyway`);
     }
 
-    // ── Faction alert check — only respond if in current system ──
-    yield "faction_alert_check";
-    const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
-    if (alertTarget && alertTarget !== bot.system) {
-      ctx.log("info", `Faction alert in ${alertTarget} — ignoring (stationary mode)`);
-    }
+    // â”€â”€ Hull check â€” retreat to a high-security system to repair â”€â”€
+     await bot.refreshShip();
+     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+     if (hullPct <= settings.repairThreshold) {
+       ctx.log("system", `Hull at ${hullPct}% â€” retreating to high-security system for repairs`);
+       yield "emergency_repair";
+       const docked = await navigateToSafeStation(ctx, safetyOpts);
+       if (docked) {
+         await completeActiveMissions(ctx);
+         await repairShip(ctx);
+         await tryRefuel(ctx, { skipApprovedCheck: true });
+         await checkAndAcceptMissions(ctx);
+         await ensureInsured(ctx);
+         await bot.checkSkills();
+         await ensureUndocked(ctx);
+         // Return to stationary position
+         if (bot.system !== originalSystem) {
+           ctx.log("travel", `Returning to stationary system ${originalSystem}...`);
+           const arrived = await navigateToSystem(ctx, originalSystem, safetyOpts);
+           if (!arrived) {
+             ctx.log("error", `Could not return to ${originalSystem} â€” staying in ${bot.system}`);
+           }
+         }
+         if (bot.poi !== originalPoi) {
+           ctx.log("travel", `Returning to stationary POI ${originalPoi}...`);
+           const travelResp = await bot.exec("travel", { target_poi: originalPoi });
+           if (travelResp.error && !travelResp.error.message.includes("already")) {
+             ctx.log("error", `Failed to return to POI ${originalPoi}: ${travelResp.error.message}`);
+           } else {
+             bot.poi = originalPoi;
+           }
+         }
+       }
+       continue;
+     }
 
-    // ── Wait and scan for targets ──
-    ctx.log("info", `Waiting for targets at ${originalPoi}...`);
-    yield "scan_for_targets";
+     // â”€â”€ Faction alert check â€” only respond if in current system â”€â”€
+     yield "faction_alert_check";
+     const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
+     if (alertTarget && alertTarget !== bot.system) {
+       ctx.log("info", `Faction alert in ${alertTarget} â€” ignoring (stationary mode)`);
+     }
+
+     // â”€â”€ Wait and scan for targets â”€â”€
+     ctx.log("info", `Waiting for targets at ${originalPoi}...`);
+     yield "scan_for_targets";
     await ensureObservationSubscribed();
     const obsResult = await getObservationOrNearby(bot);
     const nearbyData = obsResult.result;
@@ -2434,7 +4735,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     bot.trackWildlife(nearbyData);
 
     // Check if we got pulled into battle during scanning
-    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
       // Immediate reaction to pirate scan notification (NPC only, not player scans)
       if ((nearbyData as any).notifications) {
@@ -2448,9 +4749,9 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               bot.trackNearbyPlayers(scanNearby.result);
               bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures) && !isStationEntity(e))];
+                const scanTargets = sortTargetsByPriority([...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode)]);
               for (const t of scanTargets) {
-                await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
               }
               // top up shields after immediate scan-target engagements (no per-target post-battle block)
               const ssettings = getHunterSettings(bot.username);
@@ -2464,8 +4765,9 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
       const entities = parseNearby(nearbyData);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-      const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
-      const targets = [...pirate_targets, ...creature_targets];
+      const creature_targets = pickCreatureTargets(entities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode);
+      let targets = [...pirate_targets, ...creature_targets];
+      targets = pickUnclaimedBoardingTarget(targets, bot.username);
 
       if (targets.length === 0) {
         ctx.log("combat", `No targets at ${originalPoi}`);
@@ -2476,14 +4778,22 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
       ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${originalPoi}`);
 
+      const targetsToEngage = sortTargetsByPriority(targets);
+
+      if (targetsToEngage.length === 0) {
+        ctx.log("combat", `No targets at ${originalPoi}`);
+        if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+        continue;
+      }
+
 // Engage each target
-      for (const target of targets) {
+      for (const target of targetsToEngage) {
         if (bot.state !== "running") break;
 
         await bot.refreshShip();
         const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       if (preHull <= settings.repairThreshold) {
-        ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
+        ctx.log("system", `Hull at ${preHull}% â€” too low for another fight`);
         break;
       }
 
@@ -2492,57 +4802,57 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       // Pre-fight ammo check
       const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
       if (!hasAmmo && !settings.meatShield) {
-        ctx.log("combat", "Out of ammo — aborting to resupply");
+        ctx.log("combat", "Out of ammo â€” aborting to resupply");
         break;
         }
 
         yield "engage";
-        const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+        const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
 
         if (won) {
           totalKills++;
-        ctx.log("combat", `Kill #${totalKills} — checking for new threats...`);
-
-        // Safety check for new threats
-        yield "safety_check";
-        const safetyCheckResp = await bot.exec("get_nearby");
-        if (!safetyCheckResp.error) {
-          bot.trackNearbyPlayers(safetyCheckResp.result);
-          await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
-          const nearbyEntities = parseNearby(safetyCheckResp.result);
-          const newThreats = nearbyEntities.filter(e =>
-            isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
-            !isStationEntity(e) &&
-            e.id !== target.id &&
-            e.name !== target.name
-          );
-
-          if (newThreats.length > 0) {
-            ctx.log("combat", `🚨 ${newThreats.length} new pirate(s) detected: ${newThreats.map(t => t.name).join(", ")} — engaging!`);
-            for (const newThreat of newThreats) {
-              if (bot.state !== "running") break;
-
-                const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
-                if (newWon) {
-                totalKills++;
-                ctx.log("combat", `Kill #${totalKills} (additional threat)`);
-              } else {
-                ctx.log("combat", "Retreated from new threat");
-                break;
-              }
-            }
-            }
-          }
+          ctx.log("combat", `Kill #${totalKills} â€” looting wreck before next target...`);
 
           if (!settings.disableWreckSalvaging) {
             yield "loot";
             await scavengeWrecks(ctx);
           }
 
+          // Safety check for new threats
+          yield "safety_check";
+          const safetyCheckResp = await bot.exec("get_nearby");
+          if (!safetyCheckResp.error) {
+            bot.trackNearbyPlayers(safetyCheckResp.result);
+            await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
+            const nearbyEntities = parseNearby(safetyCheckResp.result);
+            const newThreats = nearbyEntities.filter(e =>
+              isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+              !isStationEntity(e) &&
+              e.id !== target.id &&
+              e.name !== target.name
+            );
+
+            if (newThreats.length > 0) {
+              ctx.log("combat", `ðŸš¨ ${newThreats.length} new pirate(s) detected: ${newThreats.map(t => t.name).join(", ")} â€” engaging!`);
+              for (const newThreat of newThreats) {
+                if (bot.state !== "running") break;
+
+                  const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+                  if (newWon) {
+                  totalKills++;
+                  ctx.log("combat", `Kill #${totalKills} (additional threat)`);
+                } else {
+                  ctx.log("combat", "Retreated from new threat");
+                  break;
+                }
+              }
+              }
+          }
+
           // Post-kill reload
           const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           if (!hasAmmo && !settings.meatShield) {
-            ctx.log("combat", "No ammo after kill — aborting to resupply");
+            ctx.log("combat", "No ammo after kill â€” aborting to resupply");
             break;
           }
 
@@ -2550,14 +4860,14 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           await useRepairKits(ctx);
           await bot.refreshCargo();
           if (isLowOnFieldConsumables(bot.inventory)) {
-            ctx.log("combat", "Low on repair kits or shield charges — stopping to resupply");
+            ctx.log("combat", "Low on repair kits or shield charges â€” stopping to resupply");
             break;
           }
           await bot.refreshShip();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
 
       } else {
-        ctx.log("combat", `Could not engage ${target.name} (already gone, fighting, or retreated) — skipping to next target`);
+        ctx.log("combat", `Could not engage ${target.name} (already gone, fighting, or retreated) â€” skipping to next target`);
         await ctx.sleep(800);
         // continue to try remaining targets in this scan instead of aborting the whole list
       }
@@ -2568,7 +4878,152 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
   }
 }
 
-// ── Station Protection Routine ────────────────────────────────
+// â”€â”€ PVP Routine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// Player-vs-Player hunter. It does NOT patrol or roam: it camps a single system
+// POI and never moves (no navigation, no travel, no flee). Every tick it sends an
+// `attack` command at a configured target player name (global under
+// hunter.targetPlayer, overridable per-bot via <bot>.targetPlayer). If a battle is
+// live it keeps fire stance + re-targets the player each tick. Ammo is reloaded and
+// field repair kits are used in place, but the ship never leaves its POI.
+//
+// The target player must be physically present at the same POI for the attack to
+// land; if they are not, the attack just fails and is re-issued next tick (this is
+// the intended "always attacking" behaviour).
+
+async function* pvpRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshLocation();
+
+  // Camp wherever we already are. We must be at a POI (not docked, in open space)
+  // for the attack command to reach a nearby player.
+  const originalSystem = bot.system;
+  const originalPoi = bot.poi;
+
+  if (bot.docked) {
+    ctx.log("error", "PVP mode cannot camp while docked â€” undock first (start the routine undocked at the target POI).");
+    return;
+  }
+  if (!originalPoi) {
+    ctx.log("error", "PVP mode requires a current POI (be in a system POI, not a station). Cannot start.");
+    return;
+  }
+
+  ctx.log("info", `PVP mode: camping ${originalPoi} (${originalSystem}) â€” will attack the configured target player every tick (no movement).`);
+
+  // Tick cadence for re-issuing the attack command.
+  const TICK_MS = 3000;
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+    const targetPlayer = (settings.targetPlayer || "").trim();
+
+    if (!targetPlayer) {
+      ctx.log("error", "PVP mode has no target player set (Settings â–¸ Hunter â–¸ PVP Target Player). Standing by...");
+      await ctx.sleep(10000);
+      continue;
+    }
+
+    // â”€â”€ Death recovery â”€â”€
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
+    // â”€â”€ Status â”€â”€
+    yield "get_status";
+    await bot.refreshLocation();
+    await bot.refreshShip();
+    logStatus(ctx);
+
+    // â”€â”€ Low fuel cells check â”€â”€
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      continue;
+    }
+
+    // â”€â”€ Ammo reload (in place, no travel) â”€â”€
+    await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+
+    // â”€â”€ Find the target player in our POI â”€â”€
+    yield "scan_for_targets";
+    let targetEntity: NearbyEntity | null = null;
+    const nearbyResp = await bot.exec("get_nearby");
+    if (!nearbyResp.error && nearbyResp.result) {
+      bot.trackNearbyPlayers(nearbyResp.result);
+      const entities = parseNearby(nearbyResp.result);
+      const needle = targetPlayer.toLowerCase();
+      targetEntity = entities.find(
+        e =>
+          e.name.toLowerCase() === needle ||
+          e.id.toLowerCase() === needle,
+      ) || null;
+    }
+
+    // â”€â”€ Send an attack command every tick, or enter combat loop if already fighting â”€â”€
+    const targetId = targetEntity ? targetEntity.id : targetPlayer;
+    const fakeTarget = targetEntity ? targetEntity : { id: targetPlayer, name: targetPlayer } as NearbyEntity;
+
+    const existingBattle = await getBattleStatus(ctx);
+    if (existingBattle) {
+      ctx.log("combat", `âš”ï¸ Already in battle â€” engaging ${targetPlayer}`);
+      await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+      continue;
+    }
+
+    const atk = await bot.exec("attack", { target_id: targetId });
+    if (atk.error) {
+      const msg = atk.error.message.toLowerCase();
+      if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in") || msg.includes("no target")) {
+        const atk2 = await bot.exec("attack", { target_id: targetPlayer });
+        if (atk2.error) {
+          ctx.log("combat", `âš”ï¸ ${targetPlayer} not attackable at ${originalPoi} (${atk2.error.message}) â€” re-issuing next tick`);
+        } else {
+          ctx.log("combat", `âš”ï¸ Attack command sent to ${targetPlayer} (name fallback)`);
+        }
+      } else if (msg.includes("interrupted by combat") || msg.includes("interrupted by battle")) {
+        ctx.log("combat", `âš”ï¸ Attack interrupted by combat â€” entering battle immediately`);
+        const battleStatus = await getBattleStatus(ctx);
+        if (battleStatus) {
+          await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+        }
+      } else if (msg.includes("action is already pending") || msg.includes("already pending") || msg.includes("already in progress")) {
+        const battleStatus = await getBattleStatus(ctx);
+        if (battleStatus) {
+          ctx.log("combat", `âš”ï¸ Attack blocked by pending action â€” battle is live, entering combat loop`);
+          await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+        } else {
+          ctx.log("combat", `âš”ï¸ Attack on ${targetPlayer}: ${atk.error.message} â€” re-issuing next tick`);
+        }
+      } else {
+        ctx.log("combat", `âš”ï¸ Attack on ${targetPlayer}: ${atk.error.message}`);
+      }
+    } else {
+      ctx.log("combat", `âš”ï¸ Attack command sent to ${targetPlayer}${targetEntity ? "" : " (not in range â€” re-issued next tick)"}`);
+      await ctx.sleep(1000);
+      await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    }
+
+    // â”€â”€ Field repair (in place) â”€â”€
+    await useRepairKits(ctx);
+
+    // â”€â”€ Stay put: re-assert our camp position if we somehow drifted POIs â”€â”€
+    if (bot.poi && bot.poi !== originalPoi) {
+      ctx.log("travel", `PVP: re-asserting camp POI ${originalPoi} (no movement otherwise)`);
+      const travelResp = await bot.exec("travel", { target_poi: originalPoi });
+      if (!travelResp.error || (travelResp.error.message || "").toLowerCase().includes("already")) {
+        bot.poi = originalPoi;
+      }
+    }
+
+    await ctx.sleep(TICK_MS);
+  }
+}
+
+// â”€â”€ Station Protection Routine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // "Visual deterrent" mode: the hunter docks at the station and sits, uncloaked,
 // as a show of force. It performs the usual docked housekeeping (cargo check,
@@ -2578,10 +5033,10 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 // Detection is via the spacemolt-lib battle push events, which Bot already
 // tracks in `bot.currentBattle` / `bot.isInBattle()` the instant a battle
 // starts/updates anywhere the bot is involved (including a station raid that
-// pulls the docked defender in). We do NO polling — we just idle and check the
+// pulls the docked defender in). We do NO polling â€” we just idle and check the
 // `isInBattle()` flag, which is updated for free by the library's push
 // subscription. The moment it flips we:
-//   1. Undock (a docked ship cannot fight) — we assume a raid does NOT
+//   1. Undock (a docked ship cannot fight) â€” we assume a raid does NOT
 //      auto-undock us, so we do it ourselves.
 //   2. Join the fight as a regular hunter (full combat loop).
 //   3. Once the battle is over, re-dock with the station and resume waiting.
@@ -2617,7 +5072,7 @@ async function stationProtectionFight(ctx: RoutineContext, settings: ReturnType<
   // A docked ship cannot participate in a battle. Undock if still docked
   // (a raid is assumed NOT to auto-undock us, so we do it ourselves).
   if (bot.docked) {
-    ctx.log("combat", "Station under attack — undocking to defend!");
+    ctx.log("combat", "Station under attack â€” undocking to defend!");
     const undockResp = await bot.exec("undock");
     if (!undockResp.error) {
       bot.docked = false;
@@ -2628,7 +5083,7 @@ async function stationProtectionFight(ctx: RoutineContext, settings: ReturnType<
     }
   }
 
-  ctx.log("combat", `⚠️ Station battle detected (ID: ${bot.currentBattle.battleId}) — defending as hunter!`);
+  ctx.log("combat", `âš ï¸ Station battle detected (ID: ${bot.currentBattle.battleId}) â€” defending as hunter!`);
 
   const analysis = await analyzeExistingBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee);
   if (!analysis.shouldJoin) {
@@ -2647,12 +5102,13 @@ async function stationProtectionFight(ctx: RoutineContext, settings: ReturnType<
     }
   }
 
-  const enemy = (bot.currentBattle.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed);
+  const enemy = (bot.currentBattle.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
   const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
+  const fakeTargetIsCreature = fakeTarget ? isCreatureName(fakeTarget.name) : false;
   if (fakeTarget) {
-    broadcastHunterAssist(ctx, fakeTarget, isCreatureName(fakeTarget.name));
+    broadcastHunterAssist(ctx, fakeTarget, fakeTargetIsCreature);
   }
-  await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs);
+  await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs,     settings.cloakOnStart, true);
 }
 
 async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
@@ -2670,7 +5126,7 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
   if (bot.docked) {
     if (bot.isCloaked) {
       const uncloakResp = await bot.exec("cloak", { enable: false });
-      if (!uncloakResp.error) ctx.log("system", "Uncloaked — station protection must remain visible");
+      if (!uncloakResp.error) ctx.log("system", "Uncloaked â€” station protection must remain visible");
     }
     await repairShip(ctx);
     await tryRefuel(ctx, { skipApprovedCheck: true });
@@ -2678,25 +5134,34 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
     await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
   }
 
-  // Docked housekeeping only runs on this cadence — the rest of the time we idle.
+  // Docked housekeeping only runs on this cadence â€” the rest of the time we idle.
   const MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;
   let lastMaintenance = 0;
 
   while (bot.state === "running") {
-    // ── Death recovery ──
+    // â”€â”€ Death recovery â”€â”€
     const s = getHunterSettings(bot.username);
     const death = await handleDeath(ctx, s);
     if (death === "stop") return;
     if (death === "wait") continue;
 
-    // ── Instant battle detection via lib push events ──
+    // â”€â”€ Low fuel cells check â”€â”€
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (s.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= s.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, s);
+      continue;
+    }
+
+    // â”€â”€ Instant battle detection via lib push events â”€â”€
     // bot.isInBattle() is set by the library the moment a battle push arrives
     // (battle_started / battle_update / battle_damage). No polling required.
     if (bot.isInBattle()) {
-      ctx.log("combat", "Battle push received at station — engaging as hunter!");
+      ctx.log("combat", "Battle push received at station â€” engaging as hunter!");
       await stationProtectionFight(ctx, s);
       // After the fight, return to assigned protection station and resume waiting.
-      ctx.log("info", "Station defense complete — returning to assigned station to resume protection.");
+      ctx.log("info", "Station defense complete â€” returning to assigned station to resume protection.");
       const hs = s.homeStation || "";
       const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
       if (hsys && hpoi && (bot.system !== hsys || bot.poi !== hpoi)) {
@@ -2719,7 +5184,7 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
       if (redocked) {
         if (bot.isCloaked) {
           const uncloakResp = await bot.exec("cloak", { enable: false });
-          if (!uncloakResp.error) ctx.log("system", "Uncloaked after defense — resuming visible deterrent");
+          if (!uncloakResp.error) ctx.log("system", "Uncloaked after defense â€” resuming visible deterrent");
         }
         await repairShip(ctx);
         await tryRefuel(ctx, { skipApprovedCheck: true });
@@ -2730,13 +5195,13 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
       continue;
     }
 
-    // ── Keep the deterrent visible: never cloaked while docked ──
+    // â”€â”€ Keep the deterrent visible: never cloaked while docked â”€â”€
     if (bot.docked && bot.isCloaked) {
       const uncloakResp = await bot.exec("cloak", { enable: false });
       if (!uncloakResp.error) ctx.log("system", "Re-uncloaked (station protection stays visible)");
     }
 
-    // ── Docked housekeeping on a slow timer (not every loop) ──
+    // â”€â”€ Docked housekeeping on a slow timer (not every loop) â”€â”€
     if (bot.docked && Date.now() - lastMaintenance >= MAINTENANCE_INTERVAL_MS) {
       yield "docked_maintenance";
       await bot.refreshLocation();
@@ -2762,14 +5227,14 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
       await ensureInsured(ctx);
       if (bot.isCloaked) {
         const uncloakResp = await bot.exec("cloak", { enable: false });
-        if (!uncloakResp.error) ctx.log("system", "Uncloaked during maintenance — station protection stays visible");
+        if (!uncloakResp.error) ctx.log("system", "Uncloaked during maintenance â€” station protection stays visible");
       }
       lastMaintenance = Date.now();
     } else if (!bot.docked) {
       // We got undocked somehow (e.g. raid yanked us out). Re-dock at the
-      // CURRENT station POI — do NOT travel between POIs (that causes a
+      // CURRENT station POI â€” do NOT travel between POIs (that causes a
       // dock/undock flip-flop on stations with multiple POIs).
-      ctx.log("info", "No longer docked during station protection — re-docking at current station.");
+      ctx.log("info", "No longer docked during station protection â€” re-docking at current station.");
       await dockAtStation(ctx);
       if (bot.isCloaked) {
         const uncloakResp = await bot.exec("cloak", { enable: false });
@@ -2780,13 +5245,517 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
     }
 
     // Idle: do nothing but wait. The library's battle push will flip
-    // isInBattle() the instant a fight breaks out — no polling needed.
+    // isInBattle() the instant a fight breaks out â€” no polling needed.
     yield "waiting";
     await ctx.sleep(2000);
   }
 }
 
-// ── Patrol Systems Routine (cycle through configured list) ────────
+// â”€â”€ Fleet/Arena Mode Routine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// "Wingman" sub-routine for a hunter flying in an in-game fleet.
+//
+// The problem it solves: when the fleet leader opens fire, the server pulls the
+// fleet members into the battle but does NOT give them a target. Without an
+// explicit order the bot just sits in the battle doing nothing (soaking damage)
+// while the leader fights alone.
+//
+// Fleet mode does NOTHING until it detects it has joined a battle:
+//
+//   1. Standby   â€” no scanning, no patrolling, no navigation, no dock/undock.
+//                  Detection is free: spacemolt-lib push events flip
+//                  bot.isInBattle() the instant a battle we are in starts. A slow
+//                  get_battle_status poll runs as a fallback in case a push is
+//                  missed (benign "not in battle" errors are not logged).
+//   2. Wake up   â€” undock if docked (a docked ship cannot fight), uncloak, pick
+//                  the enemy (whoever is shooting at us first, then whatever the
+//                  fleet leader is shooting at, then the focus-fired target),
+//                  attack it, advance to engaged range and fight it out via the
+//                  standard hunter combat loop (fightJoinedBattle).
+//   3. Stand down â€” loot wrecks, top up shields, use repair kits, reload ammo,
+//                  then go straight back to standby. It never travels on its own:
+//                  fleet movement stays the leader's job (fleet jump/dock/undock).
+//
+// Everything else (flee threshold, in-combat repair kits/shield charges, salvage,
+// death handling) reuses the normal hunter settings.
+
+/** Battle snapshot shape returned by common.getBattleStatus. */
+type FleetBattleSnapshot = NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>;
+
+/** Refresh the dashboard status line this often while standing by. */
+const FLEET_STANDBY_STATUS_REFRESH_MS = 60 * 1000;
+
+/** How often standby checks for death (a death can only happen in a battle). */
+const FLEET_DEATH_CHECK_MS = 30 * 1000;
+
+/**
+ * Battle probe that does NOT depend on push state.
+ *
+ * `getBattleStatus` short-circuits to null for library-backed bots whenever
+ * `isInBattle()` is false, which is exactly the case we must double-check in
+ * fleet mode (a missed battle_started push would otherwise leave the bot asleep
+ * inside a live fight). So we hit the API directly. A "not in battle" response is
+ * a benign, unlogged error (see Bot.libExec), so this is safe to poll.
+ */
+async function probeFleetBattle(ctx: RoutineContext): Promise<FleetBattleSnapshot | null> {
+  const { bot } = ctx;
+  const resp = await bot.exec("get_battle_status");
+  if (resp.error || !resp.result) return null;
+
+  const result = resp.result as Record<string, unknown>;
+  const innerErr = result.error as Record<string, unknown> | undefined;
+  if (innerErr && innerErr.code === "not_in_battle") return null;
+
+  const battleId = (result.battle_id as string) || "";
+  if (!battleId) return null;
+
+  return {
+    battle_id: battleId,
+    tick: (result.tick as number) ?? undefined,
+    system_id: (result.system_id as string) || undefined,
+    sides: (result.sides as FleetBattleSnapshot["sides"]) || [],
+    participants: (result.participants as FleetBattleSnapshot["participants"]) || [],
+    your_side_id: (result.your_side_id as number) ?? undefined,
+    your_zone: result.your_zone as FleetBattleSnapshot["your_zone"],
+    your_stance: result.your_stance as FleetBattleSnapshot["your_stance"],
+    your_target_id: (result.your_target_id as string) || undefined,
+    auto_pilot: (result.auto_pilot as boolean) ?? undefined,
+    // Kept as undefined when the server omits it so we can tell "not our battle"
+    // (false) apart from "the server didn't say" (absent).
+    is_participant: (result.is_participant as boolean | undefined),
+  };
+}
+
+/** Keep bot.currentBattle in sync with what the API just told us. */
+function syncFleetBattleState(bot: Bot, status: FleetBattleSnapshot | null): void {
+  if (status) {
+    bot.currentBattle.inBattle = true;
+    bot.currentBattle.battleId = status.battle_id;
+    if (status.participants?.length) {
+      bot.currentBattle.participants = status.participants as unknown as Array<Record<string, unknown>>;
+    }
+    bot.currentBattle.lastUpdate = Date.now();
+    return;
+  }
+  if (bot.currentBattle.inBattle) {
+    bot.clearBattleState("fleet mode probe: API reports no active battle");
+  }
+}
+
+/**
+ * True when this battle is actually ours to fight (not just a battle we can see).
+ *
+ * `pushDetected` is bot.isInBattle() from BEFORE the probe: the lib only pushes
+ * battle_started/update/damage for battles we are involved in, so it is a valid
+ * last-resort signal when the API response omits the participation fields. The
+ * one push that can fire for someone else's fight is battle_alert (a raid on the
+ * station we are docked at) â€” and that case is caught by an explicit
+ * `is_participant: false` from the API.
+ */
+function isFleetBattleParticipant(
+  status: FleetBattleSnapshot,
+  username: string,
+  pushDetected: boolean,
+): boolean {
+  if (status.is_participant === true) return true;
+  if (status.is_participant === false) return false;
+  if (status.your_side_id !== undefined && status.your_side_id !== null) return true;
+  const lower = (username || "").toLowerCase();
+  if (lower && (status.participants || []).some(p => (p.username || "").toLowerCase() === lower)) {
+    return true;
+  }
+  return pushDetected;
+}
+
+interface FleetRoster {
+  /** Lowercased usernames of every fleet member (including us). */
+  members: Set<string>;
+  leader: string;
+  inFleet: boolean;
+}
+
+/** Read the in-game fleet roster so we can tell friend from foe in a battle. */
+async function getFleetRoster(ctx: RoutineContext): Promise<FleetRoster> {
+  const me = (ctx.bot.username || "").toLowerCase();
+  const empty: FleetRoster = { members: new Set(me ? [me] : []), leader: "", inFleet: false };
+  try {
+    const status = await fleetStatus(ctx);
+    if (!status || !status.in_fleet) return empty;
+    const members = new Set<string>(me ? [me] : []);
+    for (const m of status.members || []) {
+      const name = (m.username || "").toLowerCase();
+      if (name) members.add(name);
+    }
+    const leader = status.leader || (status.members || []).find(m => m.is_leader)?.username || "";
+    return { members, leader, inFleet: true };
+  } catch {
+    return empty;
+  }
+}
+
+/** Our own side in this battle (API value first, then roster inference). */
+function resolveFleetBattleSide(
+  status: FleetBattleSnapshot,
+  username: string,
+  roster: FleetRoster,
+): number | undefined {
+  if (status.your_side_id !== undefined && status.your_side_id !== null) return status.your_side_id;
+
+  const lower = (username || "").toLowerCase();
+  const mine = (status.participants || []).find(p => (p.username || "").toLowerCase() === lower);
+  if (mine) return mine.side_id;
+
+  // Not listed (the server sometimes trims the roster) â€” fall back to whichever
+  // side a fleet-mate is on. That is the side the leader is fighting for.
+  const mate = (status.participants || []).find(p => roster.members.has((p.username || "").toLowerCase()));
+  return mate?.side_id;
+}
+
+/**
+ * Choose who to shoot in a fleet battle, in priority order:
+ *   1. Whoever is currently targeting US (the attacker).
+ *   2. Whatever the fleet leader is shooting at (follow the leader's call).
+ *   3. The enemy our side is focus-firing (most friendly targets pointed at it).
+ *   4. The weakest remaining enemy, to finish it off.
+ */
+function pickFleetBattleEnemy(
+  status: FleetBattleSnapshot,
+  ourSideId: number | undefined,
+  ourIds: string[],
+  roster: FleetRoster,
+): { id: string; name: string; reason: string } | null {
+  const participants = status.participants || [];
+
+  // Friendly = a fleet-mate, or anyone sharing a side with us or a fleet-mate.
+  // Allies who joined the same side (police, faction-mates) must never be shot at.
+  const friendlySides = new Set<number>();
+  if (ourSideId !== undefined) friendlySides.add(ourSideId);
+  for (const p of participants) {
+    if (roster.members.has((p.username || "").toLowerCase()) && typeof p.side_id === "number") {
+      friendlySides.add(p.side_id);
+    }
+  }
+  const isFriendly = (p: FleetBattleSnapshot["participants"][number]): boolean => {
+    if (roster.members.has((p.username || "").toLowerCase())) return true;
+    return typeof p.side_id === "number" && friendlySides.has(p.side_id);
+  };
+
+  const enemies = participants.filter(p => !p.is_destroyed && (p.player_id || p.username) && !isFriendly(p));
+  if (enemies.length === 0) return null;
+
+  const asTarget = (p: FleetBattleSnapshot["participants"][number], reason: string) => ({
+    id: p.player_id || p.username || "",
+    name: p.username || p.player_id || "enemy",
+    reason,
+  });
+  const matches = (p: FleetBattleSnapshot["participants"][number], id: string | undefined): boolean =>
+    !!id && (p.player_id === id || p.username === id);
+
+  // 1. The attacker: an enemy whose target is us.
+  const ourIdSet = new Set(ourIds.filter(Boolean));
+  if (ourIdSet.size > 0) {
+    const onUs = enemies.find(p => p.target_id && ourIdSet.has(p.target_id));
+    if (onUs) return asTarget(onUs, "attacking us");
+  }
+
+  // With no side information at all we cannot prove who is hostile, so only the
+  // "attacking us" case above is safe. Bail out and let fightJoinedBattle
+  // re-acquire a hostile from the nearby scan instead of risking friendly fire.
+  if (friendlySides.size === 0) return null;
+
+  // 2. The leader's target.
+  const leaderLower = (roster.leader || "").toLowerCase();
+  const leader = leaderLower
+    ? participants.find(p => (p.username || "").toLowerCase() === leaderLower)
+    : undefined;
+  if (leader?.target_id) {
+    const leaderTarget = enemies.find(p => matches(p, leader.target_id));
+    if (leaderTarget) return asTarget(leaderTarget, `fleet leader ${leader.username} is on it`);
+  }
+
+  // 3. Focus fire with whoever is already shooting.
+  const targetCounts = new Map<string, number>();
+  for (const p of participants) {
+    if (!isFriendly(p) || !p.target_id) continue;
+    targetCounts.set(p.target_id, (targetCounts.get(p.target_id) ?? 0) + 1);
+  }
+  let focused: FleetBattleSnapshot["participants"][number] | null = null;
+  let focusedCount = 0;
+  for (const e of enemies) {
+    const count = Math.max(
+      e.player_id ? targetCounts.get(e.player_id) ?? 0 : 0,
+      e.username ? targetCounts.get(e.username) ?? 0 : 0,
+    );
+    if (count > focusedCount) {
+      focusedCount = count;
+      focused = e;
+    }
+  }
+  if (focused) return asTarget(focused, `focus fire (${focusedCount} ally target${focusedCount === 1 ? "" : "s"})`);
+
+  // 4. Weakest enemy.
+  const hullOf = (p: FleetBattleSnapshot["participants"][number]): number =>
+    p.hull_pct ?? p.hull_percent ?? 100;
+  const weakest = [...enemies].sort((a, b) => hullOf(a) - hullOf(b))[0];
+  return asTarget(weakest ?? enemies[0], "weakest hostile on the other side");
+}
+
+/**
+ * Returns true if every fitted weapon module is a Null Cannon (typical AoE mode
+ * layout). Used by the fleet/arena Null Cannon brace-fire cycle.
+ */
+async function hasOnlyNullCannons(ctx: RoutineContext): Promise<boolean> {
+  const weapons = await getWeaponModules(ctx);
+  if (weapons.length === 0) return false;
+  return weapons.every(w => {
+    const name = (w.name || "").toLowerCase();
+    const moduleId = (w.moduleId || "").toLowerCase();
+    return (
+      (name.includes("null") && name.includes("cannon")) ||
+      (moduleId.includes("null") && moduleId.includes("cannon"))
+    );
+  });
+}
+
+/**
+ * Wake up and fight the battle the fleet dragged us into.
+ * Returns true if the battle ended in our favour (or simply ended).
+ */
+async function fleetModeFight(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+  status: FleetBattleSnapshot,
+): Promise<boolean> {
+  const { bot } = ctx;
+
+  // A docked ship cannot participate in a battle.
+  if (bot.docked) {
+    if (!settings.fleetUndockToFight) {
+      ctx.log("combat", "In a fleet battle while docked, but fleetUndockToFight is disabled â€” holding at the station");
+      return false;
+    }
+    ctx.log("combat", "Fleet battle started while docked â€” undocking to fight!");
+    const undockResp = await bot.exec("undock");
+    const undockMsg = (undockResp.error?.message || "").toLowerCase();
+    if (undockResp.error && !undockMsg.includes("already") && !undockMsg.includes("not docked")) {
+      ctx.log("error", `Failed to undock for the fleet battle: ${undockResp.error.message}`);
+      return false;
+    }
+    bot.docked = false;
+  }
+
+  // Guns don't fire through a cloak. fightJoinedBattle re-cloaks after the fight
+  // when cloakOnStart is enabled.
+  if (bot.isCloaked) {
+    const uncloakResp = await bot.exec("cloak", { enable: false });
+    if (!uncloakResp.error) ctx.log("combat", "Uncloaked to join the fleet's battle");
+  }
+
+  const roster = await getFleetRoster(ctx);
+  const ourSideId = resolveFleetBattleSide(status, bot.username, roster);
+  const ourParticipant = (status.participants || [])
+    .find(p => (p.username || "").toLowerCase() === (bot.username || "").toLowerCase());
+
+  const enemy = pickFleetBattleEnemy(status, ourSideId, [ourParticipant?.player_id || "", bot.username], roster);
+  if (enemy) {
+    ctx.log("combat", `ðŸŽ¯ Fleet target: ${enemy.name} (${enemy.reason})${ourSideId !== undefined ? ` | our side ${ourSideId}` : ""}`);
+  } else {
+    ctx.log("combat", "No hostile listed in the battle roster â€” fightJoinedBattle will re-acquire the attacker from a nearby scan");
+  }
+
+  // Top off the magazines from cargo before shooting. Unlike patrol modes we never
+  // abandon the fleet over ammo â€” we are already in the fight.
+  const hasAmmo = await ensureAmmoLoaded(
+    ctx,
+    settings.ammoThreshold,
+    settings.maxReloadAttempts,
+    settings.ammoReloadAbsoluteThreshold,
+    settings.ammoReloadPercentThreshold,
+  );
+  if (!hasAmmo) {
+    ctx.log("combat", "âš ï¸ No ammo loaded for this fleet battle â€” fighting anyway (fleet mode never abandons the fleet mid-battle)");
+  }
+
+  const nullCannonOnly = await hasOnlyNullCannons(ctx);
+  if (nullCannonOnly) {
+    ctx.log("combat", "ðŸ” Null Cannon only detected â€” enabling brace-fire cycle (1 fire / 3 brace per 4-tick recycle)");
+  }
+
+  return await fightJoinedBattle(
+    ctx,
+    enemy ? ({ id: enemy.id, name: enemy.name } as NearbyEntity) : null,
+    settings.fleeThreshold,
+    settings.fleeFromTier,
+    settings.maxAttackTier,
+    settings.repairThreshold,
+    true,                               // canFlee â€” bail out when hull hits fleeThreshold
+    settings.shieldRechargePct ?? 80,   // percentage; fightJoinedBattle divides by 100
+    settings.onlyNPCs && !settings.fleetFightPlayers,        // onlyNPCs â€” fleet leader picks targets, but still honour global onlyNPCs unless fleetFightPlayers is enabled
+    settings.cloakOnStart,
+    false,                              // stayAtEngaged
+    settings.ammoThreshold,
+    settings.maxReloadAttempts,
+    settings.ammoReloadAbsoluteThreshold,
+    settings.ammoReloadPercentThreshold,
+    nullCannonOnly,                     // nullCannonBraceCycle
+  );
+}
+
+async function* fleetArenaModeRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshLocation();
+
+  const roster = await getFleetRoster(ctx);
+  if (roster.inFleet) {
+    ctx.log("info", `Fleet mode: in fleet (leader ${roster.leader || "unknown"}, ${roster.members.size} member(s)).`);
+  } else {
+    ctx.log("warn", "Fleet mode: not currently in a fleet â€” standing by anyway; the bot still reacts to any battle it gets pulled into.");
+  }
+  ctx.log(
+    "info",
+    `Fleet mode: standby at ${bot.poi || "(no POI)"} in ${bot.system || "(unknown system)"} â€” doing nothing until a battle starts, then engaging the fleet's target.`,
+  );
+
+  let battleCount = 0;
+  let lastProbe = 0;
+  let lastStatusRefresh = Date.now();
+  let lastDeathCheck = Date.now();
+  let standbyLogged = true;
+  let ignoredBattleId = "";
+  let consecutiveReengages = 0;
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+    const idleMs = Math.max(1000, (settings.fleetIdlePollSeconds || 2) * 1000);
+    const confirmSeconds = settings.fleetBattleConfirmSeconds ?? 10;
+    const confirmMs = confirmSeconds > 0 ? Math.max(5000, confirmSeconds * 1000) : 0;
+
+    // â”€â”€ Death recovery (respects stopOnDeath) â”€â”€
+    // Throttled: standby must stay quiet on the wire. A death can only happen in
+    // a battle, and the post-battle path forces a check by clearing lastDeathCheck.
+    if (Date.now() - lastDeathCheck >= FLEET_DEATH_CHECK_MS) {
+      lastDeathCheck = Date.now();
+      const death = await handleDeath(ctx, settings);
+      if (death === "stop") return;
+      if (death === "wait") continue;
+    }
+
+    // Fleet/Arena mode never performs cargo or fuel checks while standing by.
+    if (!isFleetArenaMode(settings.mode)) {
+      // â”€â”€ Low fuel cells check â”€â”€
+      await bot.refreshCargo();
+      const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+      if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+        await returnToHomeAndResupply(ctx, settings);
+        continue;
+      }
+    }
+
+    // â”€â”€ Detect: push flag first (free), slow API probe as missed-push insurance â”€â”€
+    const pushDetected = bot.isInBattle();
+    let status: FleetBattleSnapshot | null = null;
+    if (pushDetected) {
+      status = await probeFleetBattle(ctx);
+      lastProbe = Date.now();
+      syncFleetBattleState(bot, status);
+    } else if (confirmMs > 0 && Date.now() - lastProbe >= confirmMs) {
+      lastProbe = Date.now();
+      status = await probeFleetBattle(ctx);
+      if (status) {
+        ctx.log("combat", "Battle found by fallback poll (no push event arrived) â€” waking up");
+        syncFleetBattleState(bot, status);
+      }
+    }
+
+    // â”€â”€ Standby: genuinely do nothing â”€â”€
+    if (!status || !isFleetBattleParticipant(status, bot.username, pushDetected)) {
+      if (status && ignoredBattleId !== status.battle_id) {
+        ignoredBattleId = status.battle_id;
+        ctx.log("combat", `Battle ${status.battle_id} visible but we are not a participant â€” staying on standby.`);
+      }
+      if (!standbyLogged) {
+        ctx.log("info", "Fleet mode: standby â€” waiting for the fleet's next fight.");
+        standbyLogged = true;
+      }
+      if (Date.now() - lastStatusRefresh >= FLEET_STANDBY_STATUS_REFRESH_MS) {
+        lastStatusRefresh = Date.now();
+        yield "get_status";
+        await bot.refreshStatus();
+        logStatus(ctx);
+      }
+      yield "waiting";
+      await ctx.sleep(idleMs);
+      continue;
+    }
+
+    // â”€â”€ Wake up and fight â”€â”€
+    battleCount++;
+    standbyLogged = false;
+    ignoredBattleId = "";
+    ctx.log("combat", `âš”ï¸ Fleet mode wake-up: joined battle ${status.battle_id} (fleet battle #${battleCount}) â€” engaging!`);
+
+    yield "engage";
+    const won = await fleetModeFight(ctx, settings, status);
+
+    // â”€â”€ Stand down â”€â”€
+    // Force a death check on the next iteration: this is the only place a fleet
+    // wingman can actually die.
+    lastDeathCheck = 0;
+    await ctx.sleep(1000);
+    const after = await probeFleetBattle(ctx);
+    lastProbe = Date.now();
+    syncFleetBattleState(bot, after);
+    if (after && isFleetBattleParticipant(after, bot.username, bot.isInBattle())) {
+      // Still in it: either the fight is genuinely ongoing or we could not act
+      // (e.g. the server refused the undock). Back off progressively so a stuck
+      // battle can never turn into a hot loop of engage attempts.
+      consecutiveReengages++;
+      const backoffMs = Math.min(30000, 3000 * consecutiveReengages);
+      ctx.log("combat", `Battle ${after.battle_id} still active after the combat loop â€” re-engaging in ${Math.round(backoffMs / 1000)}s.`);
+      await ctx.sleep(backoffMs);
+      continue;
+    }
+    consecutiveReengages = 0;
+
+    if (bot.hull <= 0 || bot.isDead) {
+      // Dead â€” let the throttled death handler take over on the next iteration
+      // instead of trying to loot/reload a destroyed ship.
+      continue;
+    }
+
+    ctx.log(
+      "combat",
+      won
+        ? `âœ… Fleet battle #${battleCount} over â€” standing down.`
+        : `Fleet battle #${battleCount} ended (retreated or disengaged) â€” standing down.`,
+    );
+
+    if (!settings.disableWreckSalvaging && !bot.docked) {
+      yield "loot";
+      await scavengeWrecks(ctx);
+    }
+    await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+    await useRepairKits(ctx);
+    await ensureAmmoLoaded(
+      ctx,
+      settings.ammoThreshold,
+      settings.maxReloadAttempts,
+      settings.ammoReloadAbsoluteThreshold,
+      settings.ammoReloadPercentThreshold,
+    );
+    await bot.refreshShip();
+    ctx.log(
+      "info",
+      `Fleet mode: back on standby â€” hull ${bot.hull}/${bot.maxHull} | shields ${bot.shield}/${bot.maxShield} | ammo ${bot.ammo}`,
+    );
+    lastStatusRefresh = Date.now();
+    standbyLogged = true;
+  }
+}
+
+// â”€â”€ Patrol Systems Routine (cycle through configured list) â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
@@ -2801,9 +5770,18 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
     if (death === "stop") return;
     if (death === "wait") continue;
 
+    // â”€â”€ Low fuel cells check â”€â”€
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      continue;
+    }
+
     const patrolList = settings.patrolSystems || [];
     if (patrolList.length === 0) {
-      ctx.log("error", "patrol_systems mode but no patrolSystems configured — falling back to roam_systems");
+      ctx.log("error", "patrol_systems mode but no patrolSystems configured â€” falling back to roam_systems");
       yield* roamSystemsRoutine(ctx);
       return;
     }
@@ -2830,7 +5808,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
           ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
           await handleNavigationBattleInterrupt(ctx, settings);
         } else {
-          ctx.log("error", `Could not reach ${targetSystem} — skipping`);
+          ctx.log("error", `Could not reach ${targetSystem} â€” skipping`);
           await ctx.sleep(5000);
           continue;
         }
@@ -2850,7 +5828,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
       const { pois } = await getSystemInfo(ctx);
       const patrolPois = pois.filter(p => !isStationPoi(p));
       if (patrolPois.length === 0) {
-        ctx.log("info", "No POIs — moving to next system");
+        ctx.log("info", "No POIs â€” moving to next system");
         return;
       }
       for (const poi of patrolPois) {
@@ -2865,22 +5843,24 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-        const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
-        const targets = [...pirate_targets, ...creature_targets];
+        const creature_targets = pickCreatureTargets(entities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode);
+        let targets = [...pirate_targets, ...creature_targets];
+        targets = pickUnclaimedBoardingTarget(targets, bot.username);
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-          const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+          const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
           if (won) {
             totalKills++;
-            await scavengeWrecks(ctx);
+            recordCreatureKill(bot, target);
+            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
             // top up shields (this path previously had no shield recharge after kills)
             const csettings = getHunterSettings(bot.username);
             await topUpShields(ctx, (csettings.shieldRechargePct ?? 80) / 100);
             await useRepairKits(ctx);
             await bot.refreshCargo();
             if (isLowOnFieldConsumables(bot.inventory)) {
-              ctx.log("combat", "Low on repair kits or shield charges — stopping to resupply");
+              ctx.log("combat", "Low on repair kits or shield charges â€” stopping to resupply");
               break;
             }
           }
@@ -2891,7 +5871,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
     // Single loop support for patrol_systems mode
     // After completing one full cycle, return to base for resupply, then repeat
     if (settings.singleLoop && systemIndex >= (settings.patrolSystems?.length || 1)) {
-      ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+      ctx.log("system", "Single loop mode â€” returning to faction home base for resupply...");
       const hs = settings.homeStation || "";
       const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
       if (hsys && hpoi) {
@@ -2906,7 +5886,6 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
     }
   }
 }
-
 /** Hunter resupply: ammo, advanced repair kits, and military fuel cells from faction storage or station. */
 export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
@@ -2915,7 +5894,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
   const hs = getHunterSettings(bot.username);
 
-  // Buying is currently disabled — we only withdraw from faction storage
+  // Buying is currently disabled â€” we only withdraw from faction storage
   const allowBuying = false;
 
   // Always try to refuel when docked at home base (free fuel)
@@ -2924,24 +5903,46 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   // Repair hull if damaged
   await repairShip(ctx);
 
+  // Treat injured crew/marines before doing anything else
+  await treatPersonnel(ctx);
+
+  // Recruit fresh crew and marines up to ship capacity every time we are
+  // docked/restocking. Passing full capacity (or the 1500/450 fallback when
+  // capacity is unknown) is safe: the server only recruits what the ship can
+  // actually hold, so this always tops crew and marines off completely.
+  await bot.refreshShip();
+  const maxCrew = bot.crewCapacity || 1500;
+  const maxMarines = bot.marineCapacity || 450;
+  await recruitPersonnel(ctx, maxCrew, maxMarines);
+  await ctx.sleep(11_000);
+
   await bot.refreshLocation();
   await bot.refreshCargo();
 
   // Deposit any extra loot so user can see what was brought home.
   // When disableResupply is enabled, deposit EVERYTHING so the bot undocks
   // with an empty cargo hold (suicide / no-return runs).
+  // Build a set of all known ammo item IDs from the catalog so we never
+  // accidentally deposit ammo during the loot-cleanup phase below.
+  const allAmmoIds = new Set<string>();
+  const ammoIndex = catalogStore.getAmmoTypeIndex();
+  for (const ids of Object.values(ammoIndex)) {
+    for (const id of ids) allAmmoIds.add(id.toLowerCase());
+  }
+
   for (const item of [...bot.inventory]) {
     if (item.quantity <= 0) continue;
 
     if (!hs.disableResupply) {
       const id = item.itemId.toLowerCase();
       const isProtected =
-        id.includes("ammo") ||
+        allAmmoIds.has(id) ||
         id.includes("cell_pack") ||
         id.includes("plasma") ||
         id.includes("fuel_cell") ||
         id.includes("repair_kit") ||
-        id.includes("shield_charge");
+        id.includes("shield_charge") ||
+        id.includes("medical_supplies");
       if (isProtected) continue;
     }
 
@@ -2954,12 +5955,12 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   await bot.refreshCargo();
 
   if (hs.disableResupply) {
-    ctx.log("trade", "Resupply disabled — skipping repair kits, shield charges, and warp devices");
+    ctx.log("trade", "Resupply disabled â€” skipping repair kits, shield charges, and warp devices");
   }
 
   let freeSpace = Math.max(0, bot.cargoMax - (bot.cargo || 0));
   if (freeSpace < 5) {
-    ctx.log("trade", "Cargo almost full — skipping resupply");
+    ctx.log("trade", "Cargo almost full â€” skipping resupply");
     return;
   }
 
@@ -2995,19 +5996,19 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
   let gotAnyAmmo = false;
   const desiredAmmoBoxes = hs.desiredAmmoBoxes ?? -1;
-  let totalAmmoGotten = 0;
   for (const ammoType of weaponAmmoTypes) {
+    let typeAmmoGotten = 0;
     const ammoIndex = catalogStore.getAmmoTypeIndex();
     const possibleAmmo = ammoIndex[ammoType] || [];
     ctx.log("debug", `Catalog ammo options for ${ammoType}: ${possibleAmmo.join(", ") || "none"}`);
 
     if (possibleAmmo.length === 0) {
-      ctx.log("trade", `No catalog options for ${ammoType} — skipping`);
+      ctx.log("trade", `No catalog options for ${ammoType} â€” skipping`);
       continue;
     }
 
     if (desiredAmmoBoxes === 0) {
-      ctx.log("trade", `Ammo withdrawal disabled (desiredAmmoBoxes=0) — skipping ${ammoType}`);
+      ctx.log("trade", `Ammo withdrawal disabled (desiredAmmoBoxes=0) â€” skipping ${ammoType}`);
       continue;
     }
 
@@ -3030,12 +6031,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
      }
 
      if (desiredAmmoBoxes > 0) {
-       const remaining = desiredAmmoBoxes - totalAmmoGotten;
-       if (remaining <= 0) {
-         ctx.log("trade", `Ammo cap reached (${desiredAmmoBoxes} boxes) — skipping remaining ammo types`);
-         break;
-       }
-       ammoToGet = Math.min(ammoToGet, remaining);
+       ammoToGet = Math.max(0, Math.min(ammoToGet, desiredAmmoBoxes - currentAmmoForType));
      }
 
     // Prefer currently loaded ammo if available
@@ -3049,7 +6045,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     }
 
     if (!chosenAmmoId) {
-      ctx.log("trade", `No suitable ammo found for ${ammoType} — skipping`);
+      ctx.log("trade", `No suitable ammo found for ${ammoType} â€” skipping`);
       continue;
     }
 
@@ -3057,12 +6053,12 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       ? [chosenAmmoId, ...possibleAmmo.filter(a => a !== chosenAmmoId)]
       : possibleAmmo;
     for (const ammoId of ammoOrder) {
-      // Honor a stop request — don't keep issuing withdraws after stop
+      // Honor a stop request â€” don't keep issuing withdraws after stop
       if (bot.state !== "running") return;
       const ammoSize = getItemSize(ammoId);
       let actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
       if (desiredAmmoBoxes > 0) {
-        actualQty = Math.min(actualQty, desiredAmmoBoxes - totalAmmoGotten);
+        actualQty = Math.min(actualQty, desiredAmmoBoxes - typeAmmoGotten);
       }
       if (actualQty <= 0) {
         continue;
@@ -3077,7 +6073,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       if (!wResp.error) {
         ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
         freeSpace -= actualQty * ammoSize;
-        totalAmmoGotten += actualQty;
+        typeAmmoGotten += actualQty;
         gotAnyAmmo = true;
         break;
       } else {
@@ -3087,7 +6083,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   }
 
   if (!gotAnyAmmo) {
-    ctx.log("trade", "No ammo withdrawn — skipping ammo resupply");
+    ctx.log("trade", "No ammo withdrawn â€” skipping ammo resupply");
   }
 
   const desiredRepair = hs.desiredRepairKits ?? 12;
@@ -3127,7 +6123,17 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   if (!hs.disableResupply) {
     const shieldIds = ["shield_charge"];
     let gotShield = false;
-    const shieldToGet = Math.max(0, desiredShield - currentShield);
+    let shieldToGet = Math.max(0, desiredShield - currentShield);
+
+    if (hs.mode === "boarding" && (hs.boardingShieldChargePct ?? 0) > 0) {
+      const pct = hs.boardingShieldChargePct as number;
+      const shieldSize = getItemSize("shield_charge");
+      const shieldTargetCount = Math.floor((bot.cargoMax * (pct / 100)) / shieldSize);
+      const boardingShieldNeed = Math.max(0, shieldTargetCount - currentShield);
+      shieldToGet = boardingShieldNeed;
+      ctx.log("trade", `Boarding mode shield reserve: targeting ${pct}% of cargo = ${shieldTargetCount} shield_charge (need ${boardingShieldNeed} more)`);
+    }
+
     for (const shId of shieldIds) {
       const shSize = getItemSize(shId);
       const shQty = Math.min(shieldToGet, Math.floor(freeSpace / shSize));
@@ -3144,6 +6150,8 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
         freeSpace -= shQty * shSize;
         gotShield = true;
         break;
+      } else {
+        ctx.log("trade", `${shId}: relying on faction storage (${shQty} needed)`);
       }
     }
     if (!gotShield) {
@@ -3172,43 +6180,77 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     }
   }
 
-  // 3. Military fuel cells — fill the rest (prefer faction storage)
+  const desiredMedical = hs.desiredMedicalSupplies ?? 0;
+  const currentMedical = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("medical_supplies"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const medicalToGet = Math.max(0, desiredMedical - currentMedical);
+  if (!hs.disableResupply && medicalToGet > 0 && freeSpace >= getItemSize("medical_supplies")) {
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: "medical_supplies",
+      quantity: medicalToGet
+    });
+    if (!wResp.error) {
+      ctx.log("trade", `Withdrew ${medicalToGet} medical_supplies from faction storage`);
+      freeSpace -= medicalToGet * getItemSize("medical_supplies");
+    } else {
+      ctx.log("trade", `Medical supplies: relying on faction storage (${medicalToGet} needed)`);
+    }
+  }
+
+  // 3. Fuel cells â€” fill the rest (prefer faction storage, densest first)
   if (!hs.disableResupply) {
-    const fuelCellSize = getItemSize("military_fuel_cell");
-    if (freeSpace >= fuelCellSize) {
-      const desiredFuel = hs.desiredFuelCells ?? -1;
-      let fuelQty: number;
-      if (desiredFuel >= 0) {
-        fuelQty = Math.max(0, desiredFuel - currentFuel);
-        fuelQty = Math.min(fuelQty, Math.floor(freeSpace / fuelCellSize));
-      } else {
-        fuelQty = Math.floor(freeSpace / fuelCellSize);
-      }
+    const fuelTypes = [
+      { id: "military_fuel_cell", size: getItemSize("military_fuel_cell") },
+      { id: "premium_fuel_cell", size: getItemSize("premium_fuel_cell") },
+      { id: "fuel_cell", size: getItemSize("fuel_cell") },
+    ];
+    const desiredFuel = hs.desiredFuelCells ?? -1;
+    const fillCargo = desiredFuel < 0;
+    let remainingNeed = fillCargo ? 0 : Math.max(0, desiredFuel - currentFuel);
+    for (const { id, size } of fuelTypes) {
+      if (!fillCargo && remainingNeed <= 0) break;
+      if (freeSpace < size) continue;
+      const maxFit = Math.floor(freeSpace / size);
+      const qty = fillCargo ? maxFit : Math.min(remainingNeed, maxFit);
+      if (qty <= 0) continue;
+
       if (allowBuying) {
-        const fuelResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: fuelQty });
+        const fuelResp = await bot.exec("buy", { item_id: id, quantity: qty });
         if (!fuelResp.error) {
-          ctx.log("trade", `Resupplied ${fuelQty} military fuel cells`);
+          ctx.log("trade", `Resupplied ${qty} ${id}`);
+          freeSpace -= qty * size;
+          if (!fillCargo) remainingNeed -= qty;
         }
       } else {
         const wResp = await bot.exec("storage", {
           action: "withdraw",
           target: "faction",
-          item_id: "military_fuel_cell",
-          quantity: fuelQty
+          item_id: id,
+          quantity: qty
         });
         if (!wResp.error) {
-          ctx.log("trade", `Withdrew ${fuelQty} military fuel cells from faction storage`);
+          ctx.log("trade", `Withdrew ${qty} ${id} from faction storage`);
+          freeSpace -= qty * size;
+          if (!fillCargo) remainingNeed -= qty;
         } else {
-          ctx.log("trade", `Military fuel cells: relying on faction storage (${fuelQty} needed)`);
+          ctx.log("trade", `${id}: relying on faction storage (${qty} needed)`);
         }
       }
     }
   } else {
     ctx.log("trade", "Skipping fuel cells (disableResupply enabled)");
   }
+
+  // Refresh the in-memory inventory so the freshly withdrawn repair kits /
+  // shield charges / fuel cells are reflected. Without this, isLowOnFieldConsumables
+  // keeps reading the pre-resupply (often 0) counts and re-triggers a return-home.
+  await bot.refreshCargo();
 }
 
-// ── Cycle Patrols Routine (cycle through all patrol profiles) ─────
+// â”€â”€ Cycle Patrols Routine (cycle through all patrol profiles) â”€â”€â”€â”€â”€
 
 async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
@@ -3222,7 +6264,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
   const settings = getHunterSettings(bot.username);
 
   if (hunterPatrols.length === 0) {
-    ctx.log("error", "cycle_patrols mode but no hunterPatrols configured — falling back to roam_systems");
+    ctx.log("error", "cycle_patrols mode but no hunterPatrols configured â€” falling back to roam_systems");
     yield* roamSystemsRoutine(ctx);
     return;
   }
@@ -3239,6 +6281,15 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
     const death = await handleDeath(ctx, settings);
     if (death === "stop") return;
     if (death === "wait") continue;
+
+    // â”€â”€ Low fuel cells check â”€â”€
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      continue;
+    }
 
     const cycleMode = settings.patrolCycleMode || "sequential";
     let targetIndex: number;
@@ -3257,7 +6308,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
     const profile = hunterPatrols[targetIndex];
     if (!profile || !profile.patrolSystems || profile.patrolSystems.length === 0) {
-      ctx.log("error", `Invalid or empty patrol profile at index ${targetIndex} — skipping`);
+      ctx.log("error", `Invalid or empty patrol profile at index ${targetIndex} â€” skipping`);
       await ctx.sleep(5000);
       continue;
     }
@@ -3285,7 +6336,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
             ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
             await handleNavigationBattleInterrupt(ctx, settings);
           } else {
-            ctx.log("error", `Could not reach ${targetSystem} — skipping`);
+            ctx.log("error", `Could not reach ${targetSystem} â€” skipping`);
             await ctx.sleep(5000);
             continue;
           }
@@ -3297,7 +6348,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
       const patrolPois = pois.filter(p => !isStationPoi(p));
 
       if (patrolPois.length === 0) {
-        ctx.log("info", "No POIs — moving to next system");
+        ctx.log("info", "No POIs â€” moving to next system");
         continue;
       }
 
@@ -3313,22 +6364,24 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-        const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
-        const targets = [...pirate_targets, ...creature_targets];
+        const creature_targets = pickCreatureTargets(entities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode);
+        let targets = [...pirate_targets, ...creature_targets];
+        targets = pickUnclaimedBoardingTarget(targets, bot.username);
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-          const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+          const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
           if (won) {
             totalKills++;
-            await scavengeWrecks(ctx);
+            recordCreatureKill(bot, target);
+            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
             // top up shields (this path previously had no shield recharge after kills)
             const csettings = getHunterSettings(bot.username);
             await topUpShields(ctx, (csettings.shieldRechargePct ?? 80) / 100);
             await useRepairKits(ctx);
             await bot.refreshCargo();
             if (isLowOnFieldConsumables(bot.inventory)) {
-              ctx.log("combat", "Low on repair kits or shield charges — stopping to resupply");
+              ctx.log("combat", "Low on repair kits or shield charges â€” stopping to resupply");
               break;
             }
           }
@@ -3337,7 +6390,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
     }
 
     if (settings.singleLoop) {
-      ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+      ctx.log("system", "Single loop mode â€” returning to faction home base for resupply...");
       const hs = settings.homeStation || "";
       const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
       if (hsys && hpoi) {
@@ -3352,7 +6405,6 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
     }
   }
 }
-
 async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
@@ -3364,7 +6416,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
   const maxJumps = settings.patrolRadius;
 
   if (!pirateBase) {
-    ctx.log("error", "patrol_radius mode requires pirateBaseSystem to be configured — falling back to roam_systems");
+    ctx.log("error", "patrol_radius mode requires pirateBaseSystem to be configured â€” falling back to roam_systems");
     yield* roamSystemsRoutine(ctx);
     return;
   }
@@ -3398,7 +6450,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
     };
     const arrived = await navigateToSystem(ctx, pirateBase, safetyOpts);
     if (!arrived) {
-      ctx.log("error", `Could not reach pirate base ${pirateBase} — falling back to roam_systems`);
+      ctx.log("error", `Could not reach pirate base ${pirateBase} â€” falling back to roam_systems`);
       yield* roamSystemsRoutine(ctx);
       return;
     }
@@ -3408,7 +6460,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
   const patrolList = findSystemsWithinRadius(pirateBaseSystemId, maxJumps);
   if (patrolList.length === 0) {
-    ctx.log("error", `patrol_radius mode: no systems found within ${maxJumps} jumps of ${pirateBaseSystemId} — falling back to roam_systems`);
+    ctx.log("error", `patrol_radius mode: no systems found within ${maxJumps} jumps of ${pirateBaseSystemId} â€” falling back to roam_systems`);
     yield* roamSystemsRoutine(ctx);
     return;
   }
@@ -3421,6 +6473,15 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
     const death = await handleDeath(ctx, currentSettings);
     if (death === "stop") return;
     if (death === "wait") continue;
+
+    // â”€â”€ Low fuel cells check â”€â”€
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (currentSettings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= currentSettings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, currentSettings);
+      continue;
+    }
 
     const currentSafetyOpts = {
       fuelThresholdPct: currentSettings.refuelThreshold,
@@ -3443,7 +6504,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
           ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
           await handleNavigationBattleInterrupt(ctx, currentSettings);
         } else {
-          ctx.log("error", `Could not reach ${targetSystem} — skipping`);
+          ctx.log("error", `Could not reach ${targetSystem} â€” skipping`);
           await ctx.sleep(5000);
           continue;
         }
@@ -3456,7 +6517,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
       const { pois } = await getSystemInfo(ctx);
       const patrolPois = pois.filter(p => !isStationPoi(p));
       if (patrolPois.length === 0) {
-        ctx.log("info", "No POIs — moving to next system");
+        ctx.log("info", "No POIs â€” moving to next system");
         return;
       }
       for (const poi of patrolPois) {
@@ -3471,21 +6532,23 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, currentSettings.onlyNPCs, currentSettings.maxAttackTier));
-        const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, currentSettings.huntCreatures)).slice(0, currentSettings.maxCreaturesPerScan));
-        const targets = [...pirate_targets, ...creature_targets];
+        const creature_targets = pickCreatureTargets(entities, bot, currentSettings.huntCreatures, currentSettings.maxCreaturesPerScan, currentSettings.coordinationMode);
+        let targets = [...pirate_targets, ...creature_targets];
+        targets = pickUnclaimedBoardingTarget(targets, bot.username);
         for (const target of targets) {
           await useRepairKits(ctx);
           await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts, currentSettings.ammoReloadAbsoluteThreshold, currentSettings.ammoReloadPercentThreshold);
-          const won = await hunterEngage(ctx, target, currentSettings.fleeThreshold, currentSettings.fleeFromTier, currentSettings.minPiratesToFlee, currentSettings.maxAttackTier, undefined, currentSettings.disableScanCommandForPirates, currentSettings.repairThreshold);
+          const won = await hunterEngage(ctx, target, currentSettings.fleeThreshold, currentSettings.fleeFromTier, currentSettings.minPiratesToFlee, currentSettings.maxAttackTier, undefined, currentSettings.disableScanCommandForPirates, currentSettings.repairThreshold, currentSettings.onlyNPCs, currentSettings.cloakOnStart);
           if (won) {
             totalKills++;
+            recordCreatureKill(bot, target);
             await scavengeWrecks(ctx);
             const csettings = getHunterSettings(bot.username);
             await topUpShields(ctx, (csettings.shieldRechargePct ?? 80) / 100);
             await useRepairKits(ctx);
             await bot.refreshCargo();
             if (isLowOnFieldConsumables(bot.inventory)) {
-              ctx.log("combat", "Low on repair kits or shield charges — stopping to resupply");
+              ctx.log("combat", "Low on repair kits or shield charges â€” stopping to resupply");
               break;
             }
           }
@@ -3494,7 +6557,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
     })();
 
     if (currentSettings.singleLoop && systemIndex >= patrolList.length) {
-      ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+      ctx.log("system", "Single loop mode â€” returning to faction home base for resupply...");
       const hs = currentSettings.homeStation || "";
       const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
       if (hsys && hpoi) {
@@ -3504,13 +6567,2738 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
       } else {
         await navigateToSafeStation(ctx, currentSafetyOpts);
       }
-      await ensureHunterResupply(ctx);
-      systemIndex = 0;
+    }
+  }
+}
+// â”€â”€ Boarding Subroutine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// Called from a hunter combat flow when boarding is enabled and the target's
+// shields have dropped below boardingShieldThreshold. The subroutine:
+//   1. Suppresses shields with fire stance until below threshold.
+//   2. Issues `battle target` + `battle stance board` (V1: stance="board",
+//      target_id, marines) to initiate the boarding operation.
+//   3. Monitors the `boarding` array in get_battle_status until the operation
+//      completes (phase = "victory" or "defeat" or "withdrawn") or the battle
+//      ends.
+//   4. Returns true if the boarding was successful, false otherwise.
+//
+// The boarding stance is persistent: once issued it stays active for multiple
+// ticks (auto-closes to point-blank range). The bot does not fire normal weapons
+// while boarding. Friendly fire can still destroy the target and kill the
+// marines, so the subroutine keeps an eye on hull and bails to fire/brace if
+// things go badly.
+
+const BOARD_MAX_TICKS = 90000;
+const BOARD_TICK_MS = 5000;
+
+/**
+ * When fit marines drop below this fraction of the ship's marine capacity,
+ * the boarding hunter returns home to treat injured personnel and recruit
+ * fresh marines before continuing the patrol. This prevents the bot from
+ * sailing out to board targets with no crew left to actually perform
+ * captures.
+ */
+const MARINE_HEALTH_CHECK_THRESHOLD_PCT = 50;
+
+/**
+ * Get the number of fit marines aboard the bot's ship.
+ * Calls get_ship to refresh personnel data.
+ */
+async function getFitMarineCount(ctx: RoutineContext): Promise<number> {
+  await ctx.bot.refreshShip();
+  return ctx.bot.fitMarines;
+}
+
+/**
+ * Check if the bot's fit marine count is below the threshold fraction of
+ * its marine capacity. When true, the boarding hunter should return home
+ * to treat injured personnel and recruit fresh marines before continuing.
+ */
+async function isMarineHealthCritical(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  await bot.refreshShip();
+  const maxMarines = bot.marineCapacity || 0;
+  if (maxMarines <= 0) return false;
+  const fitMarines = bot.fitMarines || 0;
+  const marinePct = Math.round((fitMarines / maxMarines) * 100);
+  if (marinePct < MARINE_HEALTH_CHECK_THRESHOLD_PCT) {
+    ctx.log("system", `Marine health critical: ${fitMarines}/${maxMarines} fit (${marinePct}%) â€” below ${MARINE_HEALTH_CHECK_THRESHOLD_PCT}% threshold`);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Check if the bot's ship has boarding capability.
+ */
+async function checkBoardingCapability(ctx: RoutineContext): Promise<boolean> {
+  await ctx.bot.refreshShip();
+  return ctx.bot.hasBoardingCapability;
+}
+
+/**
+ * Returns info about the bot's installed boarding clamp module.
+ * Detects "boarding_clamp" (latch strength 8) and "assault_boarding_lock"
+ * (latch strength 18). When latch strength > 0, the bot can attempt
+ * boarding; higher latch strength enables more aggressive damage
+ * before the target becomes unsalvageable.
+ */
+interface BoardingClampInfo {
+  /** True if any boarding clamp module is installed. */
+  hasClamp: boolean;
+  /** Latch strength of the installed module (8 for Boarding Clamp, 18 for Assault Boarding Lock). 0 if none. */
+  latchStrength: number;
+  /** Human-readable module name. */
+  moduleName: string | null;
+  /** Whether the assault (advanced) version is installed. */
+  isAssaultLock: boolean;
+}
+
+function getBoardingClampInfo(bot: Bot): BoardingClampInfo {
+  const mods = bot.installedMods;
+  const latchStrength = bot.boardingClampLatchStrength;
+  if (latchStrength > 0) {
+    const isAssault = latchStrength >= 15;
+    return {
+      hasClamp: true,
+      latchStrength,
+      moduleName: isAssault ? "Assault Boarding Lock" : "Boarding Clamp",
+      isAssaultLock: isAssault,
+    };
+  }
+  return {
+    hasClamp: false,
+    latchStrength: 0,
+    moduleName: null,
+    isAssaultLock: false,
+  };
+}
+
+/**
+ * Resolve how many marines to commit to the boarding stance.
+ * boardingMarines=0 means "all fit marines on board".
+ */
+function resolveMarineCommitment(fitMarines: number, configured: number): number {
+  if (configured > 0) {
+    return Math.min(configured, fitMarines);
+  }
+  return fitMarines;
+}
+
+/**
+ * Pick the enemy with the lowest shields from a battle status.
+ * Used by boarding to ensure we engage the most vulnerable target.
+ * Stations are excluded â€” boarding is not currently supported on stations.
+ */
+function pickLowestShieldsEnemy(
+  status: NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>,
+  ourSideId: number | undefined,
+): { id: string; name: string } | null {
+  if (!status.participants || status.participants.length === 0) return null;
+  const side = ourSideId ?? status.your_side_id;
+  const enemies = status.participants.filter(
+    p => side === undefined || p.side_id !== side,
+  );
+  const nonStation = enemies.filter(p => {
+    const shipClass = (p.ship_class || "").toLowerCase();
+    const kind = (p as any).kind || "";
+    return shipClass !== "station" && kind.toLowerCase() !== "station";
+  });
+  const source = nonStation.length > 0 ? nonStation : enemies;
+  const alive = source.filter(p => !p.is_destroyed && (p.player_id || p.username));
+  if (alive.length === 0) return null;
+  const sorted = alive.sort(
+    (a, b) =>
+      (a.shield_pct ?? a.shield_percent ?? 100) -
+      (b.shield_pct ?? b.shield_percent ?? 100),
+  );
+  const chosen = sorted[0];
+  return {
+    id: chosen.player_id || chosen.username || "",
+    name: chosen.username || chosen.player_id || "enemy",
+  };
+}
+
+/**
+ * Find the target participant in the battle and return its shield percentage.
+ */
+function getTargetShieldPct(
+  status: NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>,
+  targetId: string,
+  targetName?: string,
+): number | null {
+  const participant = status.participants.find(
+    p => p.player_id === targetId || p.username === targetId || (targetName ? p.username === targetName : false),
+  );
+  if (!participant) return null;
+  // shield_pct is optional in the API â€” when omitted, treat as 0 (shields depleted)
+  const pct = participant.shield_pct ?? participant.shield_percent ?? 0;
+  return pct;
+}
+
+/**
+ * Check if any boarding operation in the battle status is for our target.
+ */
+function findBoardingOperation(
+  status: NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>,
+  targetId: string,
+): { operation_id: string; phase: string; progress?: string } | null {
+  if (!status.boarding || status.boarding.length === 0) return null;
+  const op = status.boarding.find(
+    b => b.target_id === targetId || b.attacker_id === status.your_target_id,
+  );
+  if (!op) {
+    // If we can't match by target, but there's a boarding operation where attacker matches our ship
+    const ourOp = status.boarding[0];
+    return {
+      operation_id: ourOp.operation_id,
+      phase: ourOp.phase,
+      progress: ourOp.progress,
+    };
+  }
+  return {
+    operation_id: op.operation_id,
+    phase: op.phase,
+    progress: op.progress,
+  };
+}
+
+/**
+ * The boarding subroutine: open the battle directly (scan + attack + advance to
+ * engaged), suppress shields with fire stance until below threshold, then issue
+ * the board stance and monitor the boarding operation to completion.
+ *
+ * This does NOT call engageTarget â€” that function runs fightFreshBattle to total
+ * destruction, which would prevent boarding. Instead we replicate the battle-opening
+ * and zone-closing logic inline, then interpose the boarding stance when shields are
+ * low enough.
+ *
+  * Returns:
+  *   "captured" â€” boarding operation succeeded (target captured)
+  *   "target_eliminated" â€” target was destroyed (before, during, or after boarding)
+  *   "failed" â€” boarding failed, aborted, or timed out; the caller may re-engage normally
+  *   "retreat" â€” hull critical, must flee
+  *
+  * On "captured", the prize ship may be at the current POI or at the POI where
+  * the battle started (battles are system-wide). The caller handles prize recovery.
+ */
+export async function boardingSubroutine(
+  ctx: RoutineContext,
+  target: NearbyEntity,
+  shieldThreshold: number,
+  marinesConfigured: number,
+  fleeThreshold: number,
+  shieldRechargePct: number,
+  cloakOnStart: boolean = false,
+): Promise<"captured" | "target_eliminated" | "failed" | "retreat"> {
+  const { bot } = ctx;
+  if (!target.id) {
+    ctx.log("combat", "Boarding: no target ID â€” aborting");
+    return "failed";
+  }
+
+  broadcastBoardingClaim(ctx, target);
+
+  // Check boarding capability
+  const canBoard = await checkBoardingCapability(ctx);
+  if (!canBoard) {
+    ctx.log("combat", "Boarding: ship lacks boarding capability â€” falling back to fire stance");
+    return "failed";
+  }
+
+  // Detect boarding clamp module for latch strength info (optional)
+  const clampInfo = getBoardingClampInfo(bot);
+  if (clampInfo.hasClamp) {
+    ctx.log("combat", `ðŸ›¸ Boarding: ${clampInfo.moduleName} installed (latch strength: ${clampInfo.latchStrength})`);
+  } else {
+    ctx.log("combat", `ðŸ›¸ Boarding: ship has boarding capability â€” using configured shield threshold (${shieldThreshold}%)`);
+  }
+
+  // Resolve marine commitment
+  const fitMarines = await getFitMarineCount(ctx);
+  if (fitMarines < 1) {
+    ctx.log("combat", "Boarding: no fit marines aboard â€” cannot board");
+    return "failed";
+  }
+  const marines = resolveMarineCommitment(fitMarines, marinesConfigured);
+  ctx.log("combat", `Boarding: ${fitMarines} fit marines aboard, committing ${marines} to board stance (threshold: ${shieldThreshold}%)`);
+
+  // â”€â”€ Phase 1: Open the battle directly (scan + attack) â”€â”€
+  ctx.log("combat", `âš”ï¸ Boarding: engaging ${target.name}...`);
+
+  // If already in a battle, skip scan/attack and go straight to advance.
+  let battleActive = false;
+  const preAttackStatus = await getBattleStatus(ctx);
+  if (preAttackStatus) {
+    battleActive = true;
+    ctx.log("combat", `âš”ï¸ Boarding: already in battle with ${target.name} â€” closing to engaged`);
+  }
+
+  if (!battleActive) {
+    // Scan the target to get ship info (non-fatal if it fails)
+    let scanResp = await bot.exec("scan", { target_id: target.id });
+    if (scanResp.error) {
+      const errMsg = scanResp.error.message.toLowerCase();
+      if (errMsg.includes("in_battle") || errMsg.includes("in combat")) {
+        ctx.log("combat", `âš”ï¸ Scan revealed battle already active with ${target.name} â€” entering combat directly`);
+        battleActive = true;
+      } else if (errMsg.includes("invalid_target")) {
+        scanResp = await bot.exec("scan", { target_id: target.name });
+      }
+    }
+    if (!scanResp.error && scanResp.result) {
+      const s = scanResp.result as Record<string, unknown>;
+      const shipType = (s.ship_type as string) || (s.ship as string) || "unknown";
+      const faction = (s.faction as string) || target.faction || "unknown";
+      ctx.log("combat", `   Scan: ${target.name} â€” ${shipType} | Faction: ${faction}`);
+    }
+
+    if (!battleActive) {
+      let attackResp = await bot.exec("attack", { target_id: target.id });
+      if (attackResp.error) {
+        const msg = attackResp.error.message.toLowerCase();
+        if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in")) {
+          ctx.log("combat", `Attack with id failed â€” trying name "${target.name}"...`);
+          attackResp = await bot.exec("attack", { target_id: target.name });
+        }
+      }
+      if (attackResp.error) {
+        const msg = attackResp.error.message.toLowerCase();
+        if (msg.includes("not found") || msg.includes("invalid") ||
+            msg.includes("no target") || msg.includes("already") || msg.includes("not in")) {
+          return "failed";
+        }
+        // Attack error but maybe a battle was started anyway â€” check
+        const postStatus = await getBattleStatus(ctx);
+        if (postStatus) {
+          battleActive = true;
+          ctx.log("combat", `âš”ï¸ Attack errored ("${attackResp.error.message}") but battle is active â€” entering combat`);
+        } else {
+          ctx.log("error", `Attack failed on ${target.name}: ${attackResp.error.message}`);
+          return "failed";
+        }
+      } else {
+        battleActive = true;
+      }
+    }
+  }
+
+  if (!battleActive) {
+    // Verify battle is live
+    const checkStatus = await getBattleStatus(ctx);
+    if (!checkStatus) {
+      ctx.log("combat", "Boarding: no active battle after attack â€” target may have been eliminated");
+      return "target_eliminated";
+    }
+  }
+
+   // â”€â”€ Phase 2+3: Suppress shields â†’ close distance â†’ board â†’ monitor â”€â”€
+   //
+   // User's directive: "as soon as the target is ready to board, we just engage
+   // boarding stance. it will get us closer and do things for us."
+   //
+   // So instead of a rigid advance-to-engaged phase followed by a separate
+   // shield-check, we run a single unified loop that:
+   //   1. Checks if battle/target ended / hull is critical
+   //   2. Checks target shield % â€” if â‰¤ threshold, brace + board IMMEDIATELY
+   //      (the board stance itself closes distance, so zone doesn't matter)
+   //   3. If shields still high, use fire to suppress + advance to close range
+   //   4. Once boarding starts, monitor the operation to completion
+   const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+
+    let tickCount = 0;
+    let boardingActive = false;
+    let lastHull = bot.hull;
+    let boardStanceIssued = false;
+
+   while (bot.state === "running") {
+     tickCount++;
+     if (tickCount > BOARD_MAX_TICKS) {
+       ctx.log("combat", "Boarding: timeout reached â€” switching to fire stance to finish");
+       await bot.exec("battle", { action: "stance", stance: "fire" });
+       return "failed";
+     }
+
+         const status = await getBattleStatus(ctx);
+          if (!status) {
+            if (boardingActive) {
+              ctx.log("combat", `âœ… Boarding: battle ended during active boarding â€” polling for captured prize (up to 8 checks, 3s apart)`);
+              await recloakAfterBattle(ctx, cloakOnStart);
+              let foundPrize = false;
+             for (let prizeTick = 0; prizeTick < 8; prizeTick++) {
+               await ctx.sleep(3000);
+               const nearbyResult = await getObservationOrNearby(bot);
+               const nearbyData = nearbyResult.result;
+               const prizes = nearbyData ? getNearbyPrizes(nearbyData) : [];
+                const capturedPrize = prizes.find(p =>
+                  p.ship_id === target.id && (p.status === "available" || p.status === "claimed")
+                ) || prizes.find(p => p.status === "available" || p.status === "claimed");
+                if (capturedPrize) {
+                  ctx.log("combat", `âœ… Boarding: CAPTURED ${target.name}! (prize found on poll ${prizeTick + 1}: ${capturedPrize.ship_name || capturedPrize.prize_id})`);
+                  bot.registerCapturedPrize(capturedPrize.ship_id, capturedPrize.ship_class || target.name, "", capturedPrize.prize_id);
+                  foundPrize = true;
+                  break;
+                }
+              ctx.log("combat", `ðŸ›¸ Prize poll ${prizeTick + 1}/8 â€” no prize yet, waiting...`);
+              
+              await bot.refreshStatus();
+              const recoveries = bot.prizeRecoveries;
+              const activeRecovery = recoveries.find(r => r.status === "in_transit" || r.status === "claimed");
+              if (activeRecovery) {
+                ctx.log("combat", `âœ… Boarding: CAPTURED ${target.name}! (active prize recovery: ${activeRecovery.ship_name || activeRecovery.prize_id})`);
+                foundPrize = true;
+                break;
+              }
+            }
+            
+            if (!foundPrize) {
+              ctx.log("combat", `âš ï¸ Boarding: prize not visible after 8 polls â€” checking target status`);
+              const nearbyResult = await getObservationOrNearby(bot);
+              const nearbyData = nearbyResult.result;
+              const prizes = nearbyData ? getNearbyPrizes(nearbyData) : [];
+              const capturedPrize = prizes.find(p =>
+                p.ship_id === target.id && (p.status === "available" || p.status === "claimed")
+              ) || prizes.find(p => p.status === "available" || p.status === "claimed");
+              if (capturedPrize) {
+                ctx.log("combat", `âœ… Boarding: CAPTURED ${target.name}! (prize found in final check)`);
+                bot.registerCapturedPrize(capturedPrize.ship_id, capturedPrize.ship_class || target.name, "", capturedPrize.prize_id);
+                await recloakAfterBattle(ctx, cloakOnStart);
+                return "captured";
+              }
+              
+              const finalStatus = await getBattleStatus(ctx);
+              if (finalStatus) {
+                const tp = finalStatus.participants.find(p => p.player_id === target.id || p.username === target.name);
+                if (tp && tp.is_destroyed) {
+                  ctx.log("combat", `âœ… Boarding: battle ended â€” ${target.name} eliminated!`);
+                  await recloakAfterBattle(ctx, cloakOnStart);
+                  return "target_eliminated";
+                }
+              }
+              
+              ctx.log("combat", `âœ… Boarding: CAPTURED ${target.name}! (boarding was active, assuming capture â€” prize may still be spawning)`);
+              await recloakAfterBattle(ctx, cloakOnStart);
+              return "captured";
+            }
+            
+            if (foundPrize) {
+              await recloakAfterBattle(ctx, cloakOnStart);
+              return "captured";
+            }
+             const tracked = Array.from(bot.capturedPrizeTracker.values()).find((cp: any) => cp.ship_id === target.id || cp.ship_class === target.name || cp.battle_id === (bot.currentBattle?.battleId || ""));
+            if (tracked) {
+              ctx.log("combat", ` Boarding: CAPTURED ${target.name}! (found in local captured prize tracker)`);
+              await recloakAfterBattle(ctx, cloakOnStart);
+              return "captured";
+            }
+          } else {
+             ctx.log("combat", ` Boarding: battle ended during boarding (local state lost?) — polling for captured prize (up to 8 checks, 3s apart)`);
+            let foundPrize2 = false;
+            for (let prizeTick = 0; prizeTick < 8; prizeTick++) {
+              await ctx.sleep(3000);
+              const nearbyResult = await getObservationOrNearby(bot);
+              const nearbyData = nearbyResult.result;
+              const prizes = nearbyData ? getNearbyPrizes(nearbyData) : [];
+              const capturedPrize = prizes.find(p =>
+                p.ship_id === target.id && (p.status === "available" || p.status === "claimed")
+              ) || prizes.find(p => p.status === "available" || p.status === "claimed");
+              if (capturedPrize) {
+                 ctx.log("combat", ` Boarding: CAPTURED ${target.name}! (prize found on poll ${prizeTick + 1}: ${capturedPrize.ship_name || capturedPrize.prize_id})`);
+                bot.registerCapturedPrize(capturedPrize.ship_id, capturedPrize.ship_class || target.name, "", capturedPrize.prize_id);
+                foundPrize2 = true;
+                break;
+              }
+               ctx.log("combat", ` Prize poll ${prizeTick+1}/8 — no prize yet, waiting...`);
+              await bot.refreshStatus();
+              const recoveries = bot.prizeRecoveries;
+              const activeRecovery = recoveries.find(r => r.status === "in_transit" || r.status === "claimed");
+              if (activeRecovery) {
+                 ctx.log("combat", ` Boarding: CAPTURED ${target.name}! (active prize recovery: ${activeRecovery.ship_name || activeRecovery.prize_id})`);
+                foundPrize2 = true;
+                break;
+              }
+            }
+            if (foundPrize2) {
+              await recloakAfterBattle(ctx, cloakOnStart);
+              return "captured";
+            }
+             const tracked2 = Array.from(bot.capturedPrizeTracker.values()).find((cp: any) => cp.ship_id === target.id || cp.ship_class === target.name || cp.battle_id === (bot.currentBattle?.battleId || ""));
+            if (tracked2) {
+               ctx.log("combat", ` Boarding: CAPTURED ${target.name}! (found in local captured prize tracker after poll)`);
+              await recloakAfterBattle(ctx, cloakOnStart);
+              return "captured";
+            }
+
+             ctx.log("combat", ` Boarding: battle ended — ${target.name} eliminated!`);
+             await recloakAfterBattle(ctx, cloakOnStart);
+           }
+           return "target_eliminated";
+         }
+
+
+
+
+
+
+     // Check hull
+     await bot.refreshShip();
+     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+     const damageThisTick = Math.max(0, lastHull - bot.hull);
+     lastHull = bot.hull;
+
+     if (hullPct <= fleeThreshold) {
+       ctx.log("combat", `ðŸ’€ Boarding: hull critical (${hullPct}%) â€” FLEEING!`);
+       await emergencyFleeSpam(ctx, `hull at ${hullPct}% during boarding`);
+       return "retreat";
+     }
+
+      // Check if our target is destroyed or no longer in the battle
+      const targetParticipant = status.participants.find(
+        p => p.player_id === target.id || p.username === target.name,
+      );
+      if (!targetParticipant) {
+        // Target is no longer in the battle â€” it was captured or eliminated
+        // by someone else. Switch to the next eligible enemy so we can
+        // continue boarding instead of firing at nothing.
+        const nextEnemy = status.participants.find(p => {
+          if (p.side_id === status.your_side_id || p.is_destroyed) return false;
+          if (p.player_id === target.id || p.username === target.name) return false;
+          const shipClass = (p.ship_class || "").toLowerCase();
+          const kind = (p as any).kind || "";
+          if (shipClass === "station" || kind.toLowerCase() === "station") return false;
+          return true;
+        });
+        if (nextEnemy) {
+          const newTargetName = nextEnemy.username || nextEnemy.player_id || "unknown";
+          ctx.log("combat", `ðŸŽ¯ Target ${target.name} no longer in battle â€” switching to ${newTargetName} for boarding`);
+          target = { id: nextEnemy.player_id || nextEnemy.username, name: newTargetName } as any;
+          await bot.exec("battle", { action: "target", target_id: target.id });
+          continue;
+        }
+        ctx.log("combat", `âœ… No more enemies â€” boarding subroutine complete`);
+        await bot.exec("battle", { action: "stance", stance: "fire" });
+        return boardStanceIssued ? "captured" : "target_eliminated";
+      }
+       if (targetParticipant.is_destroyed) {
+         ctx.log("combat", `âš ï¸ Boarding: ${target.name} was destroyed before boarding could complete`);
+         return "target_eliminated";
+       }
+
+       // â”€â”€ Dynamic re-targeting: always board the weakest enemy â”€â”€
+       const lowestShieldsEnemy = pickLowestShieldsEnemy(status, status.your_side_id);
+       if (lowestShieldsEnemy && (lowestShieldsEnemy.id !== target.id && lowestShieldsEnemy.name !== target.name)) {
+         const lowShieldPct = getTargetShieldPct(status, lowestShieldsEnemy.id, lowestShieldsEnemy.name);
+         const currentShieldPct = getTargetShieldPct(status, target.id, target.name);
+         if (lowShieldPct !== null && currentShieldPct !== null && lowShieldPct < currentShieldPct) {
+           const newTargetName = lowestShieldsEnemy.name || "unknown";
+           ctx.log("combat", `ðŸŽ¯ Re-targeting to ${newTargetName} (shields ${lowShieldPct}% < ${currentShieldPct}% on ${target.name})`);
+           target = { id: lowestShieldsEnemy.id, name: newTargetName } as any;
+           await bot.exec("battle", { action: "target", target_id: target.id });
+         }
+       }
+
+        // â”€â”€ Phase 3: Shield suppression + boarding â”€â”€
+       if (!boardingActive) {
+         // Check shield percentage â€” BEFORE zone check.
+         // If shields are already at/below threshold, brace + board immediately
+         // regardless of our zone. The boarding stance auto-closes distance.
+         const shieldPct = getTargetShieldPct(status, target.id, target.name);
+         // When no boarding clamp is installed, we must wait until shields are completely
+         // depleted (0%) before boarding â€” otherwise boarding will fail / not be available.
+         // With a boarding clamp, the configured shieldThreshold applies normally.
+          const effectiveShieldThreshold = shieldThreshold;
+
+          if (shieldPct !== null && shieldPct <= effectiveShieldThreshold) {
+            ctx.log("combat", `ðŸ›¸ Boarding: ${target.name} shields at ${shieldPct}% (â‰¤ ${effectiveShieldThreshold}%) â€” initiating board stance with ${marines} marines!`);
+            
+            const boardResp = await bot.exec("battle", {
+              action: "stance",
+              stance: "board",
+              target_id: target.id,
+              marines: marines,
+            });
+             if (boardResp.error) {
+               const msg = boardResp.error.message.toLowerCase();
+               if (msg.includes("not in battle") || msg.includes("no active battle")) {
+                 ctx.log("combat", "âœ… Boarding: battle ended before board stance could be issued");
+                 return "target_eliminated";
+               }
+               const boardRespName = await bot.exec("battle", {
+                 action: "stance",
+                 stance: "board",
+                 target_id: target.name,
+                 marines: marines,
+               });
+               if (boardRespName.error) {
+                 const msg2 = boardRespName.error.message.toLowerCase();
+                 if (msg2.includes("not in battle") || msg2.includes("no active battle")) {
+                   ctx.log("combat", "âœ… Boarding: battle ended before board stance could be issued (name)");
+                   return "target_eliminated";
+                 }
+                 if (msg2.includes("already has a boarding stance transition queued this tick") ||
+                     msg2.includes("boarding stance transition queued") ||
+                     msg2.includes("already")) {
+                   ctx.log("combat", "ðŸ›¸ Boarding: transition already queued â€” switching to passive monitoring");
+                   boardingActive = true;
+                   boardStanceIssued = true;
+    } else {
+                   ctx.log("combat", `âš ï¸ Boarding: failed to issue board stance â€” ${boardRespName.error.message} (${boardResp.error.message}) â€” switching to fire to finish`);
+                   await bot.exec("battle", { action: "stance", stance: "fire" });
+                   boardingActive = false;
+                 }
+               } else {
+                 ctx.log("combat", `ðŸ›¸ Boarding: board stance issued (via name)! Operation beginning.`);
+                 boardingActive = true;
+                 boardStanceIssued = true;
+               }
+             } else {
+               ctx.log("combat", `ðŸ›¸ Boarding: board stance issued! Operation beginning.`);
+               boardingActive = true;
+               boardStanceIssued = true;
+             }
+         } else {
+          // Shields still high â€” suppress with fire stance.
+          // Use fire + advance to close distance and reduce shields.
+          // The key: we keep firing ONLY while shields are above threshold.
+          // As soon as they drop, the next loop iteration will brace + board.
+          const enemyStance = targetParticipant?.stance || "unknown";
+          const enemyZone = targetParticipant?.zone || "unknown";
+          const ourZone = status.your_zone || "outer";
+          ctx.log("combat", `Boarding tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Target shields=${shieldPct ?? "unknown"}% (need â‰¤${effectiveShieldThreshold}%) | Dmg=${damageThisTick}`);
+
+          await bot.exec("battle", { action: "stance", stance: "fire" });
+          if (ourZone !== "engaged" && zoneDirMap[ourZone] !== undefined && zoneDirMap[ourZone] < 3) {
+            const adv = await bot.exec("battle", { action: "advance" });
+            if (adv.error) {
+              const amsg = adv.error.message.toLowerCase();
+              if (amsg.includes("not in battle") || amsg.includes("no active battle")) {
+                ctx.log("combat", "âœ… Boarding: battle ended during advance â€” target eliminated!");
+                return "target_eliminated";
+              }
+              ctx.log("combat", `âš ï¸ Advance note: ${adv.error.message}`);
+            }
+          }
+          await ctx.sleep(BOARD_TICK_MS);
+        }
+      } else {
+        // Boarding is active â€” monitor the operation
+        if (!boardStanceIssued) {
+          ctx.log("combat", `ðŸ›¸ Boarding: waiting for board stance to activate...`);
+          await ctx.sleep(BOARD_TICK_MS);
+          continue;
+        }
+
+        const shieldPctNow = getTargetShieldPct(status, target.id, target.name);
+        const effectiveShieldThresholdNow = clampInfo.hasClamp ? shieldThreshold : 0;
+        if (
+          shieldPctNow !== null &&
+          effectiveShieldThresholdNow > 0 &&
+          shieldPctNow > effectiveShieldThresholdNow &&
+          shieldPctNow > 10
+        ) {
+          ctx.log("combat", `âš ï¸ Boarding: ${target.name} shields regenerated to ${shieldPctNow}% (above ${effectiveShieldThresholdNow}% threshold) â€” resetting boarding attempt, switching to fire`);
+          await bot.exec("battle", { action: "stance", stance: "fire" });
+          boardingActive = false;
+          boardStanceIssued = false;
+          continue;
+        }
+
+      const boardingOp = findBoardingOperation(status, target.id);
+      if (boardingOp) {
+        ctx.log("combat", `ðŸ›¸ Boarding: operation ${boardingOp.operation_id} â€” phase=${boardingOp.phase} progress=${boardingOp.progress ?? "n/a"}`);
+        if (boardingOp.phase === "victory") {
+          ctx.log("combat", `âœ… Boarding: CAPTURED ${target.name}!`);
+          
+           // Switch to the next closest enemy instead of staying locked on the captured ship
+           const closerEnemy = status.participants.find(p => {
+             if (p.side_id === status.your_side_id || p.is_destroyed) return false;
+             if (p.player_id === target.id || p.username === target.name) return false;
+             const shipClass = (p.ship_class || "").toLowerCase();
+             const kind = (p as any).kind || "";
+             if (shipClass === "station" || kind.toLowerCase() === "station") return false;
+             return true;
+           });
+          
+          if (closerEnemy) {
+            const newTargetName = closerEnemy.username || closerEnemy.player_id || "unknown";
+            ctx.log("combat", `ðŸŽ¯ Switching to ${newTargetName} after capturing ${target.name}`);
+            target = { id: closerEnemy.player_id || closerEnemy.username, name: newTargetName } as any;
+            await bot.exec("battle", { action: "target", target_id: target.id });
+            await bot.exec("battle", { action: "stance", stance: "fire" });
+            boardingActive = false;
+            boardStanceIssued = false;
+            return "captured";
+          } else {
+            // No more enemies â€” battle should end soon
+            ctx.log("combat", `âœ… No more enemies after capturing ${target.name} â€” awaiting battle end`);
+            await bot.exec("battle", { action: "stance", stance: "fire" });
+            boardingActive = false;
+            boardStanceIssued = false;
+            return "captured";
+          }
+        }
+        if (boardingOp.phase === "defeat" || boardingOp.phase === "withdrawn") {
+          ctx.log("combat", `Boarding: operation ${boardingOp.phase} â€” target ${boardingOp.phase === "defeat" ? "resisted" : "withdrawn"}`);
+          boardingActive = false;
+          boardStanceIssued = false;
+        }
+      } else {
+        // Boarding operation not found in get_battle_status response.
+        const ourStanceNow = status.your_stance || "";
+        if (ourStanceNow === "board") {
+          ctx.log("combat", `ðŸ›¸ Boarding: operation data not in status yet (stance=board) â€” continuing to monitor`);
+      } else if (boardStanceIssued) {
+          ctx.log("combat", `ðŸ›¸ Boarding: board stance not yet active (still ${ourStanceNow}) â€” re-issuing to ensure it takes effect`);
+          const targetGone = !targetParticipant || targetParticipant.is_destroyed;
+          if (targetGone) {
+             const nextEnemy = status.participants.find(p => {
+               if (p.side_id === status.your_side_id || p.is_destroyed) return false;
+               if (p.player_id === target.id || p.username === target.name) return false;
+               const shipClass = (p.ship_class || "").toLowerCase();
+               const kind = (p as any).kind || "";
+               if (shipClass === "station" || kind.toLowerCase() === "station") return false;
+               return true;
+             });
+            if (nextEnemy) {
+              const newTargetName = nextEnemy.username || nextEnemy.player_id || "unknown";
+              ctx.log("combat", `ðŸŽ¯ Target ${target.name} captured/eliminated â€” switching to ${newTargetName}`);
+              target = { id: nextEnemy.player_id || nextEnemy.username, name: newTargetName } as any;
+              await bot.exec("battle", { action: "target", target_id: target.id });
+            } else {
+              ctx.log("combat", `âœ… No more enemies after ${target.name} â€” boarding subroutine complete`);
+              await bot.exec("battle", { action: "stance", stance: "fire" });
+              return "captured";
+            }
+          } else {
+            const boardResp = await bot.exec("battle", {
+              action: "stance",
+              stance: "board",
+              target_id: target.id,
+              marines: marines,
+            });
+            if (boardResp.error) {
+              const msg = boardResp.error.message.toLowerCase();
+              if (msg.includes("not in battle") || msg.includes("no active battle")) {
+                ctx.log("combat", "âœ… Boarding: battle ended during board retry");
+                await recloakAfterBattle(ctx, cloakOnStart);
+                return "target_eliminated";
+              }
+              if (msg.includes("already has a boarding stance transition queued this tick") ||
+                  msg.includes("boarding stance transition queued") ||
+                  msg.includes("already")) {
+                ctx.log("combat", `ðŸ›¸ Boarding: transition already queued â€” continuing to monitor`);
+                boardingActive = true;
+                boardStanceIssued = true;
+              } else {
+                ctx.log("combat", `âš ï¸ Boarding: re-issue board failed â€” ${boardResp.error.message} â€” switching to fire to finish`);
+                await bot.exec("battle", { action: "stance", stance: "fire" });
+                boardingActive = false;
+                boardStanceIssued = false;
+              }
+            } else {
+              ctx.log("combat", `ðŸ›¸ Boarding: board stance re-issued! Continuing operation.`);
+              boardingActive = true;
+              boardStanceIssued = true;
+            }
+            await ctx.sleep(2000);
+            continue;
+          }
+        } else {
+          const targetStillAlive = targetParticipant && !targetParticipant.is_destroyed;
+          if (!targetStillAlive) {
+            ctx.log("combat", `âœ… Boarding: ${target.name} eliminated during operation`);
+            return "target_eliminated";
+          }
+          const shieldPctNow = getTargetShieldPct(status, target.id, target.name);
+          const effectiveShieldThresholdNow = clampInfo.hasClamp ? shieldThreshold : 0;
+          if (shieldPctNow !== null && shieldPctNow <= effectiveShieldThresholdNow) {
+            ctx.log("combat", `â†©ï¸ Boarding: shields still low (${shieldPctNow}% â‰¤ ${effectiveShieldThresholdNow}%) â€” re-issuing board stance`);
+            const retryBoard = await bot.exec("battle", {
+              action: "stance",
+              stance: "board",
+              target_id: target.id,
+              marines: marines,
+            });
+              if (retryBoard.error) {
+                const msg = retryBoard.error.message.toLowerCase();
+                if (msg.includes("not in battle") || msg.includes("no active battle")) {
+                  ctx.log("combat", "âœ… Boarding: battle ended during board retry");
+                  await recloakAfterBattle(ctx, cloakOnStart);
+                  return "target_eliminated";
+                }
+              if (msg.includes("already") || msg.includes("queued")) {
+                ctx.log("combat", `ðŸ›¸ Boarding: board stance already queued â€” monitoring without further retries`);
+                boardingActive = true;
+                boardStanceIssued = true;
+              } else {
+                ctx.log("combat", `âš ï¸ Boarding: re-issue board failed â€” ${retryBoard.error.message}`);
+              }
+            } else {
+              ctx.log("combat", `ðŸ›¸ Boarding: board stance re-issued! Continuing operation.`);
+              boardingActive = true;
+              boardStanceIssued = true;
+            }
+          } else {
+            ctx.log("combat", `Boarding: operation ended, shields at ${shieldPctNow ?? "unknown"}% â€” finishing with fire stance`);
+            await bot.exec("battle", { action: "stance", stance: "fire" });
+            boardingActive = false;
+            boardStanceIssued = false;
+          }
+        }
+      }
+
+      // In-combat repair / shield top-up if needed
+      const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+      if (hullPct <= fleeThreshold) {
+        ctx.log("combat", `ðŸ’€ Boarding: hull critical (${hullPct}%) â€” FLEEING!`);
+        await emergencyFleeSpam(ctx, `hull at ${hullPct}% during boarding`);
+        return "retreat";
+      }
+      const shieldTopUpPct = shieldRechargePct / 100;
+      if (shieldPct < shieldTopUpPct * 100) {
+        await topUpShields(ctx, shieldTopUpPct);
+        await useRepairKits(ctx);
+      }
+
+      await ctx.sleep(BOARD_TICK_MS);
+   }
+  }
+
+    await recloakAfterBattle(ctx, cloakOnStart);
+    return "failed";
+  }
+
+/**
+ * Update the captured prize tracker with the actual prize data from get_nearby.
+ * This fixes mismatches where the initial ship_captured registration used the
+ * pre-capture ship_id instead of the prize's actual ship_id.
+ */
+function syncCapturedPrizeTracker(bot: Bot, prize: { ship_id?: string; prize_id?: string; ship_class?: string; status?: string }): void {
+  if (!prize.ship_id) return;
+  const existing = bot.getCapturedPrizeByShipId(prize.ship_id);
+  if (!existing && !prize.prize_id) return;
+  if (existing && existing.prize_id) {
+    if (prize.status === "claimed" || prize.status === "in_transit") {
+      bot.markPrizeClaimVerified(prize.ship_id);
+    }
+    return;
+  }
+  bot.registerCapturedPrize(prize.ship_id, prize.ship_class || "", "", prize.prize_id);
+  if (prize.status === "claimed" || prize.status === "in_transit") {
+    bot.markPrizeClaimVerified(prize.ship_id);
+  }
+}
+
+/**
+ * Check if a prize recovery is still present at the current POI via get_nearby.
+ */
+async function isPrizeStillAtPoi(ctx: RoutineContext, recovery: { prize_id: string; ship_id?: string; ship_class?: string }): Promise<boolean> {
+  const { bot } = ctx;
+  const nearbyResult = await getObservationOrNearby(bot);
+  const nearbyData = nearbyResult.result;
+  if (!nearbyData) return false;
+
+  const prizes = getNearbyPrizes(nearbyData);
+  const match = prizes.find(p => p.prize_id === recovery.prize_id || p.ship_id === recovery.ship_id);
+  if (match) {
+    syncCapturedPrizeTracker(bot, match);
+  }
+  return !!match;
+}
+
+const SERVICED_PRIZE_CACHE_TTL_MS = 60 * 1000;
+const servicedPrizeCache = new Map<string, number>();
+
+async function refuelSelfAfterPrize(ctx: RoutineContext, transferredFuel: number): Promise<void> {
+  const { bot } = ctx;
+
+  await bot.refreshShip();
+  const deficit = Math.max(0, bot.maxFuel - bot.fuel);
+  if (deficit <= 0) {
+    ctx.log("trade", "Self-refuel: ship already full â€” no refuel needed");
+    return;
+  }
+
+  const targetAdd = transferredFuel > 0
+    ? Math.ceil(transferredFuel / 100) * 100
+    : Math.ceil(deficit / 100) * 100;
+  const actualAdd = Math.min(targetAdd, deficit);
+  if (actualAdd <= 0) return;
+
+  const cellsNeeded = Math.ceil(actualAdd / 100);
+
+  if (bot.docked) {
+    const cellTypes = ["military_fuel_cell", "premium_fuel_cell", "fuel_cell"];
+    let withdrawn = 0;
+
+    for (const cellId of cellTypes) {
+      if (withdrawn >= cellsNeeded) break;
+      const remaining = cellsNeeded - withdrawn;
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: cellId,
+        quantity: remaining,
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Self-refuel: withdrew ${remaining} ${cellId} from faction storage`);
+        withdrawn += remaining;
+        break;
+      }
+    }
+
+    if (withdrawn <= 0) {
+      ctx.log("trade", "Self-refuel: no fuel cells available in faction storage");
+      return;
+    }
+
+    await bot.refreshCargo();
+
+    for (let i = 0; i < withdrawn && bot.state === "running"; i++) {
+      const rResp = await bot.exec("refuel");
+      if (rResp.error) {
+        ctx.log("error", `Self-refuel: refuel failed at cell ${i + 1}/${withdrawn}: ${rResp.error.message}`);
+        break;
+      }
+      await bot.refreshShip();
+      if (bot.fuel >= bot.maxFuel) break;
+    }
+
+    ctx.log("trade", `Self-refuel complete: added ${actualAdd} fuel (${withdrawn} cells)`);
+    return;
+  }
+
+  ctx.log("trade", "Self-refuel: not docked â€” attempting refuel from cargo fuel cells");
+  await bot.refreshCargo();
+  const cargoCells = bot.inventory
+    .filter((i) => ["military_fuel_cell", "premium_fuel_cell", "fuel_cell"].includes(i.itemId))
+    .reduce((s, i) => s + (i.quantity || 0), 0);
+
+  if (cargoCells <= 0) {
+    ctx.log("trade", "Self-refuel: no cargo fuel cells available while undocked â€” skipping");
+    return;
+  }
+
+  for (let i = 0; i < cellsNeeded && bot.state === "running"; i++) {
+    const rResp = await bot.exec("refuel");
+    if (rResp.error) {
+      ctx.log("error", `Self-refuel: refuel failed at cell ${i + 1}/${cellsNeeded}: ${rResp.error.message}`);
+      break;
+    }
+    await bot.refreshShip();
+    if (bot.fuel >= bot.maxFuel) break;
+  }
+
+  ctx.log("trade", `Self-refuel complete from cargo: added up to ${actualAdd} fuel`);
+}
+
+/**
+ * Service a prize (refuel/repair) via spacemolt_salvage service_prize.
+ */
+async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; ship_id?: string; ship_class?: string }, action: "refuel" | "repair" | "stop" | "resume" | "redirect", target?: string, quantity?: number): Promise<boolean> {
+  const { bot } = ctx;
+  const cacheKey = `${recovery.prize_id}|${action}`;
+  const cached = servicedPrizeCache.get(cacheKey);
+  if (cached && Date.now() - cached < SERVICED_PRIZE_CACHE_TTL_MS) {
+    return true;
+  }
+
+  if (action === "refuel") {
+    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelPct < 50) {
+      ctx.log("combat", `ServicePrize: ship fuel at ${fuelPct}% â€” topping up before prize refuel`);
+      await acquireFuelCellsAndRefuel(ctx);
+    }
+  }
+
+  const payload: Record<string, unknown> = {
+    id: recovery.prize_id,
+    service_action: action,
+  };
+  if (target) payload.target = target;
+  if (quantity !== undefined) payload.quantity = quantity;
+
+  const resp = await bot.exec("service_prize", payload);
+  if (resp.error) {
+    const msg = resp.error.message.toLowerCase();
+    if (msg.includes("not found") || msg.includes("invalid") || msg.includes("no prize")) {
+      ctx.log("combat", `ServicePrize: prize not found (${recovery.prize_id}) â€” may have left`);
+      return false;
+    }
+    if (msg.includes("fuel_full")) {
+      ctx.log("combat", `âœ… Prize ${recovery.ship_class || recovery.prize_id} already fully fueled`);
+      servicedPrizeCache.set(cacheKey, Date.now());
+      return true;
+    }
+    if (msg.includes("insufficient_resources") && action === "refuel") {
+      ctx.log("combat", `ServicePrize: insufficient resources to refuel prize â€” topping up ship fuel first`);
+      await acquireFuelCellsAndRefuel(ctx);
+      const retry = await bot.exec("service_prize", payload);
+      if (!retry.error) {
+        servicedPrizeCache.set(cacheKey, Date.now());
+        ctx.log("combat", `âœ… Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after refueling ship`);
+        const retryResult = retry.result as Record<string, unknown> | undefined;
+        const transferred = Math.abs((retryResult?.fuel as number) || (retryResult?.quantity as number) || 0);
+        await refuelSelfAfterPrize(ctx, transferred);
+        return true;
+      }
+      const retryMsg = retry.error.message.toLowerCase();
+      if (retryMsg.includes("fuel_full")) {
+        ctx.log("combat", `âœ… Prize ${recovery.ship_class || recovery.prize_id} already fully fueled (retry)`);
+        servicedPrizeCache.set(cacheKey, Date.now());
+        return true;
+      }
+      ctx.log("error", `ServicePrize retry failed (${action}): ${retry.error.message}`);
+      return false;
+    }
+    if (msg.includes("another action is already pending") || msg.includes("already pending")) {
+      ctx.log("combat", `ServicePrize: action already pending â€” waiting before retry`);
+      await ctx.sleep(3000);
+      const retry = await bot.exec("service_prize", payload);
+      if (!retry.error) {
+        servicedPrizeCache.set(cacheKey, Date.now());
+        ctx.log("combat", `âœ… Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after pending wait`);
+        const retryResult = retry.result as Record<string, unknown> | undefined;
+        const transferred = Math.abs((retryResult?.fuel as number) || (retryResult?.quantity as number) || 0);
+        await refuelSelfAfterPrize(ctx, transferred);
+        return true;
+      }
+      const retryMsg = retry.error.message.toLowerCase();
+      if (retryMsg.includes("fuel_full")) {
+        ctx.log("combat", `âœ… Prize ${recovery.ship_class || recovery.prize_id} already fully fueled (pending retry)`);
+        servicedPrizeCache.set(cacheKey, Date.now());
+        return true;
+      }
+      if (retryMsg.includes("insufficient_resources") && action === "refuel") {
+        ctx.log("combat", `ServicePrize: insufficient resources after pending wait â€” topping up ship fuel`);
+        await acquireFuelCellsAndRefuel(ctx);
+        const retry2 = await bot.exec("service_prize", payload);
+        if (!retry2.error) {
+          servicedPrizeCache.set(cacheKey, Date.now());
+          ctx.log("combat", `âœ… Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after refueling ship`);
+          const retry2Result = retry2.result as Record<string, unknown> | undefined;
+          const transferred = Math.abs((retry2Result?.fuel as number) || (retry2Result?.quantity as number) || 0);
+          await refuelSelfAfterPrize(ctx, transferred);
+          return true;
+        }
+      }
+      ctx.log("error", `ServicePrize pending retry failed (${action}): ${retry.error.message}`);
+      return false;
+    }
+    ctx.log("error", `ServicePrize failed (${action}): ${resp.error.message}`);
+    return false;
+  }
+
+  servicedPrizeCache.set(cacheKey, Date.now());
+  ctx.log("combat", `âœ… Prize ${recovery.ship_class || recovery.prize_id} serviced (${action})`);
+
+  if (action === "refuel") {
+    const result = resp.result as Record<string, unknown> | undefined;
+    const transferred = Math.abs((result?.fuel as number) || (result?.quantity as number) || quantity || 0);
+    await refuelSelfAfterPrize(ctx, transferred);
+  }
+
+  return true;
+}
+
+/**
+ * Service any stalled prizes at the current POI.
+ * Checks get_nearby for prizes with wait_reason set and attempts to fix them.
+ * The game enforces ownership â€” service_prize will fail if the prize isn't ours.
+ */
+async function serviceAnyStalledPrizes(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  const nearbyResult = await getObservationOrNearby(bot);
+  const nearbyData = nearbyResult.result;
+  if (!nearbyData) return;
+
+  const prizes = getNearbyPrizes(nearbyData);
+  for (const prize of prizes) {
+    if (!prize.wait_reason) continue;
+    if (bot.state !== "running") break;
+
+    ctx.log("combat", `ðŸ›¸ Prize ${prize.ship_name || prize.prize_id} stalled at ${bot.poi} (${prize.wait_reason}) â€” attempting service`);
+
+    if (prize.wait_reason === "no_fuel") {
+      await servicePrize(ctx, prize, "refuel");
+    } else if (prize.wait_reason === "incapacitated") {
+      ctx.log("combat", `Prize incapacitated â€” cannot auto-fix`);
+    } else if (prize.wait_reason === "destination_missing") {
+      ctx.log("combat", `Prize destination missing â€” cannot auto-fix`);
+    } else if (prize.wait_reason === "no_route") {
+      ctx.log("combat", `Prize has no route â€” cannot auto-fix`);
+    } else if (prize.wait_reason === "manual_stop") {
+      await servicePrize(ctx, prize, "resume");
     }
   }
 }
 
+// â”€â”€ Prize Recovery â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// After a successful boarding capture, the prize ship remains at the current
+// POI until claimed. The bot must be at the same POI (out of combat), then
+// issue spacemolt_salvage(claim_prize, ...) with a destination station base ID.
+// The prize then autonomously travels to the destination and appears in
+// get_status().prize_recoveries with status "in_transit".
 
+/**
+ * Extract intact prize ships from a get_nearby / observation result.
+ * Prizes appear in the `nearby_prizes` array of the get_nearby response.
+ */
+function getNearbyPrizes(result: unknown): PrizeInfo[] {
+  if (!result || typeof result !== "object") return [];
+  const r = result as Record<string, unknown>;
+  const prizesFromPrizes = Array.isArray(r.prizes) ? r.prizes : [];
+  const prizesFromNearby = Array.isArray(r.nearby_prizes) ? r.nearby_prizes : [];
+  const prizesRaw = prizesFromPrizes.length > 0 ? prizesFromPrizes : prizesFromNearby;
+  if (!prizesRaw || !Array.isArray(prizesRaw)) return [];
+
+  return prizesRaw.map(p => ({
+    prize_id: p.prize_id as string,
+    actor_id: p.actor_id as string,
+    ship_id: p.ship_id as string,
+    ship_class: p.ship_class as string,
+    ship_name: p.ship_name as string | undefined,
+    status: (p.status as PrizeInfo["status"]) || "available",
+    hull: p.hull as number,
+    max_hull: p.max_hull as number,
+    shield: p.shield as number,
+    max_shield: p.max_shield as number,
+    in_combat: p.in_combat as boolean,
+    wait_reason: p.wait_reason as PrizeInfo["wait_reason"] | undefined,
+  }));
+}
+
+/**
+ * Find a station base ID to use as the prize recovery destination.
+ *
+ * When boarding mode is enabled and a `boardingPrizeDestination` is set on the
+ * patrol profile, that station is used instead of the global `homeStation`.
+ * This lets the boarding hunter send captured prizes to a nearby station
+ * rather than crossing the galaxy to the home base.
+ *
+ * The destination is almost never in the current system, so we resolve it
+ * from the global mapStore to get its `base_id`. claim_prize requires the
+ * `base_id`, not the POI `id`.
+ *
+ * IMPORTANT: The destination may be stored as "system|poi" (e.g. "arneb|a356fc2c...").
+ * We must extract the poi part BEFORE matching, otherwise the `|` breaks the lookup
+ * and we return the raw string which claim_prize rejects.
+ */
+async function findDestinationBaseId(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<string | null> {
+  const destination = settings.boardingEnabled && settings.boardingPrizeDestination
+    ? settings.boardingPrizeDestination
+    : (settings.homeStation || "");
+  if (!destination) return null;
+
+  // Handle "system|poi" format â€” extract the poi part for lookup
+  const homePoi = destination.includes("|") ? destination.split("|")[1] : destination;
+  const lowerHomePoi = homePoi.toLowerCase();
+
+  // Resolve from mapStore (home station is global, not local)
+  const allSystems = mapStore.getAllSystems();
+  for (const [sysId, sys] of Object.entries(allSystems)) {
+    for (const poi of sys.pois) {
+      const travelId = poi.base_id || poi.id;
+      if (
+        travelId.toLowerCase() === lowerHomePoi ||
+        poi.id.toLowerCase() === lowerHomePoi ||
+        poi.base_id?.toLowerCase() === lowerHomePoi ||
+        (poi.base_name && poi.base_name.toLowerCase().includes(lowerHomePoi.replace(/_/g, " "))) ||
+        (poi.name && poi.name.toLowerCase().includes(lowerHomePoi.replace(/_/g, " ")))
+      ) {
+        return poi.base_id || poi.id;
+      }
+    }
+  }
+
+  // If we couldn't resolve it, return the raw setting as a last resort
+  // (it might already be a base_id)
+  return destination;
+}
+
+/**
+ * Search all POIs in the current system for a prize matching the given ship_id
+ * (if provided), or any available prize. When found, claim it with a destination
+ * station.
+ *
+ * Battles are system-wide, so a captured prize may appear at a different POI
+ * than where the bot is currently located.
+ */
+async function findAndClaimPrizeAcrossSystem(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, knownShipId?: string): Promise<boolean> {
+  const { bot } = ctx;
+  const destBaseId = await findDestinationBaseId(ctx, settings);
+  if (!destBaseId) {
+    ctx.log("combat", "FindPrize: no destination station found â€” cannot claim prize");
+    return false;
+  }
+
+  const { pois } = await getSystemInfo(ctx);
+  if (!pois || pois.length === 0) {
+    ctx.log("combat", "FindPrize: no POIs found in current system");
+    return false;
+  }
+
+  // Exclude stations from the POI search
+  const searchPois = pois.filter(p => !isStationPoi(p));
+  if (searchPois.length === 0) return false;
+
+  // If we're already at a POI, check it first before traveling
+  const currentPoiMatch = searchPois.find(p => p.id === bot.poi || p.name === bot.poi);
+  const orderedPois = currentPoiMatch ? [currentPoiMatch, ...searchPois.filter(p => p !== currentPoiMatch)] : searchPois;
+
+  for (const poi of orderedPois) {
+    if (bot.state !== "running") return false;
+
+    // Travel to this POI if not already there
+    if (bot.poi !== poi.id) {
+      ctx.log("travel", `ðŸ” FindPrize: searching for prize at ${poi.name}...`);
+      const travelResp = await bot.exec("travel", { target_poi: poi.id });
+      if (travelResp.error && !travelResp.error.message.includes("already")) {
+        ctx.log("combat", `FindPrize: could not travel to ${poi.name}: ${travelResp.error.message}`);
+        continue;
+      }
+      await ctx.sleep(2000);
+    }
+
+    // Check for prizes at this POI
+    const nearbyResult = await getObservationOrNearby(bot);
+    const nearbyData = nearbyResult.result;
+    if (!nearbyData) continue;
+
+      const prizes = getNearbyPrizes(nearbyData);
+      
+      // First check for prizes matching our captured prize tracker.
+      // A prize with status="claimed" but no wait_reason is freshly claimed
+      // and hasn't appeared in get_status prize_recoveries yet â€” claim it.
+      // A prize with status="claimed" AND a wait_reason is already claimed
+      // and stalled (e.g. no_fuel) â€” skip it to avoid re-issuing claim_prize.
+      let availablePrize = prizes.find(p => {
+        const match = bot.findCapturedPrizeMatch(p);
+        return match && (p.status === "available" || (p.status === "claimed" && !p.wait_reason));
+      });
+
+      // Fall back to knownShipId match
+      if (!availablePrize && knownShipId) {
+        availablePrize = prizes.find(p =>
+          (p.status === "available" || (p.status === "claimed" && !p.wait_reason)) &&
+          p.ship_id === knownShipId,
+        );
+      }
+
+      if (!availablePrize) {
+        continue;
+      }
+
+      if (availablePrize) {
+        ctx.log("combat", `ðŸ›¸ FindPrize: found prize ${availablePrize.ship_name || availablePrize.prize_id} at ${poi.name}!`);
+        
+        const trackedMatch = bot.findCapturedPrizeMatch(availablePrize);
+        if (trackedMatch) {
+          ctx.log("combat", `ðŸ›¸ FindPrize: matched tracked capture ship_id=${trackedMatch.ship_id}`);
+        }
+
+        // NOTE: Cannot refuel before claiming â€” only the claimant can service a prize,
+        // and claiming sends it off immediately. We verify post-claim via get_nearby.
+
+        const claimResp = await bot.exec("claim_prize", {
+          id: availablePrize.prize_id,
+          target: destBaseId,
+          crew_disposition: "aboard",
+        });
+
+       if (claimResp.error) {
+         const msg = claimResp.error.message.toLowerCase();
+         if (msg.includes("no prize") || msg.includes("not found") || msg.includes("invalid")) {
+           ctx.log("combat", `FindPrize: prize not claimable (${claimResp.error.message}) â€” may already be claimed`);
+           continue;
+         }
+         ctx.log("error", `FindPrize: claim failed: ${claimResp.error.message}`);
+         continue;
+       }
+
+       // VERIFY: Check get_nearby to confirm the prize is now claimed/in_transit
+       await ctx.sleep(2000);
+       const verifyResult = await getObservationOrNearby(bot);
+       const verifyData = verifyResult.result;
+       if (verifyData) {
+         const verifyPrizes = getNearbyPrizes(verifyData);
+         const verifyPrize = verifyPrizes.find(p => p.prize_id === availablePrize.prize_id || p.ship_id === availablePrize.ship_id);
+          if (verifyPrize) {
+            const newStatus = verifyPrize.status;
+            if (newStatus === "claimed" || newStatus === "in_transit") {
+              // If claimed but immediately stalled, don't report success
+              if (newStatus === "claimed" && verifyPrize.wait_reason) {
+                ctx.log("combat", `âš ï¸ FindPrize: prize verified as claimed but stalled (${verifyPrize.wait_reason}) â€” needs servicing`);
+                if (verifyPrize.ship_id && verifyPrize.prize_id) {
+                  const existing = bot.getCapturedPrizeByShipId(verifyPrize.ship_id);
+                  if (existing) {
+                    bot.registerCapturedPrize(verifyPrize.ship_id, verifyPrize.ship_class || existing.ship_class, existing.battle_id, verifyPrize.prize_id);
+                  }
+                }
+                continue;
+              }
+              ctx.log("combat", `âœ… Prize ${availablePrize.ship_name || availablePrize.prize_id} verified as ${newStatus} via get_nearby!`);
+             
+             // Update the tracker
+             if (verifyPrize.ship_id && verifyPrize.prize_id) {
+               const existing = bot.getCapturedPrizeByShipId(verifyPrize.ship_id);
+               if (existing) {
+                 bot.registerCapturedPrize(verifyPrize.ship_id, verifyPrize.ship_class || existing.ship_class, existing.battle_id, verifyPrize.prize_id);
+               }
+             }
+             
+             return true;
+             } else if (newStatus === "available") {
+               ctx.log("combat", `âš ï¸ FindPrize: prize still shows as "available" after claim (verification lag) â€” treating as success`);
+               if (verifyPrize.ship_id && verifyPrize.prize_id) {
+                 const existing = bot.getCapturedPrizeByShipId(verifyPrize.ship_id);
+                 if (existing) {
+                   bot.registerCapturedPrize(verifyPrize.ship_id, verifyPrize.ship_class || existing.ship_class, existing.battle_id, verifyPrize.prize_id);
+                 }
+               }
+               return true;
+             }
+          }
+        }
+
+        ctx.log("combat", `âš ï¸ FindPrize: prize not visible after claim â€” cannot verify`);
+        continue;
+      }
+   }
+
+  return false;
+}
+
+/**
+ * Attempt to claim a prize at the current POI.
+ *
+ * After a successful boarding, the prize ship should be at the same POI,
+ * out of combat. This function finds the prize in nearby_prizes, determines
+ * a destination station, and calls claim_prize to send the prize recovering
+ * to that station.
+ *
+ * When requireTrackerMatch is false (default true), any available/claimed
+ * prize at the current POI will be claimed. The game enforces ownership.
+ *
+ * Returns true if the prize was claimed, false otherwise.
+ */
+async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, requireTrackerMatch: boolean = true, specificPrize?: PrizeInfo): Promise<boolean> {
+  const { bot } = ctx;
+
+  // Need to be out of combat to claim a prize
+  const battle = await getBattleStatus(ctx);
+  if (battle) {
+    ctx.log("combat", "ClaimPrize: still in battle â€” cannot claim prize yet");
+    return false;
+  }
+
+  // Scan nearby for prizes
+  const nearbyResult = await getObservationOrNearby(bot);
+  const nearbyData = nearbyResult.result;
+  if (!nearbyData) {
+    ctx.log("combat", "ClaimPrize: no nearby data â€” cannot check for prizes");
+    return false;
+  }
+
+  const prizes = getNearbyPrizes(nearbyData);
+  
+  let availablePrize: PrizeInfo | undefined;
+
+  if (specificPrize) {
+    availablePrize = specificPrize;
+  } else if (requireTrackerMatch) {
+    // Only claim prizes matching our captured ship tracker.
+    // A prize with status="claimed" but no wait_reason is freshly claimed and
+    // hasn't appeared in get_status prize_recoveries yet â€” claim it to assign a
+    // destination. But a prize with status="claimed" AND a wait_reason is
+    // already claimed and stalled (e.g. no_fuel) â€” re-issuing claim_prize is
+    // idempotent and does nothing, so skip it to avoid an infinite loop.
+    availablePrize = prizes.find(p => {
+      const match = bot.findCapturedPrizeMatch(p);
+      return match && (p.status === "available" || (p.status === "claimed" && !p.wait_reason));
+    });
+    
+    if (!availablePrize) {
+      if (prizes.length > 0) {
+        ctx.log("combat", `ClaimPrize: found ${prizes.length} prize(s) but none match captured ship tracker`);
+      }
+      return false;
+    }
+  } else {
+    // Claim any available prize, or a claimed prize without a wait_reason
+    availablePrize = prizes.find(p => p.status === "available" || (p.status === "claimed" && !p.wait_reason));
+    if (!availablePrize) {
+      return false;
+    }
+  }
+  
+  // Log if this prize matches a tracked capture
+  const trackedMatch = bot.findCapturedPrizeMatch(availablePrize);
+  if (trackedMatch) {
+    ctx.log("combat", `ðŸ›¸ ClaimPrize: matched tracked capture ship_id=${trackedMatch.ship_id} prize_id=${availablePrize.prize_id}`);
+  }
+
+  // Find a destination station
+  const destBaseId = await findDestinationBaseId(ctx, settings);
+  if (!destBaseId) {
+    ctx.log("combat", "ClaimPrize: no destination station found to send prize to");
+    return false;
+  }
+
+  ctx.log("combat", `ðŸ›¸ Claiming prize ${availablePrize.ship_name || availablePrize.prize_id} â†’ destination: ${destBaseId}`);
+
+  // NOTE: Cannot refuel before claiming â€” only the claimant can service a prize,
+  // and claiming sends it off immediately. We verify post-claim via get_nearby.
+
+  const claimResp = await bot.exec("claim_prize", {
+    id: availablePrize.prize_id,
+    target: destBaseId,
+    crew_disposition: "aboard",
+  });
+
+  if (claimResp.error) {
+    const msg = claimResp.error.message.toLowerCase();
+    if (msg.includes("no prize") || msg.includes("not found") || msg.includes("invalid")) {
+      ctx.log("combat", `ClaimPrize: prize not claimable (${claimResp.error.message}) â€” may already be claimed`);
+      return false;
+    }
+    if (msg.includes("rate limit") || msg.includes("retry")) {
+      ctx.log("combat", `ClaimPrize: rate limited â€” will retry next tick`);
+      return false;
+    }
+    ctx.log("error", `ClaimPrize failed: ${claimResp.error.message}`);
+    return false;
+  }
+
+  // VERIFY: Check get_nearby to confirm the prize is now claimed/in_transit
+  await ctx.sleep(2000);
+  const verifyResult = await getObservationOrNearby(bot);
+  const verifyData = verifyResult.result;
+  if (verifyData) {
+    const verifyPrizes = getNearbyPrizes(verifyData);
+    const verifyPrize = verifyPrizes.find(p => p.prize_id === availablePrize.prize_id || p.ship_id === availablePrize.ship_id);
+    if (verifyPrize) {
+      const newStatus = verifyPrize.status;
+      if (newStatus === "claimed" || newStatus === "in_transit") {
+        // If the prize is claimed but immediately stalled (e.g. no_fuel),
+        // don't report success â€” the recovery isn't progressing. Return false
+        // so recoverPrize services it directly instead of looping on re-claim.
+        if (newStatus === "claimed" && verifyPrize.wait_reason) {
+          ctx.log("combat", `âš ï¸ ClaimPrize: prize verified as claimed but stalled (${verifyPrize.wait_reason}) â€” needs servicing`);
+          // Still update the tracker with the confirmed prize_id
+          if (verifyPrize.ship_id && verifyPrize.prize_id) {
+            const existing = bot.getCapturedPrizeByShipId(verifyPrize.ship_id);
+            if (existing) {
+              bot.registerCapturedPrize(verifyPrize.ship_id, verifyPrize.ship_class || existing.ship_class, existing.battle_id, verifyPrize.prize_id);
+            }
+          }
+          return false;
+        }
+        ctx.log("combat", `âœ… Prize ${availablePrize.ship_name || availablePrize.prize_id} verified as ${newStatus} via get_nearby!`);
+        
+        // Update the tracker with the confirmed prize_id
+        if (verifyPrize.ship_id && verifyPrize.prize_id) {
+          const existing = bot.getCapturedPrizeByShipId(verifyPrize.ship_id);
+          if (existing) {
+            bot.registerCapturedPrize(verifyPrize.ship_id, verifyPrize.ship_class || existing.ship_class, existing.battle_id, verifyPrize.prize_id);
+          }
+        }
+        
+        return true;
+      } else if (newStatus === "available") {
+        ctx.log("combat", `âš ï¸ ClaimPrize: prize still shows as "available" after claim command (verification lag) â€” treating as success`);
+        // Update the tracker with the confirmed prize_id if visible
+        if (verifyPrize.ship_id && verifyPrize.prize_id) {
+          const existing = bot.getCapturedPrizeByShipId(verifyPrize.ship_id);
+          if (existing) {
+            bot.registerCapturedPrize(verifyPrize.ship_id, verifyPrize.ship_class || existing.ship_class, existing.battle_id, verifyPrize.prize_id);
+          }
+        }
+        return true;
+      }
+    }
+  }
+
+  ctx.log("combat", `âš ï¸ ClaimPrize: prize not visible after claim â€” cannot verify`);
+
+  // FALLBACK: Check get_status prize_recoveries to confirm the claim worked
+  const statusResp = await bot.exec("get_status");
+  if (!statusResp.error && statusResp.result && typeof statusResp.result === "object") {
+    const statusRecoveries = (statusResp.result as Record<string, unknown>)?.prize_recoveries as Array<Record<string, unknown>> | undefined;
+    const statusRecovery = statusRecoveries?.find((pr: Record<string, unknown>) => (pr.prize_id as string) === availablePrize.prize_id || (pr.ship_id as string) === availablePrize.ship_id);
+    if (statusRecovery && (statusRecovery.status === "claimed" || statusRecovery.status === "in_transit")) {
+      ctx.log("combat", `âœ… Prize ${availablePrize.ship_name || availablePrize.prize_id} verified as ${statusRecovery.status} via get_status!`);
+      const recoveryShipId = statusRecovery.ship_id as string | undefined;
+      const recoveryPrizeId = statusRecovery.prize_id as string | undefined;
+      const recoveryShipClass = statusRecovery.ship_class as string | undefined;
+      if (recoveryShipId && recoveryPrizeId) {
+        const existing = bot.getCapturedPrizeByShipId(recoveryShipId);
+        if (existing) {
+          bot.registerCapturedPrize(recoveryShipId, recoveryShipClass || existing.ship_class, existing.battle_id, recoveryPrizeId);
+        }
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * After a boarding capture, attempt to claim the prize and monitor its
+ * recovery state until it reaches a terminal state.
+ *
+ * Battles are system-wide, so the prize ship may be at a different POI than
+ * where the bot is currently located. This function searches all system POIs
+ * for the prize if it's not at the current POI.
+ *
+ * Terminal states: delivered, destroyed, expired, recaptured.
+ * Non-terminal states: available, claimed, in_transit.
+ *
+ * Returns true if the prize was successfully delivered, false otherwise.
+ */
+async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, knownShipId?: string): Promise<boolean> {
+  const { bot } = ctx;
+  const maxWaitTicks = 30;
+  let waitTick = 0;
+
+  bot.pruneStaleCapturedPrizes();
+
+  while (bot.state === "running" && waitTick < maxWaitTicks) {
+    waitTick++;
+
+    await bot.refreshStatus();
+    const recoveries = bot.prizeRecoveries;
+
+    // PHASE 1: Claim every available prize at the current POI.
+    // Keep looping until get_nearby reports NO available prizes,
+    // so we never leave a prize behind because a single claim attempt
+    // failed (e.g. "Another action is already pending").
+    const nearbyResult = await getObservationOrNearby(bot);
+    const nearbyData = nearbyResult.result;
+    if (nearbyData) {
+      const nearbyPrizes = getNearbyPrizes(nearbyData);
+      const availablePrizes = nearbyPrizes.filter(
+        p => p.status === "available" || (p.status === "claimed" && !p.wait_reason),
+      );
+
+      if (availablePrizes.length > 0) {
+        for (const prize of availablePrizes) {
+          if (bot.state !== "running") return false;
+
+          const trackedMatch = bot.findCapturedPrizeMatch(prize);
+          if (!trackedMatch && !knownShipId && prize.status === "available") {
+            ctx.log("combat", `ðŸ›¸ RecoverPrize: found untracked available prize ${prize.ship_name || prize.prize_id} â€” claiming`);
+            const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false, prize);
+            if (claimed) {
+              ctx.log("combat", `ðŸ† Untracked prize ${prize.ship_name || prize.prize_id} claimed`);
+              if (prize.ship_id && prize.prize_id) {
+                bot.registerCapturedPrize(prize.ship_id, prize.ship_class || "", "", prize.prize_id);
+              }
+            }
+            await ctx.sleep(2000);
+            continue;
+          }
+
+          if (trackedMatch || knownShipId) {
+            if (prize.status === "claimed") {
+              const verifyEntry = trackedMatch || (knownShipId ? bot.getCapturedPrizeByShipId(knownShipId) : undefined);
+              if (verifyEntry) bot.markPrizeClaimVerified(verifyEntry.ship_id);
+            }
+            ctx.log("combat", `ðŸ›¸ RecoverPrize: attempting claim for ${prize.ship_name || prize.prize_id} (status=${prize.status})`);
+            const claimed = await claimPrizeAtCurrentPoi(ctx, settings, true, prize);
+            if (claimed) {
+              ctx.log("combat", `ðŸ† RecoverPrize: prize ${prize.ship_name || prize.prize_id} claimed successfully`);
+              if (prize.ship_id && prize.prize_id) {
+                const existing = bot.getCapturedPrizeByShipId(prize.ship_id);
+                if (existing) {
+                  bot.registerCapturedPrize(prize.ship_id, prize.ship_class || existing.ship_class, existing.battle_id, prize.prize_id);
+                }
+              }
+            }
+            await ctx.sleep(2000);
+          }
+        }
+
+        await bot.refreshStatus();
+        const updatedRecoveries = bot.prizeRecoveries;
+        const hasActiveRecovery = updatedRecoveries.some(r => {
+          const entry = bot.capturedPrizeTracker.get(r.ship_id) || (r.prize_id ? bot.capturedPrizeTracker.get(r.prize_id) : undefined);
+          return entry && (r.status === "in_transit" || r.status === "claimed");
+        });
+
+        if (hasActiveRecovery) {
+          ctx.log("combat", "RecoverPrize: prize claimed, waiting for it to leave POI...");
+          await ctx.sleep(5000);
+          continue;
+        }
+
+        const postClaimNearby = await getObservationOrNearby(bot);
+        const postClaimData = postClaimNearby.result;
+        if (postClaimData) {
+          const postClaimPrizes = getNearbyPrizes(postClaimData);
+          const stillAvailable = postClaimPrizes.filter(
+            p => p.status === "available" || (p.status === "claimed" && !p.wait_reason),
+          );
+          if (stillAvailable.length > 0) {
+            ctx.log("combat", `RecoverPrize: ${stillAvailable.length} prize(s) still available after claim attempt â€” retrying next tick`);
+            await ctx.sleep(5000);
+            continue;
+          }
+        }
+
+        // No prizes visible at all, and no active recovery â€” the prize may still
+        // be spawning. Do NOT give up; wait and retry on the next tick.
+        ctx.log("combat", `RecoverPrize: no prizes visible and no active recovery â€” prize may still be spawning, waiting (tick ${waitTick}/${maxWaitTicks})`);
+        await ctx.sleep(5000);
+        continue;
+      }
+
+      const stalled = nearbyPrizes.find(p => {
+        const match = bot.findCapturedPrizeMatch(p);
+        return match && p.status === "claimed" && p.wait_reason;
+      });
+      if (stalled) {
+        // The prize was found at the POI with status=claimed â€” it is ours.
+        // Mark it verified so that if it disappears from get_nearby later,
+        // we know it left the POI (success) rather than "still spawning".
+        const stalledMatch = bot.findCapturedPrizeMatch(stalled);
+        if (stalledMatch) bot.markPrizeClaimVerified(stalledMatch.ship_id);
+
+        if (stalled.wait_reason === "no_fuel") {
+          ctx.log("combat", `RecoverPrize: prize stalled (no_fuel) â€” attempting refuel`);
+          await servicePrize(ctx, stalled, "refuel");
+        } else if (stalled.wait_reason === "manual_stop") {
+          ctx.log("combat", `RecoverPrize: prize manually stopped â€” attempting resume`);
+          await servicePrize(ctx, stalled, "resume");
+        } else {
+          ctx.log("combat", `RecoverPrize: prize stalled (${stalled.wait_reason}) â€” cannot auto-fix, waiting`);
+        }
+        await ctx.sleep(5000);
+        continue;
+      }
+    }
+
+    const trackedEntries = Array.from(bot.capturedPrizeTracker.values());
+    let targetEntry = trackedEntries.find((e: { ship_id?: string; prize_id?: string; claim_verified?: boolean }) => {
+      if (knownShipId && e.ship_id === knownShipId) return true;
+      return e.ship_id && recoveries.some(r => r.ship_id === e.ship_id || r.prize_id === e.prize_id);
+    });
+    if (!targetEntry && trackedEntries.length > 0) {
+      targetEntry = trackedEntries[0];
+    }
+
+    if (!targetEntry) {
+      ctx.log("combat", `RecoverPrize: no tracked captured prize â€” aborting`);
+      return false;
+    }
+
+    const recovery = recoveries.find(r => r.ship_id === targetEntry.ship_id || r.prize_id === targetEntry.prize_id);
+
+    if (!recovery) {
+      ctx.log("combat", `RecoverPrize: no recovery entry for tracked prize ship=${targetEntry.ship_id} prize=${targetEntry.prize_id || "?"}`);
+      const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
+      if (claimed) {
+        ctx.log("combat", `ðŸ† RecoverPrize: prize claimed, waiting for it to leave POI...`);
+        await ctx.sleep(5000);
+        continue;
+      }
+
+      const nearbyAfterFail = await getObservationOrNearby(bot);
+      const nearbyAfterFailData = nearbyAfterFail.result;
+      if (nearbyAfterFailData) {
+        const nearbyAfterFailPrizes = getNearbyPrizes(nearbyAfterFailData);
+        const targetPrize = nearbyAfterFailPrizes.find(p =>
+          p.ship_id === targetEntry.ship_id || p.prize_id === targetEntry.prize_id,
+        );
+        if (!targetPrize) {
+          // If we previously verified this prize at the POI (saw it with
+          // status=claimed after servicing), its absence from get_nearby means
+          // it left the POI â€” recovery is complete. Do NOT keep waiting.
+          if (targetEntry.claim_verified) {
+            ctx.log("combat", `âœ… RecoverPrize: tracked prize ${targetEntry.ship_id.slice(0,8)} no longer visible â€” left POI after being claimed (verified earlier)`);
+            bot.capturedPrizeTracker.delete(targetEntry.ship_id);
+            return true;
+          }
+          // Prize not visible yet â€” it may still be spawning. Do NOT delete the
+          // tracker entry; wait and retry instead.
+          ctx.log("combat", `RecoverPrize: tracked prize ${targetEntry.ship_id.slice(0,8)} not yet visible â€” waiting for spawn (tick ${waitTick}/${maxWaitTicks})`);
+          await ctx.sleep(5000);
+          continue;
+        }
+        if (targetPrize.status === "available" || (targetPrize.status === "claimed" && !targetPrize.wait_reason)) {
+          ctx.log("combat", `RecoverPrize: claim at current POI failed â€” will retry next tick (tick ${waitTick}/${maxWaitTicks})`);
+          await ctx.sleep(10000);
+          continue;
+        }
+      }
+      await ctx.sleep(10000);
+      continue;
+    }
+
+    ctx.log("combat", `RecoverPrize[t=${targetEntry.ship_id.slice(0,8)}]: status=${recovery.status} fuel=${recovery.fuel}/${recovery.max_fuel} hull=${recovery.hull}/${recovery.max_hull} wait=${recovery.wait_reason || "none"}`);
+
+    if (recovery.status === "delivered") {
+      ctx.log("combat", `âœ… Prize ${recovery.ship_name || recovery.prize_id} delivered to ${recovery.destination_base_id}!`);
+      bot.capturedPrizeTracker.delete(targetEntry.ship_id);
+      return true;
+    }
+    if (recovery.status === "destroyed" || recovery.status === "expired" || recovery.status === "recaptured") {
+      ctx.log("combat", `RecoverPrize: prize ${recovery.status} â€” aborting recovery`);
+      bot.capturedPrizeTracker.delete(targetEntry.ship_id);
+      return false;
+    }
+
+    if (recovery.status === "claimed" || recovery.status === "in_transit") {
+      const stillThere = await isPrizeStillAtPoi(ctx, recovery);
+      if (!stillThere) {
+        ctx.log("combat", `âœ… Prize ${recovery.ship_name || recovery.prize_id} left the POI â€” recovery complete`);
+        bot.capturedPrizeTracker.delete(targetEntry.ship_id);
+        return true;
+      }
+
+      if (recovery.wait_reason === "no_fuel") {
+        ctx.log("combat", `RecoverPrize: prize stalled (no_fuel) â€” attempting refuel`);
+        const refueled = await servicePrize(ctx, recovery, "refuel");
+        if (!refueled) {
+          ctx.log("combat", `RecoverPrize: refuel failed â€” will retry next tick`);
+        }
+      } else if (recovery.wait_reason === "incapacitated") {
+        ctx.log("combat", `RecoverPrize: prize stalled (incapacitated) â€” cannot auto-fix, waiting`);
+      } else if (recovery.wait_reason === "destination_missing") {
+        ctx.log("combat", `RecoverPrize: prize stalled (destination_missing) â€” cannot auto-fix, waiting`);
+      } else if (recovery.wait_reason === "no_route") {
+        ctx.log("combat", `RecoverPrize: prize stalled (no_route) â€” cannot auto-fix, waiting`);
+      } else if (recovery.wait_reason === "manual_stop") {
+        ctx.log("combat", `RecoverPrize: prize manually stopped â€” attempting resume`);
+        const resumed = await servicePrize(ctx, recovery, "resume");
+        if (!resumed) {
+          ctx.log("combat", `RecoverPrize: resume failed â€” will retry next tick`);
+        }
+      }
+    }
+
+    await ctx.sleep(10000);
+  }
+
+  if (waitTick >= maxWaitTicks) {
+    ctx.log("combat", "RecoverPrize: timed out waiting for prize to leave POI");
+  }
+  return false;
+}
+
+/**
+ * After clearing all pirates in a stronghold, retreat to outer, optionally
+ * brace, flee from the remaining station attackers, and re-cloak.
+ *
+ * This is the post-clear sequence for boarding mode: once every non-station
+ * enemy is captured or destroyed, the station is still firing on us. We
+ * explicitly disengage so the bot can safely claim prizes and resume the
+ * patrol loop without tanking unnecessary station damage.
+ */
+async function retreatFromStronghold(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+
+  if (settings.boardingBraceOnRetreat) {
+    ctx.log("combat", "Boarding retreat: bracing to reduce incoming damage while retreating");
+    const braceResp = await bot.exec("battle", { action: "stance", stance: "brace" });
+    if (braceResp.error) {
+      ctx.log("warn", `Boarding retreat: brace failed: ${braceResp.error.message}`);
+    }
+    await ctx.sleep(10000);
+  }
+
+  ctx.log("combat", "Boarding retreat: moving to outer range (3 retreats)");
+  for (let i = 0; i < 3; i++) {
+    ctx.log("combat", `Boarding retreat: retreat ${i + 1}/3`);
+    const retreatResp = await bot.exec("battle", { action: "retreat" });
+    await ctx.sleep(10000);
+
+    if (retreatResp.error) {
+      ctx.log("warn", `Boarding retreat: retreat ${i + 1}/3 failed: ${retreatResp.error.message}`);
+    }
+  }
+
+  ctx.log("combat", "Boarding retreat: switching to flee stance");
+  const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+  if (fleeResp.error) {
+    ctx.log("warn", `Boarding retreat: flee stance failed: ${fleeResp.error.message}`);
+  }
+  await ctx.sleep(10000);
+
+  for (let retry = 0; retry < 3; retry++) {
+    const status = await getBattleStatus(ctx);
+    if (!status) {
+      await recloakAfterBattle(ctx, settings.cloakOnStart);
+      return;
+    }
+    if (retry > 0) {
+      ctx.log("combat", `Boarding retreat: still in battle after flee â€” waiting before re-cloak attempt ${retry + 1}/3`);
+      await ctx.sleep(3000);
+    }
+  }
+  await recloakAfterBattle(ctx, settings.cloakOnStart);
+}
+
+/**
+ * If we are still in a battle after boarding and the only remaining enemies
+ * are stations, flee that battle so prize claims can proceed.
+ */
+async function maybeFleeStationAfterBoarding(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<void> {
+  const status = await getBattleStatus(ctx);
+  if (!status) return;
+
+  const nonStationEnemies = status.participants.filter(p => {
+    if (p.side_id === status.your_side_id || p.is_destroyed) return false;
+    const shipClass = (p.ship_class || "").toLowerCase();
+    const kind = (p as any).kind || "";
+    return shipClass !== "station" && kind.toLowerCase() !== "station";
+  });
+
+  if (nonStationEnemies.length === 0) {
+    ctx.log("combat", "Boarding cleanup: only station enemies remain â€” fleeing battle");
+    await retreatFromStronghold(ctx, settings);
+  }
+}
+
+// â”€â”€ Boarding Routine (patrol mode with boarding) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// Similar patrol flow to roam_systems / cycle_patrols, but when boarding is
+// enabled and a target's shields drop below the configured threshold, the
+// hunter initiates a boarding operation instead of destroying the target.
+// Supports multi-system patrol via hunter patrol profiles (hunterPatrols)
+// or the legacy single `system` setting.
+
+async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshLocation();
+  let totalKills = 0;
+  let totalBoardings = 0;
+
+  await ensureObservationSubscribed();
+  await ensureHunterCoordListener(bot.username);
+
+  const all = readSettings();
+  const h = (all.hunter || {}) as any;
+  const hunterPatrols: HunterPatrolProfile[] = Array.isArray(h.hunterPatrols) ? h.hunterPatrols : [];
+  let stayPoiAnchor: { system: string; poi: string } | null = null;
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+
+    // â”€â”€ Death recovery â”€â”€
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
+    const safetyOpts = {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
+      skipBlacklist: true,
+      isCombatBot: true,
+      joinBattles: true,
+    };
+
+    // â”€â”€ Status â”€â”€
+    yield "get_status";
+    await bot.refreshLocation();
+    logStatus(ctx);
+
+    // â”€â”€ Fuel â”€â”€
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
+      continue;
+    }
+
+    // â”€â”€ Can we make it home with remaining fuel? â”€â”€
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+      if (canMakeItHome) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
+        await returnToHomeAndResupply(ctx, settings);
+        continue;
+      }
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home — proceeding anyway`);
+    }
+
+    // â”€â”€ Hull check â€” retreat to a high-security system to repair â”€â”€
+     await bot.refreshShip();
+     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+     if (hullPct <= settings.repairThreshold) {
+       ctx.log("system", `Hull at ${hullPct}% â€” retreating to high-security system for repairs`);
+       yield "emergency_repair";
+       await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+       const docked = await navigateToSafeStation(ctx, safetyOpts);
+       if (docked) {
+         await completeActiveMissions(ctx);
+         await repairShip(ctx);
+         await tryRefuel(ctx, { skipApprovedCheck: true });
+         await checkAndAcceptMissions(ctx);
+         await ensureInsured(ctx);
+         await bot.checkSkills();
+         await ensureUndocked(ctx);
+         await resubscribeObservationAfterMove(bot);
+       }
+       continue;
+     }
+
+     // â”€â”€ Marine health check â”€â”€
+     // If fit marines have dropped below half the ship's capacity (e.g. from
+     // boarding losses), finish up here and head home so treat_personnel +
+     // recruit_personnel can restore the crew. Without this check the bot
+     // sails out to board targets with no marines left to capture ships.
+     if (settings.boardingEnabled && await isMarineHealthCritical(ctx)) {
+       yield "marine_health";
+
+       // If we're in a battle, finish it before heading home
+       const inBattle = await getBattleStatus(ctx);
+       if (inBattle) {
+         ctx.log("combat", "Marine health critical â€” finishing current battle before heading home to recruit");
+         await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
+       }
+
+       ctx.log("system", `Fit marines critically low â€” returning home to treat and recruit personnel`);
+       await returnToHomeAndResupply(ctx, settings);
+       continue;
+     }
+
+     // â”€â”€ Stay-in-POI mode: anchor at one POI and re-scan each cycle â”€â”€
+     if (settings.stayInPoi) {
+       if (!stayPoiAnchor) {
+         stayPoiAnchor = { system: bot.system, poi: bot.poi };
+         ctx.log("info", `Boarding stay-in-POI mode: anchored at POI ${bot.poi} in ${bot.system} â€” re-scanning each cycle`);
+       }
+       if (bot.system !== stayPoiAnchor.system) {
+         ctx.log("travel", `Returning to anchor system ${stayPoiAnchor.system}...`);
+         await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+         const arrived = await navigateToSystem(ctx, stayPoiAnchor.system, safetyOpts);
+         if (arrived) {
+           await resubscribeObservationAfterMove(bot);
+           if (stayPoiAnchor.poi && bot.poi !== stayPoiAnchor.poi) {
+            await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+            const t = await bot.exec("travel", { target_poi: stayPoiAnchor.poi });
+            if (!t.error) {
+              bot.poi = stayPoiAnchor.poi;
+              bot.clearObservationState();
+              await ctx.sleep(1000);
+            }
+          }
+        } else {
+          ctx.log("error", `Could not return to anchor system ${stayPoiAnchor.system} â€” continuing at current location`);
+          stayPoiAnchor = null;
+        }
+      }
+      const result = yield* engageBoardingTargetsAtCurrentPoi(ctx, settings, totalKills, totalBoardings);
+      totalKills = result[0];
+      totalBoardings = result[1];
+      continue;
+    }
+
+    // â”€â”€ Determine systems to patrol â”€â”€
+    const systemList = resolveBoardingPatrolSystems(ctx.bot.username, hunterPatrols);
+    if (systemList.length === 0) {
+      ctx.log("error", "Boarding mode: no patrol systems configured â€” falling back to single system setting");
+      yield* boardingSystemPass(ctx, settings, safetyOpts, totalKills, totalBoardings);
+      continue;
+    }
+
+    // â”€â”€ Iterate through all systems in the patrol profile â”€â”€
+    let completedFullCycle = true;
+    for (const targetSystem of systemList) {
+      if (bot.state !== "running") { completedFullCycle = false; break; }
+
+      if (bot.system !== targetSystem) {
+        ctx.log("travel", `Boarding patrol: heading to ${targetSystem}...`);
+        await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+        const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
+        if (arrived) {
+          await resubscribeObservationAfterMove(bot);
+        }
+        if (!arrived) {
+          const battleAfterNav = await getBattleStatus(ctx);
+          if (battleAfterNav) {
+            ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
+            await handleNavigationBattleInterrupt(ctx, settings);
+          } else {
+            ctx.log("error", `Could not reach ${targetSystem} â€” skipping to next`);
+            completedFullCycle = false;
+            continue;
+          }
+        }
+      }
+
+      if (bot.state !== "running") { completedFullCycle = false; break; }
+
+      // â”€â”€ Single system patrol pass (POI-by-POI with boarding) â”€â”€
+      const result = yield* boardingSystemPass(ctx, settings, safetyOpts, totalKills, totalBoardings);
+      if (result) {
+        const [kills, boardings] = result;
+        totalKills = kills;
+        totalBoardings = boardings;
+      }
+    }
+
+    if (!completedFullCycle && bot.state !== "running") break;
+
+    if (completedFullCycle) {
+      ctx.log("info", `Boarding patrol cycle complete â€” ${totalKills} kill(s), ${totalBoardings} boarding(s). Restarting patrol...`);
+    }
+  }
+}
+
+/**
+ * Resolve the list of systems to patrol in boarding mode.
+ * Prefers the assigned hunter patrol profile's patrolSystems.
+ * Returns empty array when no profile is found (caller uses findNearestHuntableSystem fallback).
+ */
+function resolveBoardingPatrolSystems(
+  botUsername: string,
+  hunterPatrols: HunterPatrolProfile[],
+): string[] {
+  if (hunterPatrols.length > 0) {
+    const botHunterPatrolAssignments = ((readSettings().hunter || {}) as any)?.botHunterPatrolAssignments as Record<string, string> | undefined;
+    const assignedProfileName = botHunterPatrolAssignments?.[botUsername] || botHunterPatrolAssignments?.[""] || hunterPatrols[0]?.name;
+    const assignedProfile = hunterPatrols.find(p => p.name === assignedProfileName) || hunterPatrols[0];
+    if (assignedProfile?.patrolSystems && assignedProfile.patrolSystems.length > 0) {
+      return assignedProfile.patrolSystems;
+    }
+  }
+
+  // No profile or system found â€” return empty (caller will use findNearestHuntableSystem fallback)
+  return [];
+}
+
+/**
+ * Engage any pirate targets present at the bot's current POI.
+ *
+ * This is the shared engagement sweep used by the stay-in-POI boarding
+ * branch. It scans nearby entities, filters for valid boarding/fire
+ * targets, engages them (boarding when enabled + shields are low enough,
+ * otherwise normal fire), claims prizes, and scavenges wrecks.
+ *
+ * Unlike boardingSystemPass this does NOT travel between POIs or run the
+ * post-sweep dock/resupply sequence â€” the caller (boardingRoutine's
+ * main loop) handles hull/fuel checks and re-navigation on the next
+ * cycle.
+ *
+ * Returns [totalKills, totalBoardings].
+ */
+async function* engageBoardingTargetsAtCurrentPoi(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+  startKills: number,
+  startBoardings: number,
+): AsyncGenerator<string, [number, number], void> {
+  const { bot } = ctx;
+  let totalKills = startKills;
+  let totalBoardings = startBoardings;
+
+  if (await checkAndHandleExistingBattle(ctx, settings)) return [totalKills, totalBoardings];
+  await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
+
+  yield "scan_for_targets";
+  const nearbyResult = await getObservationOrNearby(bot);
+  const nearbyData = nearbyResult.result;
+  if (!nearbyData) {
+    ctx.log("error", `No nearby data at ${bot.poi}`);
+    return [totalKills, totalBoardings];
+  }
+  bot.trackNearbyPlayers(nearbyData);
+  bot.trackWildlife(nearbyData);
+  await serviceAnyStalledPrizes(ctx);
+
+  const entities = parseNearby(nearbyData);
+  let pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e) && !e.isCreature && !isCreatureName(e.name));
+  pirate_targets = pickUnclaimedBoardingTarget(pirate_targets, bot.username);
+
+  if (pirate_targets.length > 0) {
+    pirate_targets.sort((a, b) => {
+      const ah = a.maxHull || a.hull || 0;
+      const bh = b.maxHull || b.hull || 0;
+      return bh - ah;
+    });
+
+    ctx.log("combat", `Found ${pirate_targets.length} boarding candidate(s) at ${bot.poi} (sorted by hull: ${pirate_targets.map(p => `${p.name}(${p.maxHull || p.hull || 0})`).join(", ")})`);
+
+    for (let targetIdx = 0; targetIdx < pirate_targets.length; targetIdx++) {
+      const target = pirate_targets[targetIdx];
+      if (bot.state !== "running") break;
+
+      await bot.refreshShip();
+      const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      if (preHull <= settings.repairThreshold) {
+        ctx.log("system", `Hull at ${preHull}% â€” too low for another fight`);
+        break;
+      }
+
+      await useRepairKits(ctx);
+      const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+      if (!hasAmmo && !settings.meatShield) {
+        ctx.log("combat", "Out of ammo â€” aborting sweep");
+        break;
+      }
+
+      yield "engage";
+
+      const freshScanResp = await bot.exec("get_nearby");
+      let freshEntities: NearbyEntity[] = [];
+      if (!freshScanResp.error && freshScanResp.result) {
+        bot.trackNearbyPlayers(freshScanResp.result);
+        bot.trackWildlife(freshScanResp.result);
+        freshEntities = parseNearby(freshScanResp.result);
+      }
+      const stillPresent = freshEntities.find(e => e.id === target.id || e.name === target.name);
+      if (!stillPresent) {
+        ctx.log("combat", `âš ï¸ ${target.name} is no longer at this POI (likely claimed or left) â€” skipping to next target`);
+        continue;
+      }
+
+      const preBattlePrizes = getNearbyPrizes(freshScanResp.result);
+      const preBattlePrize = preBattlePrizes.find(p => p.status === "available" || p.status === "claimed");
+      if (preBattlePrize) {
+        ctx.log("combat", `ðŸ›¸ Found unclaimed prize ${preBattlePrize.ship_name || preBattlePrize.prize_id} at ${bot.poi} before engaging ${target.name}`);
+        const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
+        if (claimed) ctx.log("combat", `ðŸ† Prize claimed before engaging ${target.name}`);
+      }
+
+      const canBoard = settings.boardingEnabled
+        && settings.boardingShieldThreshold > 0
+        && await checkBoardingCapability(ctx)
+        && !isCreatureTarget(target as any, true); // NEVER board creatures - they are not capturable
+
+      if (canBoard) {
+        const fitMarines = await getFitMarineCount(ctx);
+        const marineRequirement = settings.boardingMarines > 0 ? settings.boardingMarines : 1;
+        if (fitMarines < marineRequirement) {
+          ctx.log("combat", `Boarding: insufficient fit marines (${fitMarines} aboard, need ${marineRequirement}) â€” cannot board`);
+        } else {
+          ctx.log("combat", `âš”ï¸ Boarding engagement: ${target.name} (shields â‰¤ ${settings.boardingShieldThreshold}% â†’ board)`);
+          const result = await boardingSubroutine(
+            ctx,
+            target,
+            settings.boardingShieldThreshold,
+            settings.boardingMarines,
+            settings.fleeThreshold,
+            settings.shieldRechargePct,
+            settings.cloakOnStart,
+          );
+
+          // If marines were wiped out during boarding (e.g. another hunter
+          // killed the target while we were latched), we can no longer board.
+          // End the sweep so the main loop sends us home to treat and recruit.
+          if (settings.boardingEnabled && await isMarineHealthCritical(ctx)) {
+            ctx.log("system", `Fit marines critically low after boarding attempt on ${target.name} â€” ending patrol to recruit`);
+            return [totalKills, totalBoardings];
+          }
+
+           if (result === "captured") {
+               totalKills++;
+               totalBoardings++;
+                 ctx.log("combat", `ðŸŽ‰ ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
+                await maybeFleeStationAfterBoarding(ctx, settings);
+                 await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
+              await bot.refreshCargo();
+              await bot.refreshStatus();
+              const recoveries = bot.prizeRecoveries;
+              if (recoveries.length > 0) {
+                const cap = recoveries[0];
+                ctx.log("combat", `ðŸ“¦ Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
+              }
+               const recovered = await recoverPrize(ctx, settings, target.id);
+              if (recovered) {
+                ctx.log("combat", `ðŸ† Prize from ${target.name} successfully recovered!`);
+              } else {
+                ctx.log("combat", `âš ï¸ Could not recover prize from ${target.name} â€” another pilot may have claimed it, or the prize is at a different POI in this system`);
+              }
+
+            yield "safety_check";
+            const postCaptureResp = await bot.exec("get_nearby");
+            if (!postCaptureResp.error) {
+              bot.trackNearbyPlayers(postCaptureResp.result);
+              bot.trackWildlife(postCaptureResp.result);
+            }
+            continue;
+          } else if (result === "target_eliminated") {
+            totalKills++;
+            ctx.log("combat", `Kill #${totalKills} (${target.name}) â€” target eliminated`);
+            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+            await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+            await useRepairKits(ctx);
+            await bot.refreshCargo();
+            await maybeFleeStationAfterBoarding(ctx, settings);
+
+            yield "safety_check";
+            const postKillResp = await bot.exec("get_nearby");
+            if (!postKillResp.error) {
+              bot.trackNearbyPlayers(postKillResp.result);
+              bot.trackWildlife(postKillResp.result);
+              const nearbyEntities = parseNearby(postKillResp.result);
+              const newThreats = nearbyEntities.filter(e =>
+                isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+                !isStationEntity(e) &&
+                e.id !== target.id &&
+                e.name !== target.name
+              );
+              if (newThreats.length > 0) {
+                ctx.log("combat", `ðŸš¨ ${newThreats.length} new pirate(s) detected after kill: ${newThreats.map(t => t.name).join(", ")} â€” engaging!`);
+                for (const newThreat of newThreats) {
+                  if (bot.state !== "running") break;
+                  const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+                  if (newWon) {
+                    totalKills++;
+                    ctx.log("combat", `Kill #${totalKills} (${newThreat.name}) â€” additional threat eliminated`);
+                  }
+                }
+              }
+            }
+            continue;
+          } else if (result === "retreat") {
+            break;
+          }
+          ctx.log("combat", `Boarding failed for ${target.name} â€” engaging normally`);
+        }
+      }
+
+      if (!coordResponding) {
+        broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
+        claimCreature(ctx, target);
+      }
+        const hsettings = getHunterSettings(ctx.bot.username);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, true);
+
+      if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
+      if (won) {
+        totalKills++;
+        ctx.log("combat", `Kill #${totalKills} (${target.name}) â€” looting...`);
+        yield "loot";
+        if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+        await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+        await useRepairKits(ctx);
+        await bot.refreshCargo();
+
+        yield "safety_check";
+        const postKillResp2 = await bot.exec("get_nearby");
+        if (!postKillResp2.error) {
+          bot.trackNearbyPlayers(postKillResp2.result);
+          bot.trackWildlife(postKillResp2.result);
+          const nearbyEntities2 = parseNearby(postKillResp2.result);
+          const newThreats2 = nearbyEntities2.filter(e =>
+            isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+            !isStationEntity(e) &&
+            e.id !== target.id &&
+            e.name !== target.name
+          );
+          if (newThreats2.length > 0) {
+            ctx.log("combat", `ðŸš¨ ${newThreats2.length} new pirate(s) detected after kill: ${newThreats2.map(t => t.name).join(", ")} â€” engaging!`);
+            for (const newThreat of newThreats2) {
+              if (bot.state !== "running") break;
+              const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+              if (newWon) {
+                totalKills++;
+                ctx.log("combat", `Kill #${totalKills} (${newThreat.name}) â€” additional threat eliminated`);
+              }
+            }
+          }
+        }
+        if (isLowOnFieldConsumables(bot.inventory)) {
+          ctx.log("combat", "Low on repair kits or shield charges â€” ending sweep");
+          break;
+        }
+      }
+    }
+  } else {
+    if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+  }
+
+  // After clearing all pirates at this POI, retreat from any remaining
+  // station attackers before looting/claiming prizes.
+  const inBattleAfterSweep = await getBattleStatus(ctx);
+  if (inBattleAfterSweep) {
+    await retreatFromStronghold(ctx, settings);
+  }
+
+  // After processing all targets at this POI, check for any prizes left behind
+  // (from battles that happened before we arrived, or from captures we missed)
+  yield "check_prizes";
+  const prizeCheckResp = await bot.exec("get_nearby");
+  if (!prizeCheckResp.error && prizeCheckResp.result) {
+    const prizesAtPoi = getNearbyPrizes(prizeCheckResp.result);
+    const missedPrizes = prizesAtPoi.filter(p => p.status === "available" || p.status === "claimed");
+    for (const missedPrize of missedPrizes) {
+      ctx.log("combat", `ðŸ›¸ Found unclaimed prize ${missedPrize.ship_name || missedPrize.prize_id} at ${bot.poi} after combat â€” claiming now`);
+      const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false, missedPrize);
+      if (claimed) ctx.log("combat", `ðŸ† Missed prize from ${bot.poi} successfully claimed!`);
+      await ctx.sleep(1000);
+    }
+    await serviceAnyStalledPrizes(ctx);
+  }
+
+   return [totalKills, totalBoardings];
+ }
+
+/**
+ * Perform a single patrol pass through all POIs in the current system,
+ * engaging pirates with boarding stance when conditions are met.
+ *
+ * Returns [totalKills, totalBoardings] if completed, or null if the loop
+ * was broken early (e.g. hull critical / out of ammo).
+ */
+async function* boardingSystemPass(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+  safetyOpts: { fuelThresholdPct: number; hullThresholdPct: number; autoCloak: boolean; skipBlacklist: boolean; isCombatBot: boolean; joinBattles: boolean },
+  startKills: number,
+  startBoardings: number,
+): AsyncGenerator<string, [number, number] | null, void> {
+  const { bot } = ctx;
+  let totalKills = startKills;
+  let totalBoardings = startBoardings;
+
+  // â”€â”€ Confirm we're in a huntable system â”€â”€
+  await fetchSecurityLevel(ctx, bot.system);
+  const currentSec = mapStore.getSystem(bot.system)?.security_level;
+  if (!isHuntableSystem(currentSec)) {
+    ctx.log("info", `${bot.system} is ${currentSec || "unknown"} security â€” searching for a huntable system...`);
+    const huntTarget = findNearestHuntableSystem(bot.system);
+    if (huntTarget) {
+      const sys = mapStore.getSystem(huntTarget);
+      ctx.log("travel", `Found huntable system: ${sys?.name || huntTarget} (${sys?.security_level}) â€” navigating...`);
+      const huntArrived = await navigateToSystem(ctx, huntTarget, safetyOpts);
+      if (!huntArrived) {
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          await handleNavigationBattleInterrupt(ctx, settings);
+        }
+      }
+      await resubscribeObservationAfterMove(bot);
+    }
+  }
+
+  // â”€â”€ Get system layout â”€â”€
+  yield "scan_system";
+  await fetchSecurityLevel(ctx, bot.system);
+  const { pois } = await getSystemInfo(ctx);
+  const patrolPois = pois.filter(p => !isStationPoi(p));
+
+  if (patrolPois.length === 0) {
+    ctx.log("info", "No non-station POIs to patrol â€” waiting 30s");
+    await ctx.sleep(30000);
+    return [totalKills, totalBoardings];
+  }
+
+  ctx.log("info", `Boarding mode: patrolling ${patrolPois.length} POI(s) in ${bot.system}...`);
+
+  for (const poi of patrolPois) {
+    if (bot.state !== "running") break;
+
+    await bot.refreshShip();
+    const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (midHull <= settings.repairThreshold) {
+      ctx.log("system", `Hull at ${midHull}% â€” aborting patrol`);
+      break;
+    }
+
+    if (await checkAndHandleExistingBattle(ctx, settings)) continue;
+
+    yield "travel_to_poi";
+    ctx.log("travel", `Boarding patrol: ${poi.name}...`);
+    await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+    const travelResp = await bot.exec("travel", { target_poi: poi.id });
+    if (travelResp.error && !travelResp.error.message.includes("already")) {
+      ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
+      continue;
+    }
+    bot.poi = poi.id;
+    bot.clearObservationState();
+    await ctx.sleep(1000);
+
+    yield "scan_for_targets";
+    const nearbyResult = await getObservationOrNearby(bot);
+    const nearbyData = nearbyResult.result;
+    if (!nearbyData) {
+      ctx.log("error", `No nearby data at ${poi.name}`);
+      continue;
+    }
+    bot.trackNearbyPlayers(nearbyData);
+    bot.trackWildlife(nearbyData);
+
+    // Service any stalled prizes at this POI (refuel, resume, etc.)
+    await serviceAnyStalledPrizes(ctx);
+
+    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
+
+    const entities = parseNearby(nearbyData);
+    let pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e) && !e.isCreature && !isCreatureName(e.name));
+    pirate_targets = pickUnclaimedBoardingTarget(pirate_targets, bot.username);
+
+    if (pirate_targets.length === 0) {
+      if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+      continue;
+    }
+
+    // Sort by hull descending â€” board the largest (most valuable) ships first.
+    // Lower-hull pirates can't threaten our shields, while high-hull pirates
+    // are worth more and are the priority boarding targets.
+    pirate_targets.sort((a, b) => {
+      const ah = a.maxHull || a.hull || 0;
+      const bh = b.maxHull || b.hull || 0;
+      return bh - ah;
+    });
+
+    ctx.log("combat", `Found ${pirate_targets.length} boarding candidate(s) at ${poi.name} (sorted by hull: ${pirate_targets.map(p => `${p.name}(${p.maxHull || p.hull || 0})`).join(", ")})`);
+
+    for (let targetIdx = 0; targetIdx < pirate_targets.length; targetIdx++) {
+      const target = pirate_targets[targetIdx];
+      if (bot.state !== "running") break;
+
+      await bot.refreshShip();
+      const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      if (preHull <= settings.repairThreshold) {
+        ctx.log("system", `Hull at ${preHull}% â€” too low for another fight`);
+        break;
+      }
+
+      await useRepairKits(ctx);
+      const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+      if (!hasAmmo && !settings.meatShield) {
+        ctx.log("combat", "Out of ammo â€” aborting patrol to resupply");
+        break;
+      }
+
+      yield "engage";
+
+      const freshScanResp = await bot.exec("get_nearby");
+      let freshEntities: NearbyEntity[] = [];
+      if (!freshScanResp.error && freshScanResp.result) {
+        bot.trackNearbyPlayers(freshScanResp.result);
+        bot.trackWildlife(freshScanResp.result);
+        freshEntities = parseNearby(freshScanResp.result);
+      }
+      const stillPresent = freshEntities.find(e => e.id === target.id || e.name === target.name);
+      if (!stillPresent) {
+        ctx.log("combat", `âš ï¸ ${target.name} is no longer at this POI (likely claimed or left) â€” skipping to next target`);
+        continue;
+      }
+
+      // Check for any available prizes at this POI before engaging
+      const preBattlePrizes = getNearbyPrizes(freshScanResp.result);
+      const preBattleAvailable = preBattlePrizes.filter(p => p.status === "available" || p.status === "claimed");
+      for (const preBattlePrize of preBattleAvailable) {
+        ctx.log("combat", `ðŸ›¸ Found unclaimed prize ${preBattlePrize.ship_name || preBattlePrize.prize_id} at ${poi.name} before engaging ${target.name}`);
+        const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false, preBattlePrize);
+        if (claimed) {
+          ctx.log("combat", `ðŸ† Prize claimed before engaging ${target.name}`);
+        }
+        await ctx.sleep(1000);
+      }
+
+      // Determine if we should attempt boarding this target
+      const canBoard = settings.boardingEnabled
+        && settings.boardingShieldThreshold > 0
+        && await checkBoardingCapability(ctx)
+        && !isCreatureTarget(target as any, true); // NEVER board creatures - they are not capturable
+
+      if (canBoard) {
+        const fitMarines = await getFitMarineCount(ctx);
+        const marineRequirement = settings.boardingMarines > 0 ? settings.boardingMarines : 1;
+        if (fitMarines < marineRequirement) {
+          ctx.log("combat", `Boarding: insufficient fit marines (${fitMarines} aboard, need ${marineRequirement}) â€” cannot board`);
+        } else {
+          ctx.log("combat", `âš”ï¸ Boarding engagement: ${target.name} (shields â‰¤ ${settings.boardingShieldThreshold}% â†’ board)`);
+          const result = await boardingSubroutine(
+            ctx,
+            target,
+            settings.boardingShieldThreshold,
+            settings.boardingMarines,
+            settings.fleeThreshold,
+            settings.shieldRechargePct,
+            settings.cloakOnStart,
+          );
+
+          // If marines were wiped out during boarding (e.g. another hunter
+          // killed the target while we were latched), we can no longer board.
+          // End the sweep so the main loop sends us home to treat and recruit.
+          if (settings.boardingEnabled && await isMarineHealthCritical(ctx)) {
+            ctx.log("system", `Fit marines critically low after boarding attempt on ${target.name} â€” ending patrol to recruit`);
+            return [totalKills, totalBoardings];
+          }
+
+          if (result === "captured") {
+            totalKills++;
+            totalBoardings++;
+             ctx.log("combat", `ðŸŽ‰ ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
+            await maybeFleeStationAfterBoarding(ctx, settings);
+            await useRepairKits(ctx);
+          await bot.refreshCargo();
+          await bot.refreshStatus();
+          const recoveries = bot.prizeRecoveries;
+          if (recoveries.length > 0) {
+            const cap = recoveries[0];
+            ctx.log("combat", `ðŸ“¦ Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
+          }
+           const recovered = await recoverPrize(ctx, settings, target.id);
+          if (recovered) {
+            ctx.log("combat", `ðŸ† Prize from ${target.name} successfully recovered!`);
+          } else {
+            ctx.log("combat", `âš ï¸ Could not recover prize from ${target.name} â€” another pilot may have claimed it, or the prize is at a different POI in this system`);
+          }
+
+          yield "safety_check";
+          const postCaptureResp = await bot.exec("get_nearby");
+          if (!postCaptureResp.error) {
+            bot.trackNearbyPlayers(postCaptureResp.result);
+            bot.trackWildlife(postCaptureResp.result);
+          }
+         continue;
+        } else if (result === "target_eliminated") {
+          totalKills++;
+          ctx.log("combat", `Kill #${totalKills} (${target.name}) â€” target eliminated`);
+          if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+          await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+          await useRepairKits(ctx);
+          await bot.refreshCargo();
+          await maybeFleeStationAfterBoarding(ctx, settings);
+
+          yield "safety_check";
+          const postKillResp = await bot.exec("get_nearby");
+          if (!postKillResp.error) {
+            bot.trackNearbyPlayers(postKillResp.result);
+            bot.trackWildlife(postKillResp.result);
+            const nearbyEntities = parseNearby(postKillResp.result);
+            const newThreats = nearbyEntities.filter(e =>
+              isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+              !isStationEntity(e) &&
+              e.id !== target.id &&
+              e.name !== target.name
+            );
+            if (newThreats.length > 0) {
+              ctx.log("combat", `ðŸš¨ ${newThreats.length} new pirate(s) detected after kill: ${newThreats.map(t => t.name).join(", ")} â€” engaging!`);
+              for (const newThreat of newThreats) {
+                if (bot.state !== "running") break;
+                const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+                if (newWon) {
+                  totalKills++;
+                  ctx.log("combat", `Kill #${totalKills} (${newThreat.name}) â€” additional threat eliminated`);
+                }
+              }
+            }
+          }
+          continue;
+       } else if (result === "retreat") {
+          break;
+        }
+        // "failed" â€” fall through to normal fire engagement
+        ctx.log("combat", `Boarding failed for ${target.name} â€” engaging normally`);
+      }
+    }
+
+     // Normal fire engagement (fallback or boarding disabled)
+     if (!coordResponding) {
+         broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
+         claimCreature(ctx, target);
+       }
+       const hsettings = getHunterSettings(ctx.bot.username);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, true);
+
+       if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
+       if (won) {
+         totalKills++;
+         ctx.log("combat", `Kill #${totalKills} (${target.name}) â€” looting...`);
+         yield "loot";
+         if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+         await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+         await useRepairKits(ctx);
+         await bot.refreshCargo();
+
+         yield "safety_check";
+         const postKillResp2 = await bot.exec("get_nearby");
+         if (!postKillResp2.error) {
+           bot.trackNearbyPlayers(postKillResp2.result);
+           bot.trackWildlife(postKillResp2.result);
+           const nearbyEntities2 = parseNearby(postKillResp2.result);
+           const newThreats2 = nearbyEntities2.filter(e =>
+             isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+             !isStationEntity(e) &&
+             e.id !== target.id &&
+             e.name !== target.name
+           );
+           if (newThreats2.length > 0) {
+             ctx.log("combat", `ðŸš¨ ${newThreats2.length} new pirate(s) detected after kill: ${newThreats2.map(t => t.name).join(", ")} â€” engaging!`);
+             for (const newThreat of newThreats2) {
+               if (bot.state !== "running") break;
+               const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+               if (newWon) {
+                 totalKills++;
+                 ctx.log("combat", `Kill #${totalKills} (${newThreat.name}) â€” additional threat eliminated`);
+               }
+             }
+           }
+         }
+         if (isLowOnFieldConsumables(bot.inventory)) {
+           ctx.log("combat", "Low on repair kits or shield charges â€” ending sweep to resupply");
+           break;
+         }
+      }
+    }
+  }
+
+  // After clearing all pirates at this POI, retreat from any remaining
+  // station attackers before looting/claiming prizes.
+  const inBattleAfterSweep = await getBattleStatus(ctx);
+  if (inBattleAfterSweep) {
+    await retreatFromStronghold(ctx, settings);
+  }
+
+  // After processing all targets at this POI, check for any prizes left behind
+  // (from battles that happened before we arrived, or from captures we missed)
+  yield "check_prizes";
+    const prizeCheckResp = await bot.exec("get_nearby");
+    if (!prizeCheckResp.error && prizeCheckResp.result) {
+      const prizesAtPoi = getNearbyPrizes(prizeCheckResp.result);
+      const missedPrizes = prizesAtPoi.filter(p => p.status === "available" || p.status === "claimed");
+      for (const missedPrize of missedPrizes) {
+        ctx.log("combat", `ðŸ›¸ Found unclaimed prize ${missedPrize.ship_name || missedPrize.prize_id} at ${bot.poi} after combat â€” claiming now`);
+        const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false, missedPrize);
+        if (claimed) {
+          ctx.log("combat", `ðŸ† Missed prize from ${bot.poi} successfully claimed!`);
+        }
+        await ctx.sleep(1000);
+      }
+      
+      // Service any stalled prizes (no fuel, etc.) regardless of tracker
+      await serviceAnyStalledPrizes(ctx);
+    }
+
+   // â”€â”€ Post-patrol decision â”€â”€
+  yield "post_patrol";
+  await bot.refreshCargo();
+  await bot.refreshShip();
+  const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+  const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+   const needsRepair = postHull <= settings.repairThreshold;
+   const hasFuelCells = bot.inventory?.some(i =>
+     i.itemId.toLowerCase() === 'fuel_cell' ||
+     i.itemId.toLowerCase() === 'premium_fuel_cell' ||
+     i.itemId.toLowerCase() === 'military_fuel_cell'
+   );
+   const needsFuel = postFuel < (settings.refuelThreshold ?? 20) && !hasFuelCells;
+   const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+   const needsAmmo = !hasAmmo && !settings.meatShield;
+
+    if (needsRepair || needsFuel || needsAmmo) {
+      // When fuel is low and a home base is configured, go directly home so the
+      // hunter returns to the correct faction storage / station instead of a
+      // random bypass station.
+if (needsFuel && settings.homeSystem) {
+        ctx.log("system", `Low fuel (${postFuel}%) — returning to home base (${settings.homeSystem})...`);
+        yield "dock";
+        await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+        const homeOk = await navigateToSystem(ctx, settings.homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 50, noJettison: true, skipBlacklist: true, homeSystem: settings.homeSystem, homeStation: settings.homeStation });
+        if (!homeOk) {
+          ctx.log("system", "Could not reach home base â€” falling back to nearest safe station");
+          yield "dock";
+          const docked = await navigateToSafeStation(ctx, safetyOpts);
+          if (!docked) ctx.log("error", "Could not dock anywhere â€” retrying next cycle");
+        } else {
+          await bot.refreshLocation();
+          const { pois: homePois } = await getSystemInfo(ctx);
+          let homeStationPoi = settings.homeStation || "";
+          if (homeStationPoi.includes("|")) {
+            homeStationPoi = homeStationPoi.split("|")[1] || "";
+          }
+          let homeStation = homeStationPoi ? homePois.find(p => p.id === homeStationPoi && isStationPoi(p)) : null;
+          if (!homeStation) {
+            homeStation = findStation(homePois, "repair") || findStation(homePois);
+          }
+          if (homeStation) {
+            if (homeStationPoi && homeStation.id === homeStationPoi) {
+              await ensureDocked(ctx, true, 0, { targetStationId: homeStationPoi });
+            } else {
+              await ensureDocked(ctx);
+            }
+            await tryRefuel(ctx, { skipApprovedCheck: true });
+            await ensureHunterResupply(ctx);
+          }
+          await bot.refreshShip();
+          const newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+          if (newFuel < (settings.refuelThreshold ?? 20)) {
+            ctx.log("system", `Still short on fuel (${newFuel}%) at home â€” falling back to nearest safe station`);
+            yield "dock";
+            const docked = await navigateToSafeStation(ctx, safetyOpts);
+            if (!docked) ctx.log("error", "Could not dock anywhere â€” retrying next cycle");
+          }
+        }
+      } else {
+        const reason = needsAmmo ? `ammo depleted` : (needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`);
+        ctx.log("system", `Patrol sweep done â€” ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% â€” ${reason}, returning to safe system...`);
+        yield "dock";
+        await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+        const docked = await navigateToSafeStation(ctx, safetyOpts);
+        if (!docked) {
+          ctx.log("error", "Could not dock anywhere â€” retrying next cycle");
+        }
+      }
+      await collectFromStorage(ctx);
+      yield "complete_missions";
+      await completeActiveMissions(ctx);
+      await bot.refreshLocation();
+      yield "check_missions";
+      await checkAndAcceptMissions(ctx);
+      yield "ensure_insured";
+      await ensureInsured(ctx);
+      yield "refuel";
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+      yield "repair";
+      await repairShip(ctx);
+      yield "reload";
+      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+      yield "fit_mods";
+      const modProfile = getModProfile("hunter");
+      if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+      yield "check_skills";
+      await bot.checkSkills();
+
+      if (settings.singleLoop) {
+        const hs = settings.homeStation || "";
+        const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+        if (hsys && hpoi) {
+          await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+          await navigateToSystem(ctx, hsys, safetyOpts);
+          const t = await bot.exec("travel", { target_poi: hpoi });
+          if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+        } else {
+          await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+          await navigateToSafeStation(ctx, safetyOpts);
+        }
+        await ensureHunterResupply(ctx);
+    }
+  } else {
+    ctx.log("system", `Patrol sweep done â€” ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% â€” continuing hunt...`);
+  }
+
+   return [totalKills, totalBoardings];
+ }
+
+// Flush creature kill store on exit so no data is lost.
+process.on("exit", () => {
+  try {
+    creatureKillStore.flushSync();
+  } catch {
+    // nothing useful to do while exiting
+  }
+});
 
 
 

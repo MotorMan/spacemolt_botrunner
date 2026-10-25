@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 import { onPlayerNameUpdate } from "./client_sync_hooks.js";
 import { perf } from "./perf.js";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 const PLAYER_NAMES_FILE = join(process.cwd(), "data", "playerNames.json");
 const FULL_PLAYER_INFO_FILE = join(process.cwd(), "data", "fullPlayerInfo.json");
@@ -168,7 +169,7 @@ export class PlayerNameStore {
       try {
         this._fullInfoDirty = false;
         this.fullPlayerInfo.lastUpdated = new Date().toISOString();
-        writeFileSync(FULL_PLAYER_INFO_FILE, JSON.stringify(this.fullPlayerInfo), "utf-8");
+        safeWriteFileSync(FULL_PLAYER_INFO_FILE, JSON.stringify(this.fullPlayerInfo), Buffer.byteLength(JSON.stringify(this.fullPlayerInfo), "utf-8"));
       } catch (err) {
         this._fullInfoDirty = true;
         const msg = err instanceof Error ? err.message : String(err);
@@ -636,9 +637,26 @@ export class PlayerNameStore {
   }
 
   /**
-   * Get detailed information for any entity (player, pirate, or empire NPC).
-   * Returns EntityDetail or null if not found.
-   */
+    * Get detailed information for an entity by its ID (player_id / pirate_id / npc id).
+    * Searches players, pirates, and empire_npcs. Returns EntityDetail or null.
+    */
+  getEntityDetailById(id: string): EntityDetail | null {
+    this.ensureLoaded();
+    if (!id) return null;
+    for (const category of ["players", "pirates", "empire_npcs"] as const) {
+      for (const entity of Object.values(this.fullPlayerInfo[category])) {
+        if (entity.id === id) {
+          return entity;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+    * Get detailed information for an entity (player, pirate, or empire NPC).
+    * Returns EntityDetail or null if not found.
+    */
   getEntityDetail(name: string): EntityDetail | null {
     this.ensureLoaded();
     const normalized = this.normalize(name);
@@ -757,7 +775,7 @@ export class PlayerNameStore {
           pirate_count: this.pirates.size,
           empire_npc_count: this.empireNpcs.size,
         };
-        writeFileSync(PLAYER_NAMES_FILE, JSON.stringify(data), "utf-8");
+        safeWriteFileSync(PLAYER_NAMES_FILE, JSON.stringify(data), Buffer.byteLength(JSON.stringify(data), "utf-8"));
       } catch (err) {
         this._namesDirty = true;
         const msg = err instanceof Error ? err.message : String(err);

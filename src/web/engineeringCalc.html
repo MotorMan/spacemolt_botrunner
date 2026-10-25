@@ -545,8 +545,8 @@
       });
 
       const effectivePower = Math.min(powerUsed, baseMaxPower);
-      const finalCpuUsed = Math.ceil(cpuUsed * (1 - efficiencyBonus));
-      const finalPowerUsed = Math.ceil(effectivePower * (1 - efficiencyBonus));
+      const finalCpuUsed = Math.floor(cpuUsed * (1 - efficiencyBonus));
+      const finalPowerUsed = Math.floor(effectivePower * (1 - efficiencyBonus));
       const finalMaxCpu = baseMaxCpu + cpuBonus;
       const powerPct = baseMaxPower > 0 ? Math.round((finalPowerUsed / baseMaxPower) * 100) : 0;
 

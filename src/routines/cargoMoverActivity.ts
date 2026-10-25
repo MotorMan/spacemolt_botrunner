@@ -11,6 +11,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { loadInTransitData } from "./cargoMoverInTransit.js";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const ACTIVITY_FILE = join(DATA_DIR, "cargoMoverActivity.json");
@@ -202,7 +203,8 @@ export function saveCargoMoverActivity(data: CargoMoverActivityData): void {
     if (!existsSync(DATA_DIR)) {
       mkdirSync(DATA_DIR, { recursive: true });
     }
-    writeFileSync(ACTIVITY_FILE, JSON.stringify(data, null, 2) + "\n");
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(ACTIVITY_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Error saving cargoMoverActivity.json:", err);
   }
@@ -337,6 +339,50 @@ export function getItemProgress(
   const activity = loadCargoMoverActivity();
   const key = progressKey(botUsername, itemId);
   return activity.itemProgress[key];
+}
+
+/**
+ * SET (not add to) the delivered counter for a bot/item progress entry. Used by
+ * delivery tracking and reconciliation so the activity-store `totalDelivered`
+ * stays in lock-step with the authoritative settings mirror. Unlike
+ * `updateItemProgress({ delivered })`, which increments, this overwrites — that
+ * prevents the activity store from drifting ahead of reality when deposits are
+ * verified/re-counted, which was the root cause of the bot believing far more
+ * had been delivered than actually arrived at the destination.
+ */
+export function setItemProgressDelivered(
+  botUsername: string,
+  itemId: string,
+  value: number,
+  opts?: { itemName?: string; targetQuantity?: number; storageType?: "faction" | "personal" }
+): void {
+  const activity = loadCargoMoverActivity();
+  const key = progressKey(botUsername, itemId);
+  let p = activity.itemProgress[key];
+  if (!p) {
+    const now = new Date().toISOString();
+    p = {
+      itemId,
+      itemName: opts?.itemName || itemId,
+      botUsername,
+      targetQuantity: opts?.targetQuantity || 0,
+      totalWithdrawn: 0,
+      totalDelivered: 0,
+      totalLost: 0,
+      totalTrips: 0,
+      startedAt: now,
+      lastUpdatedAt: now,
+      isComplete: false,
+      storageType: opts?.storageType || "faction",
+    };
+    activity.itemProgress[key] = p;
+  }
+  p.totalDelivered = value;
+  p.lastUpdatedAt = new Date().toISOString();
+  if (p.targetQuantity > 0 && p.totalDelivered >= p.targetQuantity) {
+    p.isComplete = true;
+  }
+  saveCargoMoverActivity(activity);
 }
 
 /** Get all item progress for a bot. */
@@ -521,6 +567,31 @@ export function clearLastSession(botUsername: string): void {
     activity.lastSession = undefined;
     saveCargoMoverActivity(activity);
   }
+}
+
+/**
+ * Zero the delivered counters in the activity-progress store. This is the store
+ * `findMoveJobs` reads via `getItemProgress(...).totalDelivered` — it is a
+ * fleet-wide cumulative that, unlike `settings.cargo_mover.items[].totalDelivered`,
+ * was NEVER cleared by any reset (only the settings mirror was). A stale value
+ * here makes the bot believe everything is already delivered and skip every item
+ * even after the user "resets" the settings. This is the missing half of a real
+ * full reset. Scoped to a single bot when `botUsername` is given, else all bots.
+ */
+export function resetCargoMoverDeliveryProgress(botUsername?: string): { cleared: number } {
+  const activity = loadCargoMoverActivity();
+  let cleared = 0;
+  for (const key of Object.keys(activity.itemProgress)) {
+    if (botUsername && !key.startsWith(`${botUsername}:`)) continue;
+    const p = activity.itemProgress[key];
+    if (p.totalDelivered !== 0 || p.isComplete) {
+      p.totalDelivered = 0;
+      p.isComplete = false;
+      cleared++;
+    }
+  }
+  if (cleared > 0) saveCargoMoverActivity(activity);
+  return { cleared };
 }
 
 /** Get a summary of cargo mover activity. */

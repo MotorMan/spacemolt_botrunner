@@ -1,10 +1,22 @@
 import type { RoutineContext } from "../bot.js";
+import type { BotStatus } from "../bot.js";
 import type { BattleStatus } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
 import { wildlifeStore } from "../wildlivestore.js";
 import { getBattleStatus, topUpShields, useRepairKits } from "./common.js";
 import { combatDebugLog } from "../debug.js";
+import { isBoardingClaimedByOther, releaseExpiredBoardingClaims, boardingClaims } from "../boardingCooperation.js";
+import { getHunterSettings } from "./hunter.js";
+
+async function waitForBattleUpdate(ctx: RoutineContext, beforeUpdate: number): Promise<void> {
+  for (let i = 0; i < 15; i++) {
+    await ctx.sleep(1000);
+    if (ctx.bot.currentBattle.lastUpdate > beforeUpdate) {
+      return;
+    }
+  }
+}
 
 /**
  * Returns true if the given display name belongs to a known creature (wildlife).
@@ -17,6 +29,15 @@ import { combatDebugLog } from "../debug.js";
 export function isCreatureName(name: string | undefined): boolean {
   if (!name) return false;
   return wildlifeStore.hasCreatureName(name);
+}
+
+function isCreatureNameOrSpecies(entity: NearbyEntity | null | undefined): boolean {
+  if (!entity) return false;
+  return isCreatureName(entity.name) || isCreatureName(entity.species);
+}
+
+function isCreatureFightTarget(target: NearbyEntity | null | undefined): boolean {
+  return !!target?.isCreature || target?.type === "creature" || target?.id?.startsWith("crt_") || isCreatureNameOrSpecies(target);
 }
 
 // ── Types ─────────────────────────────────────────────
@@ -48,6 +69,118 @@ export async function waitForServerTick(
   await ctx.sleep(Math.min(timeoutMs, 10000));
 }
 
+/**
+ * Check if any OTHER bot (in this client or a connected client) is running
+ * hunter mode with boarding enabled AND is a participant in the given battle.
+ * Used so non-boarding hunters don't destroy a boarding hunter's prize target.
+ *
+ * Stances are private per the API (battle_update only publishes your own
+ * stance), so we cannot read another player's "board" stance directly.
+ * Instead we detect boarding hunters via their settings: any bot running
+ * hunter mode with `boardingEnabled === true` who is also in this battle
+ * means we should brace to avoid destroying their boarding target.
+ */
+async function anyCrossClientBoardingHunterInBattle(
+  ctx: RoutineContext,
+  status: BattleStatus,
+): Promise<boolean> {
+  const getFleet = ctx.getFleetStatusAsync || ctx.getFleetStatus;
+  if (!getFleet) return false;
+
+  let statuses: BotStatus[];
+  try {
+    if (typeof getFleet === "function") {
+      statuses = await getFleet();
+    } else {
+      statuses = getFleet as unknown as BotStatus[];
+    }
+  } catch {
+    return false;
+  }
+
+  const participantNames = new Set<string>();
+  for (const p of status.participants || []) {
+    if (p.username) participantNames.add(p.username);
+    if (p.player_id) participantNames.add(p.player_id);
+  }
+
+  const self = ctx.bot.username;
+
+  for (const s of statuses) {
+    if (!s.username || s.username === self) continue;
+    if (!participantNames.has(s.username)) continue;
+    if (s.routine !== "hunter") continue;
+
+    try {
+      const settings = getHunterSettings(s.username);
+      if (settings.boardingEnabled === true) {
+        return true;
+      }
+    } catch {
+      // Best effort — skip bots whose settings we can't read
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Check if our current target is claimed by another hunter for boarding.
+ * If so, and there are other unclaimed enemies, switch to one of them.
+ * If there are no other enemies, switch to brace stance to avoid damaging
+ * the prize.
+ *
+ * Also checks cross-client bots: if any other bot in this battle is running
+ * hunter mode with boarding enabled, we brace to avoid destroying their
+ * boarding target (stances are private, so we detect via settings).
+ *
+ * Returns the (possibly new) target and whether we should brace.
+ */
+async function cooperateWithBoardingClaim(
+  ctx: RoutineContext,
+  status: BattleStatus,
+  currentTarget: NearbyEntity | null,
+): Promise<{ target: NearbyEntity | null; brace: boolean }> {
+  const { bot } = ctx;
+  releaseExpiredBoardingClaims();
+
+  if (!currentTarget) return { target: null, brace: false };
+
+  if (!isBoardingClaimedByOther(currentTarget.id, bot.username)) {
+    // No in-process claim on this target. Check cross-client: is any
+    // boarding hunter in this battle? If so, brace to avoid destroying
+    // their prize target (stances are private, detected via settings).
+    if (await anyCrossClientBoardingHunterInBattle(ctx, status)) {
+      ctx.log("combat", `🤝 Boarding cooperation: cross-client boarding hunter in battle with ${currentTarget.name} — switching to brace stance`);
+      await bot.exec("battle", { action: "stance", stance: "brace" });
+      return { target: currentTarget, brace: true };
+    }
+    return { target: currentTarget, brace: false };
+  }
+
+  const ourSideId = status!.your_side_id;
+  const enemies = status.participants.filter(p => {
+    if (p.side_id === ourSideId || p.is_destroyed) return false;
+    const pid = p.player_id || p.username || "";
+    if (!pid) return false;
+    return !isBoardingClaimedByOther(pid, bot.username);
+  });
+
+  if (enemies.length > 0) {
+    const newTarget = enemies[0];
+    ctx.log("combat", `🤝 Boarding cooperation: ${currentTarget.name} claimed by ally — switching to ${newTarget.username || newTarget.player_id}`);
+    await bot.exec("battle", { action: "target", target_id: newTarget.player_id || newTarget.username });
+    return {
+      target: { id: newTarget.player_id || newTarget.username, name: newTarget.username || newTarget.player_id } as NearbyEntity,
+      brace: false,
+    };
+  }
+
+  ctx.log("combat", `🤝 Boarding cooperation: ${currentTarget.name} claimed by ally — switching to brace stance (no other targets)`);
+  await bot.exec("battle", { action: "stance", stance: "brace" });
+  return { target: currentTarget, brace: true };
+}
+
 export const TIER_ORDER: Record<PirateTier, number> = {
   "small": 1,
   "medium": 2,
@@ -75,6 +208,7 @@ export interface NearbyEntity {
   isPirate: boolean;
   isCreature?: boolean;
   creatureId?: string;
+  species?: string;
   tier?: PirateTier;
   isBoss?: boolean;
   hull?: number;
@@ -83,6 +217,9 @@ export interface NearbyEntity {
   shield?: number;
   maxShield?: number;
   status?: string;
+  branded?: boolean;
+  brand_faction?: string;
+  brand_ranch?: string;
 }
 
 export interface WeaponModule {
@@ -115,6 +252,8 @@ let rawEntities: Array<Record<string, unknown>> = [];
       rawEntities = r.players as Array<Record<string, unknown>>;
     } else if (Array.isArray(r.nearby)) {
       rawEntities = r.nearby as Array<Record<string, unknown>>;
+    } else if (Array.isArray(r.objects)) {
+      rawEntities = r.objects as Array<Record<string, unknown>>;
     } else if (Array.isArray(r.pirates)) {
       rawEntities = r.pirates as Array<Record<string, unknown>>;
     } else if (Array.isArray(r.creatures)) {
@@ -183,11 +322,13 @@ let rawEntities: Array<Record<string, unknown>> = [];
       const creatureId = (c.creature_id as string) || "";
       if (!creatureId) continue;
 
+      const branded = !!(c.branded as boolean) || /branded/i.test((c.name as string) || "");
       entities.push({
         id: creatureId,
         name: (c.name as string) || "",
         type: "creature",
-        faction: "",
+        species: (c.species as string) || "",
+        faction: (c.brand_faction as string) || "",
         isNPC: true,
         isPirate: false,
         isCreature: true,
@@ -195,6 +336,9 @@ let rawEntities: Array<Record<string, unknown>> = [];
         hull: c.hull as number,
         maxHull: c.max_hull as number,
         inCombat: c.in_combat as boolean,
+        branded,
+        brand_faction: (c.brand_faction as string) || "",
+        brand_ranch: (c.brand_ranch as string) || "",
       });
     }
   }
@@ -219,7 +363,7 @@ export function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean, maxAttac
 
 export function isCreatureTarget(entity: NearbyEntity, huntCreatures: boolean): boolean {
   if (!huntCreatures) return false;
-  return !!(entity.isCreature || entity.type === "creature");
+  return !!(entity.isCreature || entity.type === "creature" || (entity.id && entity.id.startsWith("crt_")) || isCreatureName(entity.name) || isCreatureName(entity.species));
 }
 
 // ── Weapon & Ammo Management ─────────────────────────────────
@@ -240,9 +384,22 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
   for (const mod of modulesArray) {
     if (!mod || typeof mod !== "object") continue;
 
+    const modCategory = ((mod.category as string) || "").toLowerCase();
     const modType = ((mod.type as string) || (mod.module_type as string) || "").toLowerCase();
     const modId = ((mod.module_id as string) || (mod.mod_id as string) || (mod.id as string) || "").toLowerCase();
-    const isWeapon = modType.includes("weapon") || modType.includes("missile") || modType.includes("launcher") || modType.includes("torpedo") || modId.includes("weapon") || modId.includes("missile") || modId.includes("launcher");
+    const isWeapon =
+      modCategory === "weapon" ||
+      modCategory.includes("weapon") ||
+      modCategory.includes("cannon") ||
+      modCategory.includes("gun") ||
+      modCategory.includes("laser") ||
+      modType.includes("weapon") ||
+      modType.includes("missile") ||
+      modType.includes("launcher") ||
+      modType.includes("torpedo") ||
+      modId.includes("weapon") ||
+      modId.includes("missile") ||
+      modId.includes("launcher");
     if (!isWeapon) continue;
 
     // V2 API provides ammo_type directly, fall back to catalog lookup
@@ -264,7 +421,7 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
     const currentAmmo = (mod.current_ammo as number) ?? 0;
     const maxAmmo = (mod.magazine_size as number) ?? 0;
 
-    if (instanceId && moduleId) {
+    if (instanceId) {
       weapons.push({
         instanceId,
         moduleId,
@@ -355,7 +512,7 @@ export async function ensureAmmoLoaded(
     const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, effectiveAmmoType);
     if (matchingAmmo.length === 0) {
       ctx.log("combat", `⚠️ No ${effectiveAmmoType} ammo in cargo for "${weapon.name}" — need to resupply`);
-      continue;
+      return false;
     }
 
     const ammoItem = matchingAmmo[0];
@@ -642,11 +799,17 @@ export async function engageTarget(
   fleeFromTier: PirateTier,
   minPiratesToFlee: number,
   maxAttackTier: PirateTier,
-  sideId?: number, // Optional: if provided, skip analysis and directly join this side
+  sideId?: number,
   skipScan: boolean = false,
-  repairThreshold: number = 0,   // if >0, enables in-combat emergency repair/recharge using repairThreshold as %
-  onlyNPCs: boolean = false,     // if true, flee when encountering players
-  cloakOnStart: boolean = false, // if true, disable cloak before attack and re-cloak after battle
+  repairThreshold: number = 0,
+  onlyNPCs: boolean = false,
+  cloakOnStart: boolean = false,
+  shieldRechargePct: number = 80,
+  ammoThreshold: number = 5,
+  maxReloadAttempts: number = 3,
+  ammoReloadAbsoluteThreshold: number = 1,
+  ammoReloadPercentThreshold: number = 25,
+  stayAtEngaged: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   if (!target.id) return false;
@@ -659,7 +822,7 @@ export async function engageTarget(
       ctx.log("error", `Failed to join battle side ${sideId}: ${engageResp.error.message}`);
       return false;
     }
-    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
+    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, stayAtEngaged, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
   }
 
   const battleStatus = await getBattleStatus(ctx);
@@ -683,19 +846,10 @@ export async function engageTarget(
     }
 
     const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
+    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, stayAtEngaged, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
   }
 
   ctx.log("combat", `🎯 Engaging ${target.name}...`);
-
-  // Disable cloak before attacking if cloakOnStart is enabled
-  if (cloakOnStart && bot.isCloaked) {
-    ctx.log("combat", `Disabling cloak before attacking ${target.name}...`);
-    const cloakResp = await bot.exec("cloak", { enable: false });
-    if (cloakResp.error) {
-      ctx.log("warn", `Failed to disable cloak: ${cloakResp.error.message}`);
-    }
-  }
 
   if (!skipScan) {
     let scanResp = await bot.exec("scan", { target_id: target.id });
@@ -744,31 +898,66 @@ export async function engageTarget(
         // Prefer a real participant from the battle we just detected.
         // This is the key fix for "boss jumped us while we were attacking something else".
         const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-        return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
+    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, stayAtEngaged, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
       }
     }
     return false;
   }
 
-  ctx.log("combat", `⚔️ Battle started with ${target.name} — advancing to engage`);
-  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, cloakOnStart);
+   ctx.log("combat", `🎯 Battle started with ${target.name} — advancing to engage`);
+  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, cloakOnStart, shieldRechargePct, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold, stayAtEngaged);
 }
 
 // ── Combat Loops ──────────────────────────────────────────────
 
-/** Re-cloak after battle if cloakOnStart is enabled and bot has a cloak module. */
+/**
+ * Re-cloak after battle if cloakOnStart is enabled and bot has a cloak module.
+ *
+ * ⚠️  CRITICAL FEATURE — DO NOT DISABLE OR MOVE THIS CALL ⚠️
+ *
+ * This function is called immediately after every battle victory/exit path.
+ * Re-cloaking RIGHT AFTER battle is essential for pirate stronghold fights:
+ *   • Keeps the bot hidden from nearby pirates between fights
+ *   • Prevents being targeted while looting/scavenging
+ *   • Required for the cloakOnStart combat protocol
+ *
+ * Any code path that exits a battle MUST call this before doing anything else.
+ * Do not add delays, navigation, or other logic between battle end and re-cloak.
+ */
 export async function recloakAfterBattle(ctx: RoutineContext, cloakOnStart: boolean): Promise<void> {
   const { bot } = ctx;
   if (!cloakOnStart) return;
   if (bot.isCloaked) return;
-  
+
   const resp = await bot.exec("cloak", { enable: true });
   if (!resp.error) {
+    bot.isCloaked = true;
     ctx.log("combat", "Re-cloaked after battle victory");
   } else {
     const msg = resp.error.message.toLowerCase();
-    if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+    if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+      bot.isCloaked = true;
+    } else if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
       ctx.log("warn", `Failed to re-cloak after battle: ${resp.error.message}`);
+    }
+  }
+}
+
+export async function ensureCloakedIfNeeded(ctx: RoutineContext, cloakOnStart: boolean): Promise<void> {
+  const { bot } = ctx;
+  if (!cloakOnStart) return;
+  if (bot.isCloaked) return;
+
+  const resp = await bot.exec("cloak", { enable: true });
+  if (!resp.error) {
+    bot.isCloaked = true;
+    ctx.log("travel", "Re-cloaked before travel (cloakOnStart backup)");
+  } else {
+    const msg = resp.error.message.toLowerCase();
+    if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+      bot.isCloaked = true;
+    } else if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+      ctx.log("warn", `Failed to re-cloak before travel: ${resp.error.message}`);
     }
   }
 }
@@ -781,12 +970,28 @@ export async function fightFreshBattle(
   maxAttackTier: PirateTier,
   repairThreshold: number = 0,
   cloakOnStart: boolean = false,
+  shieldRechargePct: number = 80,
+  ammoThreshold: number = 5,
+  maxReloadAttempts: number = 3,
+  ammoReloadAbsoluteThreshold: number = 1,
+  ammoReloadPercentThreshold: number = 25,
+  stayAtEngaged: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
   let tickCount = 0;
   let lastHull = bot.hull;
+  let lastBattleTick: number | undefined;
   const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+const originalTarget = target;
+  const bracedTargets = new Set<string>();
+  let lastDamageDealt = 0;
+  let damageBaseline = 0;
+  let currentTargetId = target?.id || "";
+  let lastEnemyCount = 0;
+  let lastOurHullPct = -1;
+  const fightAtEngaged = (): boolean =>
+    stayAtEngaged || isCreatureFightTarget(originalTarget) || isCreatureFightTarget(target);
 
   ctx.log("combat", `🎯 Fighting fresh battle against ${target.name}...`);
 
@@ -846,11 +1051,10 @@ export async function fightFreshBattle(
     // Enter the combat loop so we can advance and close the distance.
     ctx.log("combat", `⚠️ Attack command errored ("${attackErrMsg}") but battle ${preAttackStatus?.battle_id} is active — entering combat loop to advance/engage`);
   } else if (preAttackStatus) {
-    ctx.log("combat", `⚔️ Battle already active with ${target.name} — setting initial stance`);
+    ctx.log("combat", `⚔️ Battle already active with ${target.name} — closing to engaged`);
   } else {
-    ctx.log("combat", `⚔️ Battle started with ${target.name} — setting initial stance`);
+    ctx.log("combat", `⚔️ Battle started with ${target.name} — closing to engaged`);
   }
-  await bot.exec("battle", { action: "stance", stance: "fire" });
   await ctx.sleep(10000);
 
   // Ensure we're at engaged zone before entering combat loop
@@ -873,7 +1077,11 @@ export async function fightFreshBattle(
     const targetZoneNum = zoneOrder["engaged"];
     if (ourZoneNum < targetZoneNum) {
       ctx.log("combat", `↩️ Advancing from ${ourZone} to ${Object.keys(zoneOrder).find(k => zoneOrder[k] === ourZoneNum + 1) || "engaged"}...`);
+      const beforeUpdate = bot.currentBattle.lastUpdate;
       const advResp = await bot.exec("battle", { action: "advance" });
+      if (!advResp.error) {
+        await waitForBattleUpdate(ctx, beforeUpdate);
+      }
       if (advResp.error) {
         const msg = advResp.error.message.toLowerCase();
         if (msg.includes("no active battle") || msg.includes("not in battle")) {
@@ -930,13 +1138,93 @@ export async function fightFreshBattle(
       return true;
     }
 
+    if (lastBattleTick !== undefined && status.tick === lastBattleTick) {
+      ctx.log("combat", `⚡ Battle tick frozen at ${status.tick} for 2 consecutive polls — treating as victory`);
+      bot.currentBattle.inBattle = false;
+      bot.currentBattle.battleId = null;
+      bot.currentBattle.participants = [];
+      await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
+      return true;
+    }
+    lastBattleTick = status.tick;
+
+    // Brace detection: track our own damage output. If a hit lands at ~25% of
+    // our baseline, the target is likely in brace stance -> switch targets.
+    const ourPartFresh = status.participants?.find((p: any) => p.username === bot.username);
+    const damageDealtFresh = (ourPartFresh as any)?.damage_dealt ?? 0;
+    const damageDeltaFresh = Math.max(0, damageDealtFresh - lastDamageDealt);
+    const ourHullPctFresh = (ourPartFresh as any)?.hull_pct ?? -1;
+    const tookDamageFresh = lastOurHullPct >= 0 && ourHullPctFresh >= 0 && ourHullPctFresh < lastOurHullPct;
+    if (ourHullPctFresh >= 0) lastOurHullPct = ourHullPctFresh;
+    if (currentTargetId !== target.id) { damageBaseline = 0; currentTargetId = target.id; }
+    if (damageDeltaFresh > damageBaseline) damageBaseline = damageDeltaFresh;
+    lastDamageDealt = damageDealtFresh;
+
+    const enemyCountFresh = (status.participants || []).filter((p: any) => p.side_id !== status!.your_side_id && !p.is_destroyed).length;
+    if (enemyCountFresh > lastEnemyCount) bracedTargets.clear();
+    // If everyone was marked braced but we took damage, someone left brace (can't attack while braced).
+    if (tookDamageFresh && enemyCountFresh > 0 && bracedTargets.size >= enemyCountFresh) bracedTargets.clear();
+    lastEnemyCount = enemyCountFresh;
+    if (bracedTargets.has(target.id) && damageDeltaFresh > 0 && damageBaseline > 0 && damageDeltaFresh >= damageBaseline * 0.5) {
+      bracedTargets.delete(target.id);
+    }
+
+    if (damageBaseline > 0 && damageDeltaFresh > 0 && damageDeltaFresh <= damageBaseline * 0.4 && target.id && !bracedTargets.has(target.id) && (bot.maxHull <= 0 || (bot.hull / bot.maxHull) * 100 > fleeThreshold)) {
+      const selfBoardingFresh = boardingClaims.get(target.id)?.claimer === bot.username;
+      if (selfBoardingFresh) {
+        ctx.log("combat", `🛡️ ${target.name} appears braced but we are boarding it — staying`);
+      } else {
+        bracedTargets.add(target.id);
+        ctx.log("combat", `🛡️ ${target.name} appears to be in BRACE stance (damage ${damageDeltaFresh} vs baseline ${damageBaseline}) — switching targets`);
+      const rosterEnemiesFresh = (status.participants || []).filter((p: any) => p.side_id !== status!.your_side_id && !p.is_destroyed && !(p.ship_class === "station" || (p as any).kind === "station"));
+      const nonBracedFresh = rosterEnemiesFresh.filter((p: any) => !bracedTargets.has(p.player_id || p.username || ""));
+      if (nonBracedFresh.length > 0) {
+        const next = nonBracedFresh[0];
+        target = { id: next.player_id || next.username, name: next.username || next.player_id } as NearbyEntity;
+        await bot.exec("battle", { action: "target", target_id: target.id });
+        damageBaseline = 0;
+        currentTargetId = target.id;
+        await ctx.sleep(300);
+        continue;
+      }
+      if (rosterEnemiesFresh.length === 0) {
+        const nearbyBrace = await acquireEnemyFromNearby(ctx, undefined, maxAttackTier, true);
+        if (nearbyBrace && nearbyBrace.id !== target.id) {
+          target = nearbyBrace;
+          await bot.exec("battle", { action: "target", target_id: target.id });
+          damageBaseline = 0;
+          currentTargetId = target.id;
+          await ctx.sleep(300);
+          continue;
+        }
+      }
+      }
+      }
+
     let targetParticipant = status.participants.find(
       p => p.player_id === target.id || p.username === target.name
     );
 
+    if (targetParticipant && target && !targetParticipant.is_destroyed) {
+      const coop = await cooperateWithBoardingClaim(ctx, status, target);
+      if (coop.brace) {
+        await ctx.sleep(10000);
+        continue;
+      }
+      if (coop.target && (coop.target.id !== target.id || coop.target.name !== target.name)) {
+        target = coop.target;
+        await bot.exec("battle", { action: "target", target_id: target.id });
+        targetParticipant = status.participants.find(
+          p => p.player_id === target.id || p.username === target.name
+        );
+        await ctx.sleep(300);
+      }
+    }
+
     if (targetParticipant && targetParticipant.is_destroyed) {
       ctx.log("combat", `⚠️ ${target.name} marked destroyed but battle still active — finding new target...`);
-      const better = pickRealBattleTarget(status, status.your_side_id);
+      const better = pickRealBattleTarget(status, status!.your_side_id);
       if (better) {
         ctx.log("combat", `🎯 Switching to ${better.name} (previous target destroyed)`);
         target = better;
@@ -972,7 +1260,19 @@ export async function fightFreshBattle(
     }
 
     if (!targetParticipant && target) {
-      const better = pickRealBattleTarget(status, status.your_side_id);
+      const coop = await cooperateWithBoardingClaim(ctx, status, target);
+      if (coop.brace) {
+        await ctx.sleep(10000);
+        continue;
+      }
+      if (coop.target && (coop.target.id !== target.id || coop.target.name !== target.name)) {
+        target = coop.target;
+        await bot.exec("battle", { action: "target", target_id: target.id });
+        await ctx.sleep(300);
+        continue;
+      }
+
+      const better = pickRealBattleTarget(status, status!.your_side_id);
       if (better && better.name !== target.name) {
         ctx.log("combat", `🎯 Switching target to ${better.name} (previous target left the battle)`);
         target = better;
@@ -1016,6 +1316,11 @@ export async function fightFreshBattle(
     const damageThisTick = Math.max(0, lastHull - bot.hull);
     lastHull = bot.hull;
 
+    const hasAmmo = await ensureAmmoLoaded(ctx, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
+    if (!hasAmmo) {
+      ctx.log("combat", `⚠️ No ammo reloaded — continuing fight (meat-shield if cargo empty)`);
+    }
+
     // In-combat emergency field repair / shield top-up (hunter style)
     if (repairThreshold > 0) {
       let didAction = false;
@@ -1025,7 +1330,7 @@ export async function fightFreshBattle(
       }
       if (shieldPct <= repairThreshold) {
         ctx.log("combat", `🛡️ Shields ${shieldPct}% ≤ repairThreshold — topping up shields in combat!`);
-        if (await topUpShields(ctx, 1.0)) didAction = true;
+        if (await topUpShields(ctx, shieldRechargePct / 100)) didAction = true;
       }
       if (didAction) {
         await ctx.sleep(10000);
@@ -1043,9 +1348,8 @@ export async function fightFreshBattle(
       ctx.log("combat", `Tick ${tickCount}: Enemy not in roster — keeping ${target.name} targeted/engaged | Hull=${hullPct}% | Shields=${shieldPct}% | Dmg=${damageThisTick}`);
       await attackTarget(ctx, target);
       await bot.exec("battle", { action: "target", target_id: target.id });
-      await bot.exec("battle", { action: "stance", stance: "fire" });
-      
-      // Refresh status to get current zone after stance change
+
+      // Refresh status to get current zone after targeting
       const currentStatus = await getBattleStatus(ctx);
       if (!currentStatus) {
         ctx.log("combat", `✅ Battle ended during enemy tracking - ${target.name} eliminated!`);
@@ -1057,7 +1361,11 @@ export async function fightFreshBattle(
       const ourZoneNow = currentStatus.your_zone || "outer";
       if (ourZoneNow !== "engaged") {
         ctx.log("combat", `↩️ Advancing from ${ourZoneNow} to engaged (enemy not in roster)`);
+        const beforeUpdate = bot.currentBattle.lastUpdate;
         const adv = await bot.exec("battle", { action: "advance" });
+        if (!adv.error) {
+          await waitForBattleUpdate(ctx, beforeUpdate);
+        }
         if (adv.error) {
           const errMsg = adv.error.message.toLowerCase();
           if (errMsg.includes("not in battle") || errMsg.includes("no active battle")) {
@@ -1131,6 +1439,31 @@ export async function fightFreshBattle(
       }
     }
 
+    // Range-based target switching: if current target is fleeing (out of range)
+    // and there's a closer hostile in the battle, switch to it instead of
+    // endlessly chasing while other enemies pound on us.
+    if (targetParticipant && target && status) {
+      const liveStatus = status;
+      const targetZoneNum = zoneDirMap[targetParticipant.zone || "outer"] ?? 0;
+      const ourZoneNum = zoneDirMap[ourCurrentZone] ?? 0;
+      if (targetZoneNum <= ourZoneNum - 2 && ourCurrentZone !== "engaged") {
+        const closerEnemy = liveStatus.participants.find(p => {
+          if (p.side_id === liveStatus.your_side_id || p.is_destroyed) return false;
+          if (p.player_id === target.id || p.username === target.name) return false;
+          const pZone = p.zone || "outer";
+          const pZoneNum = zoneDirMap[pZone] ?? 0;
+          return pZoneNum > targetZoneNum;
+        });
+        if (closerEnemy) {
+          ctx.log("combat", `🎯 Switching to ${closerEnemy.username || closerEnemy.player_id} (closer than fleeing ${target.name})`);
+          target = { id: closerEnemy.player_id || closerEnemy.username, name: closerEnemy.username || closerEnemy.player_id } as NearbyEntity;
+          await bot.exec("battle", { action: "target", target_id: target.id });
+          targetParticipant = closerEnemy;
+          await ctx.sleep(300);
+        }
+      }
+    }
+
     if (hullPct <= fleeThreshold) {
       ctx.log("combat", `💀 Hull critical (${hullPct}%) — FLEEING!`);
       await emergencyFleeSpam(ctx, "hull critical during combat");
@@ -1139,49 +1472,83 @@ export async function fightFreshBattle(
 
     // Stay within 1 zone of enemy to maintain firing range
     const zoneDiff = ourZoneNum - enemyZoneNum;
-    
-    // Always advance if we're not at engaged zone (especially when enemy zone is unknown/outer)
-    if (ourCurrentZone !== "engaged") {
-      if (zoneDiff > 1) {
-        ctx.log("combat", `↩️ Retreating from ${ourCurrentZone} to match enemy at ${enemyZone}`);
-        const retResp = await bot.exec("battle", { action: "retreat" });
-        if (retResp.error) {
-          const errMsg = retResp.error.message.toLowerCase();
-          if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-            ctx.log("combat", `✅ Battle ended (retreat failed: not in battle) - victory!`);
-            return true;
-          }
-          ctx.log("error", `Retreat failed: ${retResp.error.message}`);
-        }
-        await ctx.sleep(10000);
-      } else {
-        ctx.log("combat", `⚔️ Advancing from ${ourCurrentZone} to engaged (zoneDiff=${zoneDiff}, enemyZone=${enemyZone})`);
+
+    if (fightAtEngaged()) {
+      const ourZoneNow = status.your_zone || "outer";
+      const enemyZone = targetParticipant?.zone || "outer";
+      const ourZoneNum = zoneDirMap[ourZoneNow] ?? 0;
+      const enemyZoneNum = zoneDirMap[enemyZone] ?? 0;
+
+      if (ourZoneNow !== "engaged") {
+        ctx.log("combat", `⚔️ Advancing from ${ourZoneNow} to engaged (stay-at-engaged)`);
+        const beforeUpdate = bot.currentBattle.lastUpdate;
         const advResp = await bot.exec("battle", { action: "advance" });
+        if (!advResp.error) {
+          await waitForBattleUpdate(ctx, beforeUpdate);
+        }
         if (advResp.error) {
           const errMsg = advResp.error.message.toLowerCase();
           if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-            ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+            const stillInBattle = await getBattleStatus(ctx);
+            if (stillInBattle) {
+              ctx.log("combat", `⚠️ Advance failed but battle still active — not registered as engaged, attacking ${target.name}...`);
+              await attackTarget(ctx, target);
+              await bot.exec("battle", { action: "target", target_id: target.id });
+              await ctx.sleep(5000);
+              continue;
+            }
+            ctx.log("combat", "✅ Battle ended (advance failed: not in battle) - victory!");
+            await checkAndPraiseMorgThar(ctx, true);
+            await recloakAfterBattle(ctx, cloakOnStart);
             return true;
           }
-          ctx.log("error", `Advance failed: ${advResp.error.message}`);
+          ctx.log("error", "Advance to engaged failed: " + advResp.error.message);
         }
         await ctx.sleep(10000);
+      } else {
+        ctx.log("combat", `⚔️ Already at engaged zone (stay-at-engaged)`);
       }
-    } else if (zoneDiff > 1) {
-      ctx.log("combat", `↩️ Retreating from ${ourCurrentZone} to match enemy at ${enemyZone}`);
-      const retResp = await bot.exec("battle", { action: "retreat" });
-      if (retResp.error) {
-        const errMsg = retResp.error.message.toLowerCase();
-        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-          ctx.log("combat", `✅ Battle ended (retreat failed: not in battle) - victory!`);
-          return true;
+
+      if (targetParticipant && status) {
+        const targetZoneNum = zoneDirMap[targetParticipant.zone || "outer"] ?? 0;
+        const ourNum = zoneDirMap[status.your_zone || "outer"] ?? 0;
+        if (targetZoneNum <= ourNum - 2) {
+          const ourSideId = status!.your_side_id;
+          const currentTargetId = target.id;
+          const currentTargetName = target.name;
+          const closerEnemy = status.participants.find(p => {
+            if ((ourSideId != null && p.side_id === ourSideId) || p.is_destroyed) return false;
+            if (p.player_id === currentTargetId || p.username === currentTargetName) return false;
+            const pZone = p.zone || "outer";
+            const pZoneNum = zoneDirMap[pZone] ?? 0;
+            return pZoneNum > targetZoneNum;
+          });
+          if (closerEnemy) {
+            ctx.log("combat", `🎯 Switching to ${closerEnemy.username || closerEnemy.player_id} (current target fled out of range)`);
+            target = { id: closerEnemy.player_id || closerEnemy.username, name: closerEnemy.username || closerEnemy.player_id } as NearbyEntity;
+            await bot.exec("battle", { action: "target", target_id: target.id });
+            targetParticipant = closerEnemy;
+            await ctx.sleep(300);
+          }
         }
-        ctx.log("error", `Retreat failed: ${retResp.error.message}`);
       }
+
+      await attackTarget(ctx, target);
+      await bot.exec("battle", { action: "target", target_id: target.id });
       await ctx.sleep(10000);
-    } else if (zoneDiff < -1) {
-      ctx.log("combat", `⚔️ Advancing from ${ourCurrentZone} to match enemy at ${enemyZone}`);
+      continue;
+    }
+
+    // Hunters brawl: close to engaged and hold ground. Never retreat to match a
+    // kiting enemy — that just runs us out of the fight. The server auto-fires
+    // from our current zone; we only advance when the enemy is 2+ zones ahead.
+    if (zoneDiff < -1) {
+      ctx.log("combat", `⚔️ Advancing from ${ourCurrentZone} to close distance to enemy at ${enemyZone}`);
+      const beforeUpdate = bot.currentBattle.lastUpdate;
       const advResp = await bot.exec("battle", { action: "advance" });
+      if (!advResp.error) {
+        await waitForBattleUpdate(ctx, beforeUpdate);
+      }
       if (advResp.error) {
         const errMsg = advResp.error.message.toLowerCase();
         if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
@@ -1192,7 +1559,6 @@ export async function fightFreshBattle(
       }
       await ctx.sleep(10000);
     } else {
-      await bot.exec("battle", { action: "stance", stance: "fire" });
       await ctx.sleep(10000);
     }
   }
@@ -1208,11 +1574,9 @@ const PLAYER_KEYWORDS = ["pirate", "drifter", "raider", "outlaw", "bandit", "cor
  */
 async function isGenuinePlayer(ctx: RoutineContext, name: string | undefined): Promise<boolean> {
   if (!name) return false;
-  // Fast local checks first.
   if (isCreatureName(name)) return false;
   const lower = name.toLowerCase();
-  if (PLAYER_KEYWORDS.some(kw => lower.includes(kw))) return false; // pirate keyword
-  // Fall back to the live nearby scan to see if this name is a creature/pirate.
+  if (PLAYER_KEYWORDS.some(kw => lower.includes(kw))) return false;
   try {
     const resp = await ctx.bot.exec("get_nearby");
     if (!resp.error && resp.result) {
@@ -1221,33 +1585,36 @@ async function isGenuinePlayer(ctx: RoutineContext, name: string | undefined): P
         e.name === name || e.name.toLowerCase() === lower || e.name.toLowerCase().includes(lower)
       );
       if (match) {
-        if (isCreatureTarget(match, true)) return false;       // creature -> not a player
-        if (isPirateTarget(match, false, "boss")) return false; // pirate -> not a player
+        if (match.isCreature) return false;
+        if (match.isNPC) return false;
+        if (match.isPirate) return false;
+        return true;
       }
     }
   } catch {
-    /* non-fatal — fall through to treating as a player */
+    /* non-fatal */
   }
-  return true;
+  return false;
 }
 
 /** Pick a real enemy participant from the current battle (opposite side of ourSideId).
- *  Prefers boss-like names when present. Returns null if no valid enemy is listed yet. */
+ *  Prefers boss-like names when present. Stations are excluded — they cannot be
+ *  attacked. Returns null if no valid enemy is listed yet. */
 function pickRealBattleTarget(
   status: BattleStatus | null | undefined,
   ourSideId?: number,
 ): NearbyEntity | null {
   if (!status?.participants || status.participants.length === 0) return null;
-  
+
   // Validate ourSideId - must be a valid number from the sides present
   const validSides = status.sides?.map(s => s.side_id) || [];
-  const ourSide = (ourSideId !== undefined && validSides.includes(ourSideId)) 
-    ? ourSideId 
-    : status.your_side_id;
-  
+  const ourSide = (ourSideId !== undefined && validSides.includes(ourSideId))
+    ? ourSideId
+    : status!.your_side_id;
+
   // If we still don't have a valid side, we can't determine enemies
   if (ourSide === undefined || ourSide === null) return null;
-  
+
   const enemies = status.participants.filter(p =>
     p.side_id !== ourSide &&
     !p.is_destroyed &&
@@ -1255,12 +1622,24 @@ function pickRealBattleTarget(
   );
   if (enemies.length === 0) return null;
 
+  const nonStation = enemies.filter(p => {
+    const shipClass = (p.ship_class || "").toLowerCase();
+    const kind = (p as any).kind || "";
+    return shipClass !== "station" && kind.toLowerCase() !== "station";
+  });
+  const source = nonStation.length > 0 ? nonStation : enemies;
+
   // Prefer serious threats / bosses by name (covers Overlord, Grand Marshal, etc.)
-  const bossish = enemies.find(p => {
+  const bossish = source.find(p => {
     const name = (p.username || p.player_id || "").toLowerCase();
     return /overlord|grand marshal|warlord|admiral|nyx|korr|boss|alpha|omega|prime|executioner|sentinel|apex|razor|striker/.test(name);
   });
-  const chosen = bossish || enemies[0];
+  const sortedByShields = source.sort(
+    (a, b) =>
+      (a.shield_pct ?? a.shield_percent ?? 100) -
+      (b.shield_pct ?? b.shield_percent ?? 100),
+  );
+  const chosen = bossish || sortedByShields[0];
 
   return {
     id: chosen.player_id || chosen.username || "",
@@ -1320,6 +1699,15 @@ async function acquireEnemyFromNearby(
 /** Issue attack on a target, falling back to the name if the id is rejected. */
 async function attackTarget(ctx: RoutineContext, target: NearbyEntity): Promise<boolean> {
   const { bot } = ctx;
+  // Never issue a fresh `attack` while already in battle — the server treats us as
+  // already engaged and the mutation never resolves (hangs ~180s awaiting
+  // action_result, freezing the routine until stop). Re-targeting is handled via
+  // `battle { action: "target" }` by the caller.
+  if (bot.isInBattle()) {
+    ctx.log("combat", `Already in battle — retargeting ${target.name} instead of re-attacking`);
+    await bot.exec("battle", { action: "target", target_id: target.id });
+    return true;
+  }
   let resp = await bot.exec("attack", { target_id: target.id });
   if (resp.error) {
     const msg = resp.error.message.toLowerCase();
@@ -1409,11 +1797,28 @@ export async function fightJoinedBattle(
   shieldRechargePct: number = 80,
   onlyNPCs: boolean = false,
   cloakOnStart: boolean = false,
+  stayAtEngaged: boolean = false,
+  ammoThreshold: number = 5,
+  maxReloadAttempts: number = 3,
+  ammoReloadAbsoluteThreshold: number = 1,
+  ammoReloadPercentThreshold: number = 25,
+  nullCannonBraceCycle: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
 
   let currentTarget = target;
+
+  // Brace-stance detection via damage output.
+  const bracedTargetsJoined = new Set<string>();
+  let lastDamageDealtJoined = 0;
+  let damageBaselineJoined = 0;
+  let currentTargetIdJoined = target?.id || "";
+  let lastEnemyCountJoined = 0;
+  let lastOurHullPctJoined = -1;
+
+  let lastNullCannonTick: number | undefined;
+  let nullCannonPhase = 0;
 
   // If the caller passed a stale or unrelated target (common after attack timeout
   // when a boss jumped us), pick a real participant from the actual battle.
@@ -1423,7 +1828,7 @@ export async function fightJoinedBattle(
       p => p.player_id === currentTarget!.id || p.username === currentTarget!.name
     );
     if (!isValid) {
-      const better = pickRealBattleTarget(status, status.your_side_id);
+      const better = pickRealBattleTarget(status, status!.your_side_id);
       if (better) {
         ctx.log("combat", `Original target ${currentTarget?.name ?? "none"} not in this battle — auto-targeting real enemy ${better.name}`);
         currentTarget = better;
@@ -1431,28 +1836,75 @@ export async function fightJoinedBattle(
     }
   }
 
-  // The newer server combat code OMITS the enemy from participants, so
-  // pickRealBattleTarget is usually null. Re-acquire the real attacker from the
-  // nearby scan (which still lists pirates) so we have someone to actually fight.
-  if (!currentTarget || (status && !status.participants.some(p => p.player_id === currentTarget!.id || p.username === currentTarget!.name))) {
-    const nearbyEnemy = await acquireEnemyFromNearby(ctx, currentTarget?.name, maxAttackTier, onlyNPCs);
-    if (nearbyEnemy) {
-      ctx.log("combat", `Re-acquired enemy from nearby scan: ${nearbyEnemy.name}`);
-      currentTarget = nearbyEnemy;
-    }
+  // When joining an EXISTING battle (the only path into fightJoinedBattle — fresh
+  // battles go through fightFreshBattle), the caller's target is often a synthetic
+  // `fakeTarget` built from the battle roster. For creatures the roster's id is NOT
+  // the id the `attack` command accepts (only get_nearby's `creature_id` is), so
+  // attacking with it silently fails: the bot ends up "in" the battle but never
+  // registered as engaged, the server never auto-fires, and the hunter just sits in
+  // the outer ring and dies (most visible after a client restart mid-battle).
+  // Always re-acquire the real enemy from get_nearby — preferName keeps the correct
+  // target, and we only switch when a matching live entity is actually visible.
+  const nearbyEnemy = await acquireEnemyFromNearby(ctx, currentTarget?.name, maxAttackTier, onlyNPCs);
+  if (nearbyEnemy) {
+    ctx.log("combat", `Re-acquired enemy from nearby scan: ${nearbyEnemy.name} (id ${nearbyEnemy.id})`);
+    currentTarget = nearbyEnemy;
   }
+
+  // How we "engage" depends on whether we're already a battle participant:
+  //  - If we are NOT yet a participant (freshly pulled in), we must `attack` to register.
+  //  - If we ARE already a participant (e.g. a battle that survived a client restart),
+  //    `attack` HANGS for ~180s and the server still rejects `advance`, so we must NOT
+  //    attack. Instead we (re)target the enemy and set fire stance; the server auto-fires
+  //    at our targeted enemy and we advance. A hunter NEVER flees a one-shot creature it
+  //    can crush — it fights it.
+  let alreadyEngaged = !!status?.is_participant;
+  const doEngage = async (t: NearbyEntity): Promise<boolean> => {
+    if (alreadyEngaged) {
+      await bot.exec("battle", { action: "target", target_id: t.id });
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      return true;
+    }
+    const ok = await attackTarget(ctx, t);
+    if (ok) {
+      alreadyEngaged = true;
+    } else {
+      // Attack rejected (e.g. "already in a battle") — we're engaged, just retarget.
+      await bot.exec("battle", { action: "target", target_id: t.id });
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      alreadyEngaged = true;
+    }
+    return ok;
+  };
 
   ctx.log("combat", `🎯 Fighting in joined battle${currentTarget ? ` — targeting ${currentTarget.name}` : ''}`);
 
-  // Actually engage the enemy with the attack command. The server requires an active
-  // attack to register us as "in" the battle for `battle` advance/stance commands —
-  // otherwise advance fails with "You are not in a battle. Use attack to engage...".
   if (currentTarget) {
-    await attackTarget(ctx, currentTarget);
-    await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+    await doEngage(currentTarget);
   }
-  await bot.exec("battle", { action: "stance", stance: "fire" });
   await ctx.sleep(10000);
+
+  // Immediate readiness check after engaging — do not blindly advance if we're
+  // already critically wounded or can top-up shields before moving into range.
+  await bot.refreshShip();
+  const startHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+  const startShieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+  if (startHullPct <= fleeThreshold && canFlee) {
+    ctx.log("combat", `🚨 Hull ${startHullPct}% ≤ fleeThreshold (${fleeThreshold}%) on battle start — emergency flee!`);
+    await emergencyFleeSpam(ctx, `critical hull ${startHullPct}% on battle start`);
+    return false;
+  }
+  if (repairThreshold > 0 && startShieldPct <= repairThreshold && shieldRechargePct > 0) {
+    ctx.log("combat", `🛡️ Shields ${startShieldPct}% ≤ repairThreshold (${repairThreshold}%) — recharging before advancing`);
+    await topUpShields(ctx, shieldRechargePct / 100);
+    await ctx.sleep(10000);
+  }
+  if (repairThreshold > 0 && startHullPct <= repairThreshold) {
+    ctx.log("combat", `🛠️ Hull ${startHullPct}% ≤ repairThreshold (${repairThreshold}%) — repairing before advancing`);
+    if (await useRepairKits(ctx)) {
+      await ctx.sleep(10000);
+    }
+  }
 
   // Ensure we're at engaged zone before entering combat loop
   const postSetupStatus = await getBattleStatus(ctx);
@@ -1465,15 +1917,24 @@ export async function fightJoinedBattle(
     for (let z = ourZoneNum + 1; z <= targetZoneNum; z++) {
       const zoneName = Object.keys(zoneOrder).find(k => zoneOrder[k] === z) || "engaged";
       ctx.log("combat", `Advancing to ${zoneName}...`);
+      const beforeUpdate = bot.currentBattle.lastUpdate;
       const advResp = await bot.exec("battle", { action: "advance" });
+      if (!advResp.error) {
+        await waitForBattleUpdate(ctx, beforeUpdate);
+      }
       if (advResp.error) {
         const msg = advResp.error.message.toLowerCase();
         if (msg.includes("no active battle") || msg.includes("not in battle")) {
           // Bot not registered as engaged - need to ensure we're attacking the target
           if (currentTarget) {
             ctx.log("combat", `⚠️ Advance failed - not registered as engaged, ensuring attack on ${currentTarget.name}...`);
-            await attackTarget(ctx, currentTarget);
-            await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            // Never re-issue `attack` if we're already a participant — it hangs.
+            if (status?.is_participant) {
+              await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            } else {
+              await attackTarget(ctx, currentTarget);
+              await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            }
             await ctx.sleep(5000);
             // Check if battle is still active
             const afterAttackStatus = await getBattleStatus(ctx);
@@ -1498,11 +1959,33 @@ export async function fightJoinedBattle(
         ctx.log("error", `Advance to ${zoneName} failed: ${advResp.error.message}`);
       }
       await ctx.sleep(10000);
+      
+      // Check hull/shield after each advance step — we may be taking fire while closing distance
+      await bot.refreshShip();
+      const advHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      const advShieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+      if (advHullPct <= fleeThreshold && canFlee) {
+        ctx.log("combat", `🚨 Hull ${advHullPct}% ≤ fleeThreshold (${fleeThreshold}%) during advance — emergency flee!`);
+        await emergencyFleeSpam(ctx, `critical hull ${advHullPct}% during advance`);
+        return false;
+      }
+      if (repairThreshold > 0 && advShieldPct <= repairThreshold && shieldRechargePct > 0) {
+        ctx.log("combat", `🛡️ Shields ${advShieldPct}% ≤ repairThreshold (${repairThreshold}%) — recharging during advance`);
+        await topUpShields(ctx, shieldRechargePct / 100);
+        await ctx.sleep(10000);
+      }
+      if (repairThreshold > 0 && advHullPct <= repairThreshold) {
+        ctx.log("combat", `🛠️ Hull ${advHullPct}% ≤ repairThreshold (${repairThreshold}%) — repairing during advance`);
+        if (await useRepairKits(ctx)) {
+          await ctx.sleep(10000);
+        }
+      }
     }
   }
 
   let lastKnownEnemyZone = "outer";
   let tickCount = 0;
+  let lastBattleTick: number | undefined;
 
   while (true) {
     if (bot.state !== "running") return false;
@@ -1523,15 +2006,138 @@ export async function fightJoinedBattle(
       return true;
     }
 
-    // If our current target is no longer in the battle (destroyed, fled, or was wrong to begin with),
+    if (lastBattleTick !== undefined && status.tick === lastBattleTick) {
+      ctx.log("combat", `⚡ Battle tick frozen at ${status.tick} for 2 consecutive polls — treating as victory`);
+      bot.currentBattle.inBattle = false;
+      bot.currentBattle.battleId = null;
+      bot.currentBattle.participants = [];
+      await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
+      return true;
+    }
+    lastBattleTick = status.tick;
+
+    // Immediate hull/shield check at the start of every combat tick — do not
+    // wait for target-switching logic to decide whether we're in danger.
+    // wait for target-switching logic to decide whether we're in danger.
+    await bot.refreshShip();
+    const tickHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    const tickShieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+    if (tickHullPct <= fleeThreshold && canFlee) {
+      ctx.log("combat", `🚨 Hull ${tickHullPct}% ≤ fleeThreshold (${fleeThreshold}%) — emergency flee!`);
+      await emergencyFleeSpam(ctx, `critical hull ${tickHullPct}%`);
+      return false;
+    }
+    if (repairThreshold > 0 && tickShieldPct <= repairThreshold && shieldRechargePct > 0) {
+      ctx.log("combat", `🛡️ Shields ${tickShieldPct}% ≤ repairThreshold (${repairThreshold}%) — recharging in combat`);
+      await topUpShields(ctx, shieldRechargePct / 100);
+      await ctx.sleep(10000);
+      continue;
+    }
+    if (repairThreshold > 0 && tickHullPct <= repairThreshold) {
+      ctx.log("combat", `🛠️ Hull ${tickHullPct}% ≤ repairThreshold (${repairThreshold}%) — repairing in combat`);
+      if (await useRepairKits(ctx)) {
+        await ctx.sleep(10000);
+        continue;
+      }
+    }
+
+    // Brace detection: track our own damage output.
+    const ourPartJoined2 = status.participants?.find((p: any) => p.username === bot.username);
+    const damageDealtJoined2 = (ourPartJoined2 as any)?.damage_dealt ?? 0;
+    const damageDeltaJoined2 = Math.max(0, damageDealtJoined2 - lastDamageDealtJoined);
+    const ourHullPctJoined2 = (ourPartJoined2 as any)?.hull_pct ?? -1;
+    const tookDamageJoined2 = lastOurHullPctJoined >= 0 && ourHullPctJoined2 >= 0 && ourHullPctJoined2 < lastOurHullPctJoined;
+    if (ourHullPctJoined2 >= 0) lastOurHullPctJoined = ourHullPctJoined2;
+    if (currentTargetIdJoined !== currentTarget?.id) { damageBaselineJoined = 0; currentTargetIdJoined = currentTarget?.id || ""; }
+    if (damageDeltaJoined2 > damageBaselineJoined) damageBaselineJoined = damageDeltaJoined2;
+    lastDamageDealtJoined = damageDealtJoined2;
+
+    const enemyCountJoined = (status.participants || []).filter((p: any) => p.side_id !== status!.your_side_id && !p.is_destroyed).length;
+    if (enemyCountJoined > lastEnemyCountJoined) bracedTargetsJoined.clear();
+    if (tookDamageJoined2 && enemyCountJoined > 0 && bracedTargetsJoined.size >= enemyCountJoined) bracedTargetsJoined.clear();
+    lastEnemyCountJoined = enemyCountJoined;
+    if (currentTarget?.id && bracedTargetsJoined.has(currentTarget.id) && damageDeltaJoined2 > 0 && damageBaselineJoined > 0 && damageDeltaJoined2 >= damageBaselineJoined * 0.5) {
+      bracedTargetsJoined.delete(currentTarget.id);
+    }
+
+    if (damageBaselineJoined > 0 && damageDeltaJoined2 > 0 && damageDeltaJoined2 <= damageBaselineJoined * 0.4 && currentTarget?.id && !bracedTargetsJoined.has(currentTarget.id)) {
+      const selfBoardingJoined = boardingClaims.get(currentTarget.id)?.claimer === bot.username;
+      if (selfBoardingJoined) {
+        ctx.log("combat", `🛡️ ${currentTarget.name} appears braced but we are boarding it — staying`);
+      } else {
+        bracedTargetsJoined.add(currentTarget.id);
+        ctx.log("combat", `🛡️ ${currentTarget.name} appears to be in BRACE stance (damage ${damageDeltaJoined2} vs baseline ${damageBaselineJoined}) — switching targets`);
+        const rosterEnemiesJoined = (status.participants || []).filter((p: any) => p.side_id !== status!.your_side_id && !p.is_destroyed && !(p.ship_class === "station" || (p as any).kind === "station"));
+        const nonBracedJoined = rosterEnemiesJoined.filter((p: any) => !bracedTargetsJoined.has(p.player_id || p.username || ""));
+        if (nonBracedJoined.length > 0) {
+          const next = nonBracedJoined[0];
+          currentTarget = { id: next.player_id || next.username, name: next.username || next.player_id } as NearbyEntity;
+          await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+          damageBaselineJoined = 0;
+          currentTargetIdJoined = currentTarget.id;
+          await ctx.sleep(300);
+          continue;
+        }
+        if (rosterEnemiesJoined.length === 0) {
+          const nearbyBraceJoined2 = await acquireEnemyFromNearby(ctx, undefined, maxAttackTier, onlyNPCs);
+          if (nearbyBraceJoined2 && nearbyBraceJoined2.id !== currentTarget.id) {
+            currentTarget = nearbyBraceJoined2;
+            await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            damageBaselineJoined = 0;
+            currentTargetIdJoined = currentTarget.id;
+            await ctx.sleep(300);
+            continue;
+          }
+        }
+      }
+    }
+
+  const hullPct = tickHullPct;
+  const shieldPct = tickShieldPct;
+
+  // If our current target is no longer in the battle (destroyed, fled, or was wrong to begin with),
     // pick a fresh real enemy from the actual participants. This fixes the "targeting Frazzlebite
     // while Overlord Nyx is the one hitting us" case after an attack timeout.
     let targetParticipant = status.participants.find(
       p => currentTarget && (p.player_id === currentTarget.id || p.username === currentTarget.name)
     );
 
+    if (targetParticipant && currentTarget && !targetParticipant.is_destroyed) {
+      const coop = await cooperateWithBoardingClaim(ctx, status, currentTarget);
+      if (coop.brace) {
+        await ctx.sleep(10000);
+        continue;
+      }
+      if (coop.target && currentTarget && (coop.target.id !== currentTarget.id || coop.target.name !== currentTarget.name)) {
+        const newTarget = coop.target;
+        currentTarget = newTarget;
+        await bot.exec("battle", { action: "target", target_id: newTarget.id });
+        targetParticipant = status.participants.find(
+          p => p.player_id === newTarget.id || p.username === newTarget.name
+        );
+        await ctx.sleep(300);
+      }
+    }
+
     if (!targetParticipant) {
-      const better = pickRealBattleTarget(status, status.your_side_id);
+      const coop = await cooperateWithBoardingClaim(ctx, status, currentTarget);
+      if (coop.brace) {
+        await ctx.sleep(10000);
+        continue;
+      }
+      if (coop.target && currentTarget && (coop.target.id !== currentTarget.id || coop.target.name !== currentTarget.name)) {
+        const newTarget = coop.target;
+        currentTarget = newTarget;
+        await bot.exec("battle", { action: "target", target_id: newTarget.id });
+        await ctx.sleep(300);
+        targetParticipant = status.participants.find(
+          p => p.player_id === newTarget.id || p.username === newTarget.name
+        );
+        continue;
+      }
+
+      const better = pickRealBattleTarget(status, status!.your_side_id);
       if (better && (!currentTarget || better.id !== currentTarget.id)) {
         ctx.log("combat", `🎯 Switching target to ${better.name} (previous target invalid or left the battle)`);
         currentTarget = better;
@@ -1541,11 +2147,13 @@ export async function fightJoinedBattle(
         targetParticipant = status.participants.find(
           p => p.player_id === better.id || p.username === better.name
         );
-        // Check if new target is a real player (not a creature/pirate) and we should flee
-        if (onlyNPCs && targetParticipant && await isGenuinePlayer(ctx, targetParticipant.username)) {
-          ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
-          await emergencyFleeSpam(ctx, `target switched to player`);
-          return false;
+        if (onlyNPCs && targetParticipant) {
+          const participantRaw = targetParticipant as unknown as Record<string, unknown>;
+          if (!participantRaw.is_npc && await isGenuinePlayer(ctx, targetParticipant.username)) {
+            ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
+            await emergencyFleeSpam(ctx, `target switched to player`);
+            return false;
+          }
         }
       } else if (!better) {
         // Newer server combat code omits enemies from participants, so pickRealBattleTarget
@@ -1555,7 +2163,7 @@ export async function fightJoinedBattle(
         if (nearbyEnemy) {
           ctx.log("combat", `🎯 Re-acquired live enemy ${nearbyEnemy.name} from nearby scan — engaging`);
           currentTarget = nearbyEnemy;
-          const attackOk = await attackTarget(ctx, currentTarget);
+          const attackOk = await doEngage(currentTarget);
           if (!attackOk) {
             const afterAttack = await getBattleStatus(ctx);
             if (!afterAttack) {
@@ -1581,7 +2189,7 @@ export async function fightJoinedBattle(
 
     if (targetParticipant && targetParticipant.is_destroyed && currentTarget) {
       ctx.log("combat", `⚠️ ${currentTarget.name} marked destroyed but battle still active — finding new target...`);
-      const better = pickRealBattleTarget(status, status.your_side_id);
+      const better = pickRealBattleTarget(status, status!.your_side_id);
       if (better) {
         ctx.log("combat", `🎯 Switching to ${better.name} (previous target destroyed)`);
         currentTarget = better;
@@ -1592,7 +2200,7 @@ export async function fightJoinedBattle(
         if (nearbyEnemy) {
           ctx.log("combat", `🎯 Re-acquired ${nearbyEnemy.name} from nearby scan after target destroyed`);
           currentTarget = nearbyEnemy;
-          const attackOk = await attackTarget(ctx, currentTarget);
+          const attackOk = await doEngage(currentTarget);
           if (!attackOk) {
             const afterAttack = await getBattleStatus(ctx);
             if (!afterAttack) {
@@ -1616,32 +2224,18 @@ export async function fightJoinedBattle(
       continue;
     }
 
-    if (onlyNPCs && targetParticipant && await isGenuinePlayer(ctx, targetParticipant.username)) {
-      ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
-      await emergencyFleeSpam(ctx, `target is a player`);
-      return false;
+    if (onlyNPCs && targetParticipant) {
+      const participantRaw = targetParticipant as unknown as Record<string, unknown>;
+      if (!participantRaw.is_npc && await isGenuinePlayer(ctx, targetParticipant.username)) {
+        ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
+        await emergencyFleeSpam(ctx, `target is a player`);
+        return false;
+      }
     }
 
-    await bot.refreshShip();
-    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-    const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
-
-    // In-combat emergency field repair / shield top-up (hunter style)
-    // Only skip firing if we actually consumed items this tick (prevents infinite loop when out of stock).
-    if (repairThreshold > 0) {
-      let didAction = false;
-      if (hullPct <= repairThreshold) {
-        ctx.log("combat", `🛠️ Hull ${hullPct}% ≤ repairThreshold — using repair kits in combat!`);
-        if (await useRepairKits(ctx)) didAction = true;
-      }
-      if (shieldPct <= repairThreshold) {
-        ctx.log("combat", `🛡️ Shields ${shieldPct}% ≤ repairThreshold — topping up shields in combat!`);
-        if (await topUpShields(ctx, 1.0)) didAction = true;
-      }
-      if (didAction) {
-        await ctx.sleep(10000);
-        continue;
-      }
+    const hasAmmo = await ensureAmmoLoaded(ctx, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
+    if (!hasAmmo) {
+      ctx.log("combat", `⚠️ No ammo reloaded — continuing fight (meat-shield if cargo empty)`);
     }
 
     // Shield recharge for escorts (even when repairThreshold is 0)
@@ -1656,6 +2250,9 @@ export async function fightJoinedBattle(
     }
 
     const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+const originalTarget = target;
+  const fightAtEngaged = (): boolean =>
+      stayAtEngaged || isCreatureFightTarget(originalTarget) || isCreatureFightTarget(currentTarget);
 
     // If the enemy isn't in the participants roster (newer server combat code omits
     // them), we have no zone info for them. We still know who we're fighting via
@@ -1664,7 +2261,7 @@ export async function fightJoinedBattle(
     // "advance to close the distance" directive wants.
     if (!targetParticipant && currentTarget) {
       ctx.log("combat", `Tick ${tickCount}: Enemy not in roster — keeping ${currentTarget.name} targeted/engaged | Hull=${hullPct}% | Shields=${shieldPct}%`);
-      const attackOk = await attackTarget(ctx, currentTarget);
+      const attackOk = await doEngage(currentTarget);
       if (!attackOk) {
         const afterAttack = await getBattleStatus(ctx);
         if (!afterAttack) {
@@ -1677,10 +2274,13 @@ export async function fightJoinedBattle(
         return false;
       }
       await bot.exec("battle", { action: "target", target_id: currentTarget.id });
-      await bot.exec("battle", { action: "stance", stance: "fire" });
       const ourZoneNow = status.your_zone || "outer";
       if (ourZoneNow !== "engaged") {
+        const beforeUpdate = bot.currentBattle.lastUpdate;
         const adv = await bot.exec("battle", { action: "advance" });
+        if (!adv.error) {
+          await waitForBattleUpdate(ctx, beforeUpdate);
+        }
         if (adv.error && /not in battle/.test(adv.error.message.toLowerCase())) {
           ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
           await checkAndPraiseMorgThar(ctx, true);
@@ -1709,6 +2309,31 @@ export async function fightJoinedBattle(
       }
     }
 
+    // Range-based target switching: if current target is fleeing (out of range)
+    // and there's a closer hostile in the battle, switch to it instead of
+    // endlessly chasing while other enemies pound on us.
+    if (targetParticipant && currentTarget && status) {
+      const liveStatus = status;
+      const targetZoneNum = zoneDirMap[targetParticipant.zone || "outer"] ?? 0;
+      const ourZoneNum = zoneDirMap[ourZone] ?? 0;
+      if (targetZoneNum <= ourZoneNum - 2 && ourZone !== "engaged") {
+        const closerEnemy = liveStatus.participants.find(p => {
+          if (p.side_id === liveStatus.your_side_id || p.is_destroyed) return false;
+          if (p.player_id === currentTarget!.id || p.username === currentTarget!.name) return false;
+          const pZone = p.zone || "outer";
+          const pZoneNum = zoneDirMap[pZone] ?? 0;
+          return pZoneNum > targetZoneNum;
+        });
+        if (closerEnemy) {
+          ctx.log("combat", `🎯 Switching to ${closerEnemy.username || closerEnemy.player_id} (closer than fleeing ${currentTarget.name})`);
+          currentTarget = { id: closerEnemy.player_id || closerEnemy.username, name: closerEnemy.username || closerEnemy.player_id } as NearbyEntity;
+          await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+          targetParticipant = closerEnemy;
+          await ctx.sleep(300);
+        }
+      }
+    }
+
     if (canFlee && hullPct <= fleeThreshold) {
       ctx.log("combat", `💀 Hull critical (${hullPct}%) — FLEEING!`);
       await emergencyFleeSpam(ctx, `hull at ${hullPct}%`);
@@ -1723,24 +2348,104 @@ export async function fightJoinedBattle(
     // We can hit if |enemyZoneNum - ourZoneNum| <= 1
     const zoneDiff = ourZoneNum - enemyZoneNum;
 
-    if (zoneDiff > 1) {
-      // Enemy is behind us (e.g., we're at engaged(3), enemy at mid(1)) - retreat
-      ctx.log("combat", `↩️ Retreating from ${ourZone} to match enemy at ${enemyZone}`);
-      const retResp = await bot.exec("battle", { action: "retreat" });
-      if (retResp.error) {
-        const errMsg = retResp.error.message.toLowerCase();
-        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-          ctx.log("combat", `✅ Battle ended (retreat failed: not in battle) - victory!`);
-          await checkAndPraiseMorgThar(ctx, true);
-          return true;
+    if (fightAtEngaged()) {
+      const ourZoneNow = status.your_zone || "outer";
+      const enemyZone = targetParticipant?.zone || "outer";
+      const ourZoneNum = zoneDirMap[ourZoneNow] ?? 0;
+      const enemyZoneNum = zoneDirMap[enemyZone] ?? 0;
+
+      if (ourZoneNow !== "engaged") {
+        ctx.log("combat", `⚔️ Advancing from ${ourZoneNow} to engaged (stay-at-engaged)`);
+        const beforeUpdate = bot.currentBattle.lastUpdate;
+        const advResp = await bot.exec("battle", { action: "advance" });
+        if (!advResp.error) {
+          await waitForBattleUpdate(ctx, beforeUpdate);
         }
-        ctx.log("error", `Retreat failed: ${retResp.error.message}`);
+        if (advResp.error) {
+          const errMsg = advResp.error.message.toLowerCase();
+          if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+            const stillInBattle = await getBattleStatus(ctx);
+            if (stillInBattle) {
+              ctx.log("combat", `⚠️ Advance failed but battle still active — not registered as engaged, re-acquiring target...`);
+              if (status?.is_participant) {
+                if (currentTarget) await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+              } else {
+                if (currentTarget) await attackTarget(ctx, currentTarget);
+                if (currentTarget) await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+              }
+              await ctx.sleep(5000);
+              continue;
+            }
+            ctx.log("combat", "Battle ended (advance failed: not in battle) - victory!");
+            await checkAndPraiseMorgThar(ctx, true);
+            await recloakAfterBattle(ctx, cloakOnStart);
+            return true;
+          }
+          ctx.log("error", "Advance to engaged failed: " + advResp.error.message);
+        }
+        await ctx.sleep(10000);
+      } else {
+        ctx.log("combat", `⚔️ Already at engaged zone (stay-at-engaged)`);
       }
-      await ctx.sleep(10000);
-    } else if (zoneDiff < -1) {
-      // Enemy is ahead of us (e.g., we're at outer(0), enemy at inner(2)) - advance
-      ctx.log("combat", `⚔️ Advancing from ${ourZone} to match enemy at ${enemyZone}`);
+
+      if (targetParticipant && currentTarget && status) {
+        const targetZoneNum = zoneDirMap[targetParticipant.zone || "outer"] ?? 0;
+        const ourNum = zoneDirMap[status.your_zone || "outer"] ?? 0;
+        if (targetZoneNum <= ourNum - 2) {
+          const ourSideId = status!.your_side_id;
+          const currentTargetId = currentTarget.id;
+          const currentTargetName = currentTarget.name;
+          const closerEnemy = status.participants.find(p => {
+            if ((ourSideId != null && p.side_id === ourSideId) || p.is_destroyed) return false;
+            if (p.player_id === currentTargetId || p.username === currentTargetName) return false;
+            const pZone = p.zone || "outer";
+            const pZoneNum = zoneDirMap[pZone] ?? 0;
+            return pZoneNum > targetZoneNum;
+          });
+          if (closerEnemy) {
+            ctx.log("combat", `🎯 Creature: switching to ${closerEnemy.username || closerEnemy.player_id} (current target fled)`);
+            currentTarget = { id: closerEnemy.player_id || closerEnemy.username, name: closerEnemy.username || closerEnemy.player_id } as NearbyEntity;
+            await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            targetParticipant = closerEnemy;
+            await ctx.sleep(300);
+          }
+        }
+      }
+
+      if (nullCannonBraceCycle && status.tick !== undefined) {
+        if (status.tick !== lastNullCannonTick) {
+          lastNullCannonTick = status.tick;
+          nullCannonPhase = (nullCannonPhase + 1) % 4;
+
+          if (nullCannonPhase === 0) {
+            ctx.log("combat", `Tick ${status.tick}: Null Cannon fire stance (phase 0/4)`);
+            await bot.exec("battle", { action: "stance", stance: "fire" });
+            if (currentTarget) {
+              await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            }
+          } else {
+            ctx.log("combat", `Tick ${status.tick}: Null Cannon brace stance (phase ${nullCannonPhase}/4)`);
+            await bot.exec("battle", { action: "stance", stance: "brace" });
+          }
+        }
+        await ctx.sleep(10000);
+      } else {
+        if (currentTarget) await doEngage(currentTarget);
+        await ctx.sleep(10000);
+      }
+      continue;
+    }
+
+    // Hunters brawl: close to engaged and hold ground. Never retreat to match a
+    // kiting enemy — that just runs us out of the fight. The server auto-fires
+    // from our current zone; we only advance when the enemy is 2+ zones ahead.
+    if (zoneDiff < -1) {
+      ctx.log("combat", `⚔️ Advancing from ${ourZone} to close distance to enemy at ${enemyZone}`);
+      const beforeUpdate = bot.currentBattle.lastUpdate;
       const advResp = await bot.exec("battle", { action: "advance" });
+      if (!advResp.error) {
+        await waitForBattleUpdate(ctx, beforeUpdate);
+      }
       if (advResp.error) {
         const errMsg = advResp.error.message.toLowerCase();
         if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
@@ -1751,18 +2456,25 @@ export async function fightJoinedBattle(
         ctx.log("error", `Advance failed: ${advResp.error.message}`);
       }
       await ctx.sleep(10000);
-    } else {
-      // Within range - set fire stance
-      const stanceResp = await bot.exec("battle", { action: "stance", stance: "fire" });
-      if (stanceResp.error) {
-        const errMsg = stanceResp.error.message.toLowerCase();
-        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-          ctx.log("combat", `✅ Battle ended (stance failed: not in battle) - victory!`);
-          await checkAndPraiseMorgThar(ctx, true);
-          return true;
+    } else if (nullCannonBraceCycle && status.tick !== undefined) {
+      if (status.tick !== lastNullCannonTick) {
+        lastNullCannonTick = status.tick;
+        nullCannonPhase = (nullCannonPhase + 1) % 4;
+
+        if (nullCannonPhase === 0) {
+          ctx.log("combat", `Tick ${status.tick}: Null Cannon fire stance (phase 0/4)`);
+          await bot.exec("battle", { action: "stance", stance: "fire" });
+          if (currentTarget) {
+            await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+          }
+        } else {
+          ctx.log("combat", `Tick ${status.tick}: Null Cannon brace stance (phase ${nullCannonPhase}/4)`);
+          await bot.exec("battle", { action: "stance", stance: "brace" });
         }
-        ctx.log("error", `Stance failed: ${stanceResp.error.message}`);
       }
+      await ctx.sleep(10000);
+    } else {
+      if (currentTarget) await doEngage(currentTarget);
       await ctx.sleep(10000);
     }
   }

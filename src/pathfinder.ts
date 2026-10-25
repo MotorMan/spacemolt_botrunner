@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { perf } from "./perf.js";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 export const PATHFINDER_LANDING_MARGIN = 100.0;
 export const PATHFINDER_SPEED = 10.0;
@@ -197,7 +198,8 @@ function saveTravelData(data: PathfinderTravelData): void {
   try {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
     data.lastSaved = new Date().toISOString();
-    writeFileSync(TRAVEL_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(TRAVEL_FILE, payload, Buffer.byteLength(payload, "utf-8"));
     travelCache = data;
   } catch {}
 }

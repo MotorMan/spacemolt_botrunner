@@ -18,6 +18,7 @@ import type {
   PoiPayload,
   MarketPayload,
   CoordinationPayload,
+  CreatureClaimPayload,
   PlayerNamePayload,
   PassengerPayload,
   BotStatusPush,
@@ -29,7 +30,9 @@ import type {
   MarketQueryRequest,
   MarketQueryResponse,
   MarketQueryResult,
+  WildlifeDeltaPayload,
 } from "./client_sync_types.js";
+import { wildlifeStore, type SystemWildlife, type WildlifeFullData } from "./wildlivestore.js";
 
 export type {
   RegisteredClient,
@@ -47,7 +50,9 @@ export type {
   MarketQueryRequest,
   MarketQueryResponse,
   MarketQueryResult,
+  WildlifeDeltaPayload,
 } from "./client_sync_types.js";
+export type { SystemWildlife, WildlifeFullData } from "./wildlivestore.js";
 
 function generateApiKey(): string {
   return `master_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
@@ -66,6 +71,37 @@ export class ClientSyncMaster {
   private apiKey: string;
   private password: string;
   private mode: string;
+  /**
+   * The MAYDAY rescue primary designated by the user, shared across every
+   * connected client. A single selection on any client is stored here on the
+   * master and read by all clients' rescue routines, so they all agree on the
+   * same primary even though each client only knows its own local settings.
+   */
+  private designatedMaydayPrimary: string | null = null;
+  private creatureClaims = new Map<string, { claimer: string; targetName: string; system: string; poi: string; expiresAt: number }>();
+
+  // ── Wildlife / creature sync (light client incremental) ──────────────────
+  // The master holds the single authoritative wildlife store. Light clients get
+  // a one-time full dump on connect, then poll for *deltas* (individual system
+  // updates) so normal operation stays low-bandwidth. Every time the master
+  // merges a wildlife update — from a light client push, a full slave push, or
+  // its own bots' discoveries — the version bumps and the changed systems are
+  // logged so the next delta poll knows what to send.
+  /** Monotonic counter bumped on every wildlife merge. Serves as the "clock"
+   *  light clients use to ask "what changed since X?". */
+  private wildlifeVersion = 0;
+  /** Per-client: the last wildlife version this client acknowledged. Updated on
+   *  every register + every successful delta poll + every update push. */
+  private clientWildlifeVersions = new Map<string, number>();
+  /** Bounded changelog of (version, systemId, systemData) entries. Light clients
+   *  poll deltas since their version, so we only need to keep recent entries. */
+  private wildlifeChangeLog: Array<{ version: number; systemId: string; data: SystemWildlife }> = [];
+  /** Drop changelog entries beyond this many — old enough that no connected
+   *  light client still cares (they'd have re-synced by then). */
+  private readonly WILDLIFE_CHANGELOG_MAX = 500;
+  /** If a client's version is more than this many bumps behind the current one,
+   *  the changelog can't catch them up — they must do a full re-sync. */
+  private readonly WILDLIFE_MAX_DELTA_GAP = 50;
 
   // ── Catalog orchestration ──────────────────────────────────
   // Instead of every connected client independently downloading the gameserver's
@@ -270,6 +306,20 @@ export class ClientSyncMaster {
     return this.settings;
   }
 
+  /** The user-designated MAYDAY primary, shared across all connected clients. */
+  public getDesignatedMaydayPrimary(): string | null {
+    const s = this.settings as Record<string, unknown>;
+    return typeof s.designatedMaydayPrimary === "string" ? (s.designatedMaydayPrimary as string) : null;
+  }
+
+  /** Set (or clear, with `null`) the shared MAYDAY primary. Persisted via the
+   *  master settings so it survives a restart. */
+  public setDesignatedMaydayPrimary(username: string | null): void {
+    const s = this.settings as Record<string, unknown>;
+    s.designatedMaydayPrimary = username || null;
+    this.saveSettings();
+  }
+
   /**
    * Merge in updated settings (e.g. after the user edits the Connect Clients
    * page) so a live master picks up changes like the per-file opt-out list
@@ -342,6 +392,10 @@ export class ClientSyncMaster {
       selfUrl: payload.url || undefined,
       light: !!payload.light,
     });
+    // On (re)register a client is at the master's current wildlife version;
+    // the light client will do its one-time full sync before polling for deltas,
+    // so recording the version now just avoids serving stale deltas in the gap.
+    this.clientWildlifeVersions.set(id, this.wildlifeVersion);
     return Promise.resolve({ clientId: id, ok: true });
   }
 
@@ -408,6 +462,7 @@ export class ClientSyncMaster {
         this.clients.delete(cid);
         this.botStatuses.delete(cid);
         this.catalogVersions.delete(cid);
+        this.clientWildlifeVersions.delete(cid);
         if (this.downloaderClientId === cid) this.downloaderClientId = null;
       }
     }
@@ -434,6 +489,7 @@ export class ClientSyncMaster {
   public disconnect(clientId: string): boolean {
     this.botStatuses.delete(clientId);
     this.catalogVersions.delete(clientId);
+    this.clientWildlifeVersions.delete(clientId);
     if (this.downloaderClientId === clientId) this.downloaderClientId = null;
     return this.clients.delete(clientId);
   }
@@ -443,14 +499,7 @@ export class ClientSyncMaster {
     if (c) c.lastSeen = Date.now();
   }
 
-  public chatRelay(body: { channel: string; content: string; sender?: string; clientId?: string }): { ok: boolean } {
-    // Relay a client's non-API bot-chat message into this master's in-memory
-    // bot chat channel so routines on the master (mayday calls, periodic status
-    // checks, …) can see it. The message is tagged with the originating client
-    // label so every connected client (slave + light) that pulls `chat-history`
-    // sees the union of all clients' bot chat. This is what lets the lightweight
-    // connect mode share the cross-client bot chat channel without any of the
-    // heavy file sync that the full slave mode does.
+  public chatRelay(body: { channel: string; content: string; sender?: string; clientId?: string; metadata?: Record<string, unknown> }): { ok: boolean } {
     const client = body.clientId ? this.clients.get(body.clientId) : undefined;
     const label = client?.label;
     const prefix = label ? `[${label}] ` : "";
@@ -459,6 +508,7 @@ export class ClientSyncMaster {
       recipients: [],
       channel: (body.channel as any) || "general",
       content: String(body.content || ""),
+      metadata: body.metadata,
     });
     return { ok: true };
   }
@@ -547,6 +597,37 @@ export class ClientSyncMaster {
     return true;
   }
 
+  public registerCreatureClaim(payload: CreatureClaimPayload): boolean {
+    this.creatureClaims.set(payload.targetId, {
+      claimer: payload.claimer,
+      targetName: payload.targetName,
+      system: payload.system,
+      poi: payload.poi,
+      expiresAt: payload.expiresAt,
+    });
+    return true;
+  }
+
+  public getCreatureClaims(): CreatureClaimPayload[] {
+    const now = Date.now();
+    const out: CreatureClaimPayload[] = [];
+    for (const [targetId, claim] of this.creatureClaims) {
+      if (claim.expiresAt <= now) {
+        this.creatureClaims.delete(targetId);
+        continue;
+      }
+      out.push({
+        claimer: claim.claimer,
+        targetId,
+        targetName: claim.targetName,
+        system: claim.system,
+        poi: claim.poi,
+        expiresAt: claim.expiresAt,
+      });
+    }
+    return out;
+  }
+
   public playerNamesUpdate(_payload: PlayerNamePayload): boolean {
     return true;
   }
@@ -557,6 +638,126 @@ export class ClientSyncMaster {
 
   public wildlifeUpdate(_payload: { data: unknown }): boolean {
     return true;
+  }
+
+  /**
+   * Record a wildlife update from a connected client (or the master's own
+   * `drainPushes` hook) and bump the wildlife version so light clients polling
+   * for deltas pick up the change.
+   *
+   * The payload can be either:
+   *  - `{ system: string, data: SystemWildlife }` — a single-system update from
+   *    a light client's per-discovery push (low bandwidth).
+   *  - `WildlifeFullData` (`{ systems: Record<string, SystemWildlife>, ... }`) —
+   *    a full-dataset push from a full slave (backward compatible).
+   *
+   * For full-dataset pushes we diff each system against the store first so only
+   * systems that actually changed are logged in the changelog — otherwise a
+   * full slave re-sending the same galaxy every 15 s would flood the changelog
+   * and every light client.
+   *
+   * Returns the new master version + how many systems actually changed.
+   */
+  public recordWildlifeUpdate(
+    clientId: string,
+    payload: WildlifeDeltaPayload | WildlifeFullData,
+  ): { ok: boolean; version: number; changed: number } {
+    let systems: Record<string, SystemWildlife>;
+    if ("system" in payload && "data" in payload) {
+      const single = payload as WildlifeDeltaPayload;
+       systems = { [single.system]: single.data as unknown as SystemWildlife };
+    } else {
+      systems = (payload as WildlifeFullData).systems || {};
+    }
+
+    const changed: Record<string, SystemWildlife> = {};
+    for (const [sysId, sysData] of Object.entries(systems)) {
+      if (!sysData || typeof sysData !== "object") continue;
+      const current = wildlifeStore.getSystemData(sysId);
+      if (current && !this.systemsEqual(current as SystemWildlife, sysData as SystemWildlife)) {
+        changed[sysId] = sysData as SystemWildlife;
+      } else if (!current) {
+        changed[sysId] = sysData as SystemWildlife;
+      }
+    }
+
+    if (Object.keys(changed).length > 0) {
+      wildlifeStore.mergeFrom({ systems: changed, lastUpdated: new Date().toISOString(), counts: wildlifeStore.getCounts() });
+      this.wildlifeVersion++;
+      for (const [sysId, sysData] of Object.entries(changed)) {
+        this.wildlifeChangeLog.push({ version: this.wildlifeVersion, systemId: sysId, data: sysData });
+      }
+      // Trim the changelog so a long-running master doesn't grow unbounded.
+      const over = this.wildlifeChangeLog.length - this.WILDLIFE_CHANGELOG_MAX;
+      if (over > 0) this.wildlifeChangeLog.splice(0, over);
+    }
+
+    this.clientWildlifeVersions.set(clientId, this.wildlifeVersion);
+    return { ok: true, version: this.wildlifeVersion, changed: Object.keys(changed).length };
+  }
+
+  /** Current master wildlife version. Light clients send this back as `since`
+   *  on their next delta poll. */
+  public getWildlifeVersion(): number {
+    return this.wildlifeVersion;
+  }
+
+  /**
+   * Return wildlife systems that changed since `sinceVersion`, for a light
+   * client delta poll. If the client is too far behind (master restarted, or the
+   * changelog was trimmed) `needsFull` is set so the client knows to re-pull the
+   * full galaxy instead.
+   *
+   * The returned `systems` always holds the CURRENT authoritative state of each
+   * changed system (read fresh from the store), not a stale historical snapshot.
+   */
+  public getWildlifeDeltas(
+    sinceVersion: number,
+    clientId: string,
+  ): { version: number; systems: Record<string, SystemWildlife>; needsFull: boolean } {
+    this.clientWildlifeVersions.set(clientId, this.wildlifeVersion);
+
+    if (this.wildlifeChangeLog.length === 0) {
+      return { version: this.wildlifeVersion, systems: {}, needsFull: false };
+    }
+
+    const gap = this.wildlifeVersion - sinceVersion;
+    if (gap <= 0) {
+      return { version: this.wildlifeVersion, systems: {}, needsFull: false };
+    }
+
+    // Too many updates skipped — the changelog can't catch them up.
+    if (gap > this.WILDLIFE_MAX_DELTA_GAP) {
+      return { version: this.wildlifeVersion, systems: {}, needsFull: true };
+    }
+
+    // If the client's version predates the oldest changelog entry, the log was
+    // trimmed and we can't reconstruct what they missed.
+    const oldest = this.wildlifeChangeLog[0].version;
+    if (sinceVersion < oldest) {
+      return { version: this.wildlifeVersion, systems: {}, needsFull: true };
+    }
+
+    // Collect the set of system ids that changed, then read their CURRENT state
+    // from the store (not the historical snapshot in the changelog).
+    const changedIds = new Set<string>();
+    for (const entry of this.wildlifeChangeLog) {
+      if (entry.version > sinceVersion) changedIds.add(entry.systemId);
+    }
+
+    const systems: Record<string, SystemWildlife> = {};
+    for (const sysId of changedIds) {
+      const current = wildlifeStore.getSystemData(sysId);
+      if (current) systems[sysId] = current;
+    }
+
+    return { version: this.wildlifeVersion, systems, needsFull: false };
+  }
+
+  /** Shallow-structural equality for systems — cheap and sufficient for the
+   *  changelog diff (we only need to know IF anything changed, not what exactly). */
+  private systemsEqual(a: SystemWildlife, b: SystemWildlife): boolean {
+    return JSON.stringify(a) === JSON.stringify(b);
   }
 
   public getBots(): Array<Record<string, unknown>> {

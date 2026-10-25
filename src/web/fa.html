@@ -80,6 +80,8 @@
     .fa-status { font-size: 12px; color: var(--text-dim); padding: 4px 0; }
     .fa-status.err { color: #f85149; }
     .fa-status.loading { color: #58a6ff; }
+    .fa-faction-id { font-size: 12px; color: var(--text-dim); font-family: 'Consolas', 'Monaco', monospace; }
+    .fa-faction-id.has-id { color: #58a6ff; font-weight: 600; }
   </style>
 </head>
 <body>
@@ -91,6 +93,11 @@
 
   <div class="fa-controls">
     <select id="faBotSelect"><option value="">-- select bot --</option></select>
+    <div id="faFactionIdBox" style="display:none;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);margin-left:8px;">
+      <span style="color:var(--text-dim);">Faction:</span>
+      <span id="faFactionId" class="fa-faction-id"></span>
+    </div>
+    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer;margin-left:8px;"><input type="checkbox" id="faUseFactionId" style="width:14px;height:14px;"> Use bot's faction ID (view faction log)</label>
     <div class="fa-cat-group" id="faCatGroup">
       <button class="fa-cat-btn" data-cat="" style="background:rgba(88,166,255,0.2);color:#58a6ff;border-color:#58a6ff;">all</button>
       <button class="fa-cat-btn" data-cat="trading" style="background:#1a1a2e;color:#555;border-color:#333;">trading</button>
@@ -120,10 +127,19 @@
     <button id="faLoadPagesBtn" onclick="loadMultiplePages()">Load Pages</button>
     <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faLoadAllBots" style="width:14px;height:14px;">Load all bots</label>
     <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faShowBotSummary" style="width:14px;height:14px;">Bot summary</label>
-    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeGifts" style="width:14px;height:14px;">Exclude gifts</label>
-    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionWithdraw" style="width:14px;height:14px;">Exclude faction withdraw</label>
-    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeExchangeFill" style="width:14px;height:14px;">Exclude exchange fills</label>
-    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludePassengerFare" style="width:14px;height:14px;">Exclude passenger fares</label>
+    <div id="faFiltersPersonal" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeGifts" style="width:14px;height:14px;">Exclude gifts</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionWithdraw" style="width:14px;height:14px;">Exclude faction withdraw</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeExchangeFill" style="width:14px;height:14px;">Exclude exchange fills</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludePassengerFare" style="width:14px;height:14px;">Exclude passenger fares</label>
+    </div>
+    <div id="faFiltersFaction" style="display:none;gap:6px;flex-wrap:wrap;align-items:center;">
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionDeposit" style="width:14px;height:14px;">Exclude faction deposit</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionWithdrawal" style="width:14px;height:14px;">Exclude faction withdrawal</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionRent" style="width:14px;height:14px;">Exclude rent</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionMaintenance" style="width:14px;height:14px;">Exclude maintenance</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionRevenue" style="width:14px;height:14px;">Exclude station revenue</label>
+    </div>
     <button id="faPasteBtn" onclick="openPasteModal()">Paste JSON</button>
     <button id="faExportBtn" onclick="exportResults()" style="background:#21262d">Export</button>
     <button onclick="clearFaResults()" style="background:#21262d;border:1px solid var(--border);color:var(--text);">Clear Log</button>
@@ -186,6 +202,8 @@
   let pendingLoad = false;
   let activeCat = '';
   let activeEventType = '';
+  let useFactionId = false;
+  let selectedBotFaction = '';
   let seenIds = new Set();
   let lastLoadedPage = 1;
 
@@ -198,7 +216,8 @@
     session: ['login'],
     trading: ['buy', 'sell'],
     combat: ['damage', 'kill', 'outcome'],
-    mission: ['abandon', 'expire', 'complete']
+    mission: ['abandon', 'expire', 'complete'],
+    faction: ['deposit', 'transfer', 'withdraw', 'refuel', 'maintenance_paid', 'rent_paid', 'transit_lounge_departures', 'facility_rented', 'listing_fee_earned', 'station_revenue', 'rent_received', 'production_cycle', 'rent_warning']
   };
 
   // ── Helpers ─────────────────────────────────────────────
@@ -241,8 +260,33 @@
     const sel = document.getElementById('faBotSelect');
     const cur = sel.value;
     sel.innerHTML = '<option value="">-- select bot --</option>' +
-      bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}${b.state === 'running' ? ' ●' : ''}</option>`).join('');
+      bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}${b.state === 'running' ? ' ●' : ''}${b.faction ? ' · ' + esc(b.faction) : ''}</option>`).join('');
     if (cur && [...sel.options].some(o => o.value === cur)) sel.value = cur;
+    updateFactionIdDisplay();
+  }
+
+  function getSelectedBot() {
+    const name = document.getElementById('faBotSelect').value;
+    return bots.find(b => b.username === name) || null;
+  }
+
+  function updateFactionIdDisplay() {
+    const box = document.getElementById('faFactionIdBox');
+    const idEl = document.getElementById('faFactionId');
+    const bot = getSelectedBot();
+    // Prefer a faction ID already resolved via faction_info; fall back to
+    // bot.faction (from get_status) for the display.
+    const faction = selectedBotFaction || (bot && bot.faction ? bot.faction : '');
+    selectedBotFaction = faction;
+    if (faction) {
+      box.style.display = 'flex';
+      idEl.textContent = faction;
+      idEl.className = 'fa-faction-id has-id';
+    } else {
+      box.style.display = 'none';
+      idEl.textContent = '';
+      idEl.className = 'fa-faction-id';
+    }
   }
 
   // ── WebSocket ───────────────────────────────────────────
@@ -402,10 +446,39 @@
 
     const page = Math.max(1, parseInt(document.getElementById('faStartPageInput').value) || 1);
     const params = {};
-    if (activeCat) params.category = activeCat;
+    if (useFactionId) {
+      if (!selectedBotFaction) {
+        // Resolve the bot's own faction ID via faction_info (bot.faction may
+        // not be populated from get_status on library-backed bots).
+        pendingLoad = false;
+        document.getElementById('faLoadBtn').disabled = false;
+        document.getElementById('faCooldown').style.display = 'none';
+        setFaStatus('Resolving bot faction ID...', false, true);
+        sendExecWithRetry(bot, 'faction_info', {}, (result) => {
+          if (result.error) {
+            setFaStatus('Error resolving faction: ' + esc(result.error), true);
+            return;
+          }
+          const data = result.data || {};
+          const factionId = data.id || data.faction_id;
+          selectedBotFaction = factionId;
+          updateFactionIdDisplay();
+          if (!selectedBotFaction) {
+            setFaStatus('Selected bot is not in a faction. Choose a bot in a faction.', true);
+            return;
+          }
+          loadActionLog();
+        });
+        return;
+      }
+      params.category = 'faction';
+      params.faction_id = selectedBotFaction;
+    } else {
+      if (activeCat) params.category = activeCat;
+    }
     if (activeEventType) params.event_type = activeEventType;
     params.page = page;
-    const label = activeCat || 'all';
+    const label = (useFactionId ? 'faction ' + selectedBotFaction : activeCat || 'all');
     setFaStatus('Loading action log for ' + esc(bot) + ' (category: ' + label + ', page ' + page + ')...', false, true);
 
     sendExecWithRetry(bot, 'get_action_log', params, (result) => {
@@ -464,9 +537,43 @@
     const startPage = Math.max(1, parseInt(document.getElementById('faStartPageInput').value) || 1);
     const pageCount = Math.max(1, Math.min(10, parseInt(document.getElementById('faPageCountInput').value) || 1));
     const params = {};
-    if (activeCat) params.category = activeCat;
+    if (useFactionId) {
+      if (!singleBot) {
+        pendingLoad = false;
+        document.getElementById('faLoadPagesBtn').disabled = false;
+        document.getElementById('faCooldown').style.display = 'none';
+        setFaStatus('Select a bot to use its faction ID.', true);
+        return;
+      }
+      if (!selectedBotFaction) {
+        pendingLoad = false;
+        document.getElementById('faLoadPagesBtn').disabled = false;
+        document.getElementById('faCooldown').style.display = 'none';
+        setFaStatus('Resolving bot faction ID...', false, true);
+        sendExecWithRetry(singleBot, 'faction_info', {}, (result) => {
+          if (result.error) {
+            setFaStatus('Error resolving faction: ' + esc(result.error), true);
+            return;
+          }
+          const data = result.data || {};
+          const factionId = data.id || data.faction_id;
+          selectedBotFaction = factionId;
+          updateFactionIdDisplay();
+          if (!selectedBotFaction) {
+            setFaStatus('Selected bot is not in a faction. Choose a bot in a faction.', true);
+            return;
+          }
+          loadMultiplePages();
+        });
+        return;
+      }
+      params.category = 'faction';
+      params.faction_id = selectedBotFaction;
+    } else {
+      if (activeCat) params.category = activeCat;
+    }
     if (activeEventType) params.event_type = activeEventType;
-    const label = activeCat || 'all';
+    const label = (useFactionId ? 'faction ' + selectedBotFaction : activeCat || 'all');
 
     const targetBots = loadAllBots ? bots.map(b => b.username) : [singleBot];
     const botTotal = targetBots.length;
@@ -538,28 +645,31 @@
     });
   }
 
-  // Pull credits from structured fields first; fall back to parsing the
-  // summary text (e.g. "Sold 12x Power Cell @ 2671 each (32052 credits)").
+  // Pull credits from summary text first, since it explicitly states
+  // direction ("Earned 9753 credits" vs "Facility rent: 58 credits"). The
+  // structured d.credits field is unreliable for faction events (stored with
+  // the opposite sign from what the summary says), so only use it as a
+  // fallback when the summary gives no clear signal.
   function extractCredits(e, d, summary, eventType) {
-    if (typeof d.credits === 'number') return d.credits;
-    if (typeof d.total_cost === 'number') return -d.total_cost;
-    if (typeof d.cost === 'number') return -d.cost;
-
-    const ev = String(eventType || '').toLowerCase();
     const text = String(summary || '');
+    const ev = String(eventType || '').toLowerCase();
     const m = text.match(/\(([\d,]+)\s*credits?\)/i) || text.match(/([\d,]+)\s*credits?/i);
     if (m) {
       const amt = parseInt(m[1].replace(/,/g, ''), 10);
-      if (!isNaN(amt)) {
-        let sign = 1;
-        if (/(^|[^a-z])(buy|bought|purchase|purchased|spent|withdraw|paid|cost|fee)/i.test(text) || ev === 'buy') {
-          sign = -1;
-        } else if (/(^|[^a-z])(sell|sold|received|earned|reward|income|gain)/i.test(text) || ev === 'sell') {
-          sign = 1;
+      if (!isNaN(amt) && amt > 0) {
+        if (/(^|[^a-z])(buy|bought|purchase|purchased|spent|withdraw|paid|cost|fee)/i.test(text) || /(paid|withdraw|cost|fee|maintenance|refuel)$/i.test(ev)) {
+          return -amt;
         }
-        return sign * amt;
+        if (/(^|[^a-z])(sell|sold|received|earned|reward|income|gain)/i.test(text) || /(revenue|deposit|listing_fee|rented)$/i.test(ev)) {
+          return amt;
+        }
+        // Summary has an amount but no clear direction word — fall through
+        // to structured fields as a last resort.
       }
     }
+    if (typeof d.credits === 'number') return d.credits;
+    if (typeof d.total_cost === 'number') return -d.total_cost;
+    if (typeof d.cost === 'number') return -d.cost;
     return 0;
   }
 
@@ -579,6 +689,11 @@
     const excludeFactionWithdraw = document.getElementById('faExcludeFactionWithdraw').checked;
     const excludeExchangeFill = document.getElementById('faExcludeExchangeFill').checked;
     const excludePassengerFare = document.getElementById('faExcludePassengerFare').checked;
+    const excludeFactionDeposit = document.getElementById('faExcludeFactionDeposit').checked;
+    const excludeFactionWithdrawal = document.getElementById('faExcludeFactionWithdrawal').checked;
+    const excludeFactionRent = document.getElementById('faExcludeFactionRent').checked;
+    const excludeFactionMaintenance = document.getElementById('faExcludeFactionMaintenance').checked;
+    const excludeFactionRevenue = document.getElementById('faExcludeFactionRevenue').checked;
     filteredEntries = rawEntries.filter(e => {
       if (activeCat && e.category !== activeCat) return false;
       if (activeEventType && e.eventType !== activeEventType) return false;
@@ -586,6 +701,11 @@
       if (excludeFactionWithdraw && e.category === 'faction' && e.eventType.includes('withdraw')) return false;
       if (excludeExchangeFill && e.eventType.includes('exchange_fill')) return false;
       if (excludePassengerFare && e.eventType.includes('passenger_fare')) return false;
+      if (excludeFactionDeposit && e.category === 'faction' && e.eventType.includes('deposit')) return false;
+      if (excludeFactionWithdrawal && e.category === 'faction' && e.eventType.includes('withdrawal')) return false;
+      if (excludeFactionRent && e.category === 'faction' && (e.eventType.includes('rent_paid') || e.eventType.includes('rent_received'))) return false;
+      if (excludeFactionMaintenance && e.category === 'faction' && e.eventType.includes('maintenance_paid')) return false;
+      if (excludeFactionRevenue && e.category === 'faction' && (e.eventType.includes('station_revenue') || e.eventType.includes('listing_fee_earned'))) return false;
       return true;
     });
     creditsIn = 0;
@@ -701,12 +821,22 @@
       summaryEl.style.display = 'block';
       const excludeGifts = document.getElementById('faExcludeGifts').checked;
       const excludeFactionWithdraw = document.getElementById('faExcludeFactionWithdraw').checked;
+      const excludeFactionDeposit = document.getElementById('faExcludeFactionDeposit').checked;
+      const excludeFactionWithdrawal = document.getElementById('faExcludeFactionWithdrawal').checked;
+      const excludeFactionRent = document.getElementById('faExcludeFactionRent').checked;
+      const excludeFactionMaintenance = document.getElementById('faExcludeFactionMaintenance').checked;
+      const excludeFactionRevenue = document.getElementById('faExcludeFactionRevenue').checked;
       const botStats = {};
       for (const e of rawEntries) {
         const bot = e.bot || 'unknown';
         if (!botStats[bot]) botStats[bot] = { in: 0, out: 0 };
         const include = !(excludeGifts && e.category === 'trading' && (e.eventType.includes('gift_sent') || e.eventType.includes('gift_received'))) &&
-                        !(excludeFactionWithdraw && e.category === 'faction' && e.eventType.includes('withdraw'));
+                        !(excludeFactionWithdraw && e.category === 'faction' && e.eventType.includes('withdraw')) &&
+                        !(excludeFactionDeposit && e.category === 'faction' && e.eventType.includes('deposit')) &&
+                        !(excludeFactionWithdrawal && e.category === 'faction' && e.eventType.includes('withdrawal')) &&
+                        !(excludeFactionRent && e.category === 'faction' && (e.eventType.includes('rent_paid') || e.eventType.includes('rent_received'))) &&
+                        !(excludeFactionMaintenance && e.category === 'faction' && e.eventType.includes('maintenance_paid')) &&
+                        !(excludeFactionRevenue && e.category === 'faction' && (e.eventType.includes('station_revenue') || e.eventType.includes('listing_fee_earned')));
         if (include) {
           if (e.credits > 0) botStats[bot].in += e.credits;
           else if (e.credits < 0) botStats[bot].out += Math.abs(e.credits);
@@ -763,6 +893,25 @@
 
   document.getElementById('faEventTypeSelect').addEventListener('change', () => {
     activeEventType = document.getElementById('faEventTypeSelect').value;
+    applyFilter();
+    renderResults();
+  });
+
+  document.getElementById('faBotSelect').addEventListener('change', () => {
+    updateFactionIdDisplay();
+  });
+
+  document.getElementById('faUseFactionId').addEventListener('change', () => {
+    useFactionId = document.getElementById('faUseFactionId').checked;
+    const personal = document.getElementById('faFiltersPersonal');
+    const faction = document.getElementById('faFiltersFaction');
+    if (useFactionId) {
+      personal.style.display = 'none';
+      faction.style.display = 'flex';
+    } else {
+      personal.style.display = 'flex';
+      faction.style.display = 'none';
+    }
     applyFilter();
     renderResults();
   });

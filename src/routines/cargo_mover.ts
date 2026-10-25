@@ -50,6 +50,8 @@ import {
   getItemProgress,
   loadCargoMoverActivity,
   saveCargoMoverActivity,
+  resetCargoMoverDeliveryProgress,
+  setItemProgressDelivered,
   createMovement,
   updateMovement,
   completeMovement,
@@ -67,6 +69,7 @@ import {
   getBotClaimedQuantity,
   canClaimItemQuantity,
   cleanupStaleLocks,
+  resetCoordinationTracking,
 } from "./cargoMoverCoordination.js";
 import {
   addInTransitItems,
@@ -74,6 +77,7 @@ import {
   getInTransitQuantity,
   getInTransitSummary,
   cleanupStaleInTransit,
+  resetInTransitData,
 } from "./cargoMoverInTransit.js";
 
 /** Simple dock function that does NOT call collectFromStorage. */
@@ -121,8 +125,9 @@ interface CargoMoverSettings {
   factionStorageBot?: string;
   refuelThreshold: number;
   repairThreshold: number;
-  militaryFuelCells: number;
-  ignorePiratesWhenCloaked: boolean;
+    militaryFuelCells: number;
+    disableMarketBuy: boolean;
+    ignorePiratesWhenCloaked: boolean;
   ignoreBlacklistWhenCloaked: boolean;
   /** Bulk-move sub-routine: move EVERYTHING from the source faction storage to
    *  the destination instead of the hand-picked `items` list. */
@@ -132,11 +137,24 @@ interface CargoMoverSettings {
   bulkIgnoreOver: number;
   /** Transfer ordering: alphabetical, reverse alphabetical, or random. */
   bulkOrder: "alphabetical" | "reverse_alphabetical" | "random";
+  /** Source mode: "single" uses the configured sourceStation; "all" scans all
+   *  faction-storage stations and picks the next one with items to clean. */
+  bulkSourceMode: "single" | "all";
   /** Seed-base mode: first move a small amount of every item so the destination
    *  has a presence of each, then switch to full moving once all items are present. */
   bulkSeedMode: boolean;
   /** Amount per item to seed during seed-base mode. */
   bulkSeedAmount: number;
+  /** When true, bulk move will include fuel cells (premium, military, energy)
+   *  as regular cargo instead of skipping them. */
+  bulkMoveFuelCells: boolean;
+  /** Item ids the user explicitly excluded from bulk move — these are never
+   *  planned, loaded, or delivered by the bulk-move sub-routine. */
+  bulkExcludeItems: string[];
+  /** Station references (system|poiId or base_id) the user explicitly excluded
+   *  from bulk move "all" mode — these stations will never be scanned or used
+   *  as a source. */
+  bulkExcludeStations: string[];
 }
 
 export function getCargoMoverSettings(username?: string): CargoMoverSettings {
@@ -178,6 +196,7 @@ export function getCargoMoverSettings(username?: string): CargoMoverSettings {
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     militaryFuelCells: (t.militaryFuelCells as number) || 10,
+    disableMarketBuy: (t.disableMarketBuy as boolean) ?? false,
     // When cloaked a ship cannot be ambushed, so (default ON) it may ignore
     // pirates and blacklisted systems while cloaked.
     ignorePiratesWhenCloaked: (botOverrides.ignorePiratesWhenCloaked as boolean) ?? (t.ignorePiratesWhenCloaked as boolean) ?? true,
@@ -187,6 +206,14 @@ export function getCargoMoverSettings(username?: string): CargoMoverSettings {
     bulkOrder: (t.bulkOrder as "alphabetical" | "reverse_alphabetical" | "random") || "alphabetical",
     bulkSeedMode: (t.bulkSeedMode as boolean) ?? false,
     bulkSeedAmount: (t.bulkSeedAmount as number) || 10,
+    bulkMoveFuelCells: (t.bulkMoveFuelCells as boolean) ?? false,
+    bulkExcludeItems: Array.isArray(t.bulkExcludeItems)
+      ? (t.bulkExcludeItems as unknown[]).filter((v): v is string => typeof v === "string" && v.length > 0)
+      : [],
+    bulkExcludeStations: Array.isArray(t.bulkExcludeStations)
+      ? (t.bulkExcludeStations as unknown[]).filter((v): v is string => typeof v === "string" && v.length > 0)
+      : [],
+    bulkSourceMode: (t.bulkSourceMode as "single" | "all") || "single",
   };
 }
 
@@ -257,20 +284,23 @@ function isThisBotsTransitCargo(
   const lower = itemId.toLowerCase();
   if (isBulkSkipItem(itemId)) return false;
 
-  const effectiveDest = settings.destinationStation;
-  const isConfigured = settings.items.some((ci) => {
-    if (ci.itemId !== itemId) return false;
-    // An item configured with its own per-item destination still counts as
-    // "ours" only when that destination is the one we're currently serving.
-    const itemDest = ci.shipLoadoutDestination || settings.destinationStation;
-    return itemDest === effectiveDest;
-  });
+  // Any item in our configured list is this bot's transit cargo, regardless of
+  // whether it uses the global destination or a per-item shipLoadoutDestination.
+  const isConfigured = settings.items.some((ci) => ci.itemId === itemId);
   if (isConfigured) return true;
 
   // Not in our item list — but maybe we legitimately loaded it and it's still
-  // tracked as in-transit under our name for this destination.
-  const inTransitSelf = getInTransitQuantity(itemId, effectiveDest, botUsername);
-  return inTransitSelf > 0;
+  // tracked as in-transit under our name for one of our configured destinations.
+  const configuredDests = new Set(
+    settings.items
+      .filter((i) => i.itemId === itemId)
+      .map((i) => i.shipLoadoutDestination || settings.destinationStation),
+  );
+  for (const dest of configuredDests) {
+    if (getInTransitQuantity(itemId, dest, botUsername) > 0) return true;
+  }
+
+  return false;
 }
 
 /** Get current system for mobile stations like mobile_capital or frontier_station. */
@@ -318,14 +348,28 @@ function getFreeSpace(bot: Bot): number {
   return Math.max(0, bot.cargoMax - bot.cargo);
 }
 
-/** Item ids that should NEVER be bulk-moved (operational fuel/energy cells). */
-function isBulkSkipItem(itemId: string): boolean {
+/** Item ids that should NEVER be bulk-moved (operational fuel/energy cells).
+ *  When `settings.bulkMoveFuelCells` is true, fuel cells are treated as ordinary
+ *  cargo and are not skipped. */
+function isBulkSkipItem(itemId: string, settings?: CargoMoverSettings): boolean {
   const lower = itemId.toLowerCase();
-  return (
+  const isFuelCell =
     lower === "premium_fuel_cell" ||
     lower === "military_fuel_cell" ||
-    lower.includes("energy_cell")
-  );
+    lower.includes("energy_cell");
+  if (settings?.bulkMoveFuelCells && isFuelCell) return false;
+  return isFuelCell;
+}
+
+/** True when the user explicitly excluded `itemId` from bulk move via the
+ *  `bulkExcludeItems` setting (the exclusion list in the Bulk Move UI).
+ *  Excluded items are never planned, loaded, or delivered by the bulk-move
+ *  sub-routine. The comparison is case-insensitive so a hand-edited settings
+ *  file still matches the game's item ids. */
+function isBulkExcludedItem(itemId: string, settings?: CargoMoverSettings): boolean {
+  if (!settings || settings.bulkExcludeItems.length === 0) return false;
+  const lower = itemId.toLowerCase();
+  return settings.bulkExcludeItems.some((id) => id.toLowerCase() === lower);
 }
 
 function isHazardousItem(itemId: string): boolean {
@@ -333,20 +377,40 @@ function isHazardousItem(itemId: string): boolean {
   return item?.hazardous === true;
 }
 
+/** True when `itemId` is a fuel/energy cell being used purely as OPERATIONAL
+ *  fuel — premium, energy, and the military reserve — i.e. NOT an item the user
+ *  explicitly asked to move. When a fuel cell IS listed in `settings.items` it
+ *  is ordinary cargo and must be both loaded AND deposited like any other item,
+ *  so this returns false and the special handling below is bypassed.
+ *  When `settings.bulkMoveFuelCells` is true, all fuel cells are treated as
+ *  ordinary cargo regardless. */
+function isOperationalFuelCell(itemId: string, settings: CargoMoverSettings): boolean {
+  const lower = itemId.toLowerCase();
+  const isFuelCell = lower === "premium_fuel_cell" || lower === "military_fuel_cell" || lower.includes("energy_cell");
+  if (!isFuelCell) return false;
+  if (settings.bulkMoveFuelCells) return false;
+  const configured = settings.items.some((ci) => ci.itemId.toLowerCase() === lower);
+  return !configured;
+}
+
 /** Operational cells that must NEVER be deposited at the destination — they
- *  power the ship itself (premium cells, energy cells). Regular `fuel_cell` is
- *  treated as ordinary cargo and delivered normally; `military_fuel_cell` is
- *  deposited only above the user-configured reserve (see fuelDepositQty). */
-function isNeverDepositFuelItem(itemId: string): boolean {
+ *  power the ship itself (premium cells, energy cells). A fuel cell that has
+ *  been explicitly configured as cargo in `settings.items` is treated as
+ *  ordinary cargo and is deposited normally; regular `fuel_cell` is always
+ *  ordinary cargo and delivered normally. */
+function isNeverDepositFuelItem(itemId: string, settings: CargoMoverSettings): boolean {
+  if (!isOperationalFuelCell(itemId, settings)) return false;
   const lower = itemId.toLowerCase();
   return lower === "premium_fuel_cell" || lower.includes("energy_cell");
 }
 
 /** How many of an item to deposit at the destination, reserving the ship's
- *  required operational fuel. For military fuel cells we always keep the
- *  user-configured reserve (default 10) aboard for in-transit refueling and
- *  deposit only any excess; everything else deposits in full. */
-function fuelDepositQty(itemId: string, quantity: number, reserve: number): number {
+ *  required operational fuel. For military fuel cells (when used purely as
+ *  operational fuel) we keep the user-configured reserve (default 10) aboard for
+ *  in-transit refueling and deposit only any excess. A fuel cell that is itself
+ *  a configured cargo item deposits in full. Everything else deposits in full. */
+function fuelDepositQty(itemId: string, quantity: number, reserve: number, settings: CargoMoverSettings): number {
+  if (!isOperationalFuelCell(itemId, settings)) return quantity;
   if (itemId === "military_fuel_cell") {
     return Math.max(0, quantity - Math.max(0, reserve));
   }
@@ -397,12 +461,14 @@ async function undockForTravel(
 }
 
 /** Ensure the bot carries the user-configured number of military fuel cells
- * (default 10). These power in-transit refueling and are NEVER delivered to the
- * destination (fuel cells are excluded from deposits). Loads from faction
- * storage first, then falls back to buying from the market. */
+ *  (default 10). These power in-transit refueling and are NEVER delivered to the
+ *  destination (fuel cells are excluded from deposits). Loads from faction
+ *  storage first, then falls back to buying from the market unless
+ *  `settings.disableMarketBuy` is set. */
 async function ensureMilitaryFuelCells(
   ctx: RoutineContext,
   targetCount: number,
+  settings: CargoMoverSettings,
 ): Promise<number> {
   const { bot } = ctx;
   if (targetCount <= 0) return 0;
@@ -441,9 +507,9 @@ async function ensureMilitaryFuelCells(
     }
   }
 
-  // Fallback: buy from the market.
+  // Fallback: buy from the market (only if not disabled).
   const haveAfterFaction = bot.inventory.find((i) => i.itemId === "military_fuel_cell")?.quantity || 0;
-  if (haveAfterFaction < targetCount) {
+  if (haveAfterFaction < targetCount && !settings.disableMarketBuy) {
     const stillNeed = targetCount - haveAfterFaction;
     const buyResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: stillNeed });
     if (!buyResp.error) {
@@ -451,6 +517,8 @@ async function ensureMilitaryFuelCells(
     } else {
       ctx.log("warn", `Could not buy military_fuel_cell from market: ${buyResp.error.message}`);
     }
+  } else if (haveAfterFaction < targetCount && settings.disableMarketBuy) {
+    ctx.log("cargo", `⛔ Market buying disabled — skipping buy for ${targetCount - haveAfterFaction}x military_fuel_cell (have ${haveAfterFaction}/${targetCount})`);
   }
 
   const finalHave = bot.inventory.find((i) => i.itemId === "military_fuel_cell")?.quantity || 0;
@@ -913,18 +981,18 @@ function chunkBulkItems<T extends { itemId: string }>(items: T[]): T[][] {
 async function bulkStationToFaction(
   ctx: RoutineContext,
   excludeFuel = true,
+  settings?: CargoMoverSettings,
 ): Promise<number> {
   const { bot } = ctx;
   await bot.refreshStorage();
   const candidates = bot.storage.filter((i) => {
     if (i.quantity <= 0) return false;
-    if (excludeFuel) {
-      if (isBulkSkipItem(i.itemId)) return false;
-    }
+    if (excludeFuel && isBulkSkipItem(i.itemId, settings)) return false;
     return true;
   });
   if (candidates.length === 0) return 0;
 
+  const before = new Map(bot.storage.map((i) => [i.itemId, i.quantity]));
   const chunks = chunkBulkItems(candidates.map((i) => ({ itemId: i.itemId, quantity: i.quantity })));
   let movedTypes = 0;
   for (const chunk of chunks) {
@@ -940,6 +1008,25 @@ async function bulkStationToFaction(
   await sleep(BULK_SETTLE_MS);
   await bot.refreshFactionStorage(false, undefined, true);
   await bot.refreshStorage();
+
+  // VERIFY: a chunk can report success while the server silently caps/rejects
+  // an over-limit item, leaving it stranded in station storage. Re-read station
+  // storage and only count items whose quantity actually dropped to 0 as moved;
+  // anything still present could not be returned to faction (per-item cap) — call
+  // that out loudly instead of pretending the recovery succeeded.
+  let stranded = 0;
+  for (const [itemId, qtyBefore] of before) {
+    const qtyAfter = bot.storage.find((i) => i.itemId === itemId)?.quantity || 0;
+    if (qtyAfter > 0) {
+      const returned = qtyBefore - qtyAfter;
+      stranded++;
+      ctx.log("error", `⚠️ Could NOT return ${qtyAfter}x ${itemId} to faction storage (returned ${returned}/${qtyBefore} — likely exceeds faction per-item cap). Item is stranded in station storage.`);
+    }
+  }
+  if (stranded > 0) {
+    ctx.log("error", `⚠️ ${stranded} item type(s) stranded in station storage and could not be returned to faction — manual deposit via the game UI (or a smaller batch) is required.`);
+  }
+  movedTypes = before.size - stranded;
   return movedTypes;
 }
 
@@ -947,6 +1034,7 @@ async function bulkWithdrawFromStorage(
   ctx: RoutineContext,
   requested: Array<{ itemId: string; quantity: number }>,
   storageType: 'faction' | 'personal',
+  settings?: CargoMoverSettings,
 ): Promise<Map<string, number>> {
   const { bot } = ctx;
   const valid = requested.filter((r) => r.itemId && r.quantity > 0);
@@ -1024,7 +1112,7 @@ async function bulkWithdrawFromStorage(
   // it here keeps station storage empty after every single load attempt.)
   if (storageType === 'faction' && moved.size < valid.length) {
     try {
-      const recovered = await bulkStationToFaction(ctx, true);
+      const recovered = await bulkStationToFaction(ctx, true, settings);
       if (recovered > 0) {
         ctx.log("cargo", `🧹 Recovered ${recovered} item type(s) left in station storage back to faction`);
       }
@@ -1167,7 +1255,9 @@ async function bulkDepositToDestination(
 /** Deliver every deliverable item currently in the hold to the destination.
  *  Used by the graceful-shutdown path so cargo is never abandoned when the
  *  routine is asked to stop. Fuel cells are never deposited (see
- *  isNeverDepositFuelItem / fuelDepositQty). Returns the delivered items. */
+ *  isNeverDepositFuelItem / fuelDepositQty). In bulk mode, items on the user
+ *  exclusion list are left in the hold (returned to source storage on the next
+ *  startup) instead of being delivered. Returns the delivered items. */
 async function deliverCargoAboard(
   ctx: RoutineContext,
   settings: CargoMoverSettings,
@@ -1182,8 +1272,13 @@ async function deliverCargoAboard(
     if (item.quantity <= 0) continue;
     // Premium/energy cells never leave the ship; military cells keep the
     // required reserve aboard and deposit only the excess.
-    if (isNeverDepositFuelItem(item.itemId)) continue;
-    const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+    if (isNeverDepositFuelItem(item.itemId, settings)) continue;
+    // Bulk-mode exclusions must never reach the destination.
+    if (settings.enableBulkMove && isBulkExcludedItem(item.itemId, settings)) {
+      ctx.log("cargo", `⏭️ Keeping ${item.quantity}x ${item.name} aboard (excluded from bulk move — will be returned to source storage)`);
+      continue;
+    }
+    const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings);
     if (depositQty <= 0) {
       ctx.log("cargo", `🔋 Keeping ${item.quantity}x ${item.itemId} aboard (reserve ${settings.militaryFuelCells} required) — not depositing`);
       continue;
@@ -1205,8 +1300,17 @@ async function deliverCargoAboard(
     const itemIds = delivered.map((d) => d.itemId);
     const quantities = delivered.map((d) => d.quantity);
     updateDeliveryTracking(ctx, itemIds, quantities, settings);
-    // Remove delivered items from in-transit tracking.
-    removeInTransitItems(bot.username, settings.destinationStation, delivered);
+    // Remove delivered items from in-transit tracking (per-item destination).
+    const byDest = new Map<string, Array<{ itemId: string; quantity: number }>>();
+    for (const deliveredItem of delivered) {
+      const ci = settings.items.find((i) => i.itemId === deliveredItem.itemId);
+      const dest = ci?.shipLoadoutDestination || settings.destinationStation;
+      if (!byDest.has(dest)) byDest.set(dest, []);
+      byDest.get(dest)!.push(deliveredItem);
+    }
+    for (const [dest, items] of byDest) {
+      removeInTransitItems(bot.username, dest, items);
+    }
     ctx.log("cargo", `📦 Removed ${delivered.length} item type(s) from in-transit tracking after graceful delivery`);
   }
 
@@ -1233,12 +1337,13 @@ function findMoveJobs(
       continue;
     }
 
-    // Delivered progress = max of persisted settings count and activity-log
-    // progress (robust across restarts / manual edits).
-    const delivered = Math.max(
-      configItem.totalDelivered || 0,
-      getItemProgress(bot.username, configItem.itemId)?.totalDelivered || 0,
-    );
+    // Delivered progress. The settings mirror (`configItem.totalDelivered`) is
+     // the AUTHORITATIVE, reconcilable count. Prefer it exclusively; the
+     // activity-log progress was previously never cleared by a reset and could
+     // drift ahead of reality, making the bot believe everything was already
+     // delivered and skip every item. updateDeliveryTracking keeps both in sync
+     // during normal delivery, so settings alone is sufficient.
+     const delivered = configItem.totalDelivered || 0;
 
     // Skip if this item's delivery target (if configured) is already met.
     if (configItem.totalToDeliver !== undefined && configItem.totalToDeliver > 0) {
@@ -1257,14 +1362,26 @@ function findMoveJobs(
     // Also count what's already in cargo hold
     const inCargo = bot.inventory.find(i => i.itemId === configItem.itemId)?.quantity || 0;
 
-    // Total available = in storage + already in cargo
-    const totalAvailable = inStorage + inCargo;
-    
-    // Determine destination station - use shipLoadoutDestination if set, otherwise global destination
+    // Determine destination station early so inCargoForDest can use it.
     const effectiveDestStation = configItem.shipLoadoutDestination || settings.destinationStation;
     const effectiveDestSystem = resolveStationSystem(effectiveDestStation) || destSystem;
-    
-    // Check how much is already claimed by other bots (quantity-based locking)
+
+    // Only count cargo that is actually destined for this destination
+    // (same shipLoadoutDestination or global destination).
+    const inCargoForDest = bot.inventory
+       .filter((i) => {
+         if (i.itemId !== configItem.itemId) return false;
+         const ci = settings.items.find((item) => item.itemId === i.itemId);
+         if (!ci) return false;
+         const itemDest = ci.shipLoadoutDestination || settings.destinationStation;
+         return itemDest === effectiveDestStation;
+       })
+       .reduce((sum, i) => sum + i.quantity, 0);
+
+     // Total available = in storage + already in cargo
+     const totalAvailable = inStorage + inCargo;
+
+     // Check how much is already claimed by other bots (quantity-based locking)
     let availableQty = getAvailableItemQuantity(
       configItem.itemId,
       totalAvailable,
@@ -1278,17 +1395,18 @@ function findMoveJobs(
     const alreadyClaimed = getBotClaimedQuantity(bot.username, configItem.itemId);
 
     // Target = configured quantity (or totalToDeliver if set), minus what's
-    // already delivered and what's already in transit. This way we never assume
-    // every configured item is still at the source — in-transit items are already
-    // loaded (possibly in another mover's hold) and must not be re-moved.
+    // already delivered, what's already in transit, and what is already aboard
+    // and destined for this destination. This way we never reload cargo we are
+    // already carrying, and we never duplicate work that other movers have
+    // in-flight.
     const deliveryTarget =
       (configItem.totalToDeliver && configItem.totalToDeliver > 0)
         ? configItem.totalToDeliver
         : (configItem.quantity > 0 ? configItem.quantity : 0);
     const baseTargetQty = deliveryTarget > 0 ? deliveryTarget : availableQty;
-    const effectiveTargetQty = Math.max(0, baseTargetQty - delivered - inTransitQty);
+    const effectiveTargetQty = Math.max(0, baseTargetQty - delivered - inTransitQty - inCargoForDest);
 
-    ctx.log("cargo", `  ${configItem.itemName}: inStorage=${inStorage}, inCargo=${inCargo}, totalAvailable=${totalAvailable}, availableForBot=${availableQty}, inTransit=${inTransitQty}, delivered=${delivered}, effectiveTarget=${effectiveTargetQty}, alreadyClaimed=${alreadyClaimed} (storageType=${storageType})`);
+    ctx.log("cargo", `  ${configItem.itemName}: inStorage=${inStorage}, inCargo=${inCargo}, inCargoForDest=${inCargoForDest}, totalAvailable=${totalAvailable}, availableForBot=${availableQty}, inTransit=${inTransitQty}, delivered=${delivered}, effectiveTarget=${effectiveTargetQty}, alreadyClaimed=${alreadyClaimed} (storageType=${storageType})`);
 
     if (effectiveTargetQty > 0 && availableQty > 0) {
       const blacklist = (settings.ignoreBlacklistWhenCloaked && ctx.bot.isCloaked) ? [] : getSystemBlacklist();
@@ -1347,29 +1465,48 @@ function updateDeliveryTracking(
   settings: CargoMoverSettings
 ): void {
   const { bot } = ctx;
-  const all = readSettings();
-  const cargoMover = all.cargo_mover || {};
-  const items = (cargoMover.items as Array<Record<string, unknown>>) || [];
 
   let updated = false;
   for (let i = 0; i < itemIds.length; i++) {
     const itemId = itemIds[i];
     const qty = quantities[i];
+
+    // Re-read the LATEST settings from disk before mutating so concurrent
+    // writers from other movers cannot clobber this bot's update. Each item
+    // is written back individually to keep the window for collisions tiny.
+    const all = readSettings();
+    const cargoMover = all.cargo_mover || {};
+    const items = (cargoMover.items as Array<Record<string, unknown>>) || [];
     const item = items.find((it) => it.itemId === itemId);
     if (item) {
       const current = (item.totalDelivered as number) || 0;
       item.totalDelivered = current + qty;
       updated = true;
       console.log(`[CargoMover] Updated ${itemId}: ${current} -> ${current + qty} delivered`);
+      writeSettings({ cargo_mover: { items } });
+    } else {
+      ctx.log("warn", `Could not find ${itemId} in cargo mover settings — delivered count not updated in settings`);
     }
 
     // Update coordination locks
     updateDeliveredQuantity(bot.username, itemId, qty);
 
-    // Update activity tracking
-    const progress = updateItemProgress(bot.username, itemId, { delivered: qty });
-    if (progress) {
-      ctx.log("cargo", `  Progress for ${itemId}: ${progress.totalDelivered}/${progress.targetQuantity} delivered (${progress.isComplete ? 'COMPLETE' : 'in progress'})`);
+    // Update activity tracking. SET the activity-store delivered count to the
+    // authoritative cumulative settings value (not add to it) so the activity
+    // store can never drift ahead of what actually arrived — that divergence
+    // was the root cause of the bot believing far more had been delivered than
+    // the destination really held.
+    const freshAll = readSettings();
+    const freshItems = (freshAll.cargo_mover?.items as Array<Record<string, unknown>>) || [];
+    const freshItem = freshItems.find((it) => it.itemId === itemId);
+    const authoritativeDelivered = freshItem ? ((freshItem.totalDelivered as number) || 0) : qty;
+    setItemProgressDelivered(bot.username, itemId, authoritativeDelivered, {
+      itemName: freshItem?.itemName as string | undefined,
+      targetQuantity: freshItem?.totalToDeliver as number | undefined,
+      storageType: (freshItem?.storageType as "faction" | "personal") || "faction",
+    });
+    if (freshItem) {
+      ctx.log("cargo", `  Progress for ${itemId}: ${authoritativeDelivered}/${(freshItem.totalToDeliver as number) || "?"} delivered (settings-authoritative)`);
     }
 
     // Log the delivery
@@ -1379,10 +1516,48 @@ function updateDeliveryTracking(
       location: `${bot.system}/${bot.poi}`,
     });
   }
+}
 
-  if (updated) {
-    writeSettings({ cargo_mover: { items } });
+/**
+ * FULL reset of all cargo-mover delivered + transit state. Clears every
+ * persistent store the routine consults so the next cycle recomputes everything
+ * from live storage:
+ *   1. `settings.cargo_mover.items[].totalDelivered`  (the UI / settings mirror)
+ *   2. `cargoMoverActivity.itemProgress[*].totalDelivered` (the activity store
+ *      that `findMoveJobs` actually reads via `getItemProgress` — this was the
+ *      store a settings-only reset NEVER cleared, which left the bot believing
+ *      it had already delivered everything)
+ *   3. coordination quantity locks (`deliveredQuantity`)
+ *   4. in-transit tracking
+ *
+ * This is the only reset that makes the bot forget a stale "already delivered"
+ * total. The separate "Reset In-Transit Tracking" button deliberately leaves
+ * delivered counts alone (see its label); use this instead to re-run a move from
+ * scratch. Does NOT delete any items from storage — it only clears bookkeeping.
+ */
+export function resetCargoMoverAllTracking(botUsername?: string): {
+  settingsCleared: number;
+  activityCleared: number;
+  coordination: ReturnType<typeof resetCoordinationTracking>;
+  inTransit: ReturnType<typeof resetInTransitData>;
+} {
+  const all = readSettings();
+  const cargoMover = all.cargo_mover || {};
+  const items = (cargoMover.items as Array<Record<string, unknown>>) || [];
+  let settingsCleared = 0;
+  for (const item of items) {
+    if ((item.totalDelivered as number) !== 0) {
+      item.totalDelivered = 0;
+      settingsCleared++;
+    }
   }
+  if (settingsCleared > 0) writeSettings({ cargo_mover: { items } });
+
+  const activityCleared = resetCargoMoverDeliveryProgress(botUsername).cleared;
+  const coordination = resetCoordinationTracking(true);
+  const inTransit = resetInTransitData();
+
+  return { settingsCleared, activityCleared, coordination, inTransit };
 }
 
 /**
@@ -1495,17 +1670,15 @@ export async function reconcileDeliveredWithDestination(
     const item = items.find((it) => it.itemId === configItem.itemId);
     if (item) item.totalDelivered = newDelivered;
 
-    // Overwrite the activity-progress record so the dashboard + findMoveJobs agree.
-    const activity = loadCargoMoverActivity();
-    const progress = activity.itemProgress[`${bot.username}:${configItem.itemId}`];
-    if (progress) {
-      progress.totalDelivered = newDelivered;
-      progress.lastUpdatedAt = new Date().toISOString();
-      if (progress.targetQuantity > 0 && newDelivered >= progress.targetQuantity) {
-        progress.isComplete = true;
-      }
-      saveCargoMoverActivity(activity);
-    }
+    // Overwrite the activity-progress record so the dashboard + findMoveJobs
+    // agree. Always set it (creating the entry if missing) — relying on the
+    // entry already existing was why an inflated activity-store count survived a
+    // reconcile and kept the bot believing everything was delivered.
+    setItemProgressDelivered(bot.username, configItem.itemId, newDelivered, {
+      itemName: configItem.itemName,
+      targetQuantity: configItem.totalToDeliver,
+      storageType: configItem.storageType || "faction",
+    });
 
     if (newDelivered !== oldDelivered) {
       changed.push({
@@ -1526,10 +1699,11 @@ export async function reconcileDeliveredWithDestination(
 }
 
 /** Build the ordered, filtered list of items to bulk-move from the source
- *  faction storage. Excludes operational fuel/energy cells, and any item whose
- *  stored quantity exceeds `bulkIgnoreOver` (those can never fit at the
- *  destination and would just error out). `destHas` lets seed mode skip items
- *  that already have a presence at the destination. */
+ *  faction storage. Excludes operational fuel/energy cells, anything on the
+ *  user exclusion list (`bulkExcludeItems`), and any item whose stored
+ *  quantity exceeds `bulkIgnoreOver` (those can never fit at the destination
+ *  and would just error out). `destHas` lets seed mode skip items that already
+ *  have a presence at the destination. */
 function planBulkItems(
   ctx: RoutineContext,
   sourceItems: Array<{ itemId: string; name: string; quantity: number }>,
@@ -1539,7 +1713,12 @@ function planBulkItems(
 const { bot } = ctx;
    let candidates = sourceItems.filter((i) => {
       if (!i.itemId || i.quantity <= 0) return false;
-      if (isBulkSkipItem(i.itemId)) return false;
+      if (isBulkSkipItem(i.itemId, settings)) return false;
+      // User-configured exclusions: never bulk-move these items.
+      if (isBulkExcludedItem(i.itemId, settings)) {
+        ctx.log("cargo", `  ⏭️ Skipping ${i.name}: excluded from bulk move (user exclusion list)`);
+        return false;
+      }
       // Skip hazardous items unless the bot has lead-lined cargo hold modules.
       if (isHazardousItem(i.itemId) && bot.hasLeadLinedCargoHold === false) {
         ctx.log("cargo", `  ⏭️ Skipping ${i.name}: hazardous item (no lead-lined cargo module)`);
@@ -1579,6 +1758,115 @@ const { bot } = ctx;
   return planned;
 }
 
+/** Scan all stations with faction storage and return the next one that has
+ *  items to move (respecting exclusions, bulkIgnoreOver, and fuel cell skip).
+ *  Returns null if no station has items. Updates the passed settings object's
+ *  sourceStation to the selected station so the rest of the phase uses it. */
+async function findNextBulkSourceStation(
+  ctx: RoutineContext,
+  settings: CargoMoverSettings,
+): Promise<{ stationRef: string; systemId: string; itemCount: number } | null> {
+  const { bot } = ctx;
+  const allSystems = mapStore.getAllSystems();
+  // Respect the global system blacklist — never query faction storage at
+  // blacklisted systems (they're blocked for a reason).
+  const blacklistedSystems = new Set(getSystemBlacklist().map((s) => s.toLowerCase()));
+  // User-configured excluded stations (by base_id or system|poiId)
+  const excludedStations = new Set(settings.bulkExcludeStations.map((s) => s.toLowerCase()));
+  const candidates: Array<{ stationRef: string; systemId: string; poiName: string; baseId: string; totalItems: number }> = [];
+
+  // Rate limit: 500ms between API calls to avoid IP bans
+  const RATE_LIMIT_MS = 500;
+  let lastCall = 0;
+
+  for (const [sysId, sys] of Object.entries(allSystems)) {
+    // Skip blacklisted systems entirely (silent — they have no usable station)
+    if (blacklistedSystems.has(sysId.toLowerCase())) continue;
+    for (const poi of sys.pois) {
+      if (!poi.has_base || !poi.base_id) continue;
+      // Skip the destination station itself
+      if (mapStore.sameStation(poi.base_id, settings.destinationStation)) continue;
+      // Skip the configured home/source if it's set (to avoid re-scanning it when in "all" mode)
+      if (settings.sourceStation && mapStore.sameStation(poi.base_id, settings.sourceStation)) continue;
+      // Skip user-excluded stations (match by base_id or system|poiId)
+      const stationRef = sysId + "|" + poi.id;
+      if (excludedStations.has(poi.base_id.toLowerCase()) || excludedStations.has(stationRef.toLowerCase())) {
+        ctx.log("cargo", `🔎 Skipping excluded station: ${poi.base_name || poi.name || poi.id} (${stationRef})`);
+        continue;
+      }
+
+      const baseId = poi.base_id;
+      // Rate limit
+      const now = Date.now();
+      const wait = lastCall + RATE_LIMIT_MS - now;
+      if (wait > 0) await ctx.sleep(wait);
+      lastCall = Date.now();
+
+      // Remote view faction storage
+      ctx.log("cargo", `🔎 Querying faction storage at ${poi.base_name || poi.name || poi.id} (${sysId})...`);
+      const resp = await bot.exec("view_faction_storage", { station_id: baseId });
+      if (resp.error) {
+        const errMsg = resp.error.message || "";
+        // Expected errors for stations without faction storage — log at info level
+        if (errMsg.toLowerCase().includes("does not have a storage facility") ||
+            errMsg.toLowerCase().includes("no storage facility") ||
+            errMsg.toLowerCase().includes("no faction storage")) {
+          ctx.log("cargo", `   No faction storage facility`);
+        } else {
+          ctx.log("warn", `   view_faction_storage error: ${errMsg}`);
+        }
+        continue;
+      }
+      if (!resp.result) {
+        ctx.log("cargo", `   Empty response`);
+        continue;
+      }
+      const result = resp.result as Record<string, unknown>;
+      const items = Array.isArray(result.items) ? result.items : [];
+
+      let totalItems = 0;
+      let itemTypes = 0;
+      for (const item of items) {
+        const itemId = (item.item_id || item.itemId || "").toString().toLowerCase();
+        const qty = (item.quantity ?? item.qty ?? 0) as number;
+        if (!itemId || qty <= 0) continue;
+        // Apply same filters as planBulkItems
+        if (isBulkSkipItem(itemId, settings)) continue;
+        if (isBulkExcludedItem(itemId, settings)) continue;
+        if (qty > settings.bulkIgnoreOver) continue;
+        // Skip hazardous if no lead-lined hold
+        if (isHazardousItem(itemId) && bot.hasLeadLinedCargoHold === false) continue;
+        totalItems += qty;
+        itemTypes++;
+      }
+
+      if (totalItems > 0) {
+        candidates.push({
+          stationRef: sysId + "|" + poi.id,
+          systemId: sysId,
+          poiName: poi.base_name || poi.name || poi.id,
+          baseId,
+          totalItems,
+        });
+        ctx.log("cargo", `   ✅ Found ${totalItems} items (${itemTypes} types) available for bulk move`);
+      } else {
+        ctx.log("cargo", `   No movable items (after filters)`);
+      }
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  // Sort by most items first (greedy: clean the fullest stations first)
+  candidates.sort((a, b) => b.totalItems - a.totalItems);
+
+  const best = candidates[0];
+  ctx.log("cargo", `🔎 Auto-selected source: ${best.poiName} (${best.systemId}) — ${best.totalItems} items available (from ${candidates.length} station(s) with items)`);
+  // Update settings so the rest of the phase uses this station
+  settings.sourceStation = best.stationRef;
+  return { stationRef: best.stationRef, systemId: best.systemId, itemCount: best.totalItems };
+}
+
 /** Bulk-move sub-routine. Moves everything (respecting `bulkIgnoreOver`,
  *  `bulkOrder`, and `bulkSeedMode`) from the source faction storage to the
  *  destination. Runs a single round: load as much as fits, deliver, then return
@@ -1597,10 +1885,30 @@ async function runBulkMovePhase(
   warnedNoCloak: { warned: boolean },
 ): Promise<void> {
   const { bot } = ctx;
+
+  // ── AUTO-SOURCE: if bulkSourceMode is "all", scan all faction stations
+  //  and pick the next one with items to clean. This lets the mover act as a
+  //  multi-station cleanup routine without needing a fixed source.
+  if (settings.bulkSourceMode === "all") {
+    const nextSource = await findNextBulkSourceStation(ctx, settings);
+    if (!nextSource) {
+      ctx.log("cargo", `📦 Bulk Move (ALL): no stations with items found — waiting 60s`);
+      await ctx.sleep(60000);
+      return;
+    }
+    ctx.log("cargo", `📦 Bulk Move (ALL): selected ${nextSource.stationRef} (${nextSource.itemCount} items)`);
+  }
+
   const mode = settings.bulkSeedMode ? "SEED-BASE" : "FULL";
+  const excludeNote = settings.bulkExcludeItems.length > 0
+    ? `, excluded=${settings.bulkExcludeItems.length} item(s): ${settings.bulkExcludeItems.join(", ")}`
+    : "";
   ctx.log("cargo", `═══════════════════════════════════════════════════════`);
-  ctx.log("cargo", `📦 Bulk Move (${mode}) — order=${settings.bulkOrder}, ignoreOver=${settings.bulkIgnoreOver}`);
-  ctx.log("cargo", `   Source: ${settings.sourceStation}`);
+  ctx.log("cargo", `📦 Bulk Move (${mode}) — order=${settings.bulkOrder}, ignoreOver=${settings.bulkIgnoreOver}${excludeNote}`);
+  const sourceLabel = settings.bulkSourceMode === "all"
+    ? `auto-selected (${settings.sourceStation})`
+    : settings.sourceStation;
+  ctx.log("cargo", `   Source: ${sourceLabel}`);
   ctx.log("cargo", `   Destination: ${settings.destinationStation} (${settings.destinationStorageType})`);
 
   const sourceSystem = resolveStationSystem(settings.sourceStation);
@@ -1610,9 +1918,17 @@ async function runBulkMovePhase(
 
   // ── Navigate to source & dock ──────────────────────────────
   if (bot.system !== sourceSystem) {
+    // Pre-departure safety: if docked, top off fuel and load military fuel cells
+    // BEFORE undocking so the bot doesn't sail off on a long journey under-fueled
+    // and without in-transit refueling reserves.
+    if (bot.docked) {
+      await tryRefuel(ctx);
+      await bot.refreshFactionStorage(false, undefined, true);
+      await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells, settings);
+    }
+    if (!await ensureFueled(ctx, safetyOpts.fuelThresholdPct)) { await ctx.sleep(30000); return; }
     await undockForTravel(ctx, warnedNoCloak);
     if (bot.state !== "running") return;
-    if (!await ensureFueled(ctx, safetyOpts.fuelThresholdPct)) { await ctx.sleep(30000); return; }
     if (!await navigateToSystem(ctx, sourceSystem, safetyOpts)) { await ctx.sleep(30000); return; }
   }
   if (!bot.docked || !botIsAtStation(bot, settings.sourceStation)) {
@@ -1643,7 +1959,7 @@ async function runBulkMovePhase(
   // filled, crash, stop, battle). Push them back to faction BEFORE we plan/load
   // so they're counted correctly and never lost in personal storage.
   try {
-    const recovered = await bulkStationToFaction(ctx, true);
+    const recovered = await bulkStationToFaction(ctx, true, settings);
     if (recovered > 0) {
       ctx.log("cargo", `🧹 Recovered ${recovered} item type(s) from station storage back to faction before loading`);
     }
@@ -1659,7 +1975,7 @@ async function runBulkMovePhase(
   // which is unrelated to this routine's source and would make us plan against
   // the wrong inventory.
   await bot.refreshFactionStorage(false, settings.sourceStation);
-  await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
+  await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells, settings);
 
   // ── Empty a full hold BEFORE planning/loading ──────────────
   // If the bot starts a bulk-move phase with a (near) full hold — e.g. it was
@@ -1678,13 +1994,13 @@ async function runBulkMovePhase(
   // holds, which is exactly how a bot gets stuck hauling a full cargo it can't
   // unload. Dump whenever orphaned cargo is present.
   const bulkHasOrphanCargo = bot.inventory.some(
-    (i) => i.quantity > 0 && !isBulkSkipItem(i.itemId),
+    (i) => i.quantity > 0 && !isBulkSkipItem(i.itemId, settings),
   );
   if (bot.inventory.length > 0 && (bulkFullness >= 0.9 || bulkHasOrphanCargo)) {
     ctx.log("cargo", `🧹 Bulk move startup: hold ${Math.round(bulkFullness * 100)}% full (orphan cargo present: ${bulkHasOrphanCargo}) — emptying to storage before loading`);
     for (const item of [...bot.inventory]) {
       if (item.quantity <= 0) continue;
-      if (isBulkSkipItem(item.itemId)) continue;
+      if (isBulkSkipItem(item.itemId, settings)) continue;
       const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
       if (!dResp.error) {
         ctx.log("cargo", `🧹 Bulk startup: emptied ${item.quantity}x ${item.name} to faction storage`);
@@ -1727,7 +2043,7 @@ async function runBulkMovePhase(
       // Seed pass found nothing new to bring in — that means every sourced item
       // already has a presence at the destination, so seeding is complete.
       const allPresent = bot.factionStorage
-        .filter((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId) && i.quantity <= settings.bulkIgnoreOver)
+        .filter((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId, settings) && !isBulkExcludedItem(i.itemId, settings) && i.quantity <= settings.bulkIgnoreOver)
         .every((i) => destHas.has(i.itemId));
       if (allPresent) {
         ctx.log("cargo", `✅ Seed pass complete — every sourced item now has a presence at the destination. Disabling seed mode and switching to FULL moves.`);
@@ -1796,7 +2112,7 @@ async function runBulkMovePhase(
 
     if (batch.length === 0) break;
 
-    const moved = await bulkWithdrawFromStorage(ctx, batch, "faction");
+    const moved = await bulkWithdrawFromStorage(ctx, batch, "faction", settings);
     if (moved.size > 0) loadedAny = true;
     for (const [itemId, qty] of moved) {
       const p = planned.find((pp) => pp.itemId === itemId);
@@ -1837,15 +2153,18 @@ async function runBulkMovePhase(
   const deliverItems = bot.inventory
     .filter((item) => {
       if (item.quantity <= 0) return false;
-      if (isBulkSkipItem(item.itemId)) return false;
-      return fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells) > 0;
+      if (isBulkSkipItem(item.itemId, settings)) return false;
+      // Never deliver user-excluded items — leave them in the hold; the startup
+      // dump returns them to the source faction storage on the next pass.
+      if (isBulkExcludedItem(item.itemId, settings)) return false;
+      return fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings) > 0;
     })
     .map((item) => ({
       itemId: item.itemId,
-      quantity: fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells),
+      quantity: fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings),
     }));
 
-  if (deliverItems.length > 0) {
+    if (deliverItems.length > 0) {
     const deposited = await bulkDepositToDestination(
       ctx,
       deliverItems,
@@ -1864,8 +2183,9 @@ async function runBulkMovePhase(
     await bot.refreshCargo();
     const remainingInCargo = bot.inventory.filter((item) => {
       if (item.quantity <= 0) return false;
-      if (isBulkSkipItem(item.itemId)) return false;
-      const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+      if (isBulkSkipItem(item.itemId, settings)) return false;
+      if (isBulkExcludedItem(item.itemId, settings)) return false;
+      const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings);
       return depositQty > 0;
     });
     if (remainingInCargo.length > 0) {
@@ -1873,7 +2193,7 @@ async function runBulkMovePhase(
       const strandedItems = remainingInCargo.map((i) => `${i.quantity}x ${i.itemId}`).join(", ");
       logCargoActivity(bot.username, "deposit_failed", `${remainingInCargo.length} item type(s) stranded in cargo after bulk deposit — moving to station storage: ${strandedItems}`);
       for (const item of remainingInCargo) {
-        const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+        const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings);
         if (depositQty <= 0) continue;
         const stationResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: depositQty });
         if (!stationResp.error) {
@@ -1892,7 +2212,7 @@ async function runBulkMovePhase(
   // it is never stranded in personal storage. We are docked at the SOURCE
   // station here, so this deposits into the source's faction storage.
   try {
-    const recovered = await bulkStationToFaction(ctx, true);
+    const recovered = await bulkStationToFaction(ctx, true, settings);
     if (recovered > 0) {
       ctx.log("cargo", `🧹 Recovered ${recovered} item type(s) from station storage back to faction after delivery`);
     }
@@ -2244,7 +2564,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           location: `${bot.system}/${bot.poi}`,
         });
         await bot.refreshCargo();
-        if (bot.inventory.some((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId))) {
+        if (bot.inventory.some((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId, gSettings))) {
           await deliverCargoAboard(ctx, gSettings);
         }
         for (const item of gSettings.items) {
@@ -2484,9 +2804,10 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           }
           if (!errMsg.includes("already")) {
             // Check if it's a mobile station that moved
-            if (settings.destinationStation === "mobile_capital" && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
+            const isMobileCapitalDest = settings.destinationStation === "mobile_capital" || settings.destinationStation.includes("mobile_capital");
+            if (isMobileCapitalDest && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
               ctx.log("cargo", "Mobile capital not found at expected location during recovery, querying current system...");
-              const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
+              const currentSystem = await getMobileStationSystem(ctx, "mobile_capital");
               if (currentSystem) {
                 ctx.log("cargo", `Mobile capital is now in system ${currentSystem}`);
                 // Navigate to the new system
@@ -2560,14 +2881,18 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           if (item.quantity <= 0) continue;
           // Premium/energy cells never leave the ship; military cells keep the
           // required reserve aboard and deposit only the excess.
-          if (isNeverDepositFuelItem(item.itemId)) continue;
-          const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+          if (isNeverDepositFuelItem(item.itemId, settings)) continue;
+          const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings);
           if (depositQty <= 0) {
             ctx.log("cargo", `🔋 Keeping ${item.quantity}x ${item.itemId} aboard (reserve ${settings.militaryFuelCells} required) — not depositing`);
             continue;
           }
           if (item.itemId === "military_fuel_cell") {
-            ctx.log("cargo", `🔋 Depositing ${depositQty}x military_fuel_cell (keeping reserve ${settings.militaryFuelCells}, carrying ${item.quantity})`);
+            if (isOperationalFuelCell(item.itemId, settings)) {
+              ctx.log("cargo", `🔋 Depositing ${depositQty}x military_fuel_cell (keeping reserve ${settings.militaryFuelCells}, carrying ${item.quantity})`);
+            } else {
+              ctx.log("cargo", `🔋 Depositing ${depositQty}x military_fuel_cell (configured cargo — delivering all, carrying ${item.quantity})`);
+            }
           }
 
           const depositResult = await depositToDestination(
@@ -2588,6 +2913,18 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           const itemIds = deliveredItems.map((d) => d.itemId);
           const quantities = deliveredItems.map((d) => d.quantity);
           updateDeliveryTracking(ctx, itemIds, quantities, settings);
+
+          // Remove delivered items from in-transit tracking (per-item destination).
+          const byDest = new Map<string, Array<{ itemId: string; quantity: number }>>();
+          for (const deliveredItem of deliveredItems) {
+            const ci = settings.items.find((i) => i.itemId === deliveredItem.itemId);
+            const dest = ci?.shipLoadoutDestination || settings.destinationStation;
+            if (!byDest.has(dest)) byDest.set(dest, []);
+            byDest.get(dest)!.push(deliveredItem);
+          }
+          for (const [dest, items] of byDest) {
+            removeInTransitItems(bot.username, dest, items);
+          }
         }
       }
 
@@ -2634,14 +2971,16 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       saveLastSession(bot.username, settings.sourceStation, settings.destinationStation,
         settings.items.map(i => ({ itemId: i.itemId, itemName: i.itemName, quantity: i.quantity, storageType: i.storageType || 'faction' })),
         0, "navigating_to_source", bot.system, bot.poi || "", bot.docked);
-      
-      await undockForTravel(ctx, warnedNoCloak);
-      if (bot.state !== "running") {
-        ctx.log("system", "⛔ Stopping — emergency detected");
-        logCargoActivity(bot.username, "interruption", "Emergency detected during navigation to source", {
-          location: `${bot.system}/${bot.poi}`,
-        });
-        return;
+
+      // Pre-departure safety: if docked, top off fuel and load military fuel cells
+      // BEFORE undocking. Without this the bot would undock first, then call
+      // ensureFueled while already in space (where station refuel is unavailable),
+      // and never load the military fuel cells needed for in-transit refueling —
+      // so it would sail off on a long journey with a low tank and empty reserves.
+      if (bot.docked) {
+        await tryRefuel(ctx);
+        await bot.refreshFactionStorage(false, undefined, true);
+        await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells, settings);
       }
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
@@ -2651,6 +2990,14 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         });
         await ctx.sleep(30000);
         continue;
+      }
+      await undockForTravel(ctx, warnedNoCloak);
+      if (bot.state !== "running") {
+        ctx.log("system", "⛔ Stopping — emergency detected");
+        logCargoActivity(bot.username, "interruption", "Emergency detected during navigation to source", {
+          location: `${bot.system}/${bot.poi}`,
+        });
+        return;
       }
       ctx.log("travel", `Heading to source system ${sourceSystem}...`);
       const arrived = await navigateToSystem(ctx, sourceSystem, safetyOpts);
@@ -2764,7 +3111,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       // These are never delivered and power in-transit refueling.
       // Read the SOURCE station's faction storage (not general.factionStorageStation).
       await bot.refreshFactionStorage(false, settings.sourceStation);
-      await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
+      await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells, settings);
     }
 
     // Clear UNRELATED cargo items to FACTION storage (not personal) so other
@@ -2938,6 +3285,15 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         loadedThisIteration = true;
       } else {
         const batch: Array<{ itemId: string; quantity: number; storageType: 'faction' | 'personal' }> = [];
+        // Track cumulative cargo usage AS we build the batch so we never request
+        // more than the hold can hold. Previously each item was sized against the
+        // full free space independently, so a batch could ask for ~14 full holds
+        // at once — that pulled the ENTIRE remaining target of every item out of
+        // faction storage into station (personal) storage, and anything that
+        // didn't fit (or exceeded the per-item cap) got stranded there and could
+        // not be returned to faction. Capping the batch to one trip's worth keeps
+        // every item in faction storage until it is actually pulled for this trip.
+        let usedInBatch = 0;
         for (const job of jobs) {
           const remaining = jobRemaining.get(job.itemId) || 0;
           if (remaining <= 0) continue;
@@ -2950,15 +3306,18 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             continue;
           }
 
-          const maxFitInCargo = Math.floor(liveFreeNow / Math.max(1, itemSize));
+          const freeForBatch = liveFreeNow - usedInBatch;
+          if (freeForBatch <= 0) break;
+          const maxFitInCargo = Math.floor(freeForBatch / Math.max(1, itemSize));
           const loadQty = Math.min(remaining, maxFitInCargo);
           if (loadQty <= 0) {
             ctx.log("cargo", `Skipping ${job.itemName}: cannot fit any units (size=${itemSize}, freeSpace=${liveFreeNow})`);
             continue;
           }
 
-          ctx.log("cargo", `🔄 Batch loading: ${job.itemName} remaining=${remaining}, will load up to ${loadQty} (size ${itemSize}, free ${liveFreeNow})`);
+          ctx.log("cargo", `🔄 Batch loading: ${job.itemName} remaining=${remaining}, will load up to ${loadQty} (size ${itemSize}, free ${liveFreeNow}, batch used ${usedInBatch})`);
           batch.push({ itemId: job.itemId, quantity: loadQty, storageType: job.storageType });
+          usedInBatch += loadQty * itemSize;
         }
 
           if (batch.length > 0) {
@@ -3171,9 +3530,18 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     }
 
     if (loadedItems.length > 0) {
-      addInTransitItems(bot.username, settings.destinationStation, loadedItems);
+      const byDest = new Map<string, Array<{ itemId: string; itemName: string; quantity: number }>>();
+      for (const loaded of loadedItems) {
+        const ci = settings.items.find((i) => i.itemId === loaded.itemId);
+        const dest = ci?.shipLoadoutDestination || settings.destinationStation;
+        if (!byDest.has(dest)) byDest.set(dest, []);
+        byDest.get(dest)!.push(loaded);
+      }
+      for (const [dest, items] of byDest) {
+        addInTransitItems(bot.username, dest, items);
+      }
       const totalInTransit = loadedItems.reduce((sum, i) => sum + i.quantity, 0);
-      ctx.log("cargo", `📦 Added ${loadedItems.length} item types to in-transit tracking (${totalInTransit} total items) → ${settings.destinationStation}`);
+      ctx.log("cargo", `📦 Added ${loadedItems.length} item types to in-transit tracking (${totalInTransit} total items)`);
       // Robust milestone log: cargo has left the source and is now in transit.
       logCargoActivity(bot.username, "in_transit", `Cargo in transit: ${totalInTransit} items heading to ${settings.destinationStation}`, {
         location: `${bot.system}/${bot.poi}`,
@@ -3286,66 +3654,61 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         }
         if (!errMsg.includes("already")) {
           // Check if mobile capital moved and we got location info
-          if (settings.destinationStation === "mobile_capital" && errMsg.includes("jump to") && errMsg.includes("to find it")) {
+          const isMobileCapitalDest = settings.destinationStation === "mobile_capital" || settings.destinationStation.includes("mobile_capital");
+          if (isMobileCapitalDest && errMsg.includes("jump to") && errMsg.includes("to find it")) {
             // Parse the error message like "Jump to First Step to find it."
             const match = tResp.error.message.match(/jump to (.+?) to find it/i);
-            if (match) {
-              const newSystemName = match[1];
-              ctx.log("cargo", `Mobile capital relocated to system: ${newSystemName}`);
+             if (match) {
+               const newSystemName = match[1];
+               ctx.log("cargo", `Mobile capital relocated to system: ${newSystemName}`);
 
-              // Update map store with new location
-              // We need to get the system ID from the name, or use the name directly
-              // For now, we'll query the current location and update the map
-              const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
-              if (currentSystem) {
-                // Update the map store
-                mapStore.updateMobileCapitolLocation(currentSystem, newSystemName, "mobile_capital");
-                ctx.log("cargo", `Updated map store: mobile capital now in ${newSystemName} (${currentSystem})`);
+               // Resolve the new system name to a system ID from the map store
+               const targetSystem = mapStore.getSystems().find(
+                 (s) => s.name && s.name.toLowerCase() === newSystemName.toLowerCase()
+               );
+               const targetSystemId = targetSystem?.id || newSystemName;
 
-                // Navigate to the new system
-                if (bot.system !== currentSystem) {
-                  ctx.log("travel", `Mobile capital moved - navigating to ${newSystemName} (${currentSystem})...`);
-                  const arrived = await navigateToSystem(ctx, currentSystem, safetyOpts);
-                  if (!arrived || bot.state !== "running") {
-                    if (bot.state !== "running") {
-                      ctx.log("system", "⛔ Stopping — emergency detected");
-                      return;
-                    }
-                    ctx.log("error", `Failed to reach mobile capital's new system ${currentSystem}`);
-                    logCargoActivity(bot.username, "error", `Failed to navigate to mobile capital's new system ${currentSystem}`, {
-                      location: `${bot.system}/${bot.poi}`,
-                    });
-                    allJobsCompleted = false;
-                    break;
-                  }
-                  ctx.log("cargo", `✅ Arrived at mobile capital's new system ${currentSystem}`);
-                }
+               // Update the map store with the new mobile capital location
+               mapStore.updateMobileCapitolLocation(targetSystemId, newSystemName, "mobile_capital");
+               ctx.log("cargo", `Updated map store: mobile capital now in ${newSystemName} (${targetSystemId})`);
 
-                // Retry travel to the mobile capital
-                const retryResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.destinationStation) });
-                if (retryResp.error) {
-                  const retryErrMsg = retryResp.error.message.toLowerCase();
-                  if (!retryErrMsg.includes("already")) {
-                    ctx.log("error", `Still failed to travel to relocated mobile capital: ${retryResp.error.message}`);
-                    logCargoActivity(bot.username, "error", `Travel to relocated mobile capital failed: ${retryResp.error.message}`, {
-                      location: `${bot.system}/${bot.poi}`,
-                    });
-                    allJobsCompleted = false;
-                    break;
-                  }
-                } else {
-                  bot.poi = stationTravelTarget(settings.destinationStation);
-                }
-              } else {
-                ctx.log("error", "Could not determine mobile capital's new location from error message");
-                logCargoActivity(bot.username, "error", "Could not parse mobile capital relocation from error message", {
-                  location: `${bot.system}/${bot.poi}`,
-                  error: tResp.error.message,
-                });
-                allJobsCompleted = false;
-                break;
-              }
-            } else {
+               // Navigate to the new system using the system name directly
+               const normalizedBotSystem = bot.system.toLowerCase().replace(/_/g, ' ').trim();
+               const normalizedTarget = newSystemName.toLowerCase().replace(/_/g, ' ').trim();
+               if (normalizedBotSystem !== normalizedTarget) {
+                 ctx.log("travel", `Mobile capital moved - navigating to ${newSystemName}...`);
+                 const arrived = await navigateToSystem(ctx, newSystemName, safetyOpts);
+                 if (!arrived || bot.state !== "running") {
+                   if (bot.state !== "running") {
+                     ctx.log("system", "⛔ Stopping — emergency detected");
+                     return;
+                   }
+                   ctx.log("error", `Failed to reach mobile capital's new system ${newSystemName}`);
+                   logCargoActivity(bot.username, "error", `Failed to navigate to mobile capital's new system ${newSystemName}`, {
+                     location: `${bot.system}/${bot.poi}`,
+                   });
+                   allJobsCompleted = false;
+                   break;
+                 }
+                 ctx.log("cargo", `✅ Arrived at mobile capital's new system ${newSystemName}`);
+               }
+
+               // Retry travel to the mobile capital
+               const retryResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.destinationStation) });
+               if (retryResp.error) {
+                 const retryErrMsg = retryResp.error.message.toLowerCase();
+                 if (!retryErrMsg.includes("already")) {
+                   ctx.log("error", `Still failed to travel to relocated mobile capital: ${retryResp.error.message}`);
+                   logCargoActivity(bot.username, "error", `Travel to relocated mobile capital failed: ${retryResp.error.message}`, {
+                     location: `${bot.system}/${bot.poi}`,
+                   });
+                   allJobsCompleted = false;
+                   break;
+                 }
+               } else {
+                 bot.poi = stationTravelTarget(settings.destinationStation);
+               }
+             } else {
               ctx.log("error", "Could not parse new system name from mobile capital relocation error");
               logCargoActivity(bot.username, "error", "Could not parse system name from mobile capital relocation error", {
                 location: `${bot.system}/${bot.poi}`,
@@ -3356,9 +3719,9 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             }
           }
           // Check if it's a mobile station that moved (fallback for other cases)
-          else if (settings.destinationStation === "mobile_capital" && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
+          else if (isMobileCapitalDest && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
             ctx.log("cargo", "Mobile capital not found at expected location, querying current system...");
-            const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
+            const currentSystem = await getMobileStationSystem(ctx, "mobile_capital");
             if (currentSystem) {
               ctx.log("cargo", `Mobile capital is now in system ${currentSystem}`);
               // Navigate to the new system
@@ -3452,13 +3815,17 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           if (item.quantity <= 0) return false;
           // Premium/energy cells never leave the ship; military cells keep the
           // required reserve aboard and deposit only the excess.
-          if (isNeverDepositFuelItem(item.itemId)) return false;
-          return fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells) > 0;
+          if (isNeverDepositFuelItem(item.itemId, settings)) return false;
+          return fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings) > 0;
         })
         .map((item) => {
-          const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+          const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings);
           if (item.itemId === "military_fuel_cell") {
-            ctx.log("cargo", `🔋 Depositing ${depositQty}x military_fuel_cell (keeping reserve ${settings.militaryFuelCells}, carrying ${item.quantity})`);
+            if (isOperationalFuelCell(item.itemId, settings)) {
+              ctx.log("cargo", `🔋 Depositing ${depositQty}x military_fuel_cell (keeping reserve ${settings.militaryFuelCells}, carrying ${item.quantity})`);
+            } else {
+              ctx.log("cargo", `🔋 Depositing ${depositQty}x military_fuel_cell (configured cargo — delivering all, carrying ${item.quantity})`);
+            }
           }
           return { itemId: item.itemId, quantity: depositQty };
         });
@@ -3503,8 +3870,17 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         const quantities = deliveredItems.map((d) => d.quantity);
         updateDeliveryTracking(ctx, itemIds, quantities, settings);
 
-        // Remove delivered items from in-transit tracking
-        removeInTransitItems(bot.username, settings.destinationStation, deliveredItems);
+        // Remove delivered items from in-transit tracking (per-item destination)
+        const byDest = new Map<string, Array<{ itemId: string; quantity: number }>>();
+        for (const delivered of deliveredItems) {
+          const ci = settings.items.find((i) => i.itemId === delivered.itemId);
+          const dest = ci?.shipLoadoutDestination || settings.destinationStation;
+          if (!byDest.has(dest)) byDest.set(dest, []);
+          byDest.get(dest)!.push(delivered);
+        }
+        for (const [dest, items] of byDest) {
+          removeInTransitItems(bot.username, dest, items);
+        }
         ctx.log("cargo", `📦 Removed ${deliveredItems.length} item types from in-transit tracking (${deliveredItems.reduce((sum, d) => sum + d.quantity, 0)} verified deliveries)`);
 
         // Update trip completion tracking
@@ -3520,9 +3896,13 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       });
     }
 
-    // Refuel at destination to prevent getting stuck on return journey
+    // Refuel at destination to prevent getting stuck on return journey.
+    // Also load military fuel cells here so the return trip (and the next
+    // outbound cycle) has in-transit refueling reserves — without this the bot
+    // returns home with an empty cargo hold but no military fuel cells aboard.
     await tryRefuel(ctx);
-
+    await bot.refreshFactionStorage(false, undefined, true);
+    await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells, settings);
     await bot.refreshCargo();
 
     // Check if all jobs are complete (no remaining items for any job)
@@ -3567,14 +3947,6 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
     // Travel back to source system if needed
     if (bot.system !== sourceSystem) {
-      await undockForTravel(ctx, warnedNoCloak);
-      if (bot.state !== "running") {
-        ctx.log("system", "⛔ Stopping — emergency detected");
-        logCargoActivity(bot.username, "interruption", "Emergency detected during return to source", {
-          location: `${bot.system}/${bot.poi}`,
-        });
-        return;
-      }
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Cannot refuel to return to source");
@@ -3583,6 +3955,14 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         });
         await ctx.sleep(30000);
         continue;
+      }
+      await undockForTravel(ctx, warnedNoCloak);
+      if (bot.state !== "running") {
+        ctx.log("system", "⛔ Stopping — emergency detected");
+        logCargoActivity(bot.username, "interruption", "Emergency detected during return to source", {
+          location: `${bot.system}/${bot.poi}`,
+        });
+        return;
       }
       ctx.log("travel", `Heading back to ${sourceSystem}...`);
       logCargoActivity(bot.username, "navigation", `Returning to source system ${sourceSystem}`, {

@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 const FULL_CIVILIANS_INFO_FILE = join(process.cwd(), "data", "fullCiviliansInfo.json");
 
@@ -42,6 +43,8 @@ export interface CivilianRecord {
     transportedAt: string;
     status: "delivered" | "stranded";
   }>;
+  /** Bot usernames that have successfully delivered this civilian (full delivery, fare received), keyed by bot username with transport count. */
+  transportedBy: Record<string, number>;
 }
 
 interface FullCiviliansInfoData {
@@ -97,7 +100,7 @@ export class CivilianStore {
         business: Array.from(this.civilians.values()).filter(c => c.accommodationClass === "business").length,
         first: Array.from(this.civilians.values()).filter(c => c.accommodationClass === "first").length,
       };
-      writeFileSync(FULL_CIVILIANS_INFO_FILE, JSON.stringify(this.data, null, 2), "utf-8");
+      safeWriteFileSync(FULL_CIVILIANS_INFO_FILE, JSON.stringify(this.data, null, 2), Buffer.byteLength(JSON.stringify(this.data, null, 2), "utf-8"));
     } catch (err) {
       console.error("[CivilianStore] Save failed:", err);
     }
@@ -156,11 +159,12 @@ export class CivilianStore {
       timesSeenAtStation: { [passenger.destination]: 1 },
       lastSeenAtStation: passenger.destination,
       transportHistory: [],
+      transportedBy: {},
     };
     this.civilians.set(normalizedId, record);
   }
 
-  addOrUpdate(passenger: CivilianPassenger): void {
+  addOrUpdate(passenger: CivilianPassenger, transportedBy?: string): void {
     this.ensureLoaded();
     const now = new Date().toISOString();
     const normalizedId = this.normalizeId(passenger.citizenId);
@@ -168,6 +172,7 @@ export class CivilianStore {
 
     if (existing) {
       existing.lastSeen = now;
+      if (!existing.transportedBy) existing.transportedBy = {};
       existing.timesTransported += 1;
       existing.totalFare += passenger.fare;
       if (passenger.status === "delivered") {
@@ -179,6 +184,9 @@ export class CivilianStore {
           transportedAt: now,
           status: "delivered",
         });
+        if (transportedBy) {
+          existing.transportedBy[transportedBy] = (existing.transportedBy[transportedBy] || 0) + 1;
+        }
       }
       if (passenger.bio) {
         existing.bio = passenger.bio;
@@ -213,6 +221,9 @@ export class CivilianStore {
               status: "delivered",
             }]
           : [],
+        transportedBy: passenger.status === "delivered" && transportedBy
+          ? { [transportedBy]: 1 }
+          : {},
       };
       this.civilians.set(normalizedId, record);
     }
@@ -223,6 +234,26 @@ export class CivilianStore {
   get(citizenId: string): CivilianRecord | undefined {
     this.ensureLoaded();
     return this.civilians.get(this.normalizeId(citizenId));
+  }
+
+  /** True when at least one bot has successfully delivered this civilian (full delivery, fare received). */
+  hasBeenTransportedByAnyone(citizenId: string): boolean {
+    const record = this.civilians.get(this.normalizeId(citizenId));
+    return !!(record && record.transportedBy && Object.keys(record.transportedBy).length > 0);
+  }
+
+  /** Bot usernames that have successfully delivered this civilian. */
+  getTransportedBots(citizenId: string): string[] {
+    const record = this.civilians.get(this.normalizeId(citizenId));
+    if (!record || !record.transportedBy) return [];
+    return Object.keys(record.transportedBy);
+  }
+
+  /** True when this specific bot has successfully delivered this civilian. */
+  hasBeenTransportedByBot(citizenId: string, botUsername: string): boolean {
+    const record = this.civilians.get(this.normalizeId(citizenId));
+    if (!record || !record.transportedBy) return false;
+    return record.transportedBy[botUsername] > 0;
   }
 
   getAll(): CivilianRecord[] {

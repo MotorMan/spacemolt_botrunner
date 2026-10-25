@@ -16,5 +16,18 @@ export const CONNECTION_ERROR_PATTERNS =
 /** True when an error message indicates the transport socket is dead. */
 export function isConnectionError(message?: string | null): boolean {
   if (!message) return false;
+  // "Fuyue is not connected to kruger_60. Use find_route..." is a genuine
+  // server/business error (the bot is no longer at the system it thinks it is),
+  // NOT a dead socket — even though it contains "not connected". Treating it as
+  // a connection error makes sendResilient retry the stale jump forever.
+  if (/is not connected to/i.test(message) || /use find_route/i.test(message)) return false;
   return CONNECTION_ERROR_PATTERNS.test(message);
+}
+
+/** True when an error indicates the bot moved during a reconnect and the
+ *  previously-issued jump/travel target is no longer valid from its current
+ *  position. Routines should refresh position and recompute. */
+export function isStalePositionError(message?: string | null): boolean {
+  if (!message) return false;
+  return /is not connected to/i.test(message) || /use find_route/i.test(message);
 }

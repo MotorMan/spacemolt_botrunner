@@ -11,6 +11,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const COORDINATION_FILE = join(DATA_DIR, "fuelTransferCoordination.json");
@@ -149,7 +150,8 @@ export function saveCoordinationData(data: FtCoordinationData): void {
     if (!existsSync(DATA_DIR)) {
       mkdirSync(DATA_DIR, { recursive: true });
     }
-    writeFileSync(COORDINATION_FILE, JSON.stringify(data, null, 2) + "\n");
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(COORDINATION_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Error saving fuelTransferCoordination.json:", err);
   }
@@ -161,7 +163,8 @@ export function saveInTransitData(data: FtInTransitData): void {
       mkdirSync(DATA_DIR, { recursive: true });
     }
     data.lastUpdated = new Date().toISOString();
-    writeFileSync(IN_TRANSIT_FILE, JSON.stringify(data, null, 2) + "\n");
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(IN_TRANSIT_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Error saving fuelTransferInTransit.json:", err);
   }

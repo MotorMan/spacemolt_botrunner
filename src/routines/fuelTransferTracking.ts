@@ -1,5 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
+import { getFactionStorageCache, updateFactionStorageCache } from "../factionStorageCache.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const TRACKING_FILE = join(DATA_DIR, "fuelTransfer.json");
@@ -78,7 +80,8 @@ export function loadFuelTransferData(): FuelTransferData {
 export function saveFuelTransferData(data: FuelTransferData): void {
   try {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(TRACKING_FILE, JSON.stringify(data, null, 2) + "\n");
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(TRACKING_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Error saving fuelTransfer.json:", err);
   }
@@ -138,32 +141,49 @@ export function updateFactionStorageFromDeposit(
   itemName?: string
 ): void {
   try {
-    const record = loadFactionStorageRecord(station);
+    let record = loadFactionStorageRecord(station);
     const now = Date.now();
     
     if (!record) {
-      const newRecord: FactionStorageRecord = {
+      record = {
         factionName,
         station,
         lastUpdated: now,
         entries: [{ itemId, quantity: depositedQty, name: itemName }],
       };
-      const sanitized = station.replace(/::/g, "--").replace(/[^a-zA-Z0-9\-_]/g, "_");
-      if (!existsSync(FACTION_STORAGE_DIR)) mkdirSync(FACTION_STORAGE_DIR, { recursive: true });
-      writeFileSync(join(FACTION_STORAGE_DIR, `${sanitized}.json`), JSON.stringify(newRecord, null, 2), "utf-8");
-      return;
-    }
-    
-    const existingEntry = record.entries.find(e => e.itemId === itemId);
-    if (existingEntry) {
-      existingEntry.quantity += depositedQty;
     } else {
-      record.entries.push({ itemId, quantity: depositedQty, name: itemName });
+      const existingEntry = record.entries.find(e => e.itemId === itemId);
+      if (existingEntry) {
+        existingEntry.quantity += depositedQty;
+      } else {
+        record.entries.push({ itemId, quantity: depositedQty, name: itemName });
+      }
     }
     record.lastUpdated = now;
     
     const sanitized = station.replace(/::/g, "--").replace(/[^a-zA-Z0-9\-_]/g, "_");
-    writeFileSync(join(FACTION_STORAGE_DIR, `${sanitized}.json`), JSON.stringify(record, null, 2), "utf-8");
+    if (!existsSync(FACTION_STORAGE_DIR)) mkdirSync(FACTION_STORAGE_DIR, { recursive: true });
+    const payload = JSON.stringify(record, null, 2);
+    safeWriteFileSync(join(FACTION_STORAGE_DIR, `${sanitized}.json`), payload, Buffer.byteLength(payload, "utf-8"));
+
+    // Keep the factionStorageCache in sync so subsequent station-qty reads
+    // (getRemoteFactionAllItemsRateLimited / getItemStatus) see this deposit
+    // instead of a stale cache that still reports ~0 at the station. Without
+    // this the FT routine re-deposits endlessly and the loadout progress
+    // counter runs past its target.
+    try {
+      const cached = getFactionStorageCache(factionName, station);
+      if (cached) {
+        const hasItem = cached.entries.some(e => e.itemId === itemId);
+        const entries = cached.entries.map(e =>
+          e.itemId === itemId ? { ...e, quantity: e.quantity + depositedQty } : e
+        );
+        const finalEntries = hasItem ? entries : [...entries, { itemId, quantity: depositedQty, name: itemName }];
+        updateFactionStorageCache(factionName, finalEntries, station);
+      }
+    } catch (cacheErr) {
+      console.warn(`Error syncing faction storage cache for ${station}:`, cacheErr);
+    }
   } catch (err) {
     console.warn(`Error updating faction storage for ${station}:`, err);
   }
@@ -186,7 +206,8 @@ export function refreshFactionStorageCache(
     };
     
     if (!existsSync(FACTION_STORAGE_DIR)) mkdirSync(FACTION_STORAGE_DIR, { recursive: true });
-    writeFileSync(join(FACTION_STORAGE_DIR, `${sanitized}.json`), JSON.stringify(record, null, 2), "utf-8");
+    const payload = JSON.stringify(record, null, 2);
+    safeWriteFileSync(join(FACTION_STORAGE_DIR, `${sanitized}.json`), payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.warn(`Error refreshing faction storage cache for ${station}:`, err);
   }
@@ -379,7 +400,8 @@ export function saveFacilityTransferLoadout(name: string, loadout: Omit<Facility
       forceFullDelivery: loadout.forceFullDelivery ?? existing?.forceFullDelivery ?? false,
     };
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+    const payload = JSON.stringify(loadouts, null, 2) + "\n";
+    safeWriteFileSync(LOADOUTS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Error saving facilityTransferLoadouts.json:", err);
   }
@@ -391,7 +413,8 @@ export function deleteFacilityTransferLoadout(name: string): boolean {
     if (name in loadouts) {
       delete loadouts[name];
       if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-      writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+      const payload = JSON.stringify(loadouts, null, 2) + "\n";
+    safeWriteFileSync(LOADOUTS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
       return true;
     }
   } catch (err) {
@@ -410,7 +433,8 @@ export function setLoadoutActive(name: string, active: boolean): void {
     if (name in loadouts) {
       loadouts[name].active = active;
       if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-      writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+      const payload = JSON.stringify(loadouts, null, 2) + "\n";
+    safeWriteFileSync(LOADOUTS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
     }
   } catch (err) {
     console.error("Error setting loadout active:", err);
@@ -423,7 +447,8 @@ export function setLoadoutForceFullDelivery(name: string, forceFullDelivery: boo
     if (name in loadouts) {
       loadouts[name].forceFullDelivery = forceFullDelivery;
       if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-      writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+      const payload = JSON.stringify(loadouts, null, 2) + "\n";
+    safeWriteFileSync(LOADOUTS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
     }
   } catch (err) {
     console.error("Error setting loadout force full delivery:", err);
@@ -466,7 +491,8 @@ function loadProgressData(): FacilityTransferProgress {
 function saveProgressData(data: FacilityTransferProgress): void {
   try {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(PROGRESS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(PROGRESS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Error saving facilityTransferProgress.json:", err);
   }
@@ -568,7 +594,8 @@ export function saveStationCompletion(stationId: string, loadoutName: string, it
     });
     const file = getStationCompletionFilePath();
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(file, JSON.stringify(completions, null, 2) + "\n", "utf-8");
+      const payload = JSON.stringify(completions, null, 2) + "\n";
+      safeWriteFileSync(file, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Error saving facilityTransferCompletions.json:", err);
   }
@@ -596,7 +623,8 @@ export function clearLoadoutCompletions(loadoutName: string): void {
     }
     const file = getStationCompletionFilePath();
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(file, JSON.stringify(completions, null, 2) + "\n", "utf-8");
+      const payload = JSON.stringify(completions, null, 2) + "\n";
+      safeWriteFileSync(file, payload, Buffer.byteLength(payload, "utf-8"));
     // Force-full loadouts are judged by hauled progress, so resetting a
     // completion must also reset the haul counters or the loadout would be
     // re-marked complete on the next check.
@@ -610,7 +638,8 @@ export function clearAllCompletions(): void {
   try {
     const file = getStationCompletionFilePath();
     if (existsSync(file)) {
-      writeFileSync(file, JSON.stringify({}, null, 2) + "\n", "utf-8");
+      const payload = JSON.stringify({}, null, 2) + "\n";
+      safeWriteFileSync(file, payload, Buffer.byteLength(payload, "utf-8"));
     }
     clearAllProgress();
   } catch (err) {

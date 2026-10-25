@@ -1,0 +1,1218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ship Pricing Calc - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background: var(--bg); color: var(--text); }
+    body { padding: 16px; display:flex; flex-direction:column; overflow:hidden; }
+    .spc-layout { flex:1; min-height:0; display:flex; flex-direction:column; gap:12px; }
+    .spc-header { display:flex; align-items:center; gap:12px; flex-wrap:wrap; flex-shrink:0; }
+    .spc-header h3 { margin:0; color:var(--text-bright); }
+    .spc-controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .spc-controls label { font-size:12px; color:var(--text-dim); }
+    .spc-controls select, .spc-controls input { padding:6px 10px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:12px; }
+    .spc-content { flex:1; min-height:0; overflow:auto; }
+    .spc-ship { background:var(--bg-card); border:1px solid var(--border); border-radius:6px; margin-bottom:8px; overflow:hidden; }
+    .spc-ship-head { padding:10px 12px; cursor:pointer; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .spc-ship-head:hover { background:var(--bg-row-hover); }
+    .spc-ship-name { font-weight:600; color:var(--text-bright); flex:1; min-width:140px; }
+    .spc-ship-class { font-size:11px; color:var(--text-dim); }
+    .spc-ship-total { font-size:14px; font-weight:700; color:var(--green); font-family:monospace; }
+    .spc-ship-price { font-size:14px; font-weight:700; color:var(--green); font-family:monospace; }
+    .spc-ship-body { display:none; padding:0 12px 12px 12px; border-top:1px solid var(--border); }
+    .spc-ship.expanded .spc-ship-body { display:block; }
+    .spc-section { margin-top:10px; }
+    .spc-section-title { font-size:11px; font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; }
+    .spc-table { width:100%; border-collapse:collapse; font-size:11px; }
+    .spc-table th { text-align:left; padding:4px 8px; border-bottom:1px solid var(--border); color:var(--text-dim); font-weight:600; }
+    .spc-table td { padding:4px 8px; border-bottom:1px solid #21262d; }
+    .spc-table tr:last-child td { border-bottom:none; }
+    .spc-price { font-family:monospace; text-align:right; }
+    .spc-cost { font-family:monospace; text-align:right; color:var(--yellow); }
+    .spc-total { font-family:monospace; text-align:right; font-weight:700; color:var(--green); }
+    .spc-badge { display:inline-block; padding:1px 5px; border-radius:3px; font-size:10px; font-weight:600; }
+    .spc-badge-market { background:#0d2818; color:var(--green); }
+    .spc-badge-base { background:#2d1b00; color:var(--yellow); }
+    .spc-badge-missing { background:#2d0000; color:var(--red); }
+    .spc-badge-tax { background:#0d1b2d; color:#60a5fa; }
+    .spc-empty { text-align:center; padding:40px; color:var(--text-dim); }
+    .spc-bar { display:flex; gap:12px; align-items:center; padding:8px 12px; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; flex-shrink:0; flex-wrap:wrap; }
+    .spc-stat { font-size:12px; color:var(--text-dim); }
+    .spc-stat b { color:var(--text-bright); }
+    .override-modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.7); z-index:1000; align-items:center; justify-content:center; }
+    .override-modal { background:var(--bg-card); border:1px solid var(--border); border-radius:8px; padding:16px; min-width:320px; max-width:90vw; }
+    .override-modal h4 { margin:0 0 12px 0; color:var(--text-bright); font-size:14px; }
+    .override-modal input { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:14px; font-family:monospace; margin-bottom:12px; box-sizing:border-box; }
+    .override-modal-btns { display:flex; gap:8px; justify-content:flex-end; }
+    .override-modal-btns button { padding:6px 14px; border-radius:4px; cursor:pointer; font-size:12px; border:1px solid var(--border); }
+    .override-modal-btns .btn-primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .override-modal-btns .btn-cancel { background:transparent; color:var(--text); }
+    .override-badge { display:inline-block; padding:1px 5px; border-radius:3px; font-size:10px; font-weight:600; background:#2d1b00; color:var(--yellow); margin-left:4px; }
+  </style>
+</head>
+<body>
+  <div class="spc-layout">
+    <div class="spc-header">
+      <h3>Ship Pricing Calc</h3>
+    <div class="spc-controls">
+      <label>Bot:</label>
+      <select id="botSelect"><option value="">Select bot...</option></select>
+      <button class="primary" onclick="fetchShips()">Fetch Ships</button>
+      <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:var(--text-dim)">
+        <input type="checkbox" id="skipOffStationShips" checked onchange="onSkipFilterChange()"> Skip off-station ships
+      </label>
+    </div>
+    </div>
+    <div class="spc-bar" id="spcBar">
+      <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:var(--text-dim)">
+        <input type="checkbox" id="useTaxEstimate" checked onchange="onPricingModeChange()"> Use game-assessed ship values
+      </label>
+      <span class="spc-stat">Base/Market Multiplier (missing prices): <b id="multiplierVal">42</b>x</span>
+      <input type="number" id="multiplier" value="42" step="0.01" min="1" style="width:70px;font-size:12px;padding:4px 8px;" onchange="document.getElementById('multiplierVal').textContent=parseFloat(this.value||1).toFixed(2)">
+      <span class="spc-stat">Tax-Estimate Multiplier: <b id="taxMultiplierVal">1.20</b>x</span>
+      <input type="number" id="taxMultiplier" value="1.20" step="0.01" min="1" style="width:70px;font-size:12px;padding:4px 8px;" onchange="document.getElementById('taxMultiplierVal').textContent=parseFloat(this.value||1).toFixed(2)">
+      <span class="spc-stat" id="spcStats"></span>
+      <span class="spc-stat" style="cursor:pointer" onclick="var el=document.getElementById('overrideList');el.style.display=el.style.display==='none'?'flex':'none'" title="Click to toggle overrides">
+        Overrides: <b id="overrideCount" style="color:var(--yellow)">0</b>
+      </span>
+      <button onclick="refreshMarketData()">Refresh Market Data</button>
+      <div id="overrideList" style="display:none;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg-card);border:1px solid var(--border);border-radius:4px;flex-wrap:wrap;gap:4px;align-items:center"></div>
+    </div>
+    <div class="spc-content" id="spcContent">
+      <div class="spc-empty">Select a bot and click Fetch Ships to begin.</div>
+    </div>
+  </div>
+
+  <div id="overrideModal" class="override-modal-overlay" onclick="if(event.target===this)hideOverrideModal()">
+    <div class="override-modal">
+      <h4 id="overrideItemLabel">Override price</h4>
+      <input type="number" id="overridePriceInput" inputmode="numeric" onkeydown="if(event.key==='Enter')submitOverride();if(event.key==='Escape')hideOverrideModal()">
+      <div class="override-modal-btns">
+        <button class="btn-cancel" onclick="hideOverrideModal()">Cancel</button>
+        <button class="btn-primary" onclick="submitOverride()">Set Override</button>
+      </div>
+    </div>
+  </div>
+
+    <script>
+    let catalog = { ships: {}, items: {}, recipes: {} };
+    let marketIndex = new Map();
+    let remoteMarketCache = new Map();
+    let shipList = [];
+    let shipStates = new Map();
+    let shipPricing = new Map();
+    let fetchQueue = [];
+    let isProcessing = false;
+    let fetchBot = '';
+    let multiplier = 2.42;
+    let listingMap = new Map();
+    let shipInfoMap = new Map();
+    let shipLocations = new Map();
+    let priceOverrides = new Map();
+    let overrideModalTarget = null;
+    let currentBotLocation = null;
+    let stationRef = null;
+    let stationColorMap = new Map();
+    let mapData = null;
+    let poiLookup = new Map();
+    let taxEstimateMap = new Map();
+    let useTaxEstimate = true;
+
+    function buildPoiLookup() {
+      poiLookup.clear();
+      if (!mapData || !mapData.systems) return;
+      const systems = mapData.systems;
+      if (Array.isArray(systems)) {
+        for (const sys of systems) {
+          for (const poi of (sys.pois || [])) {
+            registerPoi(poi);
+          }
+        }
+      } else if (typeof systems === 'object') {
+        for (const sys of Object.values(systems)) {
+          if (sys && typeof sys === 'object') {
+            for (const poi of (sys.pois || [])) {
+              registerPoi(poi);
+            }
+          }
+        }
+      }
+    }
+
+    function registerPoi(poi) {
+      if (!poi || !poi.id) return;
+      const idLower = poi.id.toLowerCase();
+      if (!poiLookup.has(idLower)) {
+        poiLookup.set(idLower, { poiId: poi.id, baseId: poi.base_id || null, baseName: poi.base_name || null, name: poi.name || null });
+      }
+      if (poi.base_id) {
+        const baseLower = poi.base_id.toLowerCase();
+        if (!poiLookup.has(baseLower)) {
+          poiLookup.set(baseLower, { poiId: poi.id, baseId: poi.base_id || null, baseName: poi.base_name || null, name: poi.name || null });
+        }
+      }
+      if (poi.base_name) {
+        const nameLower = poi.base_name.toLowerCase();
+        if (!poiLookup.has(nameLower)) {
+          poiLookup.set(nameLower, { poiId: poi.id, baseId: poi.base_id || null, baseName: poi.base_name || null, name: poi.name || null });
+        }
+      }
+      if (poi.name) {
+        const nameLower = poi.name.toLowerCase();
+        if (!poiLookup.has(nameLower)) {
+          poiLookup.set(nameLower, { poiId: poi.id, baseId: poi.base_id || null, baseName: poi.base_name || null, name: poi.name || null });
+        }
+      }
+    }
+
+    function normalizeStationToken(token) {
+      if (!token) return '';
+      const lower = String(token).toLowerCase();
+      const poiEntry = poiLookup.get(lower);
+      if (poiEntry) {
+        const candidate = poiEntry.baseId || poiEntry.baseName || poiEntry.name || poiEntry.poiId;
+        return candidate.toLowerCase();
+      }
+      if (!stationRef) return lower;
+      const byId = stationRef.by_station_id?.[lower];
+      if (byId) return byId.station_id.toLowerCase();
+      const byUnder = stationRef.by_underline_name?.[lower];
+      if (byUnder) return byUnder.station_id.toLowerCase();
+      return lower;
+    }
+
+    function stationsMatch(a, b) {
+      if (!a || !b) return false;
+      const na = normalizeStationToken(a);
+      const nb = normalizeStationToken(b);
+      if (na === nb) return true;
+      if (!stationRef) return false;
+      const infoA = stationRef.by_station_id?.[na] || stationRef.by_underline_name?.[na];
+      const infoB = stationRef.by_station_id?.[nb] || stationRef.by_underline_name?.[nb];
+      if (!infoA || !infoB) return false;
+      if (infoA.system_id && infoB.system_id && infoA.system_id.toLowerCase() !== infoB.system_id.toLowerCase()) return false;
+      return infoA.station_id.toLowerCase() === infoB.station_id.toLowerCase();
+    }
+
+    function getStationColor(stationToken) {
+      const key = normalizeStationToken(stationToken);
+      if (!key) return 'var(--text-dim)';
+      if (!stationColorMap.has(key)) {
+        let hash = 0;
+        for (let i = 0; i < key.length; i++) hash = ((hash << 5) - hash) + key.charCodeAt(i);
+        const hue = Math.abs(hash) % 360;
+        stationColorMap.set(key, `hsl(${hue}, 70%, 65%)`);
+      }
+      return stationColorMap.get(key);
+    }
+
+    async function loadStationRef() {
+      try {
+        const [stationRes, mapRes] = await Promise.all([
+          fetch('/api/stationRef'),
+          fetch('/data/map.json')
+        ]);
+        const stationData = await stationRes.json().catch(() => null);
+        const mapJson = await mapRes.json().catch(() => null);
+        stationRef = stationData || null;
+        mapData = mapJson || null;
+        buildPoiLookup();
+      } catch (e) {
+        console.error('Failed to load stationRef/map:', e);
+        stationRef = null;
+        mapData = null;
+        poiLookup.clear();
+      }
+    }
+
+    async function loadCatalog() {
+      try {
+        const res = await fetch('/data/catalog.json');
+        catalog = await res.json();
+      } catch (e) {
+        console.error('Failed to load catalog:', e);
+      }
+    }
+
+    async function loadMarketData() {
+      try {
+        const res = await fetch('/data/marketDetails.json?t=' + Date.now(), { cache: 'no-store' });
+        const data = await res.json();
+        marketIndex.clear();
+        for (const entry of (data.items || [])) {
+          const key = (entry.itemId || '').toLowerCase();
+          if (!marketIndex.has(key)) marketIndex.set(key, []);
+          marketIndex.get(key).push(entry);
+        }
+      } catch (e) {
+        console.error('Failed to load market data:', e);
+      }
+      remoteMarketCache.clear();
+    }
+
+    async function refreshMarketData() {
+      await loadMarketData();
+      for (const [shipId, pricing] of shipPricing) {
+        if (shipStates.get(shipId) === 'loaded') {
+          enqueueShip(shipId);
+        }
+      }
+    }
+
+    async function loadPriceOverrides() {
+      try {
+        const res = await fetch('/api/price-overrides');
+        const data = await res.json();
+        priceOverrides.clear();
+        for (const [itemId, info] of Object.entries(data)) {
+          if (info && typeof info.price === 'number') {
+            priceOverrides.set(itemId.toLowerCase(), info.price);
+          }
+        }
+        updateOverridesBar();
+        refreshAllLoadedShips();
+      } catch (e) {
+        console.error('Failed to load price overrides:', e);
+      }
+    }
+
+    async function loadBotLocation(bot) {
+      try {
+        const res = await fetch('/api/bots');
+        const data = await res.json();
+        const botStatus = Array.isArray(data) ? data.find(b => b.username === bot) : null;
+        if (botStatus) {
+          const poi = botStatus.poi || '';
+          currentBotLocation = { system: botStatus.system || '', poi };
+        } else {
+          currentBotLocation = null;
+        }
+      } catch (e) {
+        console.error('Failed to load bot location:', e);
+        currentBotLocation = null;
+      }
+    }
+
+    function onSkipFilterChange() {
+      if (!shipList.length) return;
+      const skipOffStation = document.getElementById('skipOffStationShips')?.checked;
+      const ships = shipList;
+      const botPoi = currentBotLocation?.poi || '';
+      const queuedShips = skipOffStation && botPoi
+        ? ships.filter(s => {
+            const shipBaseId = s.location_base_id || '';
+            return shipBaseId === '' || stationsMatch(shipBaseId, botPoi);
+          })
+        : ships;
+      fetchQueue = queuedShips.map(s => (s.id || s.ship_id || '')).filter(Boolean);
+      shipStates.clear();
+      shipInfoMap.clear();
+      for (const s of ships) {
+        const sid = s.id || s.ship_id || '';
+        const inQueue = fetchQueue.includes(sid);
+        shipStates.set(sid, inQueue ? 'pending' : 'skipped');
+      }
+      renderShipList();
+      const skippedCount = ships.length - queuedShips.length;
+      const statsText = ships.length + ' ships' + (skippedCount > 0 ? ' (' + skippedCount + ' skipped, click to load)' : ' queued (click to prioritize)');
+      const statsEl = document.getElementById('spcStats');
+      if (statsEl) statsEl.textContent = statsText;
+      processQueue();
+    }
+
+    function onPricingModeChange() {
+      const checkbox = document.getElementById('useTaxEstimate');
+      const multInput = document.getElementById('multiplier');
+      const taxMultInput = document.getElementById('taxMultiplier');
+      useTaxEstimate = !!checkbox?.checked;
+      if (multInput) multInput.disabled = useTaxEstimate;
+      if (taxMultInput) taxMultInput.disabled = !useTaxEstimate;
+      refreshAllLoadedShips();
+    }
+
+    async function setPriceOverride(itemId, price) {
+      try {
+        const res = await fetch('/api/price-overrides', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ itemId, price })
+        });
+        const json = await res.json();
+        if (json.ok) {
+          priceOverrides.set(itemId.toLowerCase(), price);
+          updateOverridesBar();
+          refreshAllLoadedShips();
+          return true;
+        }
+      } catch (e) {
+        console.error('Failed to set price override:', e);
+      }
+      return false;
+    }
+
+    async function removePriceOverride(itemId) {
+      try {
+        const res = await fetch('/api/price-overrides', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ itemId })
+        });
+        const json = await res.json();
+        if (json.ok) {
+          priceOverrides.delete(itemId.toLowerCase());
+          updateOverridesBar();
+          refreshAllLoadedShips();
+        }
+      } catch (e) {
+        console.error('Failed to remove price override:', e);
+      }
+    }
+
+    async function clearAllOverrides() {
+      if (!confirm('Clear ALL price overrides?')) return;
+      try {
+        const res = await fetch('/api/price-overrides', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        const json = await res.json();
+        if (json.ok) {
+          priceOverrides.clear();
+          updateOverridesBar();
+          refreshAllLoadedShips();
+        }
+      } catch (e) {
+        console.error('Failed to clear overrides:', e);
+      }
+    }
+
+    function refreshAllLoadedShips() {
+      for (const [shipId, state] of shipStates) {
+        if (state === 'loaded') {
+          enqueueShip(shipId);
+        }
+      }
+    }
+
+    function getOverridePrice(itemId) {
+      const key = (itemId || '').toLowerCase();
+      return priceOverrides.get(key) || null;
+    }
+
+    function hasOverride(itemId) {
+      return priceOverrides.has((itemId || '').toLowerCase());
+    }
+
+    function updateOverridesBar() {
+      const countEl = document.getElementById('overrideCount');
+      const listEl = document.getElementById('overrideList');
+      if (countEl) {
+        countEl.textContent = priceOverrides.size;
+      }
+      if (listEl) {
+        if (priceOverrides.size === 0) {
+          listEl.innerHTML = '<span style="color:var(--text-dim);font-size:11px">No overrides</span>';
+        } else {
+          let html = '';
+          for (const [itemId, price] of priceOverrides) {
+            html += '<span style="display:inline-flex;align-items:center;gap:4px;background:#2d1b00;color:var(--yellow);padding:2px 6px;border-radius:3px;font-size:11px;font-family:monospace">' +
+              esc(itemId) + ': ' + price.toLocaleString() + 'cr' +
+              ' <button onclick="removePriceOverride(\'' + esc(itemId) + '\')" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:12px;padding:0 2px" title="Remove override">×</button>' +
+              '</span> ';
+          }
+          html += '<button onclick="clearAllOverrides()" style="background:none;border:1px solid var(--border);color:var(--red);cursor:pointer;font-size:10px;padding:2px 6px;border-radius:3px;margin-left:4px">Clear All</button>';
+          listEl.innerHTML = html;
+        }
+      }
+    }
+
+    function showOverrideModal(itemId, currentPrice) {
+      overrideModalTarget = itemId;
+      const modal = document.getElementById('overrideModal');
+      const input = document.getElementById('overridePriceInput');
+      const label = document.getElementById('overrideItemLabel');
+      if (modal && input && label) {
+        label.textContent = 'Override price for: ' + itemId;
+        input.value = currentPrice != null ? currentPrice : '';
+        modal.style.display = 'flex';
+        input.focus();
+        input.select();
+      }
+    }
+
+    function hideOverrideModal() {
+      const modal = document.getElementById('overrideModal');
+      if (modal) modal.style.display = 'none';
+      overrideModalTarget = null;
+    }
+
+    async function submitOverride() {
+      const input = document.getElementById('overridePriceInput');
+      if (!input || !overrideModalTarget) return;
+      const price = parseInt(input.value, 10);
+      if (!Number.isFinite(price) || price <= 0) {
+        alert('Enter a valid positive price');
+        return;
+      }
+      const ok = await setPriceOverride(overrideModalTarget, price);
+      hideOverrideModal();
+      if (ok) {
+        const itemId = overrideModalTarget;
+      }
+    }
+
+    function onItemPriceClick(itemId, currentPrice) {
+      showOverrideModal(itemId, currentPrice);
+    }
+
+    async function queryRemoteMarket(itemId) {
+      const key = (itemId || '').toLowerCase();
+      if (remoteMarketCache.has(key)) return remoteMarketCache.get(key) || null;
+      const overridePrice = getOverridePrice(itemId);
+      if (overridePrice != null) {
+        const result = { bestSell: { price: overridePrice, qty: 0, station: 'override' }, bestBuy: null };
+        remoteMarketCache.set(key, result);
+        return result;
+      }
+      let bestSell = null;
+      let bestBuy = null;
+      const filterResults = (sellData, buyData) => {
+        const itemEntry = catalog.items[key] || {};
+        const baseValue = itemEntry.base_value || 0;
+        const baseMat = isBaseMaterial(itemId);
+        const module = isShipModule(itemId);
+        if (sellData && sellData.results && sellData.results.length > 0) {
+          const filtered = sellData.results.filter(r => {
+            if (baseMat && r.price < 10) return false;
+            if (module && r.price < 2000) return false;
+            if (baseValue > 0 && r.price < baseValue) return false;
+            if (baseValue > 0 && r.price > baseValue * 100) return false;
+            return true;
+          });
+          if (filtered.length > 0) {
+            const best = filtered[0];
+            bestSell = { price: best.price, qty: best.quantity, station: best.stationName };
+          }
+        }
+        if (buyData && buyData.results && buyData.results.length > 0) {
+          const filtered = buyData.results.filter(r => {
+            if (baseMat && r.price < 10) return false;
+            if (module && r.price < 2000) return false;
+            if (baseValue > 0 && r.price < baseValue) return false;
+            if (baseValue > 0 && r.price > baseValue * 100) return false;
+            return true;
+          });
+          if (filtered.length > 0) {
+            const best = filtered[0];
+            bestBuy = { price: best.price, qty: best.quantity, station: best.stationName };
+          }
+        }
+      };
+      try {
+        const [sellRes, buyRes] = await Promise.all([
+          fetch('/api/client-sync/market-query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId, tradeType: 'buy' })
+          }),
+          fetch('/api/client-sync/market-query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId, tradeType: 'sell' })
+          })
+        ]);
+        const sellData = await sellRes.json();
+        const buyData = await buyRes.json();
+        filterResults(sellData, buyData);
+        if (bestSell || bestBuy) {
+          const result = { bestSell, bestBuy };
+          remoteMarketCache.set(key, result);
+          return result;
+        }
+      } catch (e) {
+        console.warn('Primary market query failed for', itemId, e);
+      }
+      try {
+        const [sellRes, buyRes] = await Promise.all([
+          fetch('/api/client-sync/market-query-handler', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId, tradeType: 'buy' })
+          }),
+          fetch('/api/client-sync/market-query-handler', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId, tradeType: 'sell' })
+          })
+        ]);
+        const sellData = await sellRes.json();
+        const buyData = await buyRes.json();
+        filterResults(sellData, buyData);
+        if (bestSell || bestBuy) {
+          const result = { bestSell, bestBuy };
+          remoteMarketCache.set(key, result);
+          return result;
+        }
+      } catch (e) {
+        console.warn('Fallback market query failed for', itemId, e);
+      }
+      remoteMarketCache.set(key, null);
+      return null;
+    }
+
+    async function populateBotSelect() {
+      const sel = document.getElementById('botSelect');
+      try {
+        const res = await fetch('/api/bots/discovered');
+        const data = await res.json();
+        const names = (data.usernames || []).filter(Boolean);
+        sel.innerHTML = '<option value="">Select bot...</option>' +
+          names.map(n => '<option value="' + esc(n) + '">' + esc(n) + '</option>').join('');
+      } catch (e) {
+        console.error('Failed to load bots:', e);
+      }
+    }
+
+    function isRefinedOreProduct(itemId) {
+      const id = (itemId || '').toLowerCase();
+      return /ingot|plate|sheet|rod|powder|alloy/.test(id) && !/ore/.test(id);
+    }
+
+    function isBaseMaterial(itemId) {
+      const id = (itemId || '').toLowerCase();
+      return /ore|ingot|plate|sheet|rod|powder|alloy/.test(id);
+    }
+
+    function isShipModule(itemId) {
+      const id = (itemId || '').toLowerCase();
+      return /module|shield|engine|weapon|cloak|cpu|drive|compressor|expander|harvester|stabilizer|projector|hardener|bay|mount/.test(id);
+    }
+
+    function getMarketPrice(itemId) {
+      const key = (itemId || '').toLowerCase();
+      const entries = marketIndex.get(key);
+      if (!entries || entries.length === 0) {
+        return null;
+      }
+      const itemEntry = catalog.items[key] || {};
+      const baseValue = itemEntry.base_value || 0;
+      const baseMat = isBaseMaterial(itemId);
+      const module = isShipModule(itemId);
+      let bestSell = null;
+      let bestBuy = null;
+      for (const entry of entries) {
+        for (const o of (entry.sellOrders || [])) {
+          if (baseMat && o.price < 10) continue;
+          if (module && o.price < 2000) continue;
+          if (baseValue > 0 && o.price < baseValue) continue;
+          if (baseValue > 0 && o.price > baseValue * 100) continue;
+          if (!bestSell || o.price < bestSell.price) bestSell = { price: o.price, qty: o.quantity, station: entry.stationName };
+        }
+        for (const o of (entry.buyOrders || [])) {
+          if (baseMat && o.price < 10) continue;
+          if (module && o.price < 2000) continue;
+          if (baseValue > 0 && o.price < baseValue) continue;
+          if (baseValue > 0 && o.price > baseValue * 100) continue;
+          if (!bestBuy || o.price > bestBuy.price) bestBuy = { price: o.price, qty: o.quantity, station: entry.stationName };
+        }
+      }
+      return { bestSell, bestBuy };
+    }
+
+    async function getMarketPriceAsync(itemId) {
+      const key = (itemId || '').toLowerCase();
+      const remote = await queryRemoteMarket(itemId);
+      if (remote && (remote.bestSell || remote.bestBuy)) return remote;
+      const local = getMarketPrice(itemId);
+      if (local && (local.bestSell || local.bestBuy)) return local;
+      return null;
+    }
+
+    async function resolveItemPrice(itemId, baseValue) {
+      const overridePrice = getOverridePrice(itemId);
+      if (overridePrice != null) {
+        return { price: overridePrice, source: 'override', detail: 'manual override ' + overridePrice.toLocaleString() + 'cr' };
+      }
+      const mp = await getMarketPriceAsync(itemId);
+      if (mp && mp.bestSell) {
+        return { price: mp.bestSell.price, source: 'market', detail: 'lowest sell ' + mp.bestSell.price.toLocaleString() + 'cr (' + mp.bestSell.qty + 'x @ ' + mp.bestSell.station + ')' };
+      }
+      if (mp && mp.bestBuy) {
+        return { price: mp.bestBuy.price, source: 'market', detail: 'highest buy ' + mp.bestBuy.price.toLocaleString() + 'cr (' + mp.bestBuy.qty + 'x @ ' + mp.bestBuy.station + ')' };
+      }
+      const fallback = Math.floor((baseValue || 0) * multiplier);
+      return { price: fallback, source: 'base', detail: 'no market data → base ' + baseValue + ' × ' + multiplier };
+    }
+
+    async function computeRecipeCost(itemId) {
+      const key = (itemId || '').toLowerCase();
+      const recipes = Object.values(catalog.recipes || {});
+      const recipe = recipes.find(r => {
+        const outputs = r.outputs || [];
+        return outputs.some(o => (o.item_id || '').toLowerCase() === key);
+      });
+      if (!recipe) return null;
+      let total = 0;
+      let lines = [];
+      for (const inp of (recipe.inputs || [])) {
+        const itemEntry = catalog.items[inp.item_id] || {};
+        const baseVal = itemEntry.base_value || 0;
+        const rp = await resolveItemPrice(inp.item_id, baseVal);
+        const cost = rp.price * (inp.quantity || 1);
+        total += cost;
+        lines.push({ itemId: inp.item_id, qty: inp.quantity || 1, unitPrice: rp.price, cost, source: rp.source, detail: rp.detail });
+      }
+      return { total, lines, recipeId: recipe.id };
+    }
+
+    async function computeShipPricing(shipData) {
+      const result = { hull: { cost: 0, lines: [] }, modules: [], total: 0, source: 'base', detail: '' };
+      if (!shipData) return result;
+      const ship = (shipData.ship && typeof shipData.ship === 'object') ? shipData.ship : shipData;
+      const shipId = (ship.class_id || ship.type || ship.id || '').toLowerCase();
+      const shipEntry = catalog.ships[shipId] || null;
+      const baseHull = ship.base_hull || ship.max_hull || 0;
+      console.debug('computeShipPricing shipId=', shipId, 'shipEntry=', !!shipEntry, 'modules=', Array.isArray(shipData.modules) ? shipData.modules.length : 'n/a', 'shipDataKeys=', Object.keys(shipData));
+
+      if (useTaxEstimate) {
+        const originalShipId = (
+          shipData.id || shipData.ship_id ||
+          ship.id || ship.ship_id ||
+          ship.class_id || ship.type || ''
+        ).toLowerCase();
+        const assessedValue = taxEstimateMap.get(originalShipId) || 0;
+        const taxMult = parseFloat(document.getElementById('taxMultiplier')?.value || 1.20);
+        const pricedValue = assessedValue > 0 ? Math.floor(assessedValue * taxMult) : 0;
+        result.hull.cost = pricedValue;
+        if (assessedValue > 0) {
+          result.hull.lines.push({ itemId: 'game-assessed-value', qty: 1, unitPrice: assessedValue, cost: pricedValue, source: 'tax', detail: 'assessed ' + assessedValue.toLocaleString() + 'cr × ' + taxMult.toFixed(2) + ' (tax estimate)' });
+        } else {
+          result.hull.lines.push({ itemId: 'no-tax-data', qty: 1, unitPrice: 0, cost: 0, source: 'missing', detail: 'no assessed value in tax estimate for this ship' });
+        }
+        result.total = pricedValue;
+        result.source = 'tax';
+        result.detail = assessedValue > 0 ? 'game-assessed value ' + assessedValue.toLocaleString() + 'cr × ' + taxMult.toFixed(2) : 'no tax estimate data available';
+        return result;
+      }
+
+      if (shipEntry && Array.isArray(shipEntry.build_materials)) {
+        let hullCost = 0;
+        for (const mat of shipEntry.build_materials) {
+          const itemId = mat.item_id;
+          const qty = mat.quantity || 1;
+          const itemEntry = catalog.items[itemId] || {};
+          const baseVal = itemEntry.base_value || 0;
+          const rp = await resolveItemPrice(itemId, baseVal);
+          const cost = rp.price * qty;
+          hullCost += cost;
+          result.hull.lines.push({ itemId, qty, unitPrice: rp.price, cost, source: rp.source, detail: rp.detail });
+        }
+        result.hull.cost = hullCost;
+      } else {
+        result.hull.cost = 0;
+        result.hull.lines.push({ itemId: 'unknown', qty: 1, unitPrice: 0, cost: 0, source: 'missing', detail: 'no build_materials in catalog' });
+      }
+
+      const modules = [];
+      if (Array.isArray(shipData.modules)) {
+        for (const mod of shipData.modules) {
+          const modTypeId = (mod.type_id || mod.module_id || mod.item_id || mod.id || '').toLowerCase();
+          const modEntry = catalog.items[modTypeId] || {};
+          const modBase = modEntry.base_value || 0;
+          const mp = await getMarketPriceAsync(modTypeId);
+          let cost, source, detail;
+          let recipeCost = null;
+          if (mp && mp.bestSell) {
+            cost = mp.bestSell.price;
+            source = 'market';
+            detail = 'lowest sell ' + mp.bestSell.price.toLocaleString() + 'cr (' + mp.bestSell.qty + 'x @ ' + mp.bestSell.station + ')';
+          } else if (mp && mp.bestBuy) {
+            cost = mp.bestBuy.price;
+            source = 'market';
+            detail = 'highest buy ' + mp.bestBuy.price.toLocaleString() + 'cr (' + mp.bestBuy.qty + 'x @ ' + mp.bestBuy.station + ')';
+          } else {
+            recipeCost = await computeRecipeCost(modTypeId);
+            if (recipeCost) {
+              cost = recipeCost.total;
+              source = 'recipe';
+              detail = 'recipe ' + recipeCost.recipeId + ' materials';
+            } else {
+              cost = Math.floor(modBase * multiplier);
+              source = 'base';
+              detail = 'no market/recipe data → base ' + modBase + ' × ' + multiplier;
+            }
+          }
+          result.modules.push({ mod, modTypeId, cost, source, detail, recipeLines: recipeCost ? recipeCost.lines : [] });
+          result.total += cost;
+        }
+      }
+      result.total += result.hull.cost;
+      return result;
+    }
+
+    function enqueueShip(shipId, front = false) {
+      shipStates.set(shipId, 'queued');
+      if (front) {
+        const idx = fetchQueue.indexOf(shipId);
+        if (idx >= 0) fetchQueue.splice(idx, 1);
+        fetchQueue.unshift(shipId);
+      } else {
+        if (!fetchQueue.includes(shipId)) fetchQueue.push(shipId);
+      }
+      updateAllShipStatuses();
+      if (!isProcessing) processQueue();
+    }
+
+    async function processQueue() {
+      if (isProcessing) return;
+      isProcessing = true;
+      while (fetchQueue.length > 0) {
+        const shipId = fetchQueue.shift();
+        const card = document.getElementById('ship-card-' + shipId);
+        const body = document.getElementById('ship-body-' + shipId);
+        if (card) card.classList.add('spc-ship-loading');
+        shipStates.set(shipId, 'loading');
+        updateShipStatus(shipId);
+        try {
+          const shipInfo = await fetchShipDetails(fetchBot, shipId);
+          console.debug('shipInfo for', shipId, shipInfo);
+          const pricing = await computeShipPricing(shipInfo);
+          console.debug('pricing for', shipId, pricing);
+          shipPricing.set(shipId, pricing);
+          shipInfoMap.set(shipId, shipInfo);
+          shipStates.set(shipId, 'loaded');
+          if (body) {
+            body.innerHTML = renderShipBody(shipId, shipInfo, pricing);
+          }
+          if (card) {
+            card.classList.remove('spc-ship-loading');
+            card.classList.add('spc-ship-loaded');
+            const nameEl = card.querySelector('.spc-ship-name');
+            if (nameEl && shipInfo) {
+              const ship = (shipInfo.ship && typeof shipInfo.ship === 'object') ? shipInfo.ship : shipInfo;
+              const cls = ship.class_name || ship.ship_class || ship.class_id || '';
+              const customName = (ship.custom_name || '').trim();
+              const baseName = (ship.name || ship.ship_name || '').trim();
+              const specialName = customName && customName !== cls ? customName : (baseName && baseName !== cls ? baseName : '');
+              nameEl.textContent = cls + (specialName ? ' - ' + specialName : '') + ' - ' + shipId;
+            }
+          }
+        } catch (e) {
+          console.error('processQueue error for', shipId, e);
+          shipStates.set(shipId, 'error');
+          if (body) {
+            body.innerHTML = '<div class="spc-empty">Failed to load ship details</div>';
+          }
+          if (card) card.classList.remove('spc-ship-loading');
+        }
+        updateShipStatus(shipId);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      isProcessing = false;
+    }
+
+    async function fetchShips() {
+      const bot = document.getElementById('botSelect').value;
+      if (!bot) return alert('Select a bot first');
+      fetchBot = bot;
+      const content = document.getElementById('spcContent');
+      content.innerHTML = '<div class="spc-empty">Fetching ship list...</div>';
+      try {
+        const res = await fetch('/api/ship-pricing/list-ships', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot })
+        });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || 'Failed');
+        const shipsRaw = json.data;
+        let ships = [];
+        if (shipsRaw && Array.isArray(shipsRaw.ships)) ships = shipsRaw.ships;
+        else if (Array.isArray(shipsRaw)) ships = shipsRaw;
+        else if (shipsRaw && typeof shipsRaw === 'object') ships = [shipsRaw];
+        if (ships.length === 0) {
+          content.innerHTML = '<div class="spc-empty">No ships found.</div>';
+          return;
+        }
+        await loadCatalog();
+        await loadMarketData();
+        await fetchListings(bot);
+        await loadPriceOverrides();
+        await loadBotLocation(bot);
+        await loadStationRef();
+        await fetchTaxEstimate(bot);
+        const checkbox = document.getElementById('useTaxEstimate');
+        useTaxEstimate = checkbox ? checkbox.checked : true;
+        const multInput = document.getElementById('multiplier');
+        const taxMultInput = document.getElementById('taxMultiplier');
+        multiplier = parseFloat(multInput?.value || 2.42);
+        if (multInput) multInput.disabled = useTaxEstimate;
+        if (taxMultInput) taxMultInput.disabled = !useTaxEstimate;
+        shipList = ships;
+        shipLocations.clear();
+        for (const s of ships) {
+          const sid = s.id || s.ship_id || '';
+          shipLocations.set(sid, {
+            location: s.location || '',
+            locationBaseId: s.location_base_id || '',
+            isActive: !!s.is_active,
+            listingId: s.listing_id || null,
+            listingPrice: s.listing_price || null,
+            listingBaseId: s.listing_base_id || null,
+          });
+        }
+        const skipOffStation = document.getElementById('skipOffStationShips')?.checked;
+        const botPoi = currentBotLocation?.poi || '';
+        const queuedShips = skipOffStation && botPoi
+          ? ships.filter(s => {
+              const shipBaseId = s.location_base_id || '';
+              return shipBaseId === '' || stationsMatch(shipBaseId, botPoi);
+            })
+          : ships;
+        fetchQueue = queuedShips.map(s => (s.id || s.ship_id || '')).filter(Boolean);
+        shipStates.clear();
+        shipInfoMap.clear();
+        for (const s of ships) {
+          const sid = s.id || s.ship_id || '';
+          const inQueue = fetchQueue.includes(sid);
+          shipStates.set(sid, inQueue ? 'pending' : 'skipped');
+        }
+        renderShipList();
+        const skippedCount = ships.length - queuedShips.length;
+        const statsText = ships.length + ' ships' + (skippedCount > 0 ? ' (' + skippedCount + ' skipped, click to load)' : ' queued (click to prioritize)');
+        document.getElementById('spcStats').textContent = statsText;
+        processQueue();
+      } catch (e) {
+        content.innerHTML = '<div class="spc-empty">Error: ' + e.message + '</div>';
+      }
+    }
+
+    async function fetchShipDetails(bot, shipId) {
+      try {
+        const res = await fetch('/api/ship-pricing/get-ship', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot, ship_id: shipId })
+        });
+        const json = await res.json();
+        console.debug('get_ship response for', shipId, json);
+        if (json.ok && json.data) return json.data;
+      } catch (e) {
+        console.error('get_ship failed for', shipId, e);
+      }
+      return null;
+    }
+
+    async function fetchListings(bot) {
+      try {
+        const res = await fetch('/api/ship-pricing/browse-ships', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot })
+        });
+        const json = await res.json();
+        if (json.ok && json.data) {
+          const d = json.data;
+          const listings = Array.isArray(d) ? d : (d.listings || d.ships || []);
+          listingMap = new Map();
+          for (const l of listings) {
+            const sid = l.ship_id || l.id;
+            const lid = l.listing_id || l.listingId || l.id;
+            const price = l.price;
+            if (sid) listingMap.set(sid, { listingId: lid, price });
+          }
+        } else {
+          listingMap = new Map();
+        }
+      } catch (e) {
+        console.error('browse_ships failed', e);
+        listingMap = new Map();
+      }
+    }
+
+    async function fetchTaxEstimate(bot) {
+      try {
+        const res = await fetch('/api/ship-pricing/tax-estimate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot })
+        });
+        const json = await res.json();
+        if (json.ok && json.ships) {
+          taxEstimateMap = new Map();
+          for (const [shipId, value] of Object.entries(json.ships)) {
+            taxEstimateMap.set(shipId, value);
+          }
+        } else {
+          taxEstimateMap = new Map();
+        }
+      } catch (e) {
+        console.error('tax-estimate failed', e);
+        taxEstimateMap = new Map();
+      }
+    }
+
+    function renderShipList() {
+      const content = document.getElementById('spcContent');
+      if (shipList.length === 0) {
+        content.innerHTML = '<div class="spc-empty">No ships.</div>';
+        return;
+      }
+      let html = '';
+      for (const s of shipList) {
+        const shipId = s.id || s.ship_id || '';
+        const cls = (s.class_name || s.ship_class || s.class_id || s.type || '').trim();
+        const shipName = (s.name || s.ship_name || s.custom_name || s.customName || '').trim();
+        const displayName = cls + (shipName ? ' - ' + shipName : '') + ' - ' + shipId;
+        const state = shipStates.get(shipId) || 'pending';
+        const statusText = state === 'loaded' ? 'Loaded' : state === 'loading' ? 'Loading...' : state === 'error' ? 'Error' : state === 'skipped' ? 'Skipped (click to load)' : 'Click to load';
+        const locInfo = shipLocations.get(shipId) || {};
+        const locationText = locInfo.location || locInfo.locationBaseId || '';
+        const listingEntry = listingMap.get(shipId) || null;
+        const listingPrice = listingEntry ? listingEntry.price : null;
+        const listingBadge = listingPrice != null ? ' <span class="spc-listing-badge" title="Listed for sale" style="font-size:11px">🏷️ ' + listingPrice.toLocaleString() + 'cr</span>' : '';
+        const locBadge = locationText ? ' <span style="font-size:10px;margin-left:4px">📍 <span style="color:' + getStationColor(locationText) + '">' + esc(locationText) + '</span></span>' : '';
+        html += '<div class="spc-ship" id="ship-card-' + shipId + '" data-ship-id="' + shipId + '">' +
+          '  <div class="spc-ship-head" onclick="onShipClick(\'' + shipId + '\')">' +
+          '    <span class="spc-ship-name">' + esc(displayName) + '</span>' +
+          '    <span class="spc-ship-status" id="ship-status-' + shipId + '">' + statusText + '</span>' +
+          '    <span class="spc-ship-price" id="ship-price-' + shipId + '"></span>' +
+          locBadge +
+          listingBadge +
+          '  </div>' +
+          '  <div class="spc-ship-body" id="ship-body-' + shipId + '" style="display:none">' +
+          '    <div class="spc-empty">Click ship to load pricing details</div>' +
+          '  </div>' +
+          '</div>';
+      }
+      content.innerHTML = html;
+    }
+
+    function updateShipStatus(shipId) {
+      const el = document.getElementById('ship-status-' + shipId);
+      const state = shipStates.get(shipId) || 'pending';
+      if (!el) return;
+      if (state === 'loaded') el.textContent = 'Loaded';
+      else if (state === 'loading') el.textContent = 'Loading...';
+      else if (state === 'error') el.textContent = 'Error';
+      else if (state === 'queued') el.textContent = 'Queued';
+      else if (state === 'skipped') el.textContent = 'Skipped';
+      else el.textContent = 'Click to load';
+      const priceEl = document.getElementById('ship-price-' + shipId);
+      if (priceEl) {
+        if (state === 'loaded') {
+          const pricing = shipPricing.get(shipId);
+          priceEl.textContent = pricing ? pricing.total.toLocaleString() + 'cr' : '';
+        } else {
+          priceEl.textContent = '';
+        }
+      }
+    }
+
+    function updateAllShipStatuses() {
+      for (const [shipId] of shipStates) {
+        updateShipStatus(shipId);
+      }
+    }
+
+    function refreshShipListingBadge(shipId) {
+      const listingEntry = listingMap.get(shipId) || null;
+      const listingPrice = listingEntry ? listingEntry.price : null;
+      const card = document.getElementById('ship-card-' + shipId);
+      if (card) {
+        let badge = card.querySelector('.spc-listing-badge');
+        if (listingPrice != null) {
+          if (!badge) {
+            badge = document.createElement('span');
+            badge.className = 'spc-listing-badge';
+            badge.title = 'Listed for sale';
+            badge.style.fontSize = '11px';
+            const priceEl = card.querySelector('.spc-ship-price');
+            if (priceEl) {
+              priceEl.insertAdjacentElement('afterend', badge);
+            } else {
+              const head = card.querySelector('.spc-ship-head');
+              if (head) head.appendChild(badge);
+            }
+          }
+          badge.textContent = ' 🏷️ ' + listingPrice.toLocaleString() + 'cr';
+        } else if (badge) {
+          badge.remove();
+        }
+      }
+      const body = document.getElementById('ship-body-' + shipId);
+      if (body && card && card.classList.contains('expanded')) {
+        const shipInfo = shipInfoMap.get(shipId);
+        const pricing = shipPricing.get(shipId);
+        if (shipInfo && pricing) {
+          body.innerHTML = renderShipBody(shipId, shipInfo, pricing);
+        }
+      }
+    }
+
+    function onShipClick(shipId) {
+      const card = document.getElementById('ship-card-' + shipId);
+      const body = document.getElementById('ship-body-' + shipId);
+      const state = shipStates.get(shipId) || 'pending';
+      if (state === 'loaded') {
+        if (card.classList.contains('expanded')) {
+          card.classList.remove('expanded');
+          body.style.display = 'none';
+        } else {
+          card.classList.add('expanded');
+          body.style.display = 'block';
+        }
+        return;
+      }
+      if (state === 'loading') {
+        if (card.classList.contains('expanded')) {
+          card.classList.remove('expanded');
+          body.style.display = 'none';
+        } else {
+          card.classList.add('expanded');
+          body.style.display = 'block';
+        }
+        return;
+      }
+      if (state === 'skipped') {
+        shipStates.set(shipId, 'pending');
+        updateShipStatus(shipId);
+      }
+      enqueueShip(shipId, true);
+      card.classList.add('expanded');
+      body.style.display = 'block';
+      body.innerHTML = '<div class="spc-empty">Loading...</div>';
+    }
+
+    function renderShipBody(shipId, shipInfo, pricing) {
+      if (!shipInfo) return '<div class="spc-empty">No ship data available</div>';
+      const ship = (shipInfo.ship && typeof shipInfo.ship === 'object') ? shipInfo.ship : shipInfo;
+      const cls = ship.class_name || ship.ship_class || '';
+      const customName = (ship.custom_name || '').trim();
+      const baseName = (ship.name || ship.ship_name || '').trim();
+      const specialName = customName && customName !== cls ? customName : (baseName && baseName !== cls ? baseName : '');
+      const displayName = cls + (specialName ? ' - ' + specialName : '') + ' - ' + shipId;
+      const listingEntry = listingMap.get(shipId) || null;
+      const listingBadge = listingEntry && listingEntry.price != null ? ' <span class="spc-listing-badge" title="Listed for sale" style="font-size:11px">🏷️ ' + listingEntry.price.toLocaleString() + 'cr</span>' : '';
+      let html = '<div class="spc-ship-head" style="padding:8px 0"><b>' + esc(displayName) + '</b> <span style="color:var(--green);font-family:monospace;font-weight:700">' + pricing.total.toLocaleString() + 'cr</span>' + listingBadge + '</div>';
+      html += '<div class="spc-section">';
+      html += '<div class="spc-section-title">Hull Build Materials</div>';
+      html += '<table class="spc-table"><thead><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Cost</th><th>Source</th><th>Detail</th></tr></thead><tbody>';
+      for (const l of pricing.hull.lines) {
+        const isOverridden = hasOverride(l.itemId);
+        html += '<tr><td>' + esc(l.itemId) + (isOverridden ? ' <span class="override-badge">OVR</span>' : '') + '</td><td style="text-align:right">' + l.qty + '</td><td class="spc-price" style="cursor:pointer" onclick="onItemPriceClick(\'' + esc(l.itemId) + '\',' + l.unitPrice + ')" title="Click to set price override">' + l.unitPrice.toLocaleString() + '</td><td class="spc-cost">' + l.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (l.source === 'market' ? 'market' : l.source === 'override' ? 'market' : l.source === 'base' ? 'base' : l.source === 'tax' ? 'tax' : 'missing') + '">' + l.source + '</span></td><td style="font-size:10px;color:var(--text-dim)">' + esc(l.detail) + '</td></tr>';
+      }
+      html += '</tbody><tfoot><tr><td colspan="3" style="text-align:right;font-weight:600">Hull Total</td><td class="spc-total">' + pricing.hull.cost.toLocaleString() + '</td><td colspan="2"></td></tr></tfoot></table></div>';
+      html += '<div class="spc-section">';
+      html += '<div class="spc-section-title">Modules</div>';
+      if (pricing.modules.length === 0) {
+        html += '<div style="color:var(--text-dim);font-size:12px">No modules detected</div>';
+      } else {
+        html += '<table class="spc-table"><thead><tr><th>Module</th><th>Cost</th><th>Source</th><th>Detail</th></tr></thead><tbody>';
+        for (const m of pricing.modules) {
+          const isOverridden = hasOverride(m.modTypeId);
+          html += '<tr><td>' + esc(m.modTypeId) + (isOverridden ? ' <span class="override-badge">OVR</span>' : '') + '</td><td class="spc-cost" style="cursor:pointer" onclick="onItemPriceClick(\'' + esc(m.modTypeId) + '\',' + m.cost + ')" title="Click to set price override">' + m.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (m.source === 'market' ? 'market' : m.source === 'recipe' ? 'base' : m.source === 'base' ? 'base' : 'missing') + '">' + m.source + '</span></td><td style="font-size:10px;color:var(--text-dim)">' + esc(m.detail) + '</td></tr>';
+        }
+        html += '</tbody><tfoot><tr><td colspan="2" style="text-align:right;font-weight:600">Modules Total</td><td class="spc-total">' + pricing.modules.reduce((sum, m) => sum + m.cost, 0).toLocaleString() + '</td><td></td></tr></tfoot></table>';
+        const recipeMods = pricing.modules.filter(m => m.source === 'recipe' && m.recipeLines && m.recipeLines.length > 0);
+        if (recipeMods.length > 0) {
+          html += '<div style="margin-top:8px"><div class="spc-section-title">Module Recipe Materials</div>';
+          for (const m of recipeMods) {
+            html += '<table class="spc-table" style="margin-bottom:6px"><thead><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Cost</th><th>Source</th></tr></thead><tbody>';
+            for (const l of m.recipeLines) {
+              const isOverridden = hasOverride(l.itemId);
+              html += '<tr><td>' + esc(l.itemId) + (isOverridden ? ' <span class="override-badge">OVR</span>' : '') + '</td><td style="text-align:right">' + l.qty + '</td><td class="spc-price" style="cursor:pointer" onclick="onItemPriceClick(\'' + esc(l.itemId) + '\',' + l.unitPrice + ')" title="Click to set price override">' + l.unitPrice.toLocaleString() + '</td><td class="spc-cost">' + l.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (l.source === 'market' ? 'market' : 'base') + '">' + l.source + '</span></td></tr>';
+            }
+            html += '</tbody><tfoot><tr><td colspan="3" style="text-align:right;font-weight:600">Recipe Total</td><td class="spc-total">' + m.cost.toLocaleString() + '</td><td></td></tr></tfoot></table>';
+          }
+          html += '</div>';
+        }
+      }
+      html += '</div>';
+      html += '<div class="spc-section">';
+      html += '<div class="spc-section-title">List Ship for Sale</div>';
+      html += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">';
+      const isListed = listingEntry && listingEntry.price != null;
+      if (isListed) {
+        html += '<span style="font-size:12px;color:var(--green)">Listed for ' + listingEntry.price.toLocaleString() + 'cr</span>';
+        if (listingEntry.listingId) {
+          html += '<button class="primary" style="background:var(--red)" onclick="cancelShipListing(\'' + shipId + '\',\'' + esc(listingEntry.listingId) + '\')">Cancel Listing</button>';
+        }
+        html += '<span style="font-size:11px;color:var(--text-dim)">1% listing fee is not refunded</span>';
+      } else {
+        html += '<input type="text" id="list-price-' + shipId + '" value="' + pricing.total + '" inputmode="numeric" maxlength="9" style="width:120px;font-size:12px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:#000;color:#fff;font-family:monospace">';
+        html += '<button class="primary" onclick="listShipForSale(\'' + shipId + '\')">List for Sale</button>';
+        html += '<span style="font-size:11px;color:var(--text-dim)">1% listing fee applies</span>';
+      }
+      html += '</div></div>';
+      return html;
+    }
+
+    async function cancelShipListing(shipId, listingId) {
+      if (!listingId) return;
+      if (!confirm('Cancel the sale listing for ' + shipId + '?\nThe listing fee is not refunded.')) return;
+      const bot = fetchBot;
+      try {
+        const res = await fetch('/api/ship-pricing/cancel-ship-listing', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot, listing_id: listingId })
+        });
+        const json = await res.json();
+        if (json.ok) {
+          listingMap.delete(shipId);
+          refreshShipListingBadge(shipId);
+          alert('Cancelled listing for ' + shipId);
+        } else {
+          alert('Cancel listing failed: ' + (json.error || 'unknown'));
+        }
+      } catch (e) {
+        alert('Cancel listing failed: ' + e.message);
+      }
+    }
+
+    async function listShipForSale(shipId) {
+      const priceInput = document.getElementById('list-price-' + shipId);
+      const price = priceInput ? parseInt(priceInput.value, 10) : NaN;
+      if (!Number.isFinite(price) || price <= 0) {
+        alert('Enter a valid price before listing ' + shipId + ' for sale');
+        if (priceInput) priceInput.focus();
+        return;
+      }
+      if (!confirm('List ' + shipId + ' for sale at ' + price.toLocaleString() + ' credits?\nA 1% listing fee (non-refundable) will be charged.')) return;
+      const bot = fetchBot;
+      try {
+        const res = await fetch('/api/ship-pricing/list-ship-for-sale', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot, ship_id: shipId, price })
+        });
+        const json = await res.json();
+        if (json.ok) {
+          const listingId = json.listingId || null;
+          listingMap.set(shipId, { listingId, price });
+          refreshShipListingBadge(shipId);
+          alert('Listed ' + shipId + ' for sale at ' + price.toLocaleString() + ' cr');
+        } else {
+          alert('List for sale failed: ' + (json.error || 'unknown'));
+        }
+      } catch (e) {
+        alert('List for sale failed: ' + e.message);
+      }
+    }
+
+    function esc(s) {
+      if (s == null) return '';
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    populateBotSelect();
+    loadPriceOverrides();
+    onPricingModeChange();
+  </script>
+</body>
+</html>

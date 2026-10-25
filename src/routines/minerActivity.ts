@@ -5,6 +5,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const ACTIVITY_FILE = join(DATA_DIR, "minerActivity.json");
@@ -85,7 +86,8 @@ function readFromFile(): MinerActivityData {
 function writeToFile(data: MinerActivityData): boolean {
   try {
     ensureDataDir();
-    writeFileSync(ACTIVITY_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(ACTIVITY_FILE, payload, Buffer.byteLength(payload, "utf-8"));
     return true;
   } catch (err: any) {
     console.warn("Failed to write miner activity:", err?.message || err);

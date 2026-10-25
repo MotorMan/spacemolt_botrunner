@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const INSURANCE_FILE = join(DATA_DIR, "insurance.json");
@@ -41,7 +42,7 @@ function saveInsuranceState(state: InsuranceState): void {
   if (!existsSync(DATA_DIR)) {
     mkdirSync(DATA_DIR, { recursive: true });
   }
-  writeFileSync(INSURANCE_FILE, JSON.stringify(state, null, 2) + "\n", "utf-8");
+  safeWriteFileSync(INSURANCE_FILE, JSON.stringify(state, null, 2) + "\n", Buffer.byteLength(JSON.stringify(state, null, 2) + "\n", "utf-8"));
 }
 
 export function recordInsurancePurchase(

@@ -602,7 +602,7 @@ async function* crafterLoop(ctx: RoutineContext, s: CraftTradeSettings): AsyncGe
           ctx.log("error", `Order ${order.orderId}: recipe ${order.recipeId} not found`);
           continue;
         }
-        const venue: ResolvedVenue = resolveVenueForRecipe(order.recipeId, recipe.name, ownFacilityMap, crafterSettings);
+        const venue: ResolvedVenue = resolveVenueForRecipe(order.recipeId, recipe.name, ownFacilityMap, crafterSettings, bot);
         if (venue.missingFacility) {
           const facilityType = facTypeByRecipe.get(order.recipeId) || order.facilityType || recipe.category || recipe.name;
           ctx.log("alert", `🔴 BUILD NEEDED: ${facilityType} to craft ${recipe.output_name} — deal profit ~${Math.round(order.expectedRevenue - order.estCost)}cr @ ${order.destPoiName} (${order.recipeId})`);

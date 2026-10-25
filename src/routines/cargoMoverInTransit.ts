@@ -7,6 +7,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const IN_TRANSIT_FILE = join(DATA_DIR, "cargoMoverInTransit.json");
@@ -57,7 +58,8 @@ export function saveInTransitData(data: CargoMoverInTransitData): void {
       mkdirSync(DATA_DIR, { recursive: true });
     }
     data.lastUpdated = new Date().toISOString();
-    writeFileSync(IN_TRANSIT_FILE, JSON.stringify(data, null, 2) + "\n");
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(IN_TRANSIT_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Error saving cargoMoverInTransit.json:", err);
   }

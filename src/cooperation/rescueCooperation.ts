@@ -487,3 +487,99 @@ export interface ProcessPrivateMessageResult {
   claim: RescueClaim | null;
   skipReason?: string;
 }
+
+// ── Cross-client (N-bot) MAYDAY claim ─────────────────────────
+/**
+ * Broadcast a MAYDAY claim to EVERY connected client through the master's
+ * non-API bot chat relay (recipients: [] = broadcast), instead of sending it to
+ * a single hardcoded partner. This is what lets 3+ rescue bots on 3+ separate
+ * clients coordinate over one MAYDAY without a shared filesystem lock.
+ */
+export async function broadcastRescueClaim(
+  bot: Bot,
+  claim: RescueClaim
+): Promise<{ ok: boolean; error?: string }> {
+  const formattedClaim = formatRescueClaim(claim);
+  console.log(`[Cooperation] Broadcasting claim via Bot Chat: ${formattedClaim}`);
+  try {
+    const botChat = getBotChatChannel();
+    botChat.send({
+      sender: bot.username,
+      recipients: [], // broadcast to every connected client through the master relay
+      channel: "coordination" as BotChatChannel,
+      content: formattedClaim,
+    });
+    recordRescueClaim(claim);
+    return { ok: true };
+  } catch (err) {
+    console.log(`[Cooperation] Broadcast error: ${err instanceof Error ? err.message : String(err)}`);
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Process an incoming Bot Chat message as a cross-client MAYDAY claim.
+ * Unlike the legacy partner-only handler, this accepts claims from ANY sender on
+ * the coordination channel (the master only relays messages from registered
+ * clients, so the channel is already a trusted-bot boundary). Returns the parsed
+ * claim if one was found and recorded.
+ */
+export function processBotChatClaim(
+  message: BotChatMessage
+): { isClaim: boolean; claim: RescueClaim | null } {
+  if (message.channel !== "coordination") return { isClaim: false, claim: null };
+  const claim = parseRescueClaim(message.content);
+  if (claim) {
+    recordRescueClaim(claim);
+    console.log(`[Cooperation] Recorded cross-client claim: ${claim.player} at ${claim.system} (${claim.jumps} jumps) by ${claim.botName}`);
+    return { isClaim: true, claim };
+  }
+  return { isClaim: false, claim: null };
+}
+
+/**
+ * All currently-valid claims (from any bot other than `excludeBot`) for the same
+ * MAYDAY target. Used to decide which bot should actually launch.
+ */
+export function getOtherClaimsForMayday(
+  player: string,
+  system: string,
+  poi?: string,
+  excludeBot?: string
+): RescueClaim[] {
+  const now = Date.now();
+  const normalize = (s: string) => s.toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+  const out: RescueClaim[] = [];
+  for (const claim of recentClaims) {
+    const claimTime = new Date(claim.timestamp).getTime();
+    if (now - claimTime > CLAIM_EXPIRY_MS) continue;
+    if (excludeBot && claim.botName === excludeBot) continue;
+    const playerMatch = normalize(claim.player) === normalize(player);
+    const systemMatch = normalize(claim.system) === normalize(system);
+    const poiMatch = !poi || !claim.poi || normalize(claim.poi) === normalize(poi);
+    if (playerMatch && systemMatch && poiMatch) out.push(claim);
+  }
+  return out;
+}
+
+const claimDistance = (c: RescueClaim): number =>
+  typeof c.jumps === "number" && c.jumps >= 0 ? c.jumps : Number.POSITIVE_INFINITY;
+
+/**
+ * Decide whether THIS bot should launch the MAYDAY given every other bot's
+ * cross-client claim for the same target.
+ *
+ * Returns "yield" ONLY when another bot is STRICTLY closer. A tie — or a claim we
+ * simply haven't received yet because the relay is poll-latent — must never make
+ * us false-yield and drop the distress call, so ties default to "proceed".
+ */
+export function decideMaydayHandler(myClaim: RescueClaim): "proceed" | "yield" {
+  const others = getOtherClaimsForMayday(myClaim.player, myClaim.system, myClaim.poi, myClaim.botName);
+  let best: RescueClaim | null = null;
+  for (const c of others) {
+    if (!best || claimDistance(c) < claimDistance(best)) best = c;
+  }
+  if (!best) return "proceed";
+  if (claimDistance(best) < claimDistance(myClaim)) return "yield";
+  return "proceed";
+}

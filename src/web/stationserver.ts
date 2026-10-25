@@ -13,13 +13,26 @@ import {
   clampInterval,
   clampCardCols,
   clampFpsCap,
+  clampAmmoLow,
+  clampConsumableDays,
+  clampSupplyRefreshMin,
+  evaluateSupplies,
   MIN_POLL_INTERVAL_SEC,
   type StationConfig,
   type StationRow,
   type StationSnapshot,
   type StationSnapshots,
   type FuelCraftStatus,
+  type SupplyFacility,
+  type SupplyStock,
+  type SupplyStatus,
+  type StationBattleLog,
+  type StationBattleLogEntry,
+  loadBattleLog,
+  saveBattleLog,
 } from "./stationMonitorStore.js";
+import { getFactionStorageCache } from "../factionStorageCache.js";
+import { getStationFacilityCache } from "../stationFacilityCache.js";
 
 const GET_BASE_TIMEOUT_MS = 25_000;
 
@@ -57,6 +70,25 @@ interface SlimFacility {
   service_type: string | null;
   faction_service_type: string | null;
   station_or_faction_only: boolean;
+  /** Item a station gun feeds from. Present only on armed defense facilities. */
+  ammo_item: string | null;
+  /** Service-pool consumable (optional). */
+  service_pool_supply_item: string | null;
+  service_pool_refill_per_cycle: number;
+  service_pool_units_per_item: number;
+}
+
+/** A station facility normalized down to just what supply tracking needs. */
+interface FacilityRec {
+  id: string;
+  name: string;
+  type: string;
+  active: boolean;
+  /** Per-cycle maintenance draw, from the live record when it exposes one. */
+  maintenance: SlimMat[];
+  servicePoolSupplyItem: string | null;
+  servicePoolRefillPerCycle: number;
+  servicePoolUnitsPerItem: number;
 }
 
 export interface StationView {
@@ -74,6 +106,14 @@ export interface StationView {
   factionFuelReserve: number;
   factionFuelCapacity: number;
   fuelCraft: FuelCraftStatus | null;
+  /** Gun-ammo + facility-maintenance stock state (drives the yellow/red card tiers). */
+  supplies: SupplyStatus | null;
+  /** Faction storage stock (item_id -> qty) for build-material availability checks. */
+  factionStock: Record<string, number> | null;
+  /** True when the station's docked drone reports an active battle involving this station. */
+  combatAlert: boolean;
+  /** Battle id of the active (or most recent) combat alert. */
+  battleId: string | null;
   lastError: string | null;
   lastErrorAt: number | null;
   /** FetchedAt of the last successful get_base (last good snapshot). */
@@ -136,6 +176,7 @@ export class StationWebServer {
 
   private config: StationConfig;
   private snapshots: StationSnapshots;
+  private battleLog: StationBattleLog;
   private views: Record<string, StationView> = {};
 
   private pollInterval: ReturnType<typeof setInterval> | null = null;
@@ -148,6 +189,7 @@ export class StationWebServer {
     this.port = port;
     this.config = loadStationConfig();
     this.snapshots = loadSnapshots();
+    this.battleLog = loadBattleLog();
   }
 
   start(): void {
@@ -200,6 +242,13 @@ export class StationWebServer {
 
           if (url.pathname.startsWith("/api/station/")) {
             let stationId = decodeURIComponent(url.pathname.slice("/api/station/".length));
+            // Reviewable combat/battle log for a station row.
+            if (stationId.endsWith("/battles") && req.method === "GET") {
+              const sid = stationId.replace(/\/battles$/, "");
+              const row = this.config.rows.find((r) => r.stationId === sid);
+              const battles = row ? (this.battleLog[row.id] ?? []) : [];
+              return Response.json({ stationId: sid, battles }, { headers: corsHeaders });
+            }
             if (req.method === "GET") return this.handleStationGet(stationId, corsHeaders);
             if (req.method === "POST") {
               stationId = stationId.replace(/\/action$/, "");
@@ -330,6 +379,15 @@ export class StationWebServer {
       if (body.fpsCap != null) {
         this.config.fpsCap = clampFpsCap(body.fpsCap);
       }
+      if (body.ammoLowThreshold != null) {
+        this.config.ammoLowThreshold = clampAmmoLow(body.ammoLowThreshold);
+      }
+      if (body.consumableLowDays != null) {
+        this.config.consumableLowDays = clampConsumableDays(body.consumableLowDays);
+      }
+      if (body.supplyRefreshMin != null) {
+        this.config.supplyRefreshMin = clampSupplyRefreshMin(body.supplyRefreshMin);
+      }
       if (Array.isArray(body.rows)) {
         const seen = new Set<string>();
         this.config.rows = (body.rows as StationRow[]).map((raw) => {
@@ -452,16 +510,38 @@ export class StationWebServer {
   }
 
   // Slimmed catalog facility list (avoids shipping the 5MB raw catalog).
-  private catalogCache: { facilities: SlimFacility[] } | null = null;
+  private catalogCache: {
+    facilities: SlimFacility[];
+    byId: Record<string, SlimFacility>;
+    itemNames: Record<string, string>;
+    /** itemId -> food_type (e.g. "dish", "alcohol", "drink") for civilian food items. */
+    itemFoodTypes: Record<string, string>;
+  } | null = null;
 
-  private loadCatalog(): { facilities: SlimFacility[] } {
+  private loadCatalog(): {
+    facilities: SlimFacility[];
+    byId: Record<string, SlimFacility>;
+    itemNames: Record<string, string>;
+    itemFoodTypes: Record<string, string>;
+  } {
     if (this.catalogCache) return this.catalogCache;
     let facilities: SlimFacility[] = [];
+    const itemNames: Record<string, string> = {};
+    const itemFoodTypes: Record<string, string> = {};
     try {
       const path = join(process.cwd(), "data", "catalog.json");
       if (existsSync(path)) {
-        const raw = JSON.parse(readFileSync(path, "utf-8")) as { facilities?: Record<string, Record<string, unknown>> };
+        const raw = JSON.parse(readFileSync(path, "utf-8")) as {
+          facilities?: Record<string, Record<string, unknown>>;
+          items?: Record<string, Record<string, unknown>>;
+        };
         const facs = raw.facilities || {};
+        for (const [id, it] of Object.entries(raw.items || {})) {
+           const nm = it && typeof it === "object" ? (it.name as string) : "";
+           if (nm) itemNames[id] = nm;
+           const ft = it && typeof it === "object" ? (it.food_type as string) : "";
+           if (ft) itemFoodTypes[id] = ft;
+         }
         facilities = Object.values(facs).map((f) => ({
           id: (f.id as string) || "",
           name: (f.name as string) || "",
@@ -491,12 +571,18 @@ export class StationWebServer {
           service_type: (f.service_type as string) || null,
           faction_service_type: (f.faction_service_type as string) || null,
           station_or_faction_only: !!f.station_or_faction_only,
-        }));
+           ammo_item: (f.ammo_item as string) || null,
+           service_pool_supply_item: (f.service_pool_supply_item as string) || null,
+           service_pool_refill_per_cycle: (f.service_pool_refill_per_cycle as number) ?? 0,
+           service_pool_units_per_item: (f.service_pool_units_per_item as number) ?? 0,
+         }));
       }
     } catch {
       facilities = [];
     }
-    this.catalogCache = { facilities };
+    const byId: Record<string, SlimFacility> = {};
+    for (const f of facilities) if (f.id) byId[f.id] = f;
+    this.catalogCache = { facilities, byId, itemNames, itemFoodTypes };
     return this.catalogCache;
   }
 
@@ -554,6 +640,148 @@ export class StationWebServer {
     }
   }
 
+  /**
+   * Evaluate the station's combat state from its docked drone's passive battle
+   * detection (`Bot.currentBattle`, fed by the `battle_alert`/`battle_started`/
+   * `battle_update`/`battle_ended` WebSocket events). Returns whether the station
+   * is under attack (and the active battle id), and maintains the persistent
+   * battle log so the user can review engagements later and we know when a
+   * battle has ended (to clear the alert).
+   *
+   * The `battle_alert` event only sets `currentBattle` while the drone is docked
+   * at a station in the battle's system, so `inBattle && docked` already means
+   * "this station's location is under attack". We additionally scan the
+   * participants for our station (by id/name, or a `kind: "station"` flag when
+   * present) and record every participant name for later review — the exact way
+   * a station shows up in the participant list is still being learned, so we
+   * match leniently and log the raw data.
+   */
+  private evaluateCombat(
+    row: StationRow,
+    bot: Bot | null | undefined,
+    status: BotStatus | undefined,
+  ): { combatAlert: boolean; battleId: string | null; stationInvolved: boolean } {
+    const cb = bot?.currentBattle;
+    const battleId = (cb?.battleId as string | null) ?? null;
+    // NOTE: `currentBattle.inBattle` is set by the bot's `battle_alert` handler for
+    // ANY battle in the drone's system while docked — it does NOT mean our station
+    // (or the drone) is involved. A player farming creatures elsewhere in-system
+    // trips it. The real signal is whether our station (or the docked drone) is an
+    // actual participant of the battle, so we gate on that, not on `inBattle`.
+    const participantsRaw = Array.isArray(cb?.participants)
+      ? (cb!.participants as Array<Record<string, unknown>>)
+      : [];
+    const participants = participantsRaw
+      .map((p) => String(p.username || p.player_id || p.ship_name || p.name || ""))
+      .filter(Boolean);
+    const stationInvolved = this.stationIsParticipant(row, participantsRaw);
+    // The docked drone being a participant only counts as "station under attack"
+    // if it is still docked here — otherwise it flew off to fight somewhere else.
+    const docked = !!status?.docked;
+    const droneInvolved = docked && this.droneIsParticipant(bot, participantsRaw);
+    const involved = stationInvolved || droneInvolved;
+    const combatAlert = involved && !!battleId;
+
+    const entries = (this.battleLog[row.id] = this.battleLog[row.id] ?? []);
+    const open = entries.find((e) => e.endedAt === null);
+
+    if (combatAlert) {
+      if (!open) {
+        entries.push({
+          battleId,
+          startedAt: Date.now(),
+          endedAt: null,
+          outcome: "active",
+          participants,
+          stationInvolved,
+          droneInvolved,
+        });
+        this.flushBattleLog();
+      } else if (open.battleId !== battleId) {
+        // A new battle started before the previous one was formally closed.
+        open.endedAt = Date.now();
+        open.outcome = "superseded";
+        entries.push({
+          battleId,
+          startedAt: Date.now(),
+          endedAt: null,
+          outcome: "active",
+          participants,
+          stationInvolved,
+          droneInvolved,
+        });
+        this.flushBattleLog();
+      } else {
+        let changed = false;
+        for (const p of participants) {
+          if (!open.participants.includes(p)) {
+            open.participants.push(p);
+            changed = true;
+          }
+        }
+        if (stationInvolved && !open.stationInvolved) {
+          open.stationInvolved = true;
+          changed = true;
+        }
+        if (droneInvolved && !open.droneInvolved) {
+          open.droneInvolved = true;
+          changed = true;
+        }
+        if (changed) this.flushBattleLog();
+      }
+    } else if (open) {
+      open.endedAt = Date.now();
+      if (open.outcome === "active") open.outcome = "ended";
+      this.flushBattleLog();
+    }
+
+    return { combatAlert, battleId, stationInvolved };
+  }
+
+  /** True when the docked drone's own ship is a participant (someone pulled our
+   *  ship into the battle while it was docked at the station). */
+  private droneIsParticipant(
+    bot: Bot | null | undefined,
+    participants: Array<Record<string, unknown>>,
+  ): boolean {
+    const me = (bot?.username || "").toLowerCase();
+    if (!me) return false;
+    return participants.some((p) => {
+      const uname = String(p.username || "").toLowerCase();
+      const pid = String(p.player_id || "").toLowerCase();
+      const sname = String(p.ship_name || "").toLowerCase();
+      return uname === me || pid === me || sname === me;
+    });
+  }
+
+  /** Leniently check whether the station itself is among the battle participants. */
+  private stationIsParticipant(
+    row: StationRow,
+    participants: Array<Record<string, unknown>>,
+  ): boolean {
+    const sid = (row.stationId || "").toLowerCase();
+    const sname = (row.stationName || "").toLowerCase();
+    const match = (p: Record<string, unknown>): boolean => {
+      const pid = String(p.player_id || "").toLowerCase();
+      const uname = String(p.username || "").toLowerCase();
+      const snameP = String(p.ship_name || "").toLowerCase();
+      return !!(
+        (sid && (pid === sid || uname === sid)) ||
+        (sname && (uname === sname || snameP === sname))
+      );
+    };
+    for (const p of participants) {
+      const kind = String(p.kind || "").toLowerCase();
+      if (kind === "station" && (match(p) || !sid)) return true;
+      if (match(p)) return true;
+    }
+    return false;
+  }
+
+  private flushBattleLog(): void {
+    saveBattleLog(this.battleLog);
+  }
+
   private async readRow(
     row: StationRow,
     statusMap: Map<string, BotStatus>,
@@ -564,6 +792,10 @@ export class StationWebServer {
     const lastGood = this.snapshots[id];
     const status = statusMap.get(row.bot);
     const faction = status?.faction ?? lastGood?.faction ?? null;
+    // Combat detection is independent of the get_base read below — evaluate it
+    // up front from the drone's already-populated battle state.
+    const botForBattle = row.bot ? getBot(row.bot) : null;
+    const battle = this.evaluateCombat(row, botForBattle, status);
 
     let state = "OK";
     let lastError: string | null = prev?.lastError ?? null;
@@ -591,7 +823,8 @@ export class StationWebServer {
           const r = (resp.result ?? {}) as Record<string, unknown>;
           const base = (r.base as Record<string, unknown>) ?? {};
           const baseId = (base.id as string) || (base.poi_id as string) || "";
-          if (baseId && row.stationId && baseId !== row.stationId) {
+          const atMonitoredStation = !baseId || !row.stationId || baseId === row.stationId;
+          if (!atMonitoredStation) {
             state = "MISMATCH";
           }
           const condition = (r.condition as Record<string, unknown>) ?? {};
@@ -608,6 +841,26 @@ export class StationWebServer {
           // `fuel_reserve` at this station.
           const jobs = await this.readCraftQueue(botInstance, row.bot, queueCache);
           const fuelCraft = this.summarizeFuelCraft(jobs, row.stationId, name);
+          // Gun ammo + facility maintenance stock (faction storage only).
+          // Only read live supplies when the drone is actually at the monitored
+          // station; otherwise we would ingest the wrong station's faction
+          // storage and red-flag a healthy station. Use baseId (confirmed POI)
+          // so the cache key matches the station we actually read.
+          const supplies = atMonitoredStation
+            ? await this.readSupplies(
+                row,
+                botInstance,
+                true,
+                prev?.supplies ?? lastGood?.supplies ?? null,
+                baseId,
+              )
+            : (prev?.supplies ?? lastGood?.supplies ?? null);
+          const factionStockRaw = atMonitoredStation
+            ? await this.readFactionStock(botInstance, row, true, Math.max(1, this.config.supplyRefreshMin) * 60_000, baseId)
+            : null;
+          const factionStock = factionStockRaw?.stock
+            ? Object.fromEntries(factionStockRaw.stock)
+            : null;
           const snapshot: StationSnapshot = {
             stationId: row.stationId,
             stationName: name,
@@ -621,6 +874,10 @@ export class StationWebServer {
             faction: status?.faction ?? null,
             wrecked,
             fuelCraft,
+            supplies,
+            factionStock,
+            combatAlert: battle.combatAlert,
+            battleId: battle.battleId,
           };
           this.snapshots[id] = snapshot;
           this.markSnapshotsDirty();
@@ -640,6 +897,10 @@ export class StationWebServer {
             factionFuelReserve: snapshot.factionFuelReserve,
             factionFuelCapacity: snapshot.factionFuelCapacity,
             fuelCraft,
+            supplies,
+            factionStock,
+            combatAlert: battle.combatAlert,
+            battleId: battle.battleId,
             lastError: null,
             lastErrorAt: null,
             fetchedAt,
@@ -678,6 +939,12 @@ export class StationWebServer {
       // No fresh queue read this pass — carry the last known status forward
       // rather than reporting a fuel outage we did not actually observe.
       fuelCraft: prev?.fuelCraft ?? lastGood?.fuelCraft ?? null,
+      // Same for supplies: an undocked/offline drone can't read faction storage,
+      // and inventing an "out of ammo" state there would be a false alarm.
+      supplies: prev?.supplies ?? lastGood?.supplies ?? null,
+      factionStock: prev?.factionStock ?? lastGood?.factionStock ?? null,
+      combatAlert: battle.combatAlert,
+      battleId: battle.battleId,
       lastError,
       lastErrorAt,
       fetchedAt,
@@ -800,6 +1067,253 @@ export class StationWebServer {
     };
   }
 
+  // ── Ammo / maintenance / food supply tracking ───────────────
+  //
+  // Station guns feed from an ammo item and go silent the moment it hits zero;
+  // service/infrastructure facilities withdraw their maintenance inputs once per
+  // 1000-tick cycle and stop running when those run out. Both pools come from
+  // the STATION'S FACTION STORAGE — the docked drone's cargo and personal
+  // station storage are never touched by station facilities — so that is the
+  // only stock we count.
+  //
+  // Some facility maintenance inputs are actually civilian food (identified via
+  // the catalog's `food_type` key). Food is no longer on a tick cycle — it is
+  // consumed by civilians and the station is paid for it — so we cannot project
+  // a depletion time, and running out is only a minor (yellow) warning that
+  // never red-flags the card or harms thriving status.
+  //
+  // The numbers come from caches the rest of the botrunner already fills (the
+  // shared faction-storage cache and the per-station facility list). The monitor
+  // only issues a read of its own when a cache has gone staler than
+  // `supplyRefreshMin`, which also refills those shared caches for the
+  // dashboard's faction/station page.
+
+  /** Our own facility reads, keyed by "system|poi". These include `station_facilities`. */
+  private facilityReads = new Map<string, { facilities: FacilityRec[]; at: number }>();
+
+  /** Per-station freshness trackers so we don't re-read faction storage more
+   *  often than the configured supply refresh interval. Keyed by system|poi. */
+  private factionStockFresh = new Map<string, {
+    at: number | null;
+    stock: Map<string, number>;
+    names: Map<string, string>;
+  }>();
+
+  private static readonly ACTIVE_FACILITY_STATUSES = new Set([
+    "active",
+    "online",
+    "running",
+    "operational",
+  ]);
+
+  /**
+   * A facility counts as active (and therefore as consuming) unless it is
+   * explicitly under construction or reports a non-running status. `facility
+   * list` payloads often omit any status at all, in which case a built facility
+   * is running.
+   */
+  private facilityIsActive(f: Record<string, unknown>): boolean {
+    if (f.under_construction === true) return false;
+    if (typeof f.active === "boolean") return f.active;
+    if (typeof f.status === "string" && f.status) {
+      return StationWebServer.ACTIVE_FACILITY_STATUSES.has(f.status.toLowerCase());
+    }
+    return true;
+  }
+
+  private toFacilityRec(f: Record<string, unknown>): FacilityRec | null {
+    if (!f || typeof f !== "object") return null;
+    const id = String(f.facility_id ?? f.id ?? "");
+    const type = String(f.facility_type ?? f.type ?? f.id ?? "");
+    if (!id && !type) return null;
+    // Prefer the live, level-adjusted per-cycle draw when the server reports it;
+    // the catalog's `maintenance_inputs` is the level-1 fallback.
+    const maintenance: SlimMat[] = Array.isArray(f.maintenance_per_cycle)
+      ? (f.maintenance_per_cycle as Record<string, unknown>[])
+          .filter((m) => m && typeof m === "object" && m.item_id)
+          .map((m) => ({
+            item_id: String(m.item_id),
+            quantity: num(m.quantity, 1) || 1,
+            name: typeof m.name === "string" ? m.name : "",
+          }))
+      : [];
+    const spRaw = f.service_pool_supply_item ?? f.servicePoolSupplyItem;
+    return {
+      id: id || type,
+      name: String(f.custom_name || f.name || type || id),
+      type,
+      active: this.facilityIsActive(f),
+      maintenance,
+      servicePoolSupplyItem: typeof spRaw === "string" && spRaw ? spRaw : null,
+      servicePoolRefillPerCycle: num(f.service_pool_refill_per_cycle ?? f.servicePoolRefillPerCycle, 0),
+      servicePoolUnitsPerItem: num(f.service_pool_units_per_item ?? f.servicePoolUnitsPerItem, 0) || 0,
+    };
+  }
+
+  /**
+   * The station's own + faction facilities. `player_facilities` (the drone's
+   * personal builds) and `public_facilities` (other players') are deliberately
+   * excluded: they are not fed from this station's faction storage.
+   */
+  private async readStationFacilities(
+    botInstance: Bot,
+    stationKey: string,
+    ttlMs: number,
+  ): Promise<{ facilities: FacilityRec[]; at: number | null }> {
+    const own = this.facilityReads.get(stationKey);
+    if (own && Date.now() - own.at <= ttlMs) {
+      return { facilities: own.facilities, at: own.at };
+    }
+
+    const resp = await this.execBot(botInstance, "facility", { action: "list" });
+    if (resp.ok) {
+      const data = (resp.data ?? {}) as Record<string, unknown>;
+      const root =
+        (data.structuredContent as Record<string, unknown>) ??
+        (data.result as Record<string, unknown>) ??
+        data;
+      const pick = (k: string): Record<string, unknown>[] =>
+        Array.isArray(root?.[k]) ? (root[k] as Record<string, unknown>[]) : [];
+      const merged = new Map<string, FacilityRec>();
+      for (const raw of [...pick("station_facilities"), ...pick("faction_facilities")]) {
+        const rec = this.toFacilityRec(raw);
+        if (rec) merged.set(rec.id, rec);
+      }
+      const facilities = [...merged.values()];
+      const entry = { facilities, at: Date.now() };
+      this.facilityReads.set(stationKey, entry);
+      return { facilities, at: entry.at };
+    }
+
+    // Read failed. Fall back to the shared cache any docked bot's `facility
+    // list`/`faction_list` fills, then to our own last good read.
+    const shared = getStationFacilityCache(stationKey);
+    if (shared?.factionFacilities?.length) {
+      const facilities = shared.factionFacilities
+        .map((f) => this.toFacilityRec(f as unknown as Record<string, unknown>))
+        .filter((f): f is FacilityRec => !!f);
+      if (facilities.length) return { facilities, at: shared.lastUpdated || null };
+    }
+    if (own) return { facilities: own.facilities, at: own.at };
+    return { facilities: [], at: null };
+  }
+
+  /**
+   * Stock held in THIS station's faction storage. Faction storage is per-station,
+   * so we query it through the specific bot docked at THAT station and use what
+   * that bot just returned — never a shared cache keyed under a different station
+   * identifier (the old code wrote to `faction::<bare hex poi>` but read back
+   * under `faction::<system>|<poi>`, so it either picked up another station's
+   * stale stock or nothing at all), and never the degraded-read guard that keeps
+   * phantom stock from a previous read.
+   */
+  private async readFactionStock(
+    botInstance: Bot,
+    row: StationRow,
+    docked: boolean,
+    ttlMs: number,
+    stationPoiId: string,
+  ): Promise<SupplyStock> {
+    const stationKey = `${botInstance.system}|${stationPoiId}`;
+
+    const toStock = (
+      entries: { itemId: string; quantity: number; name?: string }[],
+    ): { stock: Map<string, number>; names: Map<string, string> } => {
+      const stock = new Map<string, number>();
+      const names = new Map<string, string>();
+      for (const e of entries) {
+        if (!e?.itemId) continue;
+        stock.set(e.itemId, (stock.get(e.itemId) ?? 0) + num(e.quantity));
+        if (e.name) names.set(e.itemId, e.name);
+      }
+      return { stock, names };
+    };
+
+    // Honor the supply refresh TTL from a local, correctly-keyed tracker so we
+    // don't hammer the game server on every sweep.
+    const fresh = this.factionStockFresh.get(stationKey);
+    if (fresh && fresh.at != null && Date.now() - fresh.at <= ttlMs) {
+      return { stock: fresh.stock, names: fresh.names, at: fresh.at, source: "cache" };
+    }
+
+    // Live read of exactly this station through this bot. bot.factionStorage is
+    // authoritative for stationPoiId right after this call returns.
+    const startedAt = Date.now();
+    try {
+      await botInstance.refreshFactionStorage(true, stationPoiId, false);
+      const got = toStock(botInstance.factionStorage);
+      const result: SupplyStock = { stock: got.stock, names: got.names, at: startedAt, source: "live" };
+      this.factionStockFresh.set(stationKey, result);
+      return result;
+    } catch {
+      // fall through to whatever we have
+    }
+
+    // Last resort: the shared cache (may have been filled by other routines
+    // keyed the same way), then nothing.
+    const cached = getFactionStorageCache(botInstance.faction || "unknown", stationKey);
+    if (cached?.entries) {
+      const got = toStock(cached.entries);
+      return { stock: got.stock, names: got.names, at: cached.lastUpdated || null, source: "cache" };
+    }
+    return { stock: new Map(), names: new Map(), at: null, source: "none" };
+  }
+
+  /** Read + evaluate a station's ammo and maintenance stock. Never throws. */
+  private async readSupplies(
+    row: StationRow,
+    botInstance: Bot,
+    docked: boolean,
+    prev: SupplyStatus | null,
+    stationPoiId: string,
+  ): Promise<SupplyStatus | null> {
+    try {
+      const ttlMs = Math.max(1, this.config.supplyRefreshMin) * 60_000;
+      const stationKey = `${botInstance.system}|${stationPoiId}`;
+      const facs = await this.readStationFacilities(botInstance, stationKey, ttlMs);
+      const stock = await this.readFactionStock(botInstance, row, docked, ttlMs, stationPoiId);
+      return this.evaluateSupplies(facs.facilities, facs.at, stock);
+    } catch (err) {
+      // A supply hiccup must never blank an otherwise good card.
+      return prev;
+    }
+  }
+
+  private evaluateSupplies(
+    facilities: FacilityRec[],
+    facilitiesAt: number | null,
+    stock: SupplyStock,
+  ): SupplyStatus {
+    const cat = this.loadCatalog();
+    // Resolve each facility against the catalog: the live record's own
+    // `maintenance_per_cycle` is level-adjusted and wins, and `ammo_item` marks
+    // the armed guns.
+    const resolved: SupplyFacility[] = facilities.map((f) => {
+      const def = cat.byId[f.type];
+      const maint = f.maintenance.length ? f.maintenance : (def?.maintenance_inputs ?? []);
+       return {
+         name: f.name,
+         active: f.active,
+         maintenance: maint.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1 })),
+         ammoItem: def?.ammo_item ?? null,
+         servicePoolSupplyItem: f.servicePoolSupplyItem ?? def?.service_pool_supply_item ?? null,
+         servicePoolRefillPerCycle: f.servicePoolRefillPerCycle || def?.service_pool_refill_per_cycle || 0,
+         servicePoolUnitsPerItem: f.servicePoolUnitsPerItem || def?.service_pool_units_per_item || 0,
+       };
+    });
+    return evaluateSupplies(
+      resolved,
+      facilitiesAt,
+      stock,
+      {
+        ammoLowThreshold: this.config.ammoLowThreshold,
+        consumableLowDays: this.config.consumableLowDays,
+      },
+      cat.itemNames,
+      cat.itemFoodTypes,
+    );
+  }
+
   /** Merged view: config rows + latest snapshot + derived state, in config order. */
   getStations(): StationView[] {
     return this.config.rows.map((row) => {
@@ -822,6 +1336,10 @@ export class StationWebServer {
         factionFuelReserve: snap?.factionFuelReserve ?? 0,
         factionFuelCapacity: snap?.factionFuelCapacity ?? 0,
         fuelCraft: snap?.fuelCraft ?? null,
+        supplies: snap?.supplies ?? null,
+        factionStock: snap?.factionStock ?? null,
+        combatAlert: snap?.combatAlert ?? false,
+        battleId: snap?.battleId ?? null,
         lastError: null,
         lastErrorAt: null,
         fetchedAt: snap?.fetchedAt ?? null,

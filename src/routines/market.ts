@@ -1,6 +1,6 @@
-import type { Routine, RoutineContext } from "../bot.js";
+import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { perf } from "../perf.js";
-import { marketStreamStore } from "../marketstreamstore.js";
+import { marketStreamStore, type MarketStreamItem } from "../marketstreamstore.js";
 import { mapStore } from "../mapstore.js";
 import {
   noteMarketRoutineActive,
@@ -8,10 +8,138 @@ import {
   noteLocalMarketObservation,
 } from "../market_local_source.js";
 import { marketDetailsStore, type MarketOrderDetail } from "../marketdetailsstore.js";
+import { updateShipListings } from "../shipsforsale.js";
+import { livePassengers } from "../livePassengers.js";
+import { record as recordMarketSnapshot } from "../marketSnapshotStore.js";
+import { loadSettings } from "../web/server.js";
+import { readSellOutcome } from "./sellOutcome.js";
+
+function readCreditDepositSettings(settings: Record<string, unknown>): {
+  creditDepositThreshold: number;
+  creditDepositIntervalSec: number;
+} {
+  const mr = (settings.market_routine as Record<string, unknown> | undefined) || {};
+  const threshold = typeof mr.creditDepositThreshold === "number" && mr.creditDepositThreshold > 0
+    ? mr.creditDepositThreshold
+    : 100000;
+  const interval = typeof mr.creditDepositIntervalSec === "number" && mr.creditDepositIntervalSec > 0
+    ? mr.creditDepositIntervalSec
+    : 300;
+  return { creditDepositThreshold: threshold, creditDepositIntervalSec: interval };
+}
+
+async function tryDepositExcessCredits(
+  bot: Bot,
+  ctx: RoutineContext,
+  lastCreditDepositAt: number,
+): Promise<number> {
+  try {
+    const settings = loadSettings();
+    const { creditDepositThreshold, creditDepositIntervalSec } = readCreditDepositSettings(settings);
+    const now = Date.now();
+    const timeSinceLast = now - lastCreditDepositAt;
+    const intervalMs = creditDepositIntervalSec * 1000;
+
+    if (timeSinceLast < intervalMs) {
+      return lastCreditDepositAt;
+    }
+
+    await bot.refreshStatus();
+
+    if (!bot.docked) {
+      ctx.log("info", `Credit deposit: bot not docked (docked=${bot.docked}, credits=${bot.credits}, faction=${bot.faction ?? "none"})`);
+      return Date.now();
+    }
+    if (bot.credits <= creditDepositThreshold) {
+      ctx.log("info", `Credit deposit: credits ${bot.credits} <= threshold ${creditDepositThreshold}, nothing to deposit`);
+      return Date.now();
+    }
+
+    // Confirm faction membership by probing storage — bot.faction from
+    // get_status isn't always populated; the storage probe is authoritative
+    // (matches the pattern in faction_trader.ts:1457).
+    const factionResp = await bot.exec("storage", { action: "view", target: "faction" });
+    if (factionResp.error) {
+      const msg = factionResp.error.message || "";
+      if (/not_in_faction|must be in a faction/i.test(msg)) {
+        ctx.log("info", `Credit deposit: bot is not in a faction (credits=${bot.credits}, threshold=${creditDepositThreshold})`);
+      } else {
+        ctx.log("warn", `Credit deposit: faction probe failed: ${factionResp.error.code} ${msg}`);
+      }
+      return Date.now();
+    }
+
+    const factionResult = (factionResp.result ?? {}) as Record<string, unknown>;
+    const factionId = (factionResult.faction_id as string) || (factionResult.faction_name as string) || null;
+    if (factionId && !bot.faction) bot.faction = factionId;
+
+    const excess = bot.credits - creditDepositThreshold;
+    if (excess <= 0) {
+      ctx.log("info", `Credit deposit: excess ${excess} <= 0, skipping`);
+      return Date.now();
+    }
+
+    const depositPayload = {
+      action: "deposit" as const,
+      target: "faction",
+      item_id: "credits",
+      quantity: excess,
+    };
+    ctx.log("info", `Credit deposit: dispatching storage.deposit for ${excess}cr to faction (threshold=${creditDepositThreshold}, interval=${creditDepositIntervalSec}s)`);
+    const depositResp = await bot.exec("storage", depositPayload);
+
+    if (!depositResp.error) {
+      ctx.log("trade", `Market routine: deposited ${excess}cr to faction storage (retained ${creditDepositThreshold}cr)`);
+      return Date.now();
+    }
+
+    // Handle stale credits: if the deposit failed because the bot doesn't actually
+    // have enough credits (bot.credits was stale from the throttled get_status),
+    // fetch a fresh get_status directly (bypassing the refreshStatus throttle) and
+    // retry with the correct amount.
+    if (/insufficient_credits/i.test(depositResp.error.message || "")) {
+      ctx.log("info", `Credit deposit: stale balance (reported ${excess}cr excess), fetching fresh status and retrying`);
+      const freshStatusResp = await bot.exec("get_status");
+      if (freshStatusResp.error) {
+        ctx.log("warn", `Credit deposit: fresh get_status failed: ${freshStatusResp.error.code} ${freshStatusResp.error.message}`);
+        return Date.now();
+      }
+      const freshResult = (freshStatusResp.result ?? {}) as Record<string, unknown>;
+      const location = freshResult.location as Record<string, unknown> | undefined;
+      const player = freshResult.player as Record<string, unknown> | undefined;
+      const p = location || player || freshResult;
+      const actualCredits = (player?.credits as number) ?? (freshResult.credits as number) ?? (p.credits as number) ?? bot.credits;
+      if (actualCredits !== bot.credits) bot.credits = actualCredits;
+      const actualExcess = actualCredits - creditDepositThreshold;
+      if (actualExcess <= 0) {
+        ctx.log("info", `Credit deposit: after fresh fetch, credits ${actualCredits} <= threshold ${creditDepositThreshold}, nothing to deposit`);
+        return Date.now();
+      }
+      ctx.log("info", `Credit deposit: retrying with ${actualExcess}cr (fresh balance=${actualCredits})`);
+      const retryResp = await bot.exec("storage", {
+        action: "deposit" as const,
+        target: "faction",
+        item_id: "credits",
+        quantity: actualExcess,
+      });
+      if (!retryResp.error) {
+        ctx.log("trade", `Market routine: deposited ${actualExcess}cr to faction storage (retained ${creditDepositThreshold}cr)`);
+        return Date.now();
+      }
+      ctx.log("warn", `Market routine: credit deposit retry failed: ${retryResp.error.code} ${retryResp.error.message}`);
+    } else {
+      ctx.log("warn", `Market routine: credit deposit to faction failed: ${depositResp.error.code} ${depositResp.error.message}`);
+    }
+    return Date.now();
+  } catch (e) {
+    ctx.log("warn", `Market routine: credit deposit exception: ${e instanceof Error ? e.message : String(e)}`);
+    return Date.now();
+  }
+}
 
 function saveItemsToMarketDetails(
   systemId: string,
-  stationPoiId: string,
+  stationKey: string,
   stationName: string,
   items: Array<Record<string, unknown>>,
 ): void {
@@ -25,27 +153,53 @@ function saveItemsToMarketDetails(
       buyOrders: MarketOrderDetail[];
       sellOrders: MarketOrderDetail[];
     }> = [];
+    const presentItemIds = new Set<string>();
 
     for (const item of items) {
       const itemId = (item.item_id as string) || (item.id as string) || "";
       const itemName = (item.name as string) || (item.item_name as string) || itemId;
       if (!itemId) continue;
+      presentItemIds.add(itemId);
 
       const buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map((order) => ({
         price: (order.price_each as number) || (order.price as number) || 0,
         quantity: (order.quantity as number) || 0,
+        source: (order.source as string) || undefined,
       })).filter((order) => order.price > 0 && order.quantity > 0);
 
       const sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map((order) => ({
         price: (order.price_each as number) || (order.price as number) || 0,
         quantity: (order.quantity as number) || 0,
+        source: (order.source as string) || undefined,
       })).filter((order) => order.price > 0 && order.quantity > 0);
+
+      const prev = marketDetailsStore.getData().items.find(
+        i => i.systemId === systemId && i.stationPoiId === stationKey && i.itemId === itemId
+      );
+      const prevBuyCount = prev?.buyOrders.length ?? -1;
+      const prevSellCount = prev?.sellOrders.length ?? -1;
+      if (prevBuyCount >= 0 && buyOrders.length === 0 && prevBuyCount > 0) {
+        console.log(`[market] ${stationKey}/${itemId}: buy orders REMOVED (was ${prevBuyCount})`);
+      }
+      if (prevSellCount >= 0 && sellOrders.length === 0 && prevSellCount > 0) {
+        console.log(`[market] ${stationKey}/${itemId}: sell orders REMOVED (was ${prevSellCount})`);
+      }
+      if (prevBuyCount >= 0 && buyOrders.length > 0 && prevBuyCount === 0) {
+        console.log(`[market] ${stationKey}/${itemId}: buy orders ADDED (${buyOrders.length})`);
+      }
+      if (prevSellCount >= 0 && sellOrders.length > 0 && prevSellCount === 0) {
+        console.log(`[market] ${stationKey}/${itemId}: sell orders ADDED (${sellOrders.length})`);
+      }
 
       obs.push({ itemId, itemName, buyOrders, sellOrders });
     }
 
     if (obs.length) {
-      marketDetailsStore.upsertItems(systemId, stationPoiId, stationName, obs);
+      const removed = marketDetailsStore.removeStationItems(systemId, stationKey, presentItemIds);
+      if (removed > 0) {
+        console.log(`[market] Removed ${removed} stale item(s) from ${stationKey} (not in latest update)`);
+      }
+      marketDetailsStore.upsertItems(systemId, stationKey, stationName, obs);
     }
     return obs;
   });
@@ -54,8 +208,209 @@ function saveItemsToMarketDetails(
   // these prices immediately instead of waiting for the (throttled) re-parse
   // of the 10MB marketDetails.json.
   if (observations.length) {
-    noteLocalMarketObservation(systemId, stationPoiId, stationName, observations);
+    noteLocalMarketObservation(systemId, stationKey, stationName, observations);
   }
+}
+
+async function tryProcessSellableItems(
+  bot: Bot,
+  items: MarketStreamItem[],
+  placedOrders: Map<string, { price: number; quantity: number }>,
+  ctx: RoutineContext,
+): Promise<void> {
+  try {
+    const settings = loadSettings();
+    const globalItems =
+      (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{ itemId: string; itemName: string; minSellPrice: number; preloadToStation: number }>) ||
+      [];
+    const sellToStationOrdersOnly = !!((settings.market_routine as Record<string, unknown>) || {}).sellToStationOrdersOnly;
+    const botSettings = (settings[bot.username] as Record<string, unknown>) || {};
+    const perBotItems =
+      (botSettings.marketRoutineItems as Array<{ itemId: string; itemName: string; minSellPrice: number; preloadToStation: number }>) || [];
+    const effectiveItems = perBotItems.length > 0 ? perBotItems : globalItems;
+
+    if (effectiveItems.length === 0) return;
+
+    const itemSize = (itemId: string): number => {
+      const invItem = bot.inventory.find(c => c.itemId === itemId);
+      if (invItem && invItem.quantity > 0 && bot.cargo > 0) {
+        const size = bot.cargo / bot.inventory.reduce((s, i) => s + i.quantity, 0);
+        return Math.max(1, Math.round(size));
+      }
+      return 10;
+    };
+
+    for (const watchedItem of effectiveItems) {
+      const marketItem = items.find(i => (i.item_id as string) === watchedItem.itemId);
+      if (!marketItem || !marketItem.buy_orders || marketItem.buy_orders.length === 0) continue;
+
+      const allSources = [...new Set(marketItem.buy_orders.map(o => (o.source as string) || "").filter(Boolean))];
+
+      const qualifyingBuyOrders = marketItem.buy_orders
+        .map(o => ({
+          price: (o.price_each as number) || (o.price as number) || 0,
+          quantity: (o.quantity as number) || 0,
+          source: (o.source as string) || "",
+        }))
+        .filter(o => o.price > 0 && o.quantity > 0)
+        .filter(o => {
+          if (!sellToStationOrdersOnly) return true;
+          return String(o.source || "").toLowerCase() === "station";
+        })
+        .sort((a, b) => b.price - a.price);
+
+      if (qualifyingBuyOrders.length === 0) {
+        if (sellToStationOrdersOnly && marketItem.buy_orders.length > 0) {
+          ctx.log(
+            "trade",
+            `Market routine: ${watchedItem.itemName} - no station buy orders at ${bot.poi} (${marketItem.buy_orders.length} total, sources: ${allSources.join(", ") || "none"})`,
+          );
+        }
+        continue;
+      }
+
+      const qualifyingAboveFloor = qualifyingBuyOrders.filter(o => o.price >= watchedItem.minSellPrice);
+
+      if (qualifyingAboveFloor.length === 0) continue;
+
+      const totalQty = qualifyingAboveFloor.reduce((sum, o) => sum + o.quantity, 0);
+      const minBuyPrice = Math.min(...qualifyingAboveFloor.map(o => o.price));
+
+      const lastOrder = placedOrders.get(watchedItem.itemId);
+      if (lastOrder && lastOrder.price === minBuyPrice && lastOrder.quantity === totalQty) continue;
+
+      let sellQty = totalQty;
+
+      if (sellQty <= 0) continue;
+
+      const preloadTarget = Math.max(0, watchedItem.preloadToStation || 0);
+
+      const parsedStationForSell = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
+      const stationItemForSell = parsedStationForSell.find(s => s.itemId === watchedItem.itemId);
+      const stationQtyForSell = stationItemForSell?.quantity || 0;
+      const sellShortfall = Math.max(0, totalQty - stationQtyForSell);
+
+      if (sellShortfall > 0) {
+        const parsedFaction = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
+        const factionItem = parsedFaction.find(s => s.itemId === watchedItem.itemId);
+        const factionQty = factionItem?.quantity || 0;
+        const actualMove = Math.min(sellShortfall, factionQty);
+
+        if (actualMove > 0) {
+          const dResp = await bot.exec("storage", {
+            action: "deposit",
+            target: "self",
+            source: "faction",
+            item_id: watchedItem.itemId,
+            quantity: actualMove,
+          });
+          if (dResp.error) {
+            ctx.log("warn", `Market routine: failed to deposit ${watchedItem.itemName} to station storage for sell: ${dResp.error.message}`);
+            continue;
+          }
+          ctx.log("trade", `Market routine: deposited ${actualMove}x ${watchedItem.itemName} to station storage for sell order`);
+        } else {
+          ctx.log("warn", `Market routine: insufficient faction storage (${factionQty} avail, need ${sellShortfall}) for ${watchedItem.itemName} sell`);
+          continue;
+        }
+      }
+
+      try {
+        const sellResp = await bot.exec("create_sell_order", {
+          item_id: watchedItem.itemId,
+          quantity: totalQty,
+          price_each: minBuyPrice,
+        });
+        if (sellResp.error) {
+          ctx.log(
+            "error",
+            `Market routine: create_sell_order failed for ${watchedItem.itemName}: ${sellResp.error.message}`,
+          );
+        } else {
+          ctx.log(
+            "trade",
+            `Market routine: listed ${totalQty}x ${watchedItem.itemName} @ ${minBuyPrice}cr (floor ${watchedItem.minSellPrice}cr, ${qualifyingAboveFloor.length} buy orders)`,
+          );
+          placedOrders.set(watchedItem.itemId, { price: minBuyPrice, quantity: totalQty });
+        }
+      } catch (e) {
+        ctx.log("error", `Market routine: sell exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+
+      if (preloadTarget > 0) {
+        try {
+          const parsedStation = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
+          const stationItem = parsedStation.find(s => s.itemId === watchedItem.itemId);
+          const stationQty = stationItem?.quantity || 0;
+          const needPreload = Math.max(0, preloadTarget - stationQty);
+
+          if (needPreload > 0) {
+            const parsedFaction = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
+            const factionItem = parsedFaction.find(s => s.itemId === watchedItem.itemId);
+            const factionQty = factionItem?.quantity || 0;
+            const actualMove = Math.min(needPreload, factionQty);
+
+            if (actualMove > 0) {
+              const dResp = await bot.exec("storage", {
+                action: "deposit",
+                target: "self",
+                source: "faction",
+                item_id: watchedItem.itemId,
+                quantity: actualMove,
+              });
+              if (!dResp.error) {
+                ctx.log("trade", `Market routine: replenished ${actualMove}x ${watchedItem.itemName} to station storage (target ${preloadTarget})`);
+              }
+            }
+          }
+        } catch {
+          /* ignore replenish errors */
+        }
+      }
+    }
+  } catch {
+    /* ignore market routine processing errors */
+  }
+}
+
+function parseMarketStationPassengers(result: unknown): {
+  station: string;
+  waiting: Array<{
+    citizen_id: string;
+    name: string;
+    class: string;
+    citizenship: string;
+    destination: string;
+    destination_name: string;
+    destination_system?: string;
+    bio?: string;
+    estimated_fare?: number;
+  }>;
+  count: number;
+} | null {
+  if (!result || typeof result !== "object") return null;
+  const r = result as Record<string, unknown>;
+  let inner = r.structuredContent && typeof r.structuredContent === "object"
+    ? (r.structuredContent as Record<string, unknown>)
+    : r;
+  const waiting = Array.isArray(inner.waiting) ? (inner.waiting as Array<Record<string, unknown>>) : [];
+  return {
+    station: (inner.station as string) || "",
+    waiting: waiting.map(p => ({
+      citizen_id: (p.citizen_id as string) || "",
+      name: (p.name as string) || "",
+      class: (p.class as string) || "economy",
+      citizenship: (p.citizenship as string) || "",
+      destination: (p.destination as string) || "",
+      destination_name: (p.destination_name as string) || "",
+      destination_system: (p.destination_system as string) || undefined,
+      bio: (p.bio as string) || undefined,
+      estimated_fare: typeof (p as Record<string, unknown>).estimated_fare === "number"
+        ? (p as Record<string, unknown>).estimated_fare as number
+        : undefined,
+    })),
+    count: (inner.count as number) || waiting.length,
+  };
 }
 
 export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -63,6 +418,27 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   let lastBaseId: string | null = null;
   let currentBaseId: string | null = null;
   let marketUpdateCb: ((entry: import("../marketstreamstore.js").MarketStreamEntry | null) => void) | null = null;
+  let lastShipBrowseAt = 0;
+  let lastCreditDepositAt = 0;
+  let lastPassengerCheckAt = 0;
+  const SHIP_BROWSE_INTERVAL_MS = 10 * 60 * 1000;
+  const PASSENGER_CHECK_INTERVAL_MS = 60 * 1000;
+  let wasConnected = bot.isConnected();
+  const placedOrders = new Map<string, { price: number; quantity: number }>();
+
+  /** Track the last known system for each mobile station POI id so that when
+   *  a mobile station (e.g. Mobile Capital / frontier_station) jumps to a new
+   *  system we can clear its stale market entries from the old system. Without
+   *  this, marketDetails.json accumulates entries for systems the station no
+   *  longer occupies, and traders plan routes against ghost buy orders. */
+  const mobileStationLastSystem = new Map<string, string>();
+
+  // Observation subscription: collect the player/pirate/empire-NPC data this bot
+  // sees at every station via the live observation feed. The feed is pushed into
+  // the shared player tracker (playerNameStore) by bot.ts's
+  // handleObservationUpdate / feedObservationIntoStore, exactly like the
+  // get_nearby result handled in botmanager.ts. Arrival/departure logging with
+  // resolved display names is also handled centrally there.
 
   // Advertise that THIS client produces its own market data. Traders running in
   // this same client then read data/marketDetails.json directly instead of
@@ -79,21 +455,74 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   function subscribeMarketUpdates(baseId: string, systemId: string, poiId: string, stationName: string) {
     unsubscribeMarketUpdates();
     const cb = (entry: import("../marketstreamstore.js").MarketStreamEntry | null) => {
-      if (!entry || !entry.items.length) return;
+      if (!entry) return;
       try {
-        // Record against the POI we are actually docked at, captured at
-        // subscribe time. Using `baseId` as the station POI id (as this used to)
-        // wrote entries under an id that does not exist in the galaxy map for
-        // every station whose base id differs from its POI id (e.g. Sol Central
-        // / confederacy_central_command), producing market rows no routine
-        // could ever travel to.
-        saveItemsToMarketDetails(systemId, poiId, stationName, entry.items as Array<Record<string, unknown>>);
+        const prevEntry = marketStreamStore.getMarket(entry.baseId || "");
+        const prevItems = prevEntry?.items ?? [];
+        const prevItemIds = new Set(prevItems.map(i => (i.item_id as string) || (i.id as string) || ""));
+        const newItemIds = new Set(entry.items.map(i => (i.item_id as string) || (i.id as string) || ""));
+        const added = [...newItemIds].filter(id => id && !prevItemIds.has(id));
+        const removed = [...prevItemIds].filter(id => id && !newItemIds.has(id));
+        if (added.length > 0 || removed.length > 0) {
+          console.log(`[market] ${entry.baseId}: +${added.length}/-${removed.length} items (${added.slice(0,3).join(", ")}${added.length > 3 ? "..." : ""} / ${removed.slice(0,3).join(", ")}${removed.length > 3 ? "..." : ""})`);
+        }
+        const isMobileCapital = entry.baseId === "frontier_station" || entry.poiId === "frontier_station" || entry.poiId === "mobile_capital" || entry.poiId === "mobile_capitol";
+        const stationKey = isMobileCapital ? "frontier_station" : entry.poiId || entry.baseId || "";
+        const stationName = entry.poiName || entry.baseId || "";
+        saveItemsToMarketDetails(entry.systemId || "", stationKey, stationName, entry.items as Array<Record<string, unknown>>);
+        recordMarketSnapshot(entry.baseId || "", {
+          baseId: entry.baseId,
+          systemId: entry.systemId,
+          poiId: entry.poiId,
+          poiName: entry.poiName,
+          updatedAt: entry.updatedAt,
+        }, entry.tick ?? 0, entry.items as Array<{
+          item_id: string;
+          item_name?: string;
+          sell_orders?: Array<{ price?: number; price_each?: number; quantity?: number; source?: string; order_id?: string; id?: string }>;
+          buy_orders?: Array<{ price?: number; price_each?: number; quantity?: number; source?: string; order_id?: string; id?: string }>;
+          [key: string]: unknown;
+        }>);
+        
+        void tryProcessSellableItems(bot, entry.items, placedOrders, ctx);
       } catch {
         /* ignore marketDetails errors from push updates */
       }
     };
     marketUpdateCb = cb;
     marketStreamStore.subscribe(baseId, cb);
+  }
+
+  // Clear the local observation cache (the server watch itself ends
+  // automatically on travel/jump, so we only tear down our local state here).
+  // Arrival/departure logging and player-name tracking are handled centrally
+  // by bot.ts on every observation_update push.
+  function unsubscribeObservation() {
+    bot.clearObservationState();
+  }
+
+  // Subscribe to the live observation feed for the station we are docked at.
+  // bot.subscribeToObservation() feeds the baseline snapshot into the player
+  // tracker and enables observation_update pushes, which bot.ts routes through
+  // handleObservationUpdate for arrival/departure logging with resolved names.
+  async function subscribeObservation() {
+    unsubscribeObservation();
+    if (!bot.account) {
+      ctx.log("warn", "Observation subscription skipped: no account handle (player tracking disabled)");
+      return;
+    }
+
+    try {
+      const obsResp = await bot.subscribeToObservation(false);
+      if (obsResp.error) {
+        ctx.log("error", `subscribe_observation failed: ${obsResp.error.message}`);
+        return;
+      }
+      // subscribeToObservation already feeds the baseline into the player tracker.
+      ctx.log("info", `Observation subscribed at ${bot.system}/${bot.poi}`);
+    } catch (err) {
+      ctx.log("error", `subscribe_observation failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   while (bot.state === "running") {
@@ -109,11 +538,20 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
 
-    const nextBaseId = bot.poi;
-    if (nextBaseId && nextBaseId !== lastBaseId) {
-      unsubscribeMarketUpdates();
+    const isConnected = bot.isConnected();
+    if (!isConnected) {
+      wasConnected = false;
+    } else if (!wasConnected) {
+      wasConnected = true;
+      lastBaseId = null;
+    }
 
-      ctx.log("info", `Subscribing to market at ${bot.system}/${bot.poi}...`);
+      const nextBaseId = bot.poi;
+      if (nextBaseId && nextBaseId !== lastBaseId) {
+        unsubscribeMarketUpdates();
+        unsubscribeObservation();
+
+        ctx.log("info", `Subscribing to market at ${bot.system}/${bot.poi}...`);
 
       const subResp = await bot.exec("subscribe_market");
       if (subResp.error) {
@@ -141,27 +579,79 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
           : [];
 
         if (baseId && items.length > 0) {
-          marketStreamStore.update(baseId, 0, items as any);
-
-          // Friendly station name, matching what the explorer writes, so both
-          // producers key marketDetails.json the same way.
           const mappedPoi = mapStore.getSystem(bot.system)?.pois.find((p) => p.id === bot.poi);
           const stationName = mappedPoi?.name
             || (snapshot.base_name as string)
             || (snapshot.station_name as string)
             || bot.poi;
 
+          marketStreamStore.update(baseId, 0, items as any, {
+            baseId,
+            systemId: bot.system,
+            poiId: bot.poi,
+            poiName: stationName,
+            updatedAt: Date.now(),
+          });
+
+          recordMarketSnapshot(baseId, {
+            baseId,
+            systemId: bot.system,
+            poiId: bot.poi,
+            poiName: stationName,
+            updatedAt: Date.now(),
+          }, 0, items as Array<{
+            item_id: string;
+            item_name?: string;
+            sell_orders?: Array<{ price?: number; price_each?: number; quantity?: number; source?: string; order_id?: string; id?: string }>;
+            buy_orders?: Array<{ price?: number; price_each?: number; quantity?: number; source?: string; order_id?: string; id?: string }>;
+            [key: string]: unknown;
+          }>);
+
+          const isMobileCapital =
+            baseId === "frontier_station" ||
+            bot.poi === "frontier_station" ||
+            bot.poi === "mobile_capital" ||
+            bot.poi === "mobile_capitol";
+          const stationKey = isMobileCapital ? "frontier_station" : bot.poi;
+
+          if (isMobileCapital) {
+            // If this mobile station jumped to a new system, clear its stale
+            // entries from the previous system so traders don't plan against
+            // ghost buy orders (e.g. a 118800cr buy order left behind in
+            // distant_light after Mobile Capital moved to altais).
+            const prevSystem = mobileStationLastSystem.get(bot.poi);
+            if (prevSystem && prevSystem !== bot.system) {
+              for (const id of ["frontier_station", "mobile_capital", "mobile_capitol"]) {
+                marketDetailsStore.clearStation(prevSystem, id);
+              }
+              ctx.log("info", `Mobile station ${bot.poi} moved ${prevSystem} → ${bot.system}; cleared stale market entries in ${prevSystem}`);
+            }
+            mobileStationLastSystem.set(bot.poi, bot.system);
+            marketDetailsStore.clearStation(bot.system, "frontier_station");
+            marketDetailsStore.clearStation(bot.system, "mobile_capital");
+            marketDetailsStore.clearStation(bot.system, "mobile_capitol");
+          } else {
+            marketDetailsStore.clearStation(bot.system, stationKey);
+          }
+
           try {
-            saveItemsToMarketDetails(bot.system, bot.poi, stationName, items);
+            saveItemsToMarketDetails(bot.system, stationKey, stationName, items);
             ctx.log("info", `Saved ${items.length} items to marketDetails.json`);
           } catch {
             /* ignore marketDetails errors */
           }
 
+          void tryProcessSellableItems(bot, items as MarketStreamItem[], placedOrders, ctx);
+
           subscribeMarketUpdates(baseId, bot.system, bot.poi, stationName);
           currentBaseId = baseId;
+          placedOrders.clear();
 
           ctx.log("info", `Market subscription active: ${items.length} items at ${baseId}`);
+
+          // Also collect the player/pirate/empire-NPC data visible at this
+          // station via the live observation feed.
+          void subscribeObservation();
         } else {
           ctx.log("warn", `subscribe_market returned no data: baseId=${baseId} items=${items.length}`);
         }
@@ -170,9 +660,83 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
       lastBaseId = nextBaseId;
     }
 
-    await ctx.sleep(30000);
+    // Periodically record the passengers waiting at this station into the
+    // live passenger roster (data/livePassengers.json) so the civilian
+    // transport routine knows who is available, where, and by name.
+    if (bot.system && bot.poi && Date.now() - lastPassengerCheckAt >= PASSENGER_CHECK_INTERVAL_MS) {
+      try {
+        yield `list_station_passengers_${bot.poi}`;
+        const resp = await bot.exec("list_station_passengers");
+        if (!resp.error && resp.result) {
+          const parsed = parseMarketStationPassengers(resp.result);
+          if (parsed) {
+            const at = {
+              systemId: bot.system,
+              stationId: bot.poi,
+              stationName: parsed.station || bot.poi,
+            };
+            let newPassengers = 0;
+            for (const p of parsed.waiting) {
+              const prev = livePassengers.get(p.citizen_id);
+              livePassengers.registerSeen(
+                {
+                  citizenId: p.citizen_id,
+                  name: p.name,
+                  accommodationClass: p.class as "economy" | "business" | "first",
+                  citizenship: p.citizenship,
+                  destination: p.destination,
+                  destinationName: p.destination_name,
+                  destinationSystem: p.destination_system,
+                  fare: p.estimated_fare ?? 0,
+                  bio: p.bio,
+                },
+                at,
+              );
+              if (!prev) newPassengers++;
+            }
+            ctx.log("info", `Live passengers: ${parsed.count} waiting at ${bot.poi} (${newPassengers} new), ${livePassengers.getCount()} tracked overall`);
+          }
+        }
+      } catch (e) {
+        ctx.log("warn", `Live passenger check failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      lastPassengerCheckAt = Date.now();
+    }
+
+    if (Date.now() - lastShipBrowseAt >= SHIP_BROWSE_INTERVAL_MS) {
+      try {
+        yield `browse_ships_${bot.poi}`;
+        const browseResp = await bot.exec("browse_ships");
+        if (browseResp.error) {
+          ctx.log("error", `browse_ships failed: ${browseResp.error.message}`);
+        } else if (browseResp.result && typeof browseResp.result === "object") {
+          const result = browseResp.result as Record<string, unknown>;
+          const listings = (
+            Array.isArray(result.listings) ? result.listings : []
+          ) as Array<Record<string, unknown>>;
+
+          if (listings.length > 0) {
+            const mappedPoi = mapStore.getSystem(bot.system)?.pois.find((p) => p.id === bot.poi);
+            const stationName = mappedPoi?.name
+              || (result.base_name as string)
+              || (result.station_name as string)
+              || bot.poi;
+            updateShipListings(bot.system, bot.poi, stationName, listings, ctx.log);
+          }
+        }
+      } catch (err) {
+        ctx.log("error", `browse_ships error: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      lastShipBrowseAt = Date.now();
+    }
+
+    // Periodically deposit excess credits to faction storage.
+    lastCreditDepositAt = await tryDepositExcessCredits(bot, ctx, lastCreditDepositAt);
+
+    await ctx.sleep(10000);
   }
 
   unsubscribeMarketUpdates();
+  unsubscribeObservation();
   noteMarketRoutineStopped(bot.username);
 };

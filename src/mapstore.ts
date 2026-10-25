@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, writeFile, copyFile
 import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
 import { log } from "./ui.js";
+import { safeCopyFileSync, safeWriteFileSync } from "./diskSpaceGuard.js";
 import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
 import { onPoiUpdate } from "./client_sync_hooks.js";
 import { perf } from "./perf.js";
@@ -510,7 +511,9 @@ class MapStore {
       this.dirty = false;
       this.data.last_saved = now();
       if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-      writeFileSync(MAP_FILE, JSON.stringify(this.data, null, 2) + "\n", "utf-8");
+      const payload = JSON.stringify(this.data, null, 2) + "\n";
+      const ok = safeWriteFileSync(MAP_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+      if (!ok) console.warn(`[DiskSpace] map.json write blocked`);
     }
   }
 
@@ -530,14 +533,16 @@ class MapStore {
 
   private performBackup(): void {
     const timestamp = this.getTimestamp();
+    if (!existsSync(BACKUP_DIR)) {
+      mkdirSync(BACKUP_DIR, { recursive: true });
+    }
     for (const file of BACKUP_FILES) {
       const src = join(DATA_DIR, file);
       if (existsSync(src)) {
         const dest = join(BACKUP_DIR, `${file}_${timestamp}`);
-        try {
-          copyFileSync(src, dest);
-        } catch (e) {
-          log("error", `Failed to backup ${file}: ${e}`);
+        const ok = safeCopyFileSync(src, dest);
+        if (!ok) {
+          log("error", `Disk space low — backup skipped for ${file}`);
         }
       }
     }
@@ -921,7 +926,17 @@ class MapStore {
 
   /** Get minutes since a POI was last explored. Returns Infinity if never explored. */
   minutesSinceExplored(systemId: string, poiId: string): number {
-    const sys = this.data.systems[systemId];
+    // Case-insensitive system lookup (keys may differ in case from the passed id)
+    let sys = this.data.systems[systemId];
+    if (!sys) {
+      const lower = systemId.toLowerCase();
+      for (const key of Object.keys(this.data.systems)) {
+        if (key.toLowerCase() === lower) {
+          sys = this.data.systems[key];
+          break;
+        }
+      }
+    }
     if (!sys) return Infinity;
 
     const poi = sys.pois.find((p) => p.id === poiId);
@@ -1579,6 +1594,9 @@ class MapStore {
         if (targetRemaining <= 0 && targetMaxRemaining > 0) {
           continue;
         }
+        if (targetRemaining <= 0 && targetResource) {
+          continue;
+        }
         if (targetOre?.depleted && !isDepletionExpired(targetOre.depleted_at)) {
           continue;
         }
@@ -1588,22 +1606,12 @@ class MapStore {
         const ore = poi.ores_found.find((o) => o.item_id === oreId);
         const resource = poi.resources?.find((r) => r.resource_id === oreId);
 
-        // Skip POIs that don't have this specific ore/resource
-        // CRITICAL FIX: If resources data exists (from get_poi scans), the ore MUST be in resources.
-        // ores_found alone is stale history and can lead to death loops when the ore is no longer there.
-        // Only trust ores_found if resources data doesn't exist for this POI at all (undefined, not empty array).
-        const hasResourcesData = poi.resources !== undefined;
-        if (hasResourcesData) {
-          // We have scan data - ore must be in resources to be valid
-          // An empty resources array [] means the ore was scanned and is NOT present
-          if (!resource) {
-            continue;
-          }
-        } else {
-          // No scan data - fall back to mining history (ores_found)
-          if (!ore && !resource) {
-            continue;
-          }
+        // Skip POIs that don't have this specific ore/resource.
+        // A POI must have either scan data or mining history for THIS ore to be considered.
+        const hasScanDataForOre = !!resource;
+        const hasMiningHistoryForOre = !!ore;
+        if (!hasScanDataForOre && !hasMiningHistoryForOre) {
+          continue;
         }
 
         const remaining = resource?.remaining ?? 0;
@@ -2225,6 +2233,33 @@ const locations = this.findOreLocations(oreId, blacklist);
     return null;
   }
 
+  /**
+   * Item IDs that look like mineable ores but are NOT — they are crafting recipe
+   * results, refined goods, or other non-extractable items that the live client
+   * sometimes leaks into POI ore lists. These must never be offered as mineable
+   * targets or shown on the map.
+   */
+  static readonly NON_MINABLE_RESOURCE_IDS = new Set([
+    "compressed_hydrogen", // crafting recipe result, not a raw resource
+    "purified_water", // refined good, not a raw resource
+  ]);
+
+  /**
+   * Whether a resource ID refers to an actual extractable mining resource.
+   * Bare category words ("gas", "ore", "ice", "radioactive") are not real items,
+   * and known crafting/refined results are excluded.
+   */
+  static isMineableResourceId(itemId: string | undefined | null): boolean {
+    if (!itemId) return false;
+    const lc = itemId.toLowerCase();
+    // Bare category words are leaked by the client but are not real items.
+    if (["gas", "ore", "ice", "radioactive", "mineral", "metal"].includes(lc)) {
+      return false;
+    }
+    if (MapStore.NON_MINABLE_RESOURCE_IDS.has(lc)) return false;
+    return true;
+  }
+
   /** Get all unique ores found across all systems. Returns [{item_id, name}]. */
   getAllKnownOres(): Array<{ item_id: string; name: string }> {
     const ores = new Map<string, string>();
@@ -2232,13 +2267,13 @@ const locations = this.findOreLocations(oreId, blacklist);
       for (const poi of sys.pois) {
         // From mining results (ores_found)
         for (const ore of poi.ores_found) {
-          if (ore.item_id && !ores.has(ore.item_id)) {
+          if (ore.item_id && MapStore.isMineableResourceId(ore.item_id) && !ores.has(ore.item_id)) {
             ores.set(ore.item_id, ore.name || ore.item_id);
           }
         }
         // From POI scans (resources)
         for (const res of poi.resources || []) {
-          if (res.resource_id && !ores.has(res.resource_id)) {
+          if (res.resource_id && MapStore.isMineableResourceId(res.resource_id) && !ores.has(res.resource_id)) {
             ores.set(res.resource_id, res.name || res.resource_id);
           }
         }

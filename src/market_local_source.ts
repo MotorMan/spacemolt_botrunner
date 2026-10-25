@@ -64,6 +64,9 @@ interface LocalMarketItem {
   buyOrders: MarketOrderDetail[];
   sellOrders: MarketOrderDetail[];
   lastUpdated: string;
+  /** 'overlay' = live observation from a market routine in this process;
+   *  undefined = came from the parsed marketDetails.json index. */
+  source?: "overlay" | "index";
 }
 
 interface RawMarketDetails {
@@ -176,6 +179,7 @@ export function noteLocalMarketObservation(
       buyOrders: item.buyOrders || [],
       sellOrders: item.sellOrders || [],
       lastUpdated: stamp,
+      source: "overlay",
     });
   }
   pruneOverlay();
@@ -212,22 +216,38 @@ export function clearLocalMarketOverlay(): void {
  *
  * Clears the sell side for that station+item in both the live overlay and the
  * in-memory file index. The next real observation from a market bot restores it.
+ *
+ * Pass `side: "buy"` to clear buy orders instead (used by faction traders when
+ * a destination station has no viable buyers).
  */
-export function noteLocalMarketUnavailable(systemId: string, stationPoiId: string, itemId: string): void {
+export function noteLocalMarketUnavailable(
+  systemId: string,
+  stationPoiId: string,
+  itemId: string,
+  side?: "buy" | "sell",
+): void {
   if (!systemId || !stationPoiId || !itemId) return;
   const stationKey = `${systemId}/${stationPoiId}`;
+  const clearSell = !side || side === "sell";
+  const clearBuy = !side || side === "buy";
 
   const byStation = overlay.get(itemId);
   const live = byStation?.get(stationKey);
-  if (live && live.sellOrders.length > 0) {
-    byStation!.set(stationKey, { ...live, sellOrders: [] });
+  if (live) {
+    const updated = { ...live };
+    if (clearSell && updated.sellOrders.length > 0) updated.sellOrders = [];
+    if (clearBuy && updated.buyOrders.length > 0) updated.buyOrders = [];
+    if (updated.sellOrders.length !== live.sellOrders.length || updated.buyOrders.length !== live.buyOrders.length) {
+      byStation!.set(stationKey, updated);
+    }
   }
 
   const indexed = index?.byItem.get(itemId);
   if (indexed) {
     for (const entry of indexed) {
-      if (entry.systemId === systemId && entry.stationPoiId === stationPoiId && entry.sellOrders.length > 0) {
-        entry.sellOrders = [];
+      if (entry.systemId === systemId && entry.stationPoiId === stationPoiId) {
+        if (clearSell && entry.sellOrders.length > 0) entry.sellOrders = [];
+        if (clearBuy && entry.buyOrders.length > 0) entry.buyOrders = [];
       }
     }
   }
@@ -458,13 +478,14 @@ async function estimateSystemDistance(fromSystem: string, toSystem: string): Pro
  * `source` marker on the result.
  */
 export async function queryLocalMarket(query: MarketQueryRequest): Promise<MarketQueryResult> {
-  const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy" } = query;
+  const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy", stationPoiId, baseStationId, systemId } = query;
   if (!itemId) {
     return { ok: false, results: [], error: "itemId required", source: "local" };
   }
 
   const idx = await getIndex();
   const live = overlay.get(itemId);
+  console.log(`[queryLocalMarket] itemId=${itemId} tradeType=${tradeType} idx=${idx ? "yes" : "no"} live=${live ? "yes" : "no"} idxEntries=${idx?.byItem.get(itemId)?.length ?? 0}`);
   if (!idx && (!live || live.size === 0)) {
     const why = lastLoadError
       ? `local market file unreadable: ${lastLoadError}`
@@ -481,13 +502,52 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
   if (live) {
     for (const [key, item] of live) byStation.set(key, item);
   }
-  if (byStation.size === 0) {
-    return { ok: false, results: [], error: "No matching orders found", source: "local" };
+
+  // Direct path: build results from the merged station map.
+  let filteredResults = await buildMarketResults(byStation, { itemId, maxPrice, minQuantity, requesterSystemId, tradeType, stationPoiId, systemId });
+
+  // Cross-system fallback: when the direct path returned nothing and the caller
+  // supplied a stable base id (e.g. a mobile station whose resolved poi_id
+  // differs from the base_id under which the market data is stored), scan every
+  // system for entries whose stationPoiId matches that base id.
+  if (filteredResults.length === 0 && baseStationId) {
+    const baseByStation = new Map<string, LocalMarketItem>();
+    if (idx) {
+      for (const item of idx.byItem.get(itemId) || []) {
+        if (item.stationPoiId === baseStationId) {
+          baseByStation.set(`${item.systemId}/${item.stationPoiId}`, item);
+        }
+      }
+    }
+    if (live) {
+      for (const [key, item] of live) {
+        if (item.stationPoiId === baseStationId) baseByStation.set(key, item);
+      }
+    }
+    if (baseByStation.size > 0) {
+      filteredResults = await buildMarketResults(baseByStation, { itemId, maxPrice, minQuantity, requesterSystemId, tradeType, stationPoiId: baseStationId, systemId });
+    }
   }
 
+  const ret: MarketQueryResult = {
+    ok: filteredResults.length > 0,
+    results: filteredResults,
+    error: filteredResults.length === 0 ? "No matching orders found" : undefined,
+    source: "local",
+  };
+  console.log(`[queryLocalMarket] itemId=${itemId} tradeType=${tradeType} returned=${ret.ok} count=${ret.results.length} first=${ret.results[0] ? `${ret.results[0].stationName}/${ret.results[0].itemName}@${ret.results[0].price}` : "none"}`);
+  return ret;
+}
+
+async function buildMarketResults(
+  byStation: Map<string, LocalMarketItem>,
+  opts: { itemId: string; maxPrice?: number; minQuantity?: number; requesterSystemId?: string; tradeType?: "buy" | "sell"; stationPoiId?: string; systemId?: string },
+): Promise<MarketQueryResponse[]> {
+  const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy", stationPoiId, systemId } = opts;
   const comparator = tradeType === "sell" ? (p: number) => p >= (maxPrice as number) : (p: number) => p <= (maxPrice as number);
   const results: MarketQueryResponse[] = [];
   for (const item of byStation.values()) {
+    if (systemId && item.systemId !== systemId) continue;
     const orders = tradeType === "sell" ? item.buyOrders : item.sellOrders;
     if (!orders || orders.length === 0) continue;
     let filtered = orders.filter((o) => o.quantity >= minQuantity);
@@ -501,6 +561,7 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
     }
     results.push({
       ok: true,
+      itemId,
       stationName: item.stationName,
       systemId: item.systemId,
       stationPoiId: item.stationPoiId,
@@ -511,12 +572,10 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
       lastUpdated: item.lastUpdated,
     });
   }
-
   results.sort((a, b) => (tradeType === "sell" ? b.price - a.price : a.price - b.price));
-  return {
-    ok: results.length > 0,
-    results: results.slice(0, 10),
-    error: results.length === 0 ? "No matching orders found" : undefined,
-    source: "local",
-  };
+  if (stationPoiId) {
+    const stationFiltered = results.filter((r) => r.stationPoiId === stationPoiId);
+    if (stationFiltered.length > 0) return stationFiltered;
+  }
+  return results.slice(0, 10);
 }

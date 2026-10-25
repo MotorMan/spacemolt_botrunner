@@ -3,7 +3,30 @@ import { writeFileSync, existsSync, readFileSync, mkdirSync, readdirSync, unlink
 import { writeFile, unlink } from "fs/promises";
 import { join } from "path";
 import { onWildlifeUpdate, isSyncPushEnabled } from "./client_sync_hooks.js";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 import { perf } from "./perf.js";
+
+/**
+ * Strip the faction-tag prefix and "BRANDED" keyword that the recent game
+ * patch prepends to branded ranch livestock display names
+ * (e.g. "[RNC] BRANDED Belt-Grazer" → "Belt-Grazer", "[RNC] Belt-Grazer" → "Belt-Grazer"),
+ * then trim, collapse spaces, and lowercase.
+ *
+ * Exported so callers in battle.ts, hunter.ts, and elsewhere can normalise a
+ * creature display name before exact-match lookups, ensuring branded and
+ * non-branded variants of the same species are treated as one.
+ */
+export function normalizeCreatureName(name: string | undefined): string {
+  if (!name) return "";
+  let cleaned = name.trim();
+  // Strip leading faction-tag prefix, e.g. "[RNC] ", "[POLICE] "
+  cleaned = cleaned.replace(/^\[[^\]]+\]\s*/g, "").trim();
+  // Strip the BRANDED keyword (case-insensitive, word-boundary)
+  cleaned = cleaned.replace(/\bBRANDED\b/gi, "").trim();
+  // Collapse any leftover double spaces
+  cleaned = cleaned.replace(/\s+/g, " ").trim();
+  return cleaned.toLowerCase();
+}
 
 const CREATURES_DIR = join(process.cwd(), "data", "creatures");
 const LEGACY_WILDLIFE_FILE = join(process.cwd(), "data", "wildlifeInfo.json");
@@ -154,6 +177,7 @@ export class WildlifeStore {
 
   constructor() {
     this.migrateIfNeeded();
+    this.cleanupDisplayNames();
     this.startTimers();
   }
 
@@ -288,17 +312,25 @@ export class WildlifeStore {
 
   private writeSystemFileSync(sys: SystemWildlife): void {
     this.ensureDir();
-    // No pretty-print: these files are machine-read only and `null, 2` tripled
-    // their size (and the write cost) for nothing.
-    writeFileSync(this.systemFilePath(sys.system), JSON.stringify(sys) + "\n", "utf-8");
+    const payload = JSON.stringify(sys) + "\n";
+    safeWriteFileSync(this.systemFilePath(sys.system), payload, Buffer.byteLength(payload, "utf-8"));
   }
 
   setBotName(name: string): void {
     this._botName = name;
   }
 
+  /**
+   * Strip the faction-tag prefix and "BRANDED" keyword that the recent game
+   * patch prepends to branded ranch livestock names (e.g. "[RNC] BRANDED
+   * Belt-Grazer" → "belt-grazer"), then normalise to lowercase.
+   *
+   * This keeps branded and non-branded variants of the same species in the
+   * same store entry so that exact-name lookups (hasCreatureName / isCreatureName)
+   * still match a creature whose display name now carries a faction tag.
+   */
   private normalize(name: string): string {
-    return name.trim().toLowerCase();
+    return normalizeCreatureName(name);
   }
 
   // ── Name index ──────────────────────────────────────────────────────────
@@ -683,9 +715,6 @@ export class WildlifeStore {
           if (!entry || !entry.n) continue;
           const existing = tlist.find((e) => e.n === entry.n && e.h === entry.h);
           if (existing) {
-            for (const id of entry.ids || []) {
-              if (id && !existing.ids.includes(id)) existing.ids.push(id);
-            }
             if (entry.seen && entry.seen > existing.seen) {
               existing.seen = entry.seen;
               if (entry.s) existing.s = entry.s;
@@ -698,7 +727,7 @@ export class WildlifeStore {
               h: entry.h || 0,
               s: entry.s || "",
               r: entry.r || "",
-              ids: [...(entry.ids || [])],
+              ids: [],
               seen: entry.seen || new Date().toISOString(),
             });
             changed = true;
@@ -780,7 +809,8 @@ export class WildlifeStore {
         if (Object.keys(entry.sys.pois).length === 0 && !entry.sys.survey) {
           if (existsSync(path)) unlinkSync(path);
         } else {
-          writeFileSync(path, JSON.stringify(entry.sys) + "\n", "utf-8");
+          const payload = JSON.stringify(entry.sys) + "\n";
+        safeWriteFileSync(path, payload, Buffer.byteLength(payload, "utf-8"));
         }
         written++;
       } catch (err) {
@@ -803,6 +833,107 @@ export class WildlifeStore {
       evicted++;
     }
     return evicted;
+  }
+
+  /**
+   * One-time cleanup: remove POI entries and fix system names that were
+   * persisted as display names instead of canonical ids.
+   *
+   * A bug stored the game's human-readable poi display name (e.g.
+   * "Shaula Gas Plume") as the POI key instead of the canonical id.  Once the
+   * game started returning canonical ids those display-name keys became
+   * orphans: reconcile() never visits them again, so they persist forever
+   * on disk.  Any POI key or `system` field containing a space is treated
+   * as a display name and removed (the system field is sanitized rather
+   * than dropped).
+   */
+  cleanupDisplayNames(): void {
+    let removedPois = 0;
+    const touchedSystems = new Set<string>();
+
+    // Clean on-disk files for systems not currently in the hot cache.
+    for (const key of this.listSystemKeys()) {
+      if (this.cache.has(key)) continue;
+      const path = this.systemFilePath(key);
+      if (!existsSync(path)) continue;
+
+      let sys: SystemWildlife;
+      try {
+        sys = JSON.parse(readFileSync(path, "utf-8")) as SystemWildlife;
+        if (!sys.pois) sys.pois = {};
+      } catch {
+        continue;
+      }
+
+      const removed = this.stripDisplayNames(sys);
+      if (removed === 0) continue;
+
+      removedPois += removed;
+      touchedSystems.add(key);
+      const empty = Object.keys(sys.pois).length === 0 && !sys.survey;
+      if (empty) {
+        try { unlinkSync(path); } catch { /* already gone */ }
+      } else {
+        const payload = JSON.stringify(sys) + "\n";
+        safeWriteFileSync(path, payload, Buffer.byteLength(payload, "utf-8"));
+      }
+    }
+
+    // Clean hot-cache entries that haven't been flushed to disk yet.
+    const cacheToDelete: string[] = [];
+    for (const [key, entry] of this.cache) {
+      const removed = this.stripDisplayNames(entry.sys);
+      if (removed > 0) {
+        removedPois += removed;
+        entry.dirty = true;
+        entry.sys.lastUpdated = new Date().toISOString();
+        const empty = Object.keys(entry.sys.pois).length === 0 && !entry.sys.survey;
+        if (empty) {
+          cacheToDelete.push(key);
+          const path = this.systemFilePath(key);
+          try { unlinkSync(path); } catch { /* fine */ }
+        } else {
+          touchedSystems.add(key);
+        }
+      }
+    }
+    for (const key of cacheToDelete) {
+      this.cache.delete(key);
+    }
+
+    if (removedPois > 0 || touchedSystems.size > 0) {
+      console.log(
+        `[WildlifeStore] Cleaned up ${removedPois} display-name POI entr` +
+        (removedPois === 1 ? "y" : "ies") +
+        ` from ${touchedSystems.size} system(s)`,
+      );
+    }
+  }
+
+  /**
+   * Strip display-name (space-containing) keys from a single SystemWildlife.
+   * Sanitizes the `system` field if it is a display name; removes POI keys
+   * that contain spaces.  Returns the number of removed POI entries.
+   */
+  private stripDisplayNames(sys: SystemWildlife): number {
+    let removed = 0;
+
+    // Fix the system field if it is a display name (contains spaces).
+    if (typeof sys.system === "string" && sys.system.includes(" ")) {
+      sys.system = sanitizeSystemName(sys.system);
+    }
+
+    // Remove POI keys that are display names (contain spaces).
+    if (sys.pois) {
+      for (const poiKey of Object.keys(sys.pois)) {
+        if (poiKey.includes(" ")) {
+          delete sys.pois[poiKey];
+          removed++;
+        }
+      }
+    }
+
+    return removed;
   }
 
   /**

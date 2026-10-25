@@ -7,12 +7,23 @@
  * - Uses auto-pricing (midpoint between min/max) or manual price
  * - Returns home to restock and repeat
  *
+ * Every station is screened BEFORE any network call is spent on it:
+ * - Settings → Station Blacklist (restricted stations that refuse docking, banned
+ *   faction outposts) and Settings → System Blacklist are always honoured, as is
+ *   the runtime "this station denied us docking" set from common.ts.
+ * - Faction deployable outposts are skipped — only the owning faction can dock
+ *   there, so both the remote order check and a visit are guaranteed waste.
+ * - Stations that answer "That station does not have a market" (or refuse to let
+ *   us dock) are remembered in data/fcStations.json and skipped until the relearn
+ *   window expires, instead of being re-queried on every pass.
+ *
  * Tracks placed orders in data/fcStations.json.
  */
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
-import type { Routine, RoutineContext } from "../bot.js";
-import { mapStore } from "../mapstore.js";
+import type { Routine, RoutineContext, Bot } from "../bot.js";
+import { mapStore, type StoredPOI } from "../mapstore.js";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -22,22 +33,64 @@ import {
   navigateToSystem,
   detectAndRecoverFromDeath,
   maxItemsForCargo,
+  cargoUsedFromInventory,
   readSettings,
   isPirateSystem,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
   travelToStationWithHint,
+  buildDeniedStationSet,
+  markStationDenied,
   type BattleState,
   getBattleStatus,
   fleeFromBattle,
+  getItemSize,
 } from "./common.js";
+import { getSystemBlacklist } from "../web/server.js";
 import { queryRemoteMarket } from "../client_sync_hooks.js";
 
 const FUEL_CELL_ITEM_ID = "fuel_cell";
 const FUEL_CELL_ITEM_NAME = "Fuel Cell";
+const MILITARY_FUEL_CELL_ITEM_ID = "military_fuel_cell";
 const FC_STATIONS_FILE = "data/fcStations.json";
+const FC_PRESTAGE_LEDGER_FILE = "data/fcPreStageLedger.json";
+const FC_PRESTAGE_LOCK_FILE = "data/fcPreStage.lock";
+const FC_PRESTAGE_RESERVATIONS_FILE = "data/fcPreStageReservations.json";
+const RESERVATION_TIMEOUT_MS = 15 * 60 * 1000;
+/** Minimum time between at-home storage refresh sweeps. The bot hammers the
+ *  server with ~2 exec calls per station × N items, so we throttle this to
+ *  once per interval instead of every cycle. */
+const DEFAULT_STORAGE_REFRESH_INTERVAL_MINUTES = 15;
+const MIN_STORAGE_REFRESH_INTERVAL_MINUTES = 5;
+/** How long to wait when the entire pre-stage plan is reserved by other bots.
+ *  A short sleep just re-runs the cycle (and refreshes storage) again, so the
+ *  default is long enough to let other bots finish their deposits. */
+const DEFAULT_BLOCKED_WAIT_MINUTES = 5;
+const MIN_BLOCKED_WAIT_MINUTES = 1;
+/** Curated list of NPC stations. Used only as an exemption list: an NPC station
+ *  named "... Outpost" (Void Gate Outpost, Deep Range Outpost) is a real, dockable
+ *  station with a market and must never be mistaken as a faction outpost. */
+const STATION_REF_FILE = "data/stationRef.json";
+
+/** Pacing between remote `view_orders` queries. The server tolerates ~2/s, so 500ms
+ *  is both the default and the floor — the old 5s spacing made a full 57-station
+ *  sweep take five minutes. */
+const DEFAULT_REMOTE_CHECK_DELAY_MS = 500;
+const MIN_REMOTE_CHECK_DELAY_MS = 500;
+/** How long a learned "no market"/"docking denied" verdict is trusted before we
+ *  spend another query re-testing it (player stations can add a market later). */
+const DEFAULT_RELEARN_HOURS = 168; // 7 days
+/** A station the server does not know about may just be missing from our map, so
+ *  it is retried far sooner than a hard "no market" answer. */
+const UNKNOWN_STATION_RELEARN_MS = 24 * 60 * 60 * 1000;
+/** Blacklist lookups read settings from disk, so cache them for a sweep. */
+const FILTER_CACHE_MS = 10_000;
+/** Stations whose stock of an item is below this fraction of maxPerStation are
+ *  treated as critical/low-priority emergencies during focus-item selection. */
+const CRITICAL_FILL_THRESHOLD = 0.5;
 
 interface FCOrder {
+  itemId: string;
   orderId: string;
   quantity: number;
   remaining: number;
@@ -46,7 +99,48 @@ interface FCOrder {
   createdAt: string;
 }
 
-interface FCStationEntry {
+/** Why a station is not a usable fuel-cell sales target. */
+export type FCSkipReason =
+  | "pirate_system"
+  | "system_blacklisted"
+  | "station_blacklisted"
+  | "outpost"
+  | "no_market"
+  | "dock_denied"
+  | "unknown_station"
+  | "no_storage";
+
+export interface SellItemConfig {
+  itemId: string;
+  itemName: string;
+  maxPerStation: number;
+  priceMode: "manual" | "auto";
+  autoMinPrice: number;
+  autoMaxPrice: number;
+  baseTargetPrice: number;
+  blockedStations: string[];
+}
+
+const SKIP_LABELS: Record<FCSkipReason, string> = {
+  pirate_system: "pirate system",
+  system_blacklisted: "system blacklisted",
+  station_blacklisted: "station blacklisted",
+  outpost: "faction outpost",
+  no_market: "no market",
+  dock_denied: "docking denied",
+  unknown_station: "unknown station",
+  no_storage: "no storage",
+};
+
+/** Skip reasons the bot can learn at runtime (the rest come from settings/map). */
+const LEARNABLE_SKIPS: ReadonlySet<FCSkipReason> = new Set<FCSkipReason>([
+  "no_market",
+  "dock_denied",
+  "unknown_station",
+  "no_storage",
+]);
+
+export interface FCStationEntry {
   systemId: string;
   poiId: string;
   poiName: string;
@@ -55,33 +149,58 @@ interface FCStationEntry {
   activeOrders: FCOrder[];
   lastVisit: string | null;
   lastPrice: number | null;
+  /** Pre-staged deposits in station storage, keyed by itemId. */
+  deposits: Record<string, number>;
+  /** Learned verdict from a real server answer ("no market", docking refused, …). */
+  learnedSkip?: FCSkipReason | null;
+  /** When the verdict was learned — drives the relearn window. */
+  learnedSkipAt?: string | null;
+  /** The server message that produced the verdict (diagnostics only). */
+  learnedSkipDetail?: string | null;
+  /** Last computed reason this station was skipped (diagnostics only). */
+  skipReason?: FCSkipReason | null;
 }
 
-interface FCStationsData {
+export interface FCStationsData {
   version: number;
   homeSystem: string;
   homeStation: string;
   stations: FCStationEntry[];
   currentStationIndex: number;
   lastStarted: string;
+  lastRemoteUpdate: number;
+}
+
+interface ItemUrgency {
+  itemId: string;
+  totalNeed: number;
+  criticalStationCount: number;
+  zeroStationCount: number;
+  criticalDeficit: number;
+}
+
+function emptyFCStationsData(): FCStationsData {
+  return {
+    version: 2,
+    homeSystem: "",
+    homeStation: "",
+    stations: [],
+    currentStationIndex: 0,
+    lastStarted: new Date().toISOString(),
+    lastRemoteUpdate: 0,
+  };
 }
 
 function loadFCStationsData(): FCStationsData {
   try {
     if (!existsSync(FC_STATIONS_FILE)) {
-      return {
-        version: 1,
-        homeSystem: "",
-        homeStation: "",
-        stations: [],
-        currentStationIndex: 0,
-        lastStarted: new Date().toISOString(),
-      };
+      return emptyFCStationsData();
     }
     const rawData = readFileSync(FC_STATIONS_FILE, "utf-8");
     const data: FCStationsData = JSON.parse(rawData);
-    // Backward compatibility: only keep fields we want, add ordersUnsold and activeOrders if missing
-    data.stations = data.stations.map(station => ({
+    // Backward compatibility: only keep fields we want, add ordersUnsold, activeOrders
+    // and the learned-skip fields (added in version 2) if missing.
+    data.stations = (data.stations ?? []).map(station => ({
       systemId: station.systemId,
       poiId: station.poiId,
       poiName: station.poiName,
@@ -90,56 +209,324 @@ function loadFCStationsData(): FCStationsData {
       activeOrders: station.activeOrders ?? [],
       lastVisit: station.lastVisit ?? null,
       lastPrice: station.lastPrice ?? null,
+      deposits: station.deposits ?? {},
+      learnedSkip: station.learnedSkip ?? null,
+      learnedSkipAt: station.learnedSkipAt ?? null,
+      learnedSkipDetail: station.learnedSkipDetail ?? null,
+      skipReason: station.skipReason ?? null,
     }));
+    data.version = 2;
+    data.lastRemoteUpdate = data.lastRemoteUpdate ?? 0;
     return data;
   } catch {
-    return {
-      version: 1,
-      homeSystem: "",
-      homeStation: "",
-      stations: [],
-      currentStationIndex: 0,
-      lastStarted: new Date().toISOString(),
-    };
+    return emptyFCStationsData();
   }
 }
 
 function saveFCStationsData(data: FCStationsData): void {
-  writeFileSync(FC_STATIONS_FILE, JSON.stringify(data, null, 2));
+  const payload = JSON.stringify(data, null, 2);
+  safeWriteFileSync(FC_STATIONS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+}
+
+// ── Station eligibility ──────────────────────────────────────
+
+let filterCache: { at: number; systems: Set<string>; stations: Set<string> } | null = null;
+
+/** Current system + station exclusions. `buildDeniedStationSet()` already folds
+ *  Settings → Station Blacklist together with every station that refused us
+ *  docking during this process's lifetime. */
+function getBlacklistFilters(force = false): { systems: Set<string>; stations: Set<string> } {
+  const now = Date.now();
+  if (!force && filterCache && now - filterCache.at < FILTER_CACHE_MS) return filterCache;
+  const settings = getFuelCellSellerSettings();
+  filterCache = {
+    at: now,
+    systems: new Set(getSystemBlacklist().map(s => s.toLowerCase())),
+    stations: buildDeniedStationSet(),
+  };
+  for (const item of settings.sellItems) {
+    for (const station of (item.blockedStations || [])) {
+      filterCache.stations.add(station.toLowerCase());
+    }
+  }
+  return filterCache;
+}
+
+export function isStationBlacklisted(systemId: string, poiId: string, stations: Set<string>): boolean {
+  if (stations.size === 0) return false;
+  return stations.has(poiId.toLowerCase()) || stations.has(`${systemId}|${poiId}`.toLowerCase());
+}
+
+let npcStationIds: Set<string> | null = null;
+
+/** POI ids of the game's own NPC stations (data/stationRef.json). */
+function getNpcStationIds(): Set<string> {
+  if (npcStationIds) return npcStationIds;
+  const ids = new Set<string>();
+  try {
+    if (existsSync(STATION_REF_FILE)) {
+      const ref = JSON.parse(readFileSync(STATION_REF_FILE, "utf-8")) as {
+        stations?: Array<{ station_id?: string }>;
+      };
+      for (const s of ref.stations ?? []) {
+        if (s.station_id) ids.add(s.station_id.toLowerCase());
+      }
+    }
+  } catch {
+    // The whitelist is only an exemption list — an unreadable file just means
+    // no exemptions, never a crash.
+  }
+  npcStationIds = ids;
+  return ids;
+}
+
+function findMapPoi(systemId: string, poiId: string): StoredPOI | undefined {
+  const sys = mapStore.getSystem(systemId);
+  if (!sys) return undefined;
+  const lower = poiId.toLowerCase();
+  return sys.pois.find(p => p.id === poiId) ?? sys.pois.find(p => p.id.toLowerCase() === lower);
+}
+
+/** True when a station is a faction outpost nobody outside the owning faction can
+ *  dock at. The only authoritative signal is `get_base` (which returns
+ *  `base_type: "outpost"`) — and we only get that for a POI we have physically
+ *  visited, so it lands in the map via get_poi/get_base. A player can name a
+ *  station anything, so the name is NEVER used. Stations with a recorded market
+ *  or an NPC id in stationRef are never treated as outposts. When the map has no
+ *  base_type for a POI we fall back to the learned dock-denied verdict at visit
+ *  time (see classifyStationError). */
+export function looksLikeOutpost(entry: Pick<FCStationEntry, "systemId" | "poiId" | "poiName">): boolean {
+  if (getNpcStationIds().has(entry.poiId.toLowerCase())) return false;
+  const poi = findMapPoi(entry.systemId, entry.poiId);
+  if (poi && poi.market && poi.market.length > 0) return false; // we have traded here before
+  const baseType = `${poi?.base_type ?? ""}`.toLowerCase();
+  if (baseType.includes("outpost")) return true;
+  // Last-resort: the map POI `type` is occasionally tagged too (rare for the
+  // deployed outposts, which ship as plain "station"), so only act on an explicit
+  // outpost type — never guess from the name.
+  const poiType = `${poi?.type ?? ""}`.toLowerCase();
+  return poiType === "outpost";
+}
+
+/** True only when the map explicitly lists this station's services and a market
+ *  is not among them. Unknown/empty service lists stay optimistic. */
+export function mapSaysNoMarket(poi: StoredPOI | undefined): boolean {
+  const svc = poi?.services;
+  if (!Array.isArray(svc) || svc.length === 0) return false;
+  return !svc.some(s => String(s).toLowerCase() === "market");
+}
+
+function ageMs(iso: string | null | undefined, now: number): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, now - t);
+}
+
+/** Record a server-proven verdict so this station is skipped from now on. */
+function markStationLearnedSkip(
+  ctx: RoutineContext,
+  entry: FCStationEntry,
+  reason: FCSkipReason,
+  detail?: string,
+): void {
+  const isNew = entry.learnedSkip !== reason;
+  entry.learnedSkip = reason;
+  entry.learnedSkipAt = new Date().toISOString();
+  entry.learnedSkipDetail = detail ? detail.slice(0, 200) : null;
+  entry.skipReason = reason;
+  if (reason === "dock_denied") {
+    // Also stop every other routine in this process from retrying the dock.
+    markStationDenied(entry.poiId);
+  }
+  if (isNew) {
+    ctx.log(
+      "fc",
+      `Marking ${entry.poiName} (${entry.poiId}) as ${SKIP_LABELS[reason]} — skipping it from now on. ` +
+        `Add "${entry.poiId}" to Settings → Station Blacklist to skip it permanently.`,
+    );
+  }
+}
+
+/**
+ * Decide whether a station may be used at all. Expired learned verdicts are
+ * cleared here (so a station that later builds a market gets retried), which is
+ * why callers persist the data after a sweep.
+ */
+export function evaluateStationSkip(
+  entry: FCStationEntry,
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+  now: number = Date.now(),
+): FCSkipReason | null {
+  // The home station is explicitly configured by the user: it is where cargo is
+  // withdrawn, so config-based exclusions never apply to it. Server-proven
+  // verdicts (no market) still do — we simply cannot sell there.
+  const isHome = entry.systemId === data.homeSystem && entry.poiId === data.homeStation;
+
+  if (entry.learnedSkip && LEARNABLE_SKIPS.has(entry.learnedSkip)) {
+    // no_storage is only meaningful in preStage mode; clear it otherwise so
+    // normal-mode runs can still visit stations that simply lack storage.
+    if (entry.learnedSkip === "no_storage" && settings.preStageMode !== "preStage") {
+      entry.learnedSkip = null;
+      entry.learnedSkipAt = null;
+      entry.learnedSkipDetail = null;
+    } else {
+      const window = entry.learnedSkip === "unknown_station"
+        ? UNKNOWN_STATION_RELEARN_MS
+        : settings.relearnMs;
+      const age = ageMs(entry.learnedSkipAt, now);
+      if (age === null || age < window) {
+        entry.skipReason = entry.learnedSkip;
+        return entry.learnedSkip;
+      }
+      // Window elapsed — give the station one more chance.
+      entry.learnedSkip = null;
+      entry.learnedSkipAt = null;
+      entry.learnedSkipDetail = null;
+    }
+  }
+
+  if (!isHome) {
+    if (isPirateSystem(entry.systemId)) {
+      entry.skipReason = "pirate_system";
+      return "pirate_system";
+    }
+    if (filters.systems.has(entry.systemId.toLowerCase())) {
+      entry.skipReason = "system_blacklisted";
+      return "system_blacklisted";
+    }
+    if (isStationBlacklisted(entry.systemId, entry.poiId, filters.stations)) {
+      entry.skipReason = "station_blacklisted";
+      return "station_blacklisted";
+    }
+    if (settings.skipOutposts && looksLikeOutpost(entry)) {
+      entry.skipReason = "outpost";
+      return "outpost";
+    }
+    if (mapSaysNoMarket(findMapPoi(entry.systemId, entry.poiId))) {
+      entry.skipReason = "no_market";
+      return "no_market";
+    }
+  }
+
+  entry.skipReason = null;
+  return null;
+}
+
+/** Split the persisted list into usable stations and a per-reason skip tally. */
+export function partitionStations(
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+): { eligible: Array<{ entry: FCStationEntry; idx: number }>; skipped: Map<FCSkipReason, number> } {
+  const eligible: Array<{ entry: FCStationEntry; idx: number }> = [];
+  const skipped = new Map<FCSkipReason, number>();
+  const now = Date.now();
+  data.stations.forEach((entry, idx) => {
+    const reason = evaluateStationSkip(entry, data, settings, filters, now);
+    if (reason) {
+      skipped.set(reason, (skipped.get(reason) ?? 0) + 1);
+      return;
+    }
+    eligible.push({ entry, idx });
+  });
+  return { eligible, skipped };
+}
+
+export function describeSkips(skipped: Map<FCSkipReason, number>): string {
+  if (skipped.size === 0) return "none";
+  return [...skipped.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => `${count} ${SKIP_LABELS[reason]}`)
+    .join(", ");
+}
+
+/** Map a server error message onto a skip verdict, or null when it is unrelated. */
+export function classifyStationError(message: string | undefined | null): FCSkipReason | null {
+  const msg = (message || "").toLowerCase();
+  if (!msg) return null;
+  // Transient conditions ("docking restricted while in battle", rate limits, …)
+  // must never be recorded as a permanent verdict about the station.
+  if (
+    msg.includes("battle") ||
+    msg.includes("combat") ||
+    msg.includes("cooldown") ||
+    msg.includes("rate limit") ||
+    msg.includes("too many") ||
+    msg.includes("try again")
+  ) {
+    return null;
+  }
+  if (msg.includes("not have a market") || msg.includes("no market") || msg.includes("without a market")) {
+    return "no_market";
+  }
+  if (
+    msg.includes("access denied") ||
+    msg.includes("docking denied") ||
+    msg.includes("not public") ||
+    msg.includes("restricted") ||
+    msg.includes("no permission") ||
+    msg.includes("not permitted") ||
+    msg.includes("not allowed to dock")
+  ) {
+    return "dock_denied";
+  }
+  if (
+    msg.includes("station not found") ||
+    msg.includes("unknown station") ||
+    msg.includes("no such station") ||
+    msg.includes("invalid station")
+  ) {
+    return "unknown_station";
+  }
+  if (
+    msg.includes("does not have a storage facility") ||
+    msg.includes("no storage facility") ||
+    msg.includes("does not offer storage")
+  ) {
+    return "no_storage";
+  }
+  return null;
 }
 
 /**
  * Check orders at a specific station remotely using view_orders with station_id.
- * Updates the station entry with current active orders.
- * Returns true if successful.
+ * Updates the station entry with current active orders. Pacing is the caller's
+ * job so a single sweep can control its own rate.
+ * Returns whether the check succeeded and any verdict learned from the failure.
  */
 async function checkStationOrdersRemote(
   ctx: RoutineContext,
-  data: FCStationsData,
   stationEntry: FCStationEntry,
-  delayMs: number = 5000,
-): Promise<boolean> {
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+): Promise<{ ok: boolean; learned: FCSkipReason | null }> {
   const { bot } = ctx;
-  
-  // Wait the specified delay before checking (to avoid spamming server)
-  await ctx.sleep(delayMs);
-  
+
   try {
     // Use station_id parameter to check orders at this station remotely
     const ordersResp = await bot.exec("view_orders", { station_id: stationEntry.poiId });
-    
+
     if (ordersResp.error || !ordersResp.result || typeof ordersResp.result !== "object") {
-      ctx.log("fc", `Remote check failed for ${stationEntry.poiName}: ${ordersResp.error?.message || "no result"}`);
-      return false;
+      const message = ordersResp.error?.message || "no result";
+      const learned = classifyStationError(message);
+      if (learned) {
+        markStationLearnedSkip(ctx, stationEntry, learned, message);
+      } else {
+        ctx.log("fc", `Remote check failed for ${stationEntry.poiName}: ${message.split("\n")[0]}`);
+      }
+      return { ok: false, learned };
     }
-    
+
     const ordersData = ordersResp.result as Record<string, unknown>;
     const orders = Array.isArray(ordersData.orders) ? ordersData.orders : [];
-    
-    // Filter for fuel_cell sell orders
-    const fcOrders = orders.filter((o: any) => o.item_id === FUEL_CELL_ITEM_ID && o.side === "sell");
-    
-    const activeOrders = fcOrders.map((o: any) => ({
+
+    const sellItemIds = new Set(settings.sellItems.map(i => i.itemId));
+    const sellOrders = orders.filter((o: any) => sellItemIds.has(o.item_id) && o.side === "sell");
+
+    const activeOrders = sellOrders.map((o: any) => ({
+      itemId: o.item_id,
       orderId: o.order_id,
       quantity: o.quantity,
       remaining: o.remaining,
@@ -147,96 +534,325 @@ async function checkStationOrdersRemote(
       priceEach: o.price_each,
       createdAt: o.created_at,
     }));
-    
+
     // Update station entry
     stationEntry.activeOrders = activeOrders;
     stationEntry.ordersUnsold = activeOrders.reduce((sum: number, o: any) => sum + o.remaining, 0);
     stationEntry.lastVisit = new Date().toISOString();
-    
+
     const totalPlaced = activeOrders.reduce((sum: any, o: any) => sum + o.quantity, 0);
     if (totalPlaced > 0) {
       stationEntry.ordersPlaced = totalPlaced;
     }
-    
+
     ctx.log("fc", `Remote check: ${stationEntry.poiName} - ${activeOrders.length} active orders, ${stationEntry.ordersUnsold} unsold`);
-    return true;
+    return { ok: true, learned: null };
   } catch (error) {
     ctx.log("error", `Remote check error for ${stationEntry.poiName}: ${error}`);
-    return false;
+    return { ok: false, learned: null };
   }
 }
 
 /**
- * Check all stations' orders remotely and update fcStations.json.
- * Processes stations sequentially with a delay between each to avoid spamming.
+ * Check all eligible stations' orders remotely and update fcStations.json.
+ *
+ * Blacklisted stations, faction outposts and stations already proven to have no
+ * market are never queried — they only produced guaranteed errors and burned
+ * `remoteCheckDelayMs` each.
  */
 async function updateAllStationsFromRemote(
   ctx: RoutineContext,
   data: FCStationsData,
-  minDelayMs: number = 5000,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
 ): Promise<void> {
-  ctx.log("fc", `Starting remote update of all ${data.stations.length} stations (min delay: ${minDelayMs}ms)...`);
-  
+  const filters = getBlacklistFilters(true);
+  const { eligible, skipped } = partitionStations(data, settings, filters);
+  const skipCount = data.stations.length - eligible.length;
+
+  ctx.log(
+    "fc",
+    `Starting remote update of ${eligible.length}/${data.stations.length} stations ` +
+      `(${settings.remoteCheckDelayMs}ms apart; skipping ${skipCount}: ${describeSkips(skipped)})...`,
+  );
+
   let successCount = 0;
   let failCount = 0;
-  
-  for (let i = 0; i < data.stations.length; i++) {
+  let learnedCount = 0;
+
+  for (let i = 0; i < eligible.length; i++) {
     if (ctx.bot.state !== "running") {
       ctx.log("fc", "Bot stopped, aborting remote update");
       break;
     }
-    
-    const station = data.stations[i];
-    ctx.log("fc", `Checking ${station.poiName}... (${i + 1}/${data.stations.length})`);
-    
-    const success = await checkStationOrdersRemote(ctx, data, station, i === 0 ? 0 : minDelayMs);
-    
-    if (success) {
-      successCount++;
+
+    const station = eligible[i].entry;
+    if (i > 0) await ctx.sleep(settings.remoteCheckDelayMs);
+
+    ctx.log("fc", `Checking ${station.poiName}... (${i + 1}/${eligible.length})`);
+
+    if (settings.preStageMode === "preStage") {
+      try {
+        await checkStationStorageRemote(ctx, station, settings);
+        successCount++;
+      } catch (error) {
+        ctx.log("error", `Storage check error for ${station.poiName}: ${error}`);
+        failCount++;
+      }
     } else {
-      failCount++;
+      const result = await checkStationOrdersRemote(ctx, station, settings);
+      if (result.ok) {
+        successCount++;
+      } else {
+        failCount++;
+        if (result.learned) learnedCount++;
+      }
     }
-    
-    // Save after each station so we don't lose progress
+
     saveFCStationsData(data);
   }
-  
-  ctx.log("fc", `Remote update complete: ${successCount} succeeded, ${failCount} failed`);
+
+  const mode = settings.preStageMode === "preStage" ? "storage" : "orders";
+  ctx.log(
+    "fc",
+    `Remote update complete (${mode}): ${successCount} succeeded, ${failCount} failed` +
+      (learnedCount > 0 ? ` (${learnedCount} newly excluded)` : ""),
+  );
   saveFCStationsData(data);
 }
 
-function getFuelCellSellerSettings(username?: string): {
+/**
+ * Check faction storage at a specific station remotely.
+ * Updates the station entry's deposits. Returns whether the check succeeded.
+ */
+async function checkStationStorageRemote(
+  ctx: RoutineContext,
+  stationEntry: FCStationEntry,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+): Promise<boolean> {
+  const updates: Record<string, number> = {};
+  const storageFlags: Record<string, { hasFaction: boolean; hasStation: boolean }> = {};
+  let hasNoStorage = false;
+
+  for (const itemConfig of settings.sellItems) {
+    const result = await getRemoteStorageQty(ctx.bot, stationEntry.poiId, itemConfig.itemId);
+    updates[itemConfig.itemId] = result.qty;
+    storageFlags[itemConfig.itemId] = { hasFaction: result.hasFactionStorage, hasStation: result.hasStationStorage };
+    if (result.noStorageFacility) hasNoStorage = true;
+
+    const errorMsg = result.factionError || result.stationError || "";
+    if (errorMsg) {
+      const skipReason = classifyStationError(errorMsg);
+      if (skipReason) {
+        markStationLearnedSkip(ctx, stationEntry, skipReason, errorMsg);
+      }
+    }
+  }
+
+  const hasAnyStorage = Object.values(storageFlags).some(f => f.hasFaction || f.hasStation);
+  stationEntry.deposits = hasAnyStorage ? { ...(stationEntry.deposits ?? {}), ...updates } : {};
+  stationEntry.lastVisit = new Date().toISOString();
+
+  if (hasNoStorage && settings.preStageMode === "preStage") {
+    markStationLearnedSkip(ctx, stationEntry, "no_storage", "Station has no faction or station storage");
+  }
+
+  ctx.log(
+    "fc",
+    `Storage check: ${stationEntry.poiName} - ` +
+      Object.entries(updates).map(([id, qty]) => `${qty}x ${id}`).join(", "),
+  );
+  return true;
+}
+
+/**
+ * Refresh faction storage counts for all eligible stations.
+ * Called at home base to keep the priority list accurate.
+ */
+async function refreshAllStationStorage(
+  ctx: RoutineContext,
+  bot: Bot,
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+): Promise<void> {
+  const { eligible } = partitionStations(data, settings, filters);
+  const count = eligible.length;
+
+  if (count === 0) return;
+
+  ctx.log("fc", `Refreshing faction storage for ${count} stations...`);
+
+  let errorCount = 0;
+  for (let i = 0; i < count; i++) {
+    if (bot.state !== "running") {
+      ctx.log("fc", "Bot stopped, aborting storage refresh");
+      break;
+    }
+
+    const station = eligible[i].entry;
+    const updates: Record<string, number> = {};
+    let hasAnyStorage = false;
+    let hasNoStorage = false;
+
+    for (const itemConfig of settings.sellItems) {
+      const result = await getRemoteStorageQty(bot, station.poiId, itemConfig.itemId);
+      updates[itemConfig.itemId] = result.qty;
+      if (result.hasFactionStorage || result.hasStationStorage) hasAnyStorage = true;
+      if (result.noStorageFacility) hasNoStorage = true;
+
+      const errorMsg = result.factionError || result.stationError || "";
+      if (errorMsg) {
+        errorCount++;
+        const skipReason = classifyStationError(errorMsg);
+        if (skipReason) {
+          markStationLearnedSkip(ctx, station, skipReason, errorMsg);
+        } else {
+          ctx.log("fc", `Unexpected storage error at ${station.poiName} (${itemConfig.itemName}): ${errorMsg.split("\n")[0]}`);
+        }
+      }
+    }
+
+    station.deposits = hasAnyStorage ? { ...(station.deposits ?? {}), ...updates } : {};
+    station.lastVisit = new Date().toISOString();
+
+    if (hasNoStorage && settings.preStageMode === "preStage") {
+      markStationLearnedSkip(ctx, station, "no_storage", "Station has no faction or station storage");
+    }
+
+    if (i < count - 1) {
+      await ctx.sleep(settings.remoteCheckDelayMs);
+    }
+  }
+
+  saveFCStationsData(data);
+  ctx.log("fc", `Storage refresh complete for ${count} stations` + (errorCount > 0 ? ` (${errorCount} storage errors, see details above)` : ""));
+}
+
+function defaultSellItems(settings: {
+  maxFuelCellsPerStation: number;
+  priceMode: string;
+  autoMinPrice: number;
+  autoMaxPrice: number;
+  baseTargetPrice: number;
+}): SellItemConfig[] {
+  return [
+    {
+      itemId: FUEL_CELL_ITEM_ID,
+      itemName: FUEL_CELL_ITEM_NAME,
+      maxPerStation: settings.maxFuelCellsPerStation,
+      priceMode: settings.priceMode as "manual" | "auto",
+      autoMinPrice: settings.autoMinPrice,
+      autoMaxPrice: settings.autoMaxPrice,
+      baseTargetPrice: settings.baseTargetPrice,
+      blockedStations: [],
+    },
+  ];
+}
+
+export function getFuelCellSellerSettings(username?: string): {
   homeSystem: string;
   homeStation: string;
   fuelCostPerJump: number;
   refuelThreshold: number;
   repairThreshold: number;
+  sellItems: SellItemConfig[];
+  preStageMode: "none" | "preStage";
+  enablePriceUpdates: boolean;
+  priceUpdateThreshold: number;
+  maxFuelCellsPerStation: number;
   priceMode: "manual" | "auto";
   baseTargetPrice: number;
   autoMinPrice: number;
   autoMaxPrice: number;
-  maxFuelCellsPerStation: number;
   useRemoteMarketQuery: boolean;
+  remoteCheckDelayMs: number;
+  remoteUpdateIntervalMs: number;
+  skipOutposts: boolean;
+  relearnMs: number;
+  militaryFuelCellsCount: number;
+  storageRefreshIntervalMs: number;
+  blockedWaitMs: number;
+  preStagePartialLock: boolean;
+  preStageTopOffThresholdPct: number;
 } {
   const all = readSettings();
   const general = (all.general as Record<string, unknown>) || {};
   const t = all.fuel_cell_seller as Record<string, unknown> | undefined;
   const fc = t || {};
-  const botOverrides = username ? (all[username] as Record<string, unknown>) : undefined;
   const priceModeVal = (fc.priceMode as string) || "auto";
   const priceMode: "manual" | "auto" = priceModeVal === "manual" ? "manual" : "auto";
+  const rawDelay = Number(fc.remoteCheckDelayMs ?? DEFAULT_REMOTE_CHECK_DELAY_MS);
+  const rawInterval = Number(fc.remoteUpdateIntervalMinutes ?? 60);
+  const rawRelearn = Number(fc.relearnHours ?? DEFAULT_RELEARN_HOURS);
+  const maxFuelCellsPerStation = (fc.maxFuelCellsPerStation as number) || 20000;
+  const baseTargetPrice = (fc.baseTargetPrice as number) || 40;
+  const autoMinPrice = (fc.autoMinPrice as number) || 30;
+  const autoMaxPrice = (fc.autoMaxPrice as number) || 50;
+
+  let sellItems: SellItemConfig[] = [];
+  const rawSellItems = fc.sellItems as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(rawSellItems) && rawSellItems.length > 0) {
+    sellItems = rawSellItems
+      .filter(i => i.itemId && typeof i.itemId === "string")
+      .map(i => ({
+        itemId: i.itemId as string,
+        itemName: (i.itemName as string) || i.itemId as string,
+        maxPerStation: (i.maxPerStation as number) || maxFuelCellsPerStation,
+        priceMode: (i.priceMode as "manual" | "auto") || priceMode,
+        autoMinPrice: (i.autoMinPrice as number) || autoMinPrice,
+        autoMaxPrice: (i.autoMaxPrice as number) || autoMaxPrice,
+        baseTargetPrice: (i.baseTargetPrice as number) || baseTargetPrice,
+        blockedStations: Array.isArray(i.blockedStations) ? i.blockedStations.filter((s: unknown) => typeof s === "string") : [],
+      }));
+  }
+  if (sellItems.length === 0) {
+    sellItems = defaultSellItems({ maxFuelCellsPerStation, priceMode, autoMinPrice, autoMaxPrice, baseTargetPrice });
+  }
+
+  const preStageMode = (fc.preStageMode as "none" | "preStage") || "none";
+  const enablePriceUpdates = (fc.enablePriceUpdates as boolean) ?? false;
+  const priceUpdateThreshold = (fc.priceUpdateThreshold as number) || 10;
+
+  const rawStorageRefreshMin = Number(fc.storageRefreshIntervalMinutes ?? DEFAULT_STORAGE_REFRESH_INTERVAL_MINUTES);
+  const rawBlockedWaitMin = Number(fc.blockedWaitMinutes ?? DEFAULT_BLOCKED_WAIT_MINUTES);
+
   return {
-    homeSystem: (botOverrides?.homeSystem as string) || (fc.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
-    homeStation: (botOverrides?.homeStation as string) || (fc.homeStation as string) || (general.factionStorageStation as string) || "sol_central",
+    homeSystem: (fc.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
+    homeStation: (fc.homeStation as string) || (general.factionStorageStation as string) || "sol_central",
     fuelCostPerJump: (fc.fuelCostPerJump as number) || 10,
     refuelThreshold: (fc.refuelThreshold as number) || 35,
     repairThreshold: (fc.repairThreshold as number) || 80,
+    sellItems,
+    preStageMode,
+    enablePriceUpdates,
+    priceUpdateThreshold,
+    maxFuelCellsPerStation,
     priceMode,
-    baseTargetPrice: (fc.baseTargetPrice as number) || 40,
-    autoMinPrice: (fc.autoMinPrice as number) || 30,
-    autoMaxPrice: (fc.autoMaxPrice as number) || 50,
-    maxFuelCellsPerStation: (fc.maxFuelCellsPerStation as number) || 20000,
+    baseTargetPrice,
+    autoMinPrice,
+    autoMaxPrice,
     useRemoteMarketQuery: (fc.useRemoteMarketQuery as boolean) ?? true,
+    remoteCheckDelayMs: Number.isFinite(rawDelay)
+      ? Math.max(MIN_REMOTE_CHECK_DELAY_MS, Math.round(rawDelay))
+      : DEFAULT_REMOTE_CHECK_DELAY_MS,
+    remoteUpdateIntervalMs: Number.isFinite(rawInterval) && rawInterval > 0
+      ? Math.round(rawInterval * 60 * 1000)
+      : 60 * 60 * 1000,
+    skipOutposts: (fc.skipOutposts as boolean) ?? true,
+    relearnMs: Number.isFinite(rawRelearn) && rawRelearn > 0
+      ? Math.round(rawRelearn * 60 * 60 * 1000)
+      : DEFAULT_RELEARN_HOURS * 60 * 60 * 1000,
+    militaryFuelCellsCount: (fc.militaryFuelCellsCount as number) || 10,
+    storageRefreshIntervalMs: Number.isFinite(rawStorageRefreshMin) && rawStorageRefreshMin > 0
+      ? Math.max(MIN_STORAGE_REFRESH_INTERVAL_MINUTES, Math.round(rawStorageRefreshMin)) * 60 * 1000
+      : DEFAULT_STORAGE_REFRESH_INTERVAL_MINUTES * 60 * 1000,
+    blockedWaitMs: Number.isFinite(rawBlockedWaitMin) && rawBlockedWaitMin > 0
+      ? Math.max(MIN_BLOCKED_WAIT_MINUTES, Math.round(rawBlockedWaitMin)) * 60 * 1000
+      : DEFAULT_BLOCKED_WAIT_MINUTES * 60 * 1000,
+    preStagePartialLock: (fc.preStagePartialLock as boolean) ?? true,
+    preStageTopOffThresholdPct: Number.isFinite(Number(fc.preStageTopOffThresholdPct))
+      ? Math.max(0, Math.min(100, Math.round(Number(fc.preStageTopOffThresholdPct))))
+      : 0,
   };
 }
 
@@ -248,16 +864,34 @@ function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: num
   return { jumps, cost: jumps * costPerJump };
 }
 
+/**
+ * Build the candidate station list from the map, excluding everything we already
+ * know we can never sell at: pirate systems, blacklisted systems/stations and
+ * faction outposts. Learned verdicts are applied later (they live per entry).
+ */
 function initializeFCStations(settings: ReturnType<typeof getFuelCellSellerSettings>): FCStationEntry[] {
   const entries: FCStationEntry[] = [];
+  const seen = new Set<string>();
+  const filters = getBlacklistFilters(true);
   const systems = mapStore.getAllSystems();
+  const mobileCapital = mapStore.getMobileCapitolLocation();
 
   for (const [systemId, sys] of Object.entries(systems)) {
     if (isPirateSystem(systemId)) continue;
+    if (filters.systems.has(systemId.toLowerCase())) continue;
 
     for (const poi of sys.pois) {
-      if (!poi.has_base) continue;
-      if (isPirateSystem(systemId)) continue;
+      if (!poi.has_base && !poi.base_id) continue;
+      if (isStationBlacklisted(systemId, poi.id, filters.stations)) continue;
+      if (settings.skipOutposts && looksLikeOutpost({ systemId, poiId: poi.id, poiName: poi.name })) continue;
+      if (mapSaysNoMarket(poi)) continue;
+
+      // The mobile capital shows up in every system it has ever been seen in;
+      // only its currently tracked location is real.
+      const key = poi.id.toLowerCase();
+      if (seen.has(key)) continue;
+      if (poi.id === "mobile_capital" && mobileCapital && mobileCapital.systemId !== systemId) continue;
+      seen.add(key);
 
       entries.push({
         systemId,
@@ -268,6 +902,11 @@ function initializeFCStations(settings: ReturnType<typeof getFuelCellSellerSetti
         activeOrders: [],
         lastVisit: null,
         lastPrice: null,
+        deposits: {},
+        learnedSkip: null,
+        learnedSkipAt: null,
+        learnedSkipDetail: null,
+        skipReason: null,
       });
     }
   }
@@ -275,96 +914,743 @@ function initializeFCStations(settings: ReturnType<typeof getFuelCellSellerSetti
   return entries;
 }
 
+/**
+ * Merge newly-mapped stations into the persisted list and retire dead rows.
+ *
+ * Order counts and learned verdicts of known stations are preserved. Entries that
+ * are now excluded (blacklisted, outpost, …) are only dropped when nothing is
+ * parked at them, so a blacklisted station that still holds our orders stays
+ * visible in the file.
+ */
+function syncFCStations(
+  ctx: RoutineContext,
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+): boolean {
+  const filters = getBlacklistFilters(true);
+  const discovered = initializeFCStations(settings);
+  const known = new Map(data.stations.map(s => [s.poiId.toLowerCase(), s]));
+
+  let added = 0;
+  for (const candidate of discovered) {
+    const existing = known.get(candidate.poiId.toLowerCase());
+    if (!existing) {
+      data.stations.push(candidate);
+      known.set(candidate.poiId.toLowerCase(), candidate);
+      added++;
+      continue;
+    }
+    // Keep names/locations current (stations get renamed, the capital moves).
+    if (candidate.poiName && existing.poiName !== candidate.poiName) existing.poiName = candidate.poiName;
+    if (existing.systemId !== candidate.systemId) existing.systemId = candidate.systemId;
+  }
+
+  const before = data.stations.length;
+  data.stations = data.stations.filter(entry => {
+    const isHome = entry.systemId === data.homeSystem && entry.poiId === data.homeStation;
+    if (isHome) return true;
+    const reason = evaluateStationSkip(entry, data, settings, filters);
+    if (!reason) return true;
+    // Config-based exclusions with nothing parked there are just noise.
+    const hasStake = entry.ordersUnsold > 0 || entry.activeOrders.length > 0;
+    return hasStake || LEARNABLE_SKIPS.has(reason);
+  });
+  const removed = before - data.stations.length;
+
+  if (added > 0 || removed > 0) {
+    ctx.log("fc", `Station list synced with map: +${added} new, -${removed} excluded (${data.stations.length} tracked)`);
+  }
+  return added > 0 || removed > 0;
+}
+
+/** Keep an auto-computed price inside the user's safe band. A lowball order on
+ *  the market (or any garbage signal) must never drag our listing below the
+ *  configured minimum — that is exactly how a 40cr order got posted. */
+function clampToPriceBand(price: number, itemConfig: SellItemConfig): number {
+  const rounded = Math.round(price);
+  return Math.min(itemConfig.autoMaxPrice, Math.max(itemConfig.autoMinPrice, rounded));
+}
+
 async function getOptimalPrice(
   ctx: RoutineContext,
   marketData: unknown,
-  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  itemConfig: SellItemConfig,
 ): Promise<number> {
   const { bot } = ctx;
 
-  if (settings.priceMode === "manual") {
-    return settings.baseTargetPrice;
+  if (itemConfig.priceMode === "manual") {
+    return itemConfig.baseTargetPrice;
   }
 
+  const bandMidpoint = Math.round((itemConfig.autoMinPrice + itemConfig.autoMaxPrice) / 2);
+
   if (!marketData || typeof marketData !== "object") {
-    return settings.baseTargetPrice;
+    return clampToPriceBand(bandMidpoint, itemConfig);
   }
 
   const md = marketData as Record<string, unknown>;
   const items = Array.isArray(md) ? md : Array.isArray(md.items) ? md.items : [];
-  const fcItem = items.find(i => (i as Record<string, unknown>).item_id === FUEL_CELL_ITEM_ID);
-  if (!fcItem) {
-    return settings.baseTargetPrice;
+  const targetItem = items.find(i => (i as Record<string, unknown>).item_id === itemConfig.itemId);
+  if (!targetItem) {
+    return clampToPriceBand(bandMidpoint, itemConfig);
   }
 
-  const fi = fcItem as Record<string, unknown>;
+  const fi = targetItem as Record<string, unknown>;
   const bestSell = (fi.best_sell as number) || 0;
   const bestBuy = (fi.best_buy as number) || 0;
 
   if (bestSell > 0 && bestBuy > 0) {
-    const midPrice = Math.round((bestBuy + bestSell) / 2);
-    if (midPrice >= settings.autoMinPrice && midPrice <= settings.autoMaxPrice) {
-      return midPrice;
-    }
+    return clampToPriceBand((bestBuy + bestSell) / 2, itemConfig);
   }
 
-  if (bestSell >= settings.autoMinPrice && bestSell <= settings.autoMaxPrice) {
-    return bestSell;
+  if (bestSell > 0) {
+    return clampToPriceBand(bestSell, itemConfig);
   }
 
-  if (bestBuy >= settings.autoMinPrice && bestBuy <= settings.autoMaxPrice) {
-    return bestBuy;
+  if (bestBuy > 0) {
+    return clampToPriceBand(bestBuy, itemConfig);
   }
 
-  return settings.baseTargetPrice;
+  return clampToPriceBand(bandMidpoint, itemConfig);
 }
 
-function getNextStation(
-  data: FCStationsData,
-  currentIndex: number,
+function getSellItemConfig(
   settings: ReturnType<typeof getFuelCellSellerSettings>,
-): number {
-  const totalStations = data.stations.length;
-  if (totalStations === 0) return -1;
+  itemId: string,
+): SellItemConfig | undefined {
+  return settings.sellItems.find(i => i.itemId === itemId);
+}
 
-  // Always prioritize the home station if it can accept more orders
-  const homeStationIdx = data.stations.findIndex(station =>
-    station.systemId === data.homeSystem && station.poiId === data.homeStation
+function getSellItemCargo(bot: Bot, itemId: string): number {
+  return bot.inventory.find(i => i.itemId === itemId)?.quantity ?? 0;
+}
+
+function hasAnySellCargo(bot: Bot, settings: ReturnType<typeof getFuelCellSellerSettings>): boolean {
+  return settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
+}
+
+function totalSellCargoQty(bot: Bot, settings: ReturnType<typeof getFuelCellSellerSettings>): number {
+  return settings.sellItems.reduce((sum, i) => sum + getSellItemCargo(bot, i.itemId), 0);
+}
+
+interface PreStageLedgerEntry {
+  quantity: number;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+interface PreStageLedger {
+  version: number;
+  entries: Record<string, PreStageLedgerEntry>;
+}
+
+function emptyPreStageLedger(): PreStageLedger {
+  return { version: 1, entries: {} };
+}
+
+function loadPreStageLedger(): PreStageLedger {
+  try {
+    if (!existsSync(FC_PRESTAGE_LEDGER_FILE)) return emptyPreStageLedger();
+    const raw = readFileSync(FC_PRESTAGE_LEDGER_FILE, "utf-8");
+    const data = JSON.parse(raw) as PreStageLedger;
+    if (!data.entries || typeof data.entries !== "object") data.entries = {};
+    return data;
+  } catch {
+    return emptyPreStageLedger();
+  }
+}
+
+function savePreStageLedger(ledger: PreStageLedger): void {
+  writeFileSync(FC_PRESTAGE_LEDGER_FILE, JSON.stringify(ledger, null, 2));
+}
+
+function ledgerKey(stationId: string, itemId: string): string {
+  return `${stationId}|${itemId}`;
+}
+
+function getLedgerQty(ledger: PreStageLedger, stationId: string, itemId: string): number {
+  const entry = ledger.entries[ledgerKey(stationId, itemId)];
+  return entry?.quantity ?? 0;
+}
+
+function setLedgerQty(ledger: PreStageLedger, stationId: string, itemId: string, qty: number, botName: string): void {
+  ledger.entries[ledgerKey(stationId, itemId)] = {
+    quantity: qty,
+    updatedAt: new Date().toISOString(),
+    updatedBy: botName,
+  };
+}
+
+async function withPreStageLock(bot: Bot, fn: () => Promise<void>): Promise<void> {
+  const lockDir = FC_PRESTAGE_LOCK_FILE;
+  const start = Date.now();
+  const timeout = 30_000;
+  while (Date.now() - start < timeout) {
+    try {
+      mkdirSync(lockDir, { recursive: true });
+      await fn();
+      return;
+    } catch (err) {
+      if (err && (err as any).code === "EEXIST") {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        continue;
+      }
+      throw err;
+    }
+  }
+  bot.log("warn", "Pre-stage lock timeout — proceeding without lock");
+  await fn();
+}
+
+interface StationReservationEntry {
+  botName: string;
+  reservedAt: string;
+  reservedQty: number;
+}
+
+type Reservations = Record<string, StationReservationEntry[]>;
+
+/** Backwards-compatible: the old format stored a single { botName, reservedAt }
+ *  per station. The new format stores an array of entries. If the file on disk
+ *  has the legacy shape, it is upgraded transparently on load. */
+function normalizeReservation(raw: unknown): StationReservationEntry[] | null {
+  if (!raw) return null;
+  if (Array.isArray(raw)) {
+    return raw.filter(
+      (r): r is StationReservationEntry =>
+        typeof r === "object" && r !== null &&
+        typeof r.botName === "string" &&
+        typeof r.reservedAt === "string",
+    ).map(r => ({ botName: r.botName, reservedAt: r.reservedAt, reservedQty: r.reservedQty ?? 0 }));
+  }
+  if (typeof raw === "object" && raw !== null) {
+    const obj = raw as { botName?: string; reservedAt?: string; reservedQty?: number };
+    if (typeof obj.botName === "string" && typeof obj.reservedAt === "string") {
+      return [{ botName: obj.botName, reservedAt: obj.reservedAt, reservedQty: obj.reservedQty ?? 0 }];
+    }
+  }
+  return null;
+}
+
+function loadReservations(): Reservations {
+  try {
+    if (!existsSync(FC_PRESTAGE_RESERVATIONS_FILE)) return {};
+    const raw = readFileSync(FC_PRESTAGE_RESERVATIONS_FILE, "utf-8");
+    const parsed = JSON.parse(raw);
+    const result: Reservations = {};
+    for (const [stationId, val] of Object.entries(parsed || {})) {
+      const arr = normalizeReservation(val);
+      if (arr && arr.length > 0) {
+        result[stationId] = arr;
+      }
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+function saveReservations(reservations: Reservations): void {
+  const payload = JSON.stringify(reservations, null, 2);
+  safeWriteFileSync(FC_PRESTAGE_RESERVATIONS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+}
+
+export function cleanExpiredReservations(reservations: Reservations): void {
+  const now = Date.now();
+  for (const [stationId, entries] of Object.entries(reservations)) {
+    const live = entries.filter(e => {
+      const reservedAt = new Date(e.reservedAt).getTime();
+      return now - reservedAt < RESERVATION_TIMEOUT_MS;
+    });
+    if (live.length === 0) {
+      delete reservations[stationId];
+    } else {
+      reservations[stationId] = live;
+    }
+  }
+}
+
+/** Total quantity reserved by *other* bots at this station (expired entries
+ *  already pruned by cleanExpiredReservations). */
+export function reservedQtyByOthers(reservations: Reservations, stationId: string, botName: string): number {
+  const entries = reservations[stationId];
+  if (!entries) return 0;
+  return entries
+    .filter(e => e.botName !== botName)
+    .reduce((sum, e) => sum + e.reservedQty, 0);
+}
+
+export function reserveStation(
+  reservations: Reservations,
+  stationId: string,
+  botName: string,
+  reservedQty: number,
+): void {
+  if (!reservations[stationId]) reservations[stationId] = [];
+  reservations[stationId] = reservations[stationId].filter(e => e.botName !== botName);
+  reservations[stationId].push({ botName, reservedAt: new Date().toISOString(), reservedQty: Math.max(0, reservedQty) });
+}
+
+export function clearStationReservation(
+  reservations: Reservations,
+  stationId: string,
+  botName: string,
+): void {
+  const entries = reservations[stationId];
+  if (!entries) return;
+  reservations[stationId] = entries.filter(e => e.botName !== botName);
+  if (reservations[stationId].length === 0) {
+    delete reservations[stationId];
+  }
+}
+
+/**
+ * When preStagePartialLock is enabled: returns true only when the sum of
+ * quantities already reserved by *other* bots plus this bot's planned deposit
+ * would exceed the station's per-item capacity (maxQty). This lets multiple
+ * bots share a station — each only locks the cargo it is actually carrying.
+ *
+ * When preStagePartialLock is disabled: falls back to the original behaviour —
+ * the station is fully locked for any other bot regardless of quantity.
+ */
+export function isStationReserved(
+  reservations: Reservations,
+  stationId: string,
+  botName: string,
+  plannedQty: number,
+  maxQty: number,
+  partialLock: boolean,
+): boolean {
+  const entries = reservations[stationId];
+  if (!entries || entries.length === 0) return false;
+
+  const otherEntries = entries.filter(e => e.botName !== botName);
+  if (otherEntries.length === 0) return false;
+
+  if (!partialLock) {
+    return true;
+  }
+
+  const totalFromOthers = otherEntries.reduce((sum, e) => sum + e.reservedQty, 0);
+  return totalFromOthers + plannedQty > maxQty;
+}
+
+interface StorageCheckResult {
+  qty: number;
+  hasFactionStorage: boolean;
+  hasStationStorage: boolean;
+  noStorageFacility: boolean;
+  factionError?: string;
+  stationError?: string;
+}
+
+async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string): Promise<StorageCheckResult> {
+  let hasFactionStorage = false;
+  let hasStationStorage = false;
+  let noFactionStorage = false;
+  let noStationStorage = false;
+  let factionError: string | undefined;
+  let stationError: string | undefined;
+
+   // Try faction storage first
+  try {
+    const factionResp = await bot.exec("view_faction_storage", { station_id: stationId });
+    if (!factionResp.error && factionResp.result) {
+      hasFactionStorage = true;
+      const result = factionResp.result as Record<string, unknown>;
+      const items = Array.isArray(result.items) ? result.items : [];
+      const found = items.find((i: any) => i.item_id === itemId || i.itemId === itemId);
+      if (found) return { qty: found.quantity ?? found.qty ?? 0, hasFactionStorage: true, hasStationStorage: false, noStorageFacility: false };
+    } else if (factionResp.error) {
+      factionError = factionResp.error.message || "";
+      const errMsg = factionError.toLowerCase();
+      if (errMsg.includes("does not have a storage facility") || errMsg.includes("no storage facility")) {
+        noFactionStorage = true;
+      } else {
+        bot.log("fc", `view_faction_storage error for ${stationId} / ${itemId}: ${factionError.split("\n")[0]}`);
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    factionError = msg;
+    bot.log("fc", `view_faction_storage threw for ${stationId} / ${itemId}: ${msg.split("\n")[0]}`);
+  }
+
+  // Fallback to station storage
+  try {
+    const stationResp = await bot.exec("view_storage", { station_id: stationId });
+    if (!stationResp.error && stationResp.result) {
+      hasStationStorage = true;
+      const result = stationResp.result as Record<string, unknown>;
+      const items = Array.isArray(result.items) ? result.items : [];
+      const found = items.find((i: any) => i.item_id === itemId || i.itemId === itemId);
+      if (found) return { qty: found.quantity ?? found.qty ?? 0, hasFactionStorage: false, hasStationStorage: true, noStorageFacility: false };
+    } else if (stationResp.error) {
+      stationError = stationResp.error.message || "";
+      const errMsg = stationError.toLowerCase();
+      if (errMsg.includes("does not offer storage")) {
+        noStationStorage = true;
+      } else {
+        bot.log("fc", `view_storage error for ${stationId} / ${itemId}: ${stationError.split("\n")[0]}`);
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    stationError = msg;
+    bot.log("fc", `view_storage threw for ${stationId} / ${itemId}: ${msg.split("\n")[0]}`);
+  }
+
+  return { qty: 0, hasFactionStorage, hasStationStorage, noStorageFacility: noFactionStorage && noStationStorage, factionError, stationError };
+}
+
+/**
+ * Build a priority list of stations that still need pre-staging for any sell item.
+ * Uses the refreshed deposits field (faction storage counts synced at home base)
+ * so the priority list reflects actual station stock, not stale ledger entries.
+ * Stations are sorted by priority: most depleted (highest total need) first,
+ * then by fuel cost (cheapest first), then by oldest last visit.
+ *
+ * When a focus item is provided, stations with 0 stock of that item are treated
+ * as emergency priority.
+ */
+async function buildPreStagePlan(
+  ctx: RoutineContext,
+  bot: Bot,
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+  focusItemId: string | null,
+): Promise<Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number> }>> {
+  const { eligible } = partitionStations(data, settings, filters);
+  const plan: Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number>; totalNeed: number; hasZeroFocus: boolean }> = [];
+
+  const focusItem = settings.sellItems.find(i => i.itemId === focusItemId) || settings.sellItems[0];
+  const focusBlocked = new Set(
+    focusItem.blockedStations.map(
+      b => b.toLowerCase()
+    )
   );
-  if (homeStationIdx >= 0) {
-    const homeStation = data.stations[homeStationIdx];
-    if (homeStation.ordersUnsold < settings.maxFuelCellsPerStation) {
-      return homeStationIdx;
+
+  for (const { entry, idx } of eligible) {
+    const needByItem: Record<string, number> = {};
+    let totalNeed = 0;
+
+    if (Object.keys(entry.deposits ?? {}).length === 0) {
+      continue;
+    }
+
+    for (const itemConfig of settings.sellItems) {
+      if (
+        itemConfig.blockedStations.some(
+          b => b.toLowerCase() === entry.poiId.toLowerCase() || b.toLowerCase() === `${entry.systemId}|${entry.poiId}`.toLowerCase(),
+        )
+      ) {
+        continue;
+      }
+
+      const knownQty = entry.deposits?.[itemConfig.itemId] || 0;
+      const need = preStageNeed(itemConfig, knownQty, settings.preStageTopOffThresholdPct);
+      if (need > 0) {
+        needByItem[itemConfig.itemId] = need;
+        totalNeed += need;
+      }
+    }
+
+    if (totalNeed > 0) {
+      const focusKey = entry.poiId.toLowerCase();
+      const focusSysKey = `${entry.systemId}|${entry.poiId}`.toLowerCase();
+      const isFocusBlocked = focusBlocked.has(focusKey) || focusBlocked.has(focusSysKey);
+      const knownFocusQty = entry.deposits?.[focusItem.itemId] || 0;
+      const hasZeroFocus = !isFocusBlocked && knownFocusQty === 0 && knownFocusQty < focusItem.maxPerStation;
+      const needsFocus = needByItem[focusItem.itemId] !== undefined;
+      if (focusItemId && !needsFocus) continue;
+      plan.push({ idx, entry, needByItem, totalNeed, hasZeroFocus });
     }
   }
 
-  // Prioritize stations with lowest unsold (highest demand), then closest, then oldest visit
-  const stationPriority = data.stations.map((station, idx) => {
+  plan.sort((a, b) => {
+    // Emergency first: stations with 0 stock of focus item
+    if (a.hasZeroFocus !== b.hasZeroFocus) return a.hasZeroFocus ? -1 : 1;
+    if (a.totalNeed !== b.totalNeed) return b.totalNeed - a.totalNeed;
+    const costA = estimateFuelCost(data.homeSystem, a.entry.systemId, settings.fuelCostPerJump).cost;
+    const costB = estimateFuelCost(data.homeSystem, b.entry.systemId, settings.fuelCostPerJump).cost;
+    if (costA !== costB) return costA - costB;
+    const lastA = a.entry.lastVisit ? new Date(a.entry.lastVisit).getTime() : 0;
+    const lastB = b.entry.lastVisit ? new Date(b.entry.lastVisit).getTime() : 0;
+    return lastA - lastB;
+  });
+
+  return plan.map(({ idx, entry, needByItem }) => ({ idx, entry, needByItem }));
+}
+
+/**
+ * Cancel existing sell orders at a station whose price has drifted beyond the
+ * configured threshold from the current optimal price. Returns the list of
+ * cancelled order IDs.
+ */
+async function updateStationPrices(
+  ctx: RoutineContext,
+  bot: Bot,
+  stationEntry: FCStationEntry,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+): Promise<string[]> {
+  if (!settings.enablePriceUpdates) return [];
+  if (stationEntry.activeOrders.length === 0) return [];
+
+  const cancelled: string[] = [];
+  const sellItemIds = new Set(settings.sellItems.map(i => i.itemId));
+
+  for (const order of stationEntry.activeOrders) {
+    if (!sellItemIds.has(order.itemId)) continue;
+    const itemConfig = getSellItemConfig(settings, order.itemId);
+    if (!itemConfig) continue;
+
+    let marketData: unknown = null;
+    const marketResp = await bot.exec("view_market", { item_id: order.itemId });
+    if (!marketResp.error && marketResp.result) {
+      marketData = marketResp.result;
+    } else if (settings.useRemoteMarketQuery !== false) {
+      try {
+        const result = await queryRemoteMarket({ itemId: order.itemId, tradeType: "sell", requesterSystemId: bot.system });
+        if (result.ok && result.results.length > 0) {
+          const best = result.results[0];
+          marketData = {
+            items: [{
+              item_id: order.itemId,
+              best_sell: best.price,
+              best_buy: best.price,
+            }],
+          };
+        }
+      } catch {
+        // ignore remote query failures for price updates
+      }
+    }
+
+    const optimalPrice = await getOptimalPrice(ctx, marketData, itemConfig);
+    const currentPrice = order.priceEach;
+    if (currentPrice <= 0) continue;
+
+    const drift = Math.abs(optimalPrice - currentPrice) / currentPrice;
+    if (drift * 100 >= settings.priceUpdateThreshold) {
+      ctx.log(
+        "fc",
+        `Price drift on ${order.itemId} order ${order.orderId}: current=${currentPrice}cr optimal=${optimalPrice}cr (${(drift * 100).toFixed(1)}% >= ${settings.priceUpdateThreshold}%) — cancelling`,
+      );
+      const cancelResp = await bot.exec("cancel_order", { order_id: order.orderId });
+      if (!cancelResp.error) {
+        cancelled.push(order.orderId);
+      } else {
+        ctx.log("error", `Cancel order ${order.orderId} failed: ${cancelResp.error.message}`);
+      }
+      await ctx.sleep(2000);
+    }
+  }
+
+  return cancelled;
+}
+
+/** Effective pre-stage deficit for an item at a station. Returns 0 when the
+ *  station is within the configured top-off threshold of full (so the bot
+ *  doesn't waste a trip restocking a unit or two), otherwise maxPerStation -
+ *  knownQty. A threshold of 0 disables the check (existing behavior). */
+function preStageNeed(
+  itemConfig: SellItemConfig,
+  knownQty: number,
+  thresholdPct: number,
+): number {
+  const need = Math.max(0, itemConfig.maxPerStation - knownQty);
+  if (need <= 0) return 0;
+  if (!thresholdPct || thresholdPct <= 0) return need;
+  const minNeed = Math.ceil(itemConfig.maxPerStation * thresholdPct / 100);
+  return need >= minNeed ? need : 0;
+}
+
+function stationNeedsItem(
+  entry: FCStationEntry,
+  itemConfig: SellItemConfig,
+  preStage: boolean,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+): boolean {
+  if (preStage) {
+    const knownQty = entry.deposits?.[itemConfig.itemId] || 0;
+    return preStageNeed(itemConfig, knownQty, settings.preStageTopOffThresholdPct) > 0;
+  }
+  const unsoldForItem = entry.activeOrders
+    .filter(o => o.itemId === itemConfig.itemId)
+    .reduce((sum, o) => sum + o.remaining, 0);
+  return unsoldForItem < itemConfig.maxPerStation;
+}
+
+function stationHasZeroStock(
+  entry: FCStationEntry,
+  itemConfig: SellItemConfig,
+  preStage: boolean,
+): boolean {
+  if (preStage) {
+    return (entry.deposits?.[itemConfig.itemId] || 0) === 0;
+  }
+  return !entry.activeOrders.some(o => o.itemId === itemConfig.itemId);
+}
+
+export function computeItemNeeds(
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+): Map<string, number> {
+  const { eligible } = partitionStations(data, settings, filters);
+  const needs = new Map<string, number>();
+  const preStage = settings.preStageMode === "preStage";
+
+  for (const item of settings.sellItems) {
+    needs.set(item.itemId, 0);
+  }
+
+  for (const { entry } of eligible) {
+    for (const item of settings.sellItems) {
+      if (!stationNeedsItem(entry, item, preStage, settings)) continue;
+
+      if (preStage) {
+        const knownQty = entry.deposits?.[item.itemId] || 0;
+        needs.set(item.itemId, (needs.get(item.itemId) || 0) + preStageNeed(item, knownQty, settings.preStageTopOffThresholdPct));
+      } else {
+        needs.set(item.itemId, (needs.get(item.itemId) || 0) + 1);
+      }
+    }
+  }
+
+  return needs;
+}
+
+function computeItemUrgency(
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+): ItemUrgency[] {
+  const { eligible } = partitionStations(data, settings, filters);
+  const preStage = settings.preStageMode === "preStage";
+  const urgencies: ItemUrgency[] = [];
+
+  for (const item of settings.sellItems) {
+    let totalNeed = 0;
+    let criticalStationCount = 0;
+    let zeroStationCount = 0;
+    let criticalDeficit = 0;
+
+    for (const { entry } of eligible) {
+      if (!stationNeedsItem(entry, item, preStage, settings)) continue;
+
+      const knownQty = preStage ? (entry.deposits?.[item.itemId] || 0) : 0;
+      const need = preStage ? preStageNeed(item, knownQty, settings.preStageTopOffThresholdPct) : Math.max(0, item.maxPerStation - knownQty);
+      if (need <= 0) continue;
+      totalNeed += need;
+
+      if (knownQty === 0) {
+        zeroStationCount++;
+        criticalStationCount++;
+        criticalDeficit += need;
+      } else if (knownQty <= item.maxPerStation * CRITICAL_FILL_THRESHOLD) {
+        criticalStationCount++;
+        criticalDeficit += need;
+      }
+    }
+
+    urgencies.push({
+      itemId: item.itemId,
+      totalNeed,
+      criticalStationCount,
+      zeroStationCount,
+      criticalDeficit,
+    });
+  }
+
+  return urgencies;
+}
+
+export function selectFocusItem(
+  itemUrgencies: ItemUrgency[],
+  currentFocusItemId: string | null,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+): string {
+  if (settings.sellItems.length <= 1) {
+    return settings.sellItems[0]?.itemId || "";
+  }
+
+  const sorted = [...itemUrgencies].sort((a, b) => {
+    if (b.criticalStationCount !== a.criticalStationCount) return b.criticalStationCount - a.criticalStationCount;
+    if (b.zeroStationCount !== a.zeroStationCount) return b.zeroStationCount - a.zeroStationCount;
+    if (b.criticalDeficit !== a.criticalDeficit) return b.criticalDeficit - a.criticalDeficit;
+    return b.totalNeed - a.totalNeed;
+  });
+
+  const bestItem = sorted[0]?.itemId || settings.sellItems[0]?.itemId || "";
+
+  if (currentFocusItemId && bestItem !== currentFocusItemId) {
+    const current = itemUrgencies.find(u => u.itemId === currentFocusItemId);
+    const best = sorted[0];
+    if (current && best && current.criticalStationCount > 0 && current.criticalStationCount >= best.criticalStationCount * 0.8) {
+      return currentFocusItemId;
+    }
+  }
+
+  return bestItem;
+}
+
+/**
+ * Pick the next station to sell at. Only stations that passed the eligibility
+ * screen are considered, so blacklisted stations, faction outposts and stations
+ * proven to have no market are never travelled to.
+ *
+ * When a focus item is provided, stations with 0 stock of that item are treated
+ * as emergency priority, followed by stations that still need the focus item.
+ */
+function getNextStation(
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+  focusItemId: string | null,
+): number {
+  const { eligible } = partitionStations(data, settings, filters);
+  if (eligible.length === 0) return -1;
+
+  // Always prioritize the home station if it can accept more orders for any sell item
+  const home = eligible.find(({ entry }) =>
+    entry.systemId === data.homeSystem && entry.poiId === data.homeStation
+  );
+  if (home && settings.sellItems.some(item => home.entry.ordersUnsold < item.maxPerStation)) {
+    return home.idx;
+  }
+
+  const preStage = settings.preStageMode === "preStage";
+  const focusItem = settings.sellItems.find(i => i.itemId === focusItemId) || settings.sellItems[0];
+
+  const stationPriority = eligible.map(({ entry: station, idx }) => {
     const cost = estimateFuelCost(data.homeSystem, station.systemId, settings.fuelCostPerJump).cost;
     const lastVisit = station.lastVisit ? new Date(station.lastVisit).getTime() : 0;
-    const isNearCap = station.ordersUnsold >= settings.maxFuelCellsPerStation;
+    const isNearCap = settings.sellItems.every(item => station.ordersUnsold >= item.maxPerStation);
+    const hasZeroFocus = !isNearCap && stationHasZeroStock(station, focusItem, preStage);
+    const needsFocus = stationNeedsItem(station, focusItem, preStage, settings);
+
     return {
       idx,
       ordersUnsold: station.ordersUnsold,
       cost,
       lastVisit,
       isNearCap,
-      // Priority: low unsold first, then low cost, then old lastVisit
-      // But skip near cap stations
-      priorityScore: isNearCap ? 999999 : station.ordersUnsold,
+      hasZeroFocus,
+      needsFocus,
+      priorityScore: isNearCap ? 999999 : hasZeroFocus ? 1 : needsFocus ? 2 : 3,
       tieBreaker: cost,
       lastTie: lastVisit,
     };
   });
 
-  // Sort by priorityScore ascending (low unsold first), then cost ascending, then lastVisit ascending
   stationPriority.sort((a, b) => {
     if (a.priorityScore !== b.priorityScore) return a.priorityScore - b.priorityScore;
     if (a.tieBreaker !== b.tieBreaker) return a.tieBreaker - b.tieBreaker;
     return a.lastTie - b.lastTie;
   });
 
-  // Always pick the best (first in sorted)
   return stationPriority[0].idx;
 }
 
@@ -387,12 +1673,24 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     fcData.currentStationIndex = 0;
     fcData.lastStarted = new Date().toISOString();
     saveFCStationsData(fcData);
+  } else {
+    // Fold in stations discovered since the list was built and retire rows that
+    // the blacklist / outpost screen now excludes.
+    syncFCStations(ctx, fcData, settings);
+    saveFCStationsData(fcData);
+  }
+
+  {
+    const { eligible, skipped } = partitionStations(fcData, settings, getBlacklistFilters(true));
+    ctx.log(
+      "fc",
+      `Tracking ${fcData.stations.length} stations: ${eligible.length} sellable, ` +
+        `${fcData.stations.length - eligible.length} skipped (${describeSkips(skipped)})`,
+    );
   }
 
   // Track last remote update time for periodic checks
-  let lastRemoteUpdate: number = 0;
-  const REMOTE_UPDATE_INTERVAL = 60 * 60 * 1000; // 1 hour in milliseconds
-  const MIN_DELAY_BETWEEN_STATION_CHECKS = 5000; // 5 seconds
+  let lastRemoteUpdate: number = fcData.lastRemoteUpdate || 0;
 
   // Persistent battle state across cycles
   const battleState: BattleState = {
@@ -403,6 +1701,9 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     isFleeing: false,
     lastFleeTime: undefined,
   };
+
+  let currentFocusItemId: string | null = null;
+  let lastStorageRefresh: number = 0;
 
   while (bot.state === "running") {
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -432,17 +1733,46 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       }
     }
 
-    // Periodic remote update of station orders (every hour)
+    // Periodic remote update of station orders
     const now = Date.now();
-    if (now - lastRemoteUpdate >= REMOTE_UPDATE_INTERVAL) {
+    if (now - lastRemoteUpdate >= settings.remoteUpdateIntervalMs) {
       ctx.log("fc", "Time for periodic remote update of station orders...");
-      await updateAllStationsFromRemote(ctx, fcData, MIN_DELAY_BETWEEN_STATION_CHECKS);
+      await updateAllStationsFromRemote(ctx, fcData, settings);
       lastRemoteUpdate = now;
-      // Reload data after update to ensure we have latest
+      fcData.lastRemoteUpdate = now;
+      saveFCStationsData(fcData);
       fcData = loadFCStationsData();
     }
 
-    const allStationsFull = fcData.stations.every(station => station.ordersUnsold >= settings.maxFuelCellsPerStation);
+    // Refresh focus item based on freshest station need counts
+    if (settings.sellItems.length > 1) {
+      const itemUrgencies = computeItemUrgency(fcData, settings, getBlacklistFilters());
+      currentFocusItemId = selectFocusItem(itemUrgencies, currentFocusItemId, settings);
+      const focusItem = settings.sellItems.find(i => i.itemId === currentFocusItemId);
+      const counts = settings.sellItems.map(i => {
+        const u = itemUrgencies.find(ur => ur.itemId === i.itemId);
+        return `${u?.totalNeed || 0} need ${i.itemName} (${u?.criticalStationCount || 0} low)`;
+      }).join(", ");
+      ctx.log("fc", `Focus item: ${focusItem?.itemName || currentFocusItemId} (${counts})`);
+    }
+
+    // Capacity is judged over sellable stations only — a blacklisted station or
+    // one without a market must not keep the routine alive forever.
+    const cycleFilters = getBlacklistFilters();
+    const { eligible: sellable, skipped: cycleSkips } = partitionStations(fcData, settings, cycleFilters);
+    if (fcData.stations.length > 0 && sellable.length === 0) {
+      ctx.log(
+        "fc",
+        `No sellable stations left (${fcData.stations.length} tracked, all skipped: ${describeSkips(cycleSkips)}) — stopping routine`,
+      );
+      saveFCStationsData(fcData);
+      return;
+    }
+    const allStationsFull = sellable.length > 0
+      && sellable.every(({ entry }) => {
+        const unsold = entry.ordersUnsold || 0;
+        return settings.sellItems.every(item => unsold >= item.maxPerStation);
+      });
     if (allStationsFull) {
       ctx.log("fc", "All stations are at or above capacity — stopping routine");
       return;
@@ -480,16 +1810,16 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     await bot.refreshStatus();
     await bot.refreshCargo();
 
-    const fuelCellItem = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-    let cargoQty = fuelCellItem?.quantity ?? 0;
-
     const atHomeStation = bot.system === settings.homeSystem && bot.poi === settings.homeStation;
+    const hasCargo = hasAnySellCargo(bot, settings);
 
     // Restart recovery: empty cargo not at home → return home; full cargo → proceed to station
-    if (!atHomeStation && cargoQty <= 0) {
+    if (!atHomeStation && !hasCargo) {
       ctx.log("fc", `Restart recovery: empty cargo not at home (${bot.system}/${bot.poi}) — returning home`);
+      if (bot.state !== "running") continue;
       yield "return_home";
       if (bot.system !== settings.homeSystem) {
+        if (bot.state !== "running") continue;
         await ensureUndocked(ctx);
         const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!fueled) {
@@ -500,6 +1830,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
       }
       if (bot.poi !== settings.homeStation) {
+        if (bot.state !== "running") continue;
         await ensureUndocked(ctx);
         const travelResp = await bot.exec("travel", { target_poi: settings.homeStation });
         if (travelResp.error) {
@@ -510,70 +1841,279 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         bot.poi = settings.homeStation;
       }
       await bot.refreshCargo();
-      const postReturnCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-      cargoQty = postReturnCargo?.quantity ?? 0;
-    } else if (!atHomeStation && cargoQty > 0) {
+    } else if (!atHomeStation && hasCargo) {
+      // In pre-stage mode, the deposit loop only processes the focus item.
+      // If the focus item is depleted from cargo, we can't deposit anything
+      // useful at any station — return home to restock instead of looping.
+      if (settings.preStageMode === "preStage" && currentFocusItemId) {
+        const focusCargo = getSellItemCargo(bot, currentFocusItemId);
+        if (focusCargo <= 0) {
+          const focusItemName = settings.sellItems.find(i => i.itemId === currentFocusItemId)?.itemName || currentFocusItemId;
+          ctx.log("fc", `Restart recovery: ${focusItemName} depleted from cargo — returning home to restock`);
+          yield "return_home";
+          if (bot.state !== "running") continue;
+          await ensureUndocked(ctx);
+          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+          if (!fueled) {
+            ctx.log("error", "Cannot refuel for return journey");
+            await ctx.sleep(60000);
+            continue;
+          }
+          await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+          if (bot.poi !== settings.homeStation) {
+            if (bot.state !== "running") continue;
+            await ensureUndocked(ctx);
+            await bot.exec("travel", { target_poi: settings.homeStation });
+            bot.poi = settings.homeStation;
+          }
+          continue;
+        }
+      }
       ctx.log("fc", `Restart recovery: cargo present — heading to selected station`);
     }
 
-    await ensureDocked(ctx);
-    await tryRefuel(ctx);
-    await repairShip(ctx);
-
-    await bot.refreshCargo();
-    const currentFuelCellCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-    const cargoAfterMaintenance = currentFuelCellCargo?.quantity ?? 0;
-    const atHomeStationAfterMaintenance = bot.system === settings.homeSystem && bot.poi === settings.homeStation;
-
-    if (cargoAfterMaintenance <= 0) {
-      if (atHomeStationAfterMaintenance) {
-        ctx.log("fc", "No cargo at home station — attempting to withdraw from faction storage");
-        
-        const freeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
-        //const withdrawResp = await bot.exec("faction_withdraw_items", { item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), });
-        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction',  item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), }); //fixed by human!
-
-        if (withdrawResp.error) {
-          ctx.log("error", `Withdraw failed: ${withdrawResp.error.message} — waiting for cargo`);
-          await ctx.sleep(10000);
-          continue;
-        }
-
-        // Wait for potential caching delays before refreshing cargo
-        await ctx.sleep(2000);
-        await bot.refreshCargo();
-        const afterWithdraw = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-        const newCargoQty = afterWithdraw?.quantity ?? 0;
-
-        if (newCargoQty <= 0) {
-          ctx.log("fc", "Withdraw returned no cargo — waiting for cargo to become available");
-          await ctx.sleep(10000);
-          continue;
-        }
-
-        ctx.log("fc", `Withdrew ${newCargoQty}x fuel cells from faction storage`);
-        cargoQty = newCargoQty;
-      } else {
-        ctx.log("fc", "Lost cargo during maintenance — returning home to restock");
-        continue;
-      }
+    if (atHomeStation) {
+      await ensureDocked(ctx);
+      await tryRefuel(ctx);
+      await repairShip(ctx);
     }
 
-    let targetIdx = getNextStation(fcData, fcData.currentStationIndex, settings);
-    if (targetIdx < 0 || fcData.stations.length === 0) {
-      ctx.log("fc", "No stations available to visit");
-      ctx.log("fc", "Initializing station list from mapStore...");
-      fcData.stations = initializeFCStations(settings);
-      fcData.currentStationIndex = 0;
-      saveFCStationsData(fcData);
+    await bot.refreshCargo();
+    const atHomeStationAfterMaintenance = bot.system === settings.homeSystem && bot.poi === settings.homeStation;
 
-      if (fcData.stations.length === 0) {
-        ctx.log("fc", "Still no stations — waiting");
+    // Soft-stop: already back home and about to start the next load — stop now
+    // instead of loading out for another cycle.
+    if (atHomeStationAfterMaintenance && bot.shouldStopAfterCycle()) {
+      bot.clearStopAfterCycle();
+      ctx.log("fc", "Stop after cycle requested — at home, stopping routine before next load");
+      bot.initiateStop();
+      return;
+    }
+
+    const milTarget = settings.militaryFuelCellsCount || 0;
+    const currentMilitaryCargo = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
+    const milDeficit = Math.max(0, milTarget - currentMilitaryCargo);
+
+    const needSellItems = settings.sellItems.some(item => getSellItemCargo(bot, item.itemId) <= 0);
+    const anySellCargo = settings.sellItems.some(item => getSellItemCargo(bot, item.itemId) > 0);
+    const needMilitary = milDeficit > 0;
+
+    if ((needSellItems || needMilitary) && atHomeStationAfterMaintenance) {
+      if (bot.state !== "running") continue;
+
+      // Offload any cargo brought back before loading out again, so it returns
+      // to home faction storage instead of being hauled between stations.
+      for (const itemConfig of settings.sellItems) {
+        const remaining = getSellItemCargo(bot, itemConfig.itemId);
+        if (remaining > 0) {
+          ctx.log("fc", `Depositing ${remaining}x remaining ${itemConfig.itemName} at home station`);
+          await ensureDocked(ctx);
+          const depResp = await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: itemConfig.itemId, quantity: remaining });
+          if (depResp.error) {
+            ctx.log("error", `Deposit ${itemConfig.itemName} at home failed: ${depResp.error.message}`);
+          }
+          await bot.refreshCargo();
+        }
+      }
+      const remainingMil = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
+      if (remainingMil > 0) {
+        ctx.log("fc", `Depositing ${remainingMil}x remaining military fuel cells at home station`);
+        await ensureDocked(ctx);
+        const depResp = await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: remainingMil });
+        if (depResp.error) {
+          ctx.log("error", `Deposit military fuel cells at home failed: ${depResp.error.message}`);
+        }
+        await bot.refreshCargo();
+      }
+
+      // If we could not offload the returning cargo (home faction storage full),
+      // wait for space to free up instead of heading out again.
+      const cargoStillOnBoard = settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
+      if (cargoStillOnBoard) {
+        ctx.log("fc", "Home faction storage is full — could not offload returning cargo; waiting for space to free up");
         await ctx.sleep(60000);
         continue;
       }
 
-      targetIdx = 0;
+      ctx.log("fc", `At home station — loading items (sell items + ${milTarget} military reserve)`);
+
+      const nowStorage = Date.now();
+      if (nowStorage - lastStorageRefresh >= settings.storageRefreshIntervalMs) {
+        const { eligible: storageEligible } = partitionStations(fcData, settings, cycleFilters);
+        ctx.log("fc", `Refreshing faction storage for ${storageEligible.length} stations...`);
+        await refreshAllStationStorage(ctx, bot, fcData, settings, cycleFilters);
+        lastStorageRefresh = nowStorage;
+        saveFCStationsData(fcData);
+      } else {
+        ctx.log("debug", `Skipping storage refresh — last refreshed ${Math.round((nowStorage - lastStorageRefresh) / 1000 / 60)}min ago (interval: ${Math.round(settings.storageRefreshIntervalMs / 60000)}min)`);
+      }
+      if (bot.state !== "running") continue;
+
+      const cargoMax = bot.cargoMax || 825;
+      const cargoUsed = cargoUsedFromInventory(bot);
+      const milItemSize = getItemSize(MILITARY_FUEL_CELL_ITEM_ID);
+      // Reserve cargo space for military fuel cells before loading sell items.
+      // Without this reservation, sell items fill the entire cargo and the
+      // military reserve (needed for emergency in-transit refueling) is never
+      // withdrawn — especially in pre-stage mode where the bot carries a full
+      // load of sell items across many jumps.
+      const milReservedSpace = milDeficit * milItemSize;
+      let freeSpace = Math.max(0, cargoMax - cargoUsed - milReservedSpace);
+
+      // Load sell items first (focus item first), then military reserve with
+      // remaining space. The reserved military space is excluded so sell items
+      // never crowd out the emergency fuel reserve.
+      const sortedSellItems = currentFocusItemId
+        ? [
+            ...settings.sellItems.filter(i => i.itemId === currentFocusItemId),
+            ...settings.sellItems.filter(i => i.itemId !== currentFocusItemId),
+          ]
+        : settings.sellItems;
+
+      for (const itemConfig of sortedSellItems) {
+        if (bot.state !== "running") break;
+
+        const currentQty = getSellItemCargo(bot, itemConfig.itemId);
+        const needQty = Math.max(0, itemConfig.maxPerStation - currentQty);
+        if (needQty <= 0) continue;
+
+        const itemSize = getItemSize(itemConfig.itemId);
+        const canFit = Math.min(needQty, Math.floor(freeSpace / itemSize));
+        if (canFit <= 0) break;
+
+        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: itemConfig.itemId, quantity: canFit });
+        if (withdrawResp.error) {
+          ctx.log("error", `Withdraw ${itemConfig.itemName} failed: ${withdrawResp.error.message}`);
+          if (withdrawResp.error.message.toLowerCase().includes("cargo_full")) break;
+          continue;
+        }
+        ctx.log("fc", `Withdrew ${canFit}x ${itemConfig.itemName} from faction storage`);
+        await ctx.sleep(1000);
+        await bot.refreshCargo();
+        const newCargoUsed = cargoUsedFromInventory(bot);
+        freeSpace = Math.max(0, cargoMax - newCargoUsed - milReservedSpace);
+        if (freeSpace <= 0) break;
+      }
+
+      await ctx.sleep(2000);
+      await bot.refreshCargo();
+      const cargoAfterSell = cargoUsedFromInventory(bot);
+      const remainingFreeSpace = Math.max(0, cargoMax - cargoAfterSell);
+
+      const milToWithdraw = Math.min(milDeficit, Math.floor(remainingFreeSpace / milItemSize));
+
+      if (milToWithdraw > 0 && bot.state === "running") {
+        const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milToWithdraw });
+        if (milWithdrawResp.error) {
+          ctx.log("error", `Military fuel cell withdraw failed: ${milWithdrawResp.error.message}`);
+        } else {
+          ctx.log("fc", `Withdrew ${milToWithdraw}x military fuel cells from faction storage`);
+        }
+      }
+
+      await bot.refreshCargo();
+      const sellItemsSummary = settings.sellItems.map(i => {
+        const qty = getSellItemCargo(bot, i.itemId);
+        return `${qty}x ${i.itemName}`;
+      }).join(", ");
+      const finalMil = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
+      ctx.log("fc", `Loaded: ${sellItemsSummary}, ${finalMil}x military fuel cells`);
+
+      const anySellCargo = settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
+      if (!anySellCargo && finalMil <= 0) {
+        ctx.log("fc", "Withdraw returned no cargo — waiting for cargo to become available");
+        await ctx.sleep(10000);
+        continue;
+      }
+    } else if (!hasCargo && !atHomeStationAfterMaintenance) {
+      ctx.log("fc", "Lost cargo during maintenance — returning home to restock");
+      continue;
+    }
+
+    let targetIdx = getNextStation(fcData, settings, cycleFilters, currentFocusItemId);
+    let preStagePlan: Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number> }> = [];
+
+    if (settings.preStageMode === "preStage") {
+      preStagePlan = await buildPreStagePlan(ctx, bot, fcData, settings, cycleFilters, currentFocusItemId);
+      if (preStagePlan.length === 0) {
+        ctx.log("fc", "All stations already stocked — returning home");
+        if (bot.state !== "running") break;
+        yield "return_home";
+        if (bot.system !== settings.homeSystem) {
+          if (bot.state !== "running") break;
+          await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+        }
+        if (bot.poi !== settings.homeStation) {
+          if (bot.state !== "running") break;
+          await ensureUndocked(ctx);
+          await bot.exec("travel", { target_poi: settings.homeStation });
+          bot.poi = settings.homeStation;
+        }
+        continue;
+      }
+
+      let selectedPlanIdx = -1;
+      const focusItemConfig = settings.sellItems.find(i => i.itemId === currentFocusItemId) || settings.sellItems[0];
+      const cargoForFocus = focusItemConfig ? getSellItemCargo(bot, focusItemConfig.itemId) : 0;
+      await withPreStageLock(bot, async () => {
+        const reservations = loadReservations();
+        cleanExpiredReservations(reservations);
+
+        const lastPlanIdx = preStagePlan.findIndex(p => p.idx === fcData.currentStationIndex);
+        const planOffset = lastPlanIdx >= 0 ? (lastPlanIdx + 1) % preStagePlan.length : 0;
+        for (let i = 0; i < preStagePlan.length; i++) {
+          const candidatePlanIdx = (planOffset + i) % preStagePlan.length;
+          const candidate = preStagePlan[candidatePlanIdx];
+          const needQty = candidate.needByItem[focusItemConfig.itemId] || 0;
+          const plannedQty = Math.min(cargoForFocus, needQty);
+          const maxQty = focusItemConfig.maxPerStation;
+          if (!isStationReserved(reservations, candidate.entry.poiId, bot.username, plannedQty, maxQty, settings.preStagePartialLock)) {
+            selectedPlanIdx = candidatePlanIdx;
+            targetIdx = candidate.idx;
+            reserveStation(reservations, candidate.entry.poiId, bot.username, plannedQty);
+            saveReservations(reservations);
+            break;
+          }
+        }
+      });
+
+      if (selectedPlanIdx < 0) {
+        const reservedStations = loadReservations();
+        const reservedCount = preStagePlan.filter(p => {
+          const entries = reservedStations[p.entry.poiId];
+          if (!entries || entries.length === 0) return false;
+          return entries.some(e => e.botName !== bot.username);
+        }).length;
+        const totalPlanQty = preStagePlan.reduce((sum, p) => sum + Object.values(p.needByItem).reduce((a, b) => a + b, 0), 0);
+        ctx.log(
+          "fc",
+          `All ${reservedCount} stations in pre-stage plan (${preStagePlan.length} total, ${totalPlanQty} units needed) ` +
+          `are reserved by other bots — waiting ${Math.round(settings.blockedWaitMs / 60000)}min` +
+          (settings.preStagePartialLock
+            ? " (partial reservation: stations may become available as other bots finish)"
+            : " (full reservation: stations will not free until the holding bot moves on)"),
+        );
+        await ctx.sleep(settings.blockedWaitMs);
+        continue;
+      }
+    } else {
+      if (targetIdx < 0) {
+        if (fcData.stations.length === 0) {
+          ctx.log("fc", "No stations tracked — initializing station list from mapStore...");
+          fcData.stations = initializeFCStations(settings);
+          fcData.currentStationIndex = 0;
+        } else {
+          syncFCStations(ctx, fcData, settings);
+        }
+        saveFCStationsData(fcData);
+
+        targetIdx = getNextStation(fcData, settings, getBlacklistFilters(true), currentFocusItemId);
+        if (targetIdx < 0) {
+          ctx.log("fc", "Every mapped station is excluded (blacklist / outpost / no market) — waiting");
+          await ctx.sleep(60000);
+          continue;
+        }
+      }
     }
 
     const target = fcData.stations[targetIdx];
@@ -596,14 +2136,25 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     ctx.log("fc", `Target: ${target.poiName} in ${target.systemId}`);
 
     await bot.refreshCargo();
-    const preTravelCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-    if (!preTravelCargo || preTravelCargo.quantity <= 0) {
-      ctx.log("fc", "No cargo before travel — returning home to restock");
+
+    const hasSellCargo = hasAnySellCargo(bot, settings);
+    if (!hasSellCargo) {
+      ctx.log("fc", "No sell cargo before travel — returning home to restock");
+      if (bot.state !== "running") break;
       yield "return_home";
       if (bot.system !== settings.homeSystem) {
+        if (bot.state !== "running") break;
+        await ensureUndocked(ctx);
+        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (!fueled) {
+          ctx.log("error", "Cannot refuel for return journey");
+          await ctx.sleep(60000);
+          continue;
+        }
         await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
       }
       if (bot.poi !== settings.homeStation) {
+        if (bot.state !== "running") break;
         await ensureUndocked(ctx);
         await bot.exec("travel", { target_poi: settings.homeStation });
         bot.poi = settings.homeStation;
@@ -611,9 +2162,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       continue;
     }
 
+    if (bot.state !== "running") break;
     await ensureUndocked(ctx);
 
     if (bot.system !== target.systemId) {
+      if (bot.state !== "running") break;
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Cannot refuel — waiting");
@@ -631,6 +2184,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     }
 
     if (bot.poi !== target.poiId) {
+      if (bot.state !== "running") break;
       ctx.log("travel", `Traveling to ${target.poiName}...`);
       const travelResult = await travelToStationWithHint(ctx, target.poiId, target.poiName, target.systemId, {
         fuelThresholdPct: safetyOpts.fuelThresholdPct,
@@ -640,7 +2194,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
       if (!travelResult.success) {
         ctx.log("error", `Travel to ${target.poiName} failed${travelResult.usedHint ? ` after redirect to ${travelResult.hintSystem}` : ''} — skipping station`);
-        targetIdx = (targetIdx + 1) % fcData.stations.length;
+        if (settings.preStageMode === "preStage") {
+          const reservations = loadReservations();
+          clearStationReservation(reservations, target.poiId, bot.username);
+          saveReservations(reservations);
+        }
         fcData.currentStationIndex = targetIdx;
         saveFCStationsData(fcData);
         continue;
@@ -649,12 +2207,21 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       bot.poi = target.poiId;
     }
 
+    if (bot.state !== "running") break;
     yield "dock";
     const dockResp = await bot.exec("dock");
 
     if (dockResp.error && !dockResp.error.message.includes("already")) {
+      const dockSkip = classifyStationError(dockResp.error.message);
+      if (dockSkip) {
+        markStationLearnedSkip(ctx, target, dockSkip, dockResp.error.message);
+      }
       ctx.log("error", `Dock failed: ${dockResp.error.message} — skipping station`);
-      targetIdx = (targetIdx + 1) % fcData.stations.length;
+      if (settings.preStageMode === "preStage") {
+        const reservations = loadReservations();
+        clearStationReservation(reservations, target.poiId, bot.username);
+        saveReservations(reservations);
+      }
       fcData.currentStationIndex = targetIdx;
       saveFCStationsData(fcData);
       continue;
@@ -664,15 +2231,6 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     ctx.log("fc", `Docked at ${target.poiName}`);
 
     await bot.refreshCargo();
-    const inCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-    const availableQty = inCargo?.quantity ?? 0;
-
-    if (availableQty <= 0) {
-      ctx.log("fc", "No fuel cells in cargo — returning home");
-      yield "return_home";
-      await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
-      continue;
-    }
 
     // Get current active orders at this station
     let currentStationOrders: FCOrder[] = [];
@@ -680,9 +2238,10 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     if (!ordersResp.error && ordersResp.result) {
       const ordersData = ordersResp.result as Record<string, unknown>;
       const orders = (ordersData.orders as any[]) || [];
-      // Filter for fuel_cell sell orders
-      const fcOrders = orders.filter(o => o.item_id === FUEL_CELL_ITEM_ID && o.side === "sell");
-      currentStationOrders = fcOrders.map(o => ({
+      const sellItemIds = new Set(settings.sellItems.map(i => i.itemId));
+      const sellOrders = orders.filter(o => sellItemIds.has(o.item_id) && o.side === "sell");
+      currentStationOrders = sellOrders.map(o => ({
+        itemId: o.item_id,
         orderId: o.order_id,
         quantity: o.quantity,
         remaining: o.remaining,
@@ -690,83 +2249,247 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         priceEach: o.price_each,
         createdAt: o.created_at,
       }));
-    }
-
-    const currentUnsold = currentStationOrders.reduce((sum, o) => sum + o.remaining, 0);
-    const quantityToPlace = availableQty;
-    if (quantityToPlace <= 0) {
-      ctx.log("fc", `No fuel cells available — returning home`);
-      yield "return_home";
-      await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
-      continue;
-    }
-
-    // Get market data for pricing
-    let marketData: unknown = null;
-    const marketResp = await bot.exec("view_market", { item_id: FUEL_CELL_ITEM_ID });
-    if (!marketResp.error && marketResp.result) {
-      marketData = marketResp.result;
-    } else if (settings.useRemoteMarketQuery !== false) {
-      // Fallback to remote market query if local view_market failed
-      ctx.log("fc", "[RemoteMarket] view_market failed, trying remote market query for fuel_cell pricing...");
-      try {
-        const result = await queryRemoteMarket({ itemId: FUEL_CELL_ITEM_ID, tradeType: "sell", requesterSystemId: bot.system });
-        if (result.ok && result.results.length > 0) {
-          const best = result.results[0];
-          ctx.log("fc", `[RemoteMarket] Got remote fuel_cell price: ${best.price}cr @ ${best.stationName} (qty: ${best.quantity})`);
-          // Build synthetic marketData for getOptimalPrice
-          marketData = {
-            items: [{
-              item_id: FUEL_CELL_ITEM_ID,
-              best_sell: best.price,
-              best_buy: best.price,
-              sell_quantity: best.quantity,
-              buy_quantity: best.quantity,
-            }],
-          };
-        } else {
-          ctx.log("fc", `[RemoteMarket] No remote fuel_cell data available: ${result.error || "no results"}`);
+    } else if (ordersResp.error) {
+      const orderSkip = classifyStationError(ordersResp.error.message);
+      if (orderSkip) {
+        markStationLearnedSkip(ctx, target, orderSkip, ordersResp.error.message);
+        if (settings.preStageMode === "preStage") {
+          const reservations = loadReservations();
+          clearStationReservation(reservations, target.poiId, bot.username);
+          saveReservations(reservations);
         }
-      } catch (err) {
-        ctx.log("fc", `[RemoteMarket] Remote query failed: ${err instanceof Error ? err.message : String(err)}`);
+        fcData.currentStationIndex = targetIdx;
+        saveFCStationsData(fcData);
+        continue;
+      }
+      ctx.log("fc", `view_orders failed at ${target.poiName}: ${ordersResp.error.message.split("\n")[0]}`);
+    }
+
+    // Run price updates if enabled — cancel orders whose price has drifted
+    if (settings.enablePriceUpdates) {
+      await bot.refreshCargo();
+      const cancelledIds = await updateStationPrices(ctx, bot, {
+        ...target,
+        activeOrders: currentStationOrders,
+        ordersPlaced: 0,
+        ordersUnsold: currentStationOrders.reduce((sum, o) => sum + o.remaining, 0),
+        deposits: target.deposits ?? {},
+      }, settings);
+      if (cancelledIds.length > 0) {
+        // Re-read orders after cancels
+        const reResp = await bot.exec("view_orders", { scope: "personal" });
+        if (!reResp.error && reResp.result) {
+          const reOrdersData = reResp.result as Record<string, unknown>;
+          const reOrders = (reOrdersData.orders as any[]) || [];
+          const sellItemIds = new Set(settings.sellItems.map(i => i.itemId));
+          currentStationOrders = reOrders
+            .filter(o => sellItemIds.has(o.item_id) && o.side === "sell")
+            .map(o => ({
+              itemId: o.item_id,
+              orderId: o.order_id,
+              quantity: o.quantity,
+              remaining: o.remaining,
+              filledQuantity: o.filled_quantity,
+              priceEach: o.price_each,
+              createdAt: o.created_at,
+            }));
+        }
       }
     }
 
-    let price: number | null = null;
-    price = await getOptimalPrice(ctx, marketData, settings);
-    ctx.log("fc", `Creating sell orders: ${quantityToPlace}x @ ${price}cr each (current unsold: ${currentUnsold})`);
-
+    // For each sell item in cargo, either create orders or pre-stage to station storage
     let ordersPlacedCount = 0;
+    let lastPrice: number | null = null;
+    const sellItemsToPlace: Array<{ itemConfig: SellItemConfig; qty: number; price: number }> = [];
+    const deposits: Record<string, number> = {};
+    let forceReturnHome = false;
 
-    if (quantityToPlace > 0) {
-      const createResp = await bot.exec("create_sell_order", {
-        item_id: FUEL_CELL_ITEM_ID,
-        quantity: quantityToPlace,
-        price_each: price!,
-      });
+    if (settings.preStageMode === "preStage") {
+      // Pre-stage mode: deposit items to faction storage at each station,
+      // falling back to station storage if faction storage is unavailable.
+      const planEntry = preStagePlan.find(p => p.idx === targetIdx);
+      const needByItem = planEntry?.needByItem ?? {};
+      let stationAcceptedDeposit = false;
+      for (const itemConfig of settings.sellItems) {
+        if (currentFocusItemId && itemConfig.itemId !== currentFocusItemId) continue;
+        const inCargo = getSellItemCargo(bot, itemConfig.itemId);
+        if (inCargo <= 0) continue;
 
-      if (createResp.error) {
-        ctx.log("error", `Create sell order failed: ${createResp.error.message}`);
-      } else {
-        ctx.log("fc", `Listed ${quantityToPlace}x ${FUEL_CELL_ITEM_NAME} @ ${price!}cr`);
-
-        // Refresh orders after creating new one
-        const updatedOrdersResp = await bot.exec("view_orders", { scope: "personal" });
-        if (!updatedOrdersResp.error && updatedOrdersResp.result) {
-          const updatedOrdersData = updatedOrdersResp.result as Record<string, unknown>;
-          const updatedOrders = (updatedOrdersData.orders as any[]) || [];
-          const updatedFcOrders = updatedOrders.filter(o => o.item_id === FUEL_CELL_ITEM_ID && o.side === "sell");
-          currentStationOrders = updatedFcOrders.map(o => ({
-            orderId: o.order_id,
-            quantity: o.quantity,
-            remaining: o.remaining,
-            filledQuantity: o.filled_quantity,
-            priceEach: o.price_each,
-            createdAt: o.created_at,
-          }));
+        if (
+          itemConfig.blockedStations.some(
+            b => b.toLowerCase() === target.poiId.toLowerCase() || b.toLowerCase() === `${target.systemId}|${target.poiId}`.toLowerCase(),
+          )
+        ) {
+          ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: blocked for this item`);
+          continue;
         }
 
-        ordersPlacedCount = quantityToPlace;
+        // Re-check remote storage on arrival to avoid over-depositing
+        const remoteResult = await getRemoteStorageQty(bot, target.poiId, itemConfig.itemId);
+        if (!remoteResult.hasFactionStorage && !remoteResult.hasStationStorage) {
+          ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: no faction storage or station storage available`);
+          const errorMsg = remoteResult.factionError || remoteResult.stationError || "";
+          if (errorMsg) {
+            const skipReason = classifyStationError(errorMsg);
+            if (skipReason) {
+              markStationLearnedSkip(ctx, target, skipReason, errorMsg);
+            }
+          }
+          continue;
+        }
+        const knownQty = remoteResult.qty;
+        const toDeposit = Math.min(inCargo, preStageNeed(itemConfig, knownQty, settings.preStageTopOffThresholdPct));
+        if (toDeposit <= 0) {
+          ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: within top-off threshold (${knownQty}/${itemConfig.maxPerStation})`);
+          target.deposits = { ...(target.deposits ?? {}), [itemConfig.itemId]: knownQty };
+          continue;
+        }
+
+  // Try faction storage first
+        const factionResp = await bot.exec("storage", {
+          action: 'deposit',
+          source: 'cargo',
+          target: 'faction',
+          item_id: itemConfig.itemId,
+          quantity: toDeposit,
+        });
+
+        if (!factionResp.error) {
+          ctx.log("fc", `Pre-staged ${toDeposit}x ${itemConfig.itemName} to ${target.poiName} faction storage`);
+          deposits[itemConfig.itemId] = toDeposit;
+          stationAcceptedDeposit = true;
+        } else {
+          // Fallback to station storage if faction storage fails
+          const stationResp = await bot.exec("storage", {
+            action: 'deposit',
+            source: 'cargo',
+            target: 'station',
+            item_id: itemConfig.itemId,
+            quantity: toDeposit,
+          });
+
+          if (!stationResp.error) {
+            ctx.log("fc", `Pre-staged ${toDeposit}x ${itemConfig.itemName} to ${target.poiName} station storage (faction storage unavailable)`);
+            deposits[itemConfig.itemId] = toDeposit;
+            stationAcceptedDeposit = true;
+          } else {
+            ctx.log("error", `Pre-stage deposit failed for ${itemConfig.itemName}: faction=${factionResp.error.message}, station=${stationResp.error.message}`);
+          }
+        }
+
+        await ctx.sleep(1000);
+      }
+
+      // If we still hold focus cargo but this station could not take any of it
+      // (full storage, deposit error, blocked, …), return home to offload into
+      // faction storage instead of hauling it between stations and burning fuel.
+      const focusStillOnBoard = currentFocusItemId ? getSellItemCargo(bot, currentFocusItemId) > 0 : false;
+      if (focusStillOnBoard && !stationAcceptedDeposit) {
+        ctx.log("fc", `${target.poiName} could not accept ${currentFocusItemId} — returning home to offload cargo`);
+        forceReturnHome = true;
+      }
+    } else {
+      // Normal mode: calculate prices and create sell orders
+      for (const itemConfig of settings.sellItems) {
+        if (currentFocusItemId && itemConfig.itemId !== currentFocusItemId) continue;
+        const inCargo = getSellItemCargo(bot, itemConfig.itemId);
+        if (inCargo <= 0) continue;
+
+        const existingForItem = currentStationOrders.filter(o => o.itemId === itemConfig.itemId);
+        const currentUnsold = existingForItem.reduce((sum, o) => sum + o.remaining, 0);
+        const quantityToPlace = Math.min(inCargo, itemConfig.maxPerStation - currentUnsold);
+
+        if (quantityToPlace <= 0) continue;
+
+        let marketData: unknown = null;
+        const marketResp = await bot.exec("view_market", { item_id: itemConfig.itemId });
+        if (!marketResp.error && marketResp.result) {
+          marketData = marketResp.result;
+        } else {
+          const marketSkip = classifyStationError(marketResp.error?.message);
+          if (marketSkip) {
+            markStationLearnedSkip(ctx, target, marketSkip, marketResp.error?.message);
+            fcData.currentStationIndex = targetIdx;
+            saveFCStationsData(fcData);
+            continue;
+          }
+          if (settings.useRemoteMarketQuery !== false) {
+            try {
+              const result = await queryRemoteMarket({ itemId: itemConfig.itemId, tradeType: "sell", requesterSystemId: bot.system });
+              if (result.ok && result.results.length > 0) {
+                const best = result.results[0];
+                marketData = {
+                  items: [{
+                    item_id: itemConfig.itemId,
+                    best_sell: best.price,
+                    best_buy: best.price,
+                    sell_quantity: best.quantity,
+                    buy_quantity: best.quantity,
+                  }],
+                };
+              }
+            } catch (err) {
+              ctx.log("fc", `[RemoteMarket] Remote query failed for ${itemConfig.itemName}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+        }
+
+        const price = await getOptimalPrice(ctx, marketData, itemConfig);
+        const clampedPrice = itemConfig.priceMode === "auto"
+          ? Math.min(itemConfig.autoMaxPrice, Math.max(itemConfig.autoMinPrice, Math.round(price)))
+          : price;
+
+        if (clampedPrice !== price && itemConfig.priceMode === "auto") {
+          ctx.log("fc", `${itemConfig.itemName} price ${price}cr outside safe band [${itemConfig.autoMinPrice}, ${itemConfig.autoMaxPrice}] — clamping to ${clampedPrice}cr`);
+        }
+
+        sellItemsToPlace.push({ itemConfig, qty: quantityToPlace, price: clampedPrice });
+      }
+
+      if (sellItemsToPlace.length > 0) {
+        ctx.log("fc", `Creating sell orders for ${sellItemsToPlace.map(s => `${s.qty}x ${s.itemConfig.itemName} @ ${s.price}cr`).join(", ")}`);
+      }
+
+      for (const placement of sellItemsToPlace) {
+        const createResp = await bot.exec("create_sell_order", {
+          item_id: placement.itemConfig.itemId,
+          quantity: placement.qty,
+          price_each: placement.price,
+        });
+
+        if (createResp.error) {
+          ctx.log("error", `Create sell order failed for ${placement.itemConfig.itemName}: ${createResp.error.message}`);
+          const createSkip = classifyStationError(createResp.error.message);
+          if (createSkip) {
+            markStationLearnedSkip(ctx, target, createSkip, createResp.error.message);
+            fcData.currentStationIndex = targetIdx;
+            saveFCStationsData(fcData);
+            continue;
+          }
+        } else {
+          ctx.log("fc", `Listed ${placement.qty}x ${placement.itemConfig.itemName} @ ${placement.price}cr`);
+          ordersPlacedCount += placement.qty;
+          lastPrice = placement.price;
+
+          await bot.refreshCargo();
+          const updatedOrdersResp = await bot.exec("view_orders", { scope: "personal" });
+          if (!updatedOrdersResp.error && updatedOrdersResp.result) {
+            const updatedOrdersData = updatedOrdersResp.result as Record<string, unknown>;
+            const updatedOrders = (updatedOrdersData.orders as any[]) || [];
+            const sellItemIds = new Set(settings.sellItems.map(i => i.itemId));
+            currentStationOrders = updatedOrders
+              .filter(o => sellItemIds.has(o.item_id) && o.side === "sell")
+              .map(o => ({
+                itemId: o.item_id,
+                orderId: o.order_id,
+                quantity: o.quantity,
+                remaining: o.remaining,
+                filledQuantity: o.filled_quantity,
+                priceEach: o.price_each,
+                createdAt: o.created_at,
+              }));
+          }
+        }
       }
     }
 
@@ -775,45 +2498,111 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     currentStation.ordersPlaced += ordersPlacedCount;
     currentStation.ordersUnsold = currentStationOrders.reduce((sum, o) => sum + o.remaining, 0);
     currentStation.activeOrders = currentStationOrders;
-    if (ordersPlacedCount > 0) {
-      currentStation.lastPrice = price;
+    if (lastPrice !== null) {
+      currentStation.lastPrice = lastPrice;
     }
     currentStation.lastVisit = new Date().toISOString();
+    if (Object.keys(deposits).length > 0) {
+      const updated = { ...(currentStation.deposits ?? {}) };
+      for (const [itemId, qty] of Object.entries(deposits)) {
+        updated[itemId] = (updated[itemId] || 0) + qty;
+      }
+      currentStation.deposits = updated;
+    }
 
-    fcData.currentStationIndex = targetIdx;
+    if (settings.preStageMode === "preStage" && preStagePlan.length > 0) {
+      const currentPlanIdx = preStagePlan.findIndex(p => p.idx === targetIdx);
+      if (currentPlanIdx >= 0) {
+        const nextPlanIdx = (currentPlanIdx + 1) % preStagePlan.length;
+        fcData.currentStationIndex = preStagePlan[nextPlanIdx].idx;
+      } else {
+        fcData.currentStationIndex = (targetIdx + 1) % fcData.stations.length;
+      }
+
+      const reservations = loadReservations();
+      clearStationReservation(reservations, target.poiId, bot.username);
+      saveReservations(reservations);
+    } else {
+      fcData.currentStationIndex = targetIdx;
+    }
     saveFCStationsData(fcData);
 
     await bot.refreshCargo();
 
-    yield "return_home";
-    ctx.log("travel", `Returning to ${settings.homeSystem}...`);
+    const allSellItemsDepleted = !settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
+    const focusItemDepleted = settings.preStageMode === "preStage" && currentFocusItemId
+      ? getSellItemCargo(bot, currentFocusItemId) <= 0
+      : false;
+    if (focusItemDepleted) {
+      const focusItemName = settings.sellItems.find(i => i.itemId === currentFocusItemId)?.itemName || currentFocusItemId;
+      ctx.log("fc", `${focusItemName} depleted from cargo — returning home to restock`);
+    }
+    const shouldReturnHome = settings.preStageMode !== "preStage" || allSellItemsDepleted || focusItemDepleted || forceReturnHome;
 
-    if (bot.system !== settings.homeSystem) {
-      await ensureUndocked(ctx);
+    if (shouldReturnHome) {
+      if (bot.state !== "running") break;
+      yield "return_home";
+      ctx.log("travel", `Returning to ${settings.homeSystem}...`);
 
-      // Refuel at target station before long journey home - use higher threshold
-      const returnThreshold = Math.max(60, settings.refuelThreshold + 20);
-      ctx.log("fc", `Pre-return fuel check: ${Math.round((bot.fuel / (bot.maxFuel || 1)) * 100)}%, refueling if below ${returnThreshold}%...`);
-      const fueled = await ensureFueled(ctx, returnThreshold);
-      if (!fueled) {
-        ctx.log("error", "Failed to refuel before return journey");
-        await ctx.sleep(30000);
+      if (bot.system !== settings.homeSystem) {
+        if (bot.state !== "running") break;
+        await ensureUndocked(ctx);
+
+        const returnThreshold = Math.max(60, settings.refuelThreshold + 20);
+        ctx.log("fc", `Pre-return fuel check: ${Math.round((bot.fuel / (bot.maxFuel || 1)) * 100)}%, refueling if below ${returnThreshold}%...`);
+        const fueled = await ensureFueled(ctx, returnThreshold);
+        if (!fueled) {
+          ctx.log("error", "Failed to refuel before return journey");
+          await ctx.sleep(30000);
+          continue;
+        }
+
+        await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+      }
+
+      // Deposit any remaining sell items and military cells
+      for (const itemConfig of settings.sellItems) {
+        if (bot.state !== "running") break;
+        const remaining = getSellItemCargo(bot, itemConfig.itemId);
+        if (remaining > 0) {
+          ctx.log("fc", `Depositing ${remaining}x remaining ${itemConfig.itemName}`);
+          await ensureDocked(ctx);
+          await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: itemConfig.itemId, quantity: remaining });
+        }
+      }
+      const remainingMil = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
+      if (remainingMil > 0 && bot.state === "running") {
+        ctx.log("fc", `Depositing ${remainingMil}x remaining military fuel cells`);
+        await ensureDocked(ctx);
+        await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: remainingMil });
+      }
+
+      saveFCStationsData(fcData);
+      ctx.log("fc", "Pre-stage run complete — returned home");
+
+      // If we could not offload the cargo we brought back (home faction storage
+      // full), wait for space to free up instead of burning fuel hauling it out
+      // again.
+      const cargoStillOnBoard = settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
+      if (cargoStillOnBoard) {
+        ctx.log("fc", "Home faction storage is full — could not offload remaining cargo; waiting for space to free up");
+        await ctx.sleep(60000);
         continue;
       }
 
-      await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+      // Soft-stop: finished the cycle and back home — stop before starting the next load.
+      if (bot.shouldStopAfterCycle()) {
+        bot.clearStopAfterCycle();
+        ctx.log("fc", "Stop after cycle requested — back home, stopping routine");
+        bot.initiateStop();
+        return;
+      }
+    } else {
+      // Pre-stage mode: undock and continue to next station
+      if (bot.state !== "running") break;
+      await ensureUndocked(ctx);
+      ctx.log("fc", `Pre-stage: continuing to next station (${totalSellCargoQty(bot, settings)} items remaining in cargo)`);
     }
-
-    const checkCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-    if (checkCargo && checkCargo.quantity > 0) {
-      ctx.log("fc", `Depositing ${checkCargo.quantity}x remaining fuel cells`);
-      await ensureDocked(ctx);
-      //await bot.exec("faction_deposit_items", { item_id: FUEL_CELL_ITEM_ID, quantity: checkCargo.quantity, });
-      await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: FUEL_CELL_ITEM_ID, quantity: checkCargo.quantity, }); //fixed by human!
-    }
-
-
-    saveFCStationsData(fcData);
 
     ctx.log("fc", `Loop complete. Next station index: ${targetIdx}`);
   }

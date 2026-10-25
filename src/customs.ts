@@ -12,6 +12,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "fs";
 import { join } from "path";
 import type { Bot } from "./bot.js";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 // Simple sleep helper to avoid circular dependency with common.ts
 function sleep(ms: number): Promise<void> {
@@ -127,7 +128,8 @@ function saveCustomsStats(stats: CustomsStats): void {
     if (!existsSync(DATA_DIR)) {
       mkdirSync(DATA_DIR, { recursive: true });
     }
-    writeFileSync(CUSTOMS_FILE, JSON.stringify(stats, null, 2) + "\n", "utf-8");
+    const payload = JSON.stringify(stats, null, 2) + "\n";
+    safeWriteFileSync(CUSTOMS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Error saving customs stats:", err);
   }

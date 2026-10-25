@@ -22,6 +22,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { rename, writeFile } from "fs/promises";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 import { perf } from "./perf.js";
 
 const DATA_DIR = join(process.cwd(), "data");
@@ -122,6 +123,67 @@ class MarketDetailsStore {
   }
 
   /**
+   * Remove every item entry for a given station. Returns how many were removed.
+   */
+  clearStation(systemId: string, stationPoiId: string): number {
+    const data = this.ensureLoaded();
+    const prefix = `${systemId}\u0000${stationPoiId}\u0000`;
+    let removed = 0;
+    const newItems: MarketItemDetails[] = [];
+    const newIndex = new Map<string, number>();
+
+    for (let i = 0; i < data.items.length; i++) {
+      const item = data.items[i];
+      const key = this.key(item.systemId, item.stationPoiId, item.itemId);
+      if (key.startsWith(prefix)) {
+        removed++;
+      } else {
+        newIndex.set(key, newItems.length);
+        newItems.push(item);
+      }
+    }
+
+    if (removed > 0) {
+      data.items = newItems;
+      this.index = newIndex;
+      this.dirty = true;
+    }
+
+    return removed;
+  }
+
+  /**
+   * Remove specific item entries for a given station. Returns how many were removed.
+   */
+  removeStationItems(systemId: string, stationPoiId: string, itemIds: Set<string>): number {
+    if (itemIds.size === 0) return 0;
+    const data = this.ensureLoaded();
+    const prefix = `${systemId}\u0000${stationPoiId}\u0000`;
+    let removed = 0;
+    const newItems: MarketItemDetails[] = [];
+    const newIndex = new Map<string, number>();
+
+    for (let i = 0; i < data.items.length; i++) {
+      const item = data.items[i];
+      const key = this.key(item.systemId, item.stationPoiId, item.itemId);
+      if (key.startsWith(prefix) && itemIds.has(item.itemId)) {
+        removed++;
+      } else {
+        newIndex.set(key, newItems.length);
+        newItems.push(item);
+      }
+    }
+
+    if (removed > 0) {
+      data.items = newItems;
+      this.index = newIndex;
+      this.dirty = true;
+    }
+
+    return removed;
+  }
+
+  /**
    * Insert or update one station's order books. Memory only — the periodic
    * flush (or `flushSync()` on shutdown) puts it on disk.
    *
@@ -217,21 +279,24 @@ class MarketDetailsStore {
   /** Blocking persist for shutdown paths. */
   flushSync(): boolean {
     if (!this.dirty) return false;
+    const text = this.serialize();
     try {
-      const text = this.serialize();
       ensureDataDir();
-      try {
-        writeFileSync(MARKET_DETAILS_TMP, text, "utf-8");
-        renameSync(MARKET_DETAILS_TMP, MARKET_DETAILS_FILE);
-      } catch {
-        writeFileSync(MARKET_DETAILS_FILE, text, "utf-8");
-      }
+      const payload = Buffer.byteLength(text, "utf-8");
+      safeWriteFileSync(MARKET_DETAILS_TMP, text, payload);
+      renameSync(MARKET_DETAILS_TMP, MARKET_DETAILS_FILE);
       this.dirty = false;
       return true;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[MarketDetails] Save failed: ${msg}`);
-      return false;
+    } catch {
+      try {
+        safeWriteFileSync(MARKET_DETAILS_FILE, text, Buffer.byteLength(text, "utf-8"));
+        this.dirty = false;
+        return true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[MarketDetails] Save failed: ${msg}`);
+        return false;
+      }
     }
   }
 }

@@ -15,7 +15,7 @@ export type ChatChannel = "global" | "faction" | "local" | "system" | "private";
 export type MissionStatus = "available" | "active" | "complete" | "failed";
 export type OrderType = "buy" | "sell";
 export type BattleZone = "outer" | "mid" | "inner" | "engaged";
-export type BattleStance = "fire" | "evade" | "brace" | "flee";
+export type BattleStance = "fire" | "evade" | "brace" | "flee" | "board";
 export type BattleActionType = "advance" | "retreat" | "stance" | "target" | "engage";
 export type CommissionStatus = "pending" | "building" | "ready" | "cancelled";
 
@@ -414,6 +414,68 @@ export interface Drone {
   bandwidth: number;
 }
 
+// ── Prizes ───────────────────────────────────────────────────
+
+export type PrizeStatus =
+  | "available"
+  | "claimed"
+  | "in_transit"
+  | "delivered"
+  | "destroyed"
+  | "expired"
+  | "recaptured";
+
+export type CrewDisposition = "aboard" | "faction_reserve";
+
+export type PrizeTransitKind = "jump" | "travel";
+
+export type PrizeWaitReason =
+  | "no_route"
+  | "no_fuel"
+  | "destination_missing"
+  | "incapacitated"
+  | "manual_stop";
+
+export interface PrizeInfo {
+  prize_id: string;
+  actor_id: string;
+  ship_id: string;
+  ship_class: string;
+  ship_name?: string;
+  status: PrizeStatus;
+  hull: number;
+  max_hull: number;
+  shield: number;
+  max_shield: number;
+  in_combat: boolean;
+  wait_reason?: PrizeWaitReason;
+}
+
+export interface PrizeRecoveryInfo {
+  prize_id: string;
+  actor_id: string;
+  ship_id: string;
+  ship_class: string;
+  ship_name?: string;
+  status: PrizeStatus;
+  destination_base_id: string;
+  prize_crew_fit: number;
+  crew_disposition: CrewDisposition;
+  hull: number;
+  max_hull: number;
+  fuel: number;
+  max_fuel: number;
+  system_id?: string;
+  poi_id?: string;
+  wait_reason?: PrizeWaitReason;
+  transit_kind?: PrizeTransitKind;
+  transit_from_system_id?: string;
+  transit_from_poi_id?: string;
+  transit_to_system_id?: string;
+  transit_to_poi_id?: string;
+  transit_arrival_tick?: number;
+}
+
 // ── Battle ───────────────────────────────────────────────────
 
 export interface BattleParticipant {
@@ -434,12 +496,37 @@ export interface BattleParticipant {
   damage_taken?: number;
   kill_count?: number;
   survived?: boolean;
+  is_npc?: boolean;
 }
 
 export interface BattleSide {
   side_id: number;
   player_count?: number;
   members?: string[];
+}
+
+export interface BattleCombatState {
+  can_escape?: boolean;
+  em_disrupted?: boolean;
+  effective_speed?: number;
+  flee_counter?: number;
+  flee_required?: number;
+  incapacitated?: boolean;
+  max_weapon_reach?: number;
+  speed_penalty_pct?: number;
+  warp_disrupted?: boolean;
+  webbed?: boolean;
+  web_strength_pct?: number;
+  disruption_ticks?: number;
+}
+
+export interface BoardingPublicStatus {
+  operation_id: string;
+  phase: string;
+  progress?: string;
+  target_id?: string;
+  attacker_id?: string;
+  self_destruct_countdown?: number;
 }
 
 export interface BattleStatus {
@@ -454,6 +541,8 @@ export interface BattleStatus {
   your_target_id?: string;
   auto_pilot?: boolean;
   is_participant?: boolean;
+  boarding?: BoardingPublicStatus[];
+  combat_state?: BattleCombatState;
 }
 
 // ── Faction ──────────────────────────────────────────────────

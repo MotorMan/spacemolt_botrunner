@@ -1,6 +1,9 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import type { StationRef } from "../stationRef.js";
+import { join, dirname } from "path";
+import { existsSync, mkdirSync } from "fs";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -9,6 +12,7 @@ import {
   ensureFueled,
   navigateToSystem,
   detectAndRecoverFromDeath,
+  buildDeniedStationSet,
   readSettings,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
@@ -18,13 +22,28 @@ import {
   type BattleState,
   isPirateSystem,
   getItemSize,
+  getCargoFuelCells,
 } from "./common.js";
 import { logTransportProfit } from "./transportProfitDebug.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getSystemBlacklist, getStationBlacklist } from "../web/server.js";
 import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { onCivilianTransportUpdate } from "../client_sync_hooks.js";
+import { passengersLounge, LoungePassenger, PassengersLoungeStore } from "../passengersLounge.js";
+import { livePassengers } from "../livePassengers.js";
+
+// HTML markup for log lines rendered in the web UI.
+const HTML_RESET = "</span>";
+const HTML_BOLD_RED = '<span class="ansi-red ansi-bright">';
+const HTML_RED = '<span class="ansi-red">';
+const HTML_GREEN = '<span class="ansi-green">';
+const HTML_YELLOW = '<span class="ansi-yellow">';
+const HTML_CYAN = '<span class="ansi-cyan">';
+
+function span(value: string, cls: string): string {
+  return `<span class="${cls}">${value}</span>`;
+}
 
 // ── Cloaking module detection and enablement ────────────────────────────────
 
@@ -177,10 +196,99 @@ function isPirateDestination(stationId: string, systemId: string | undefined): b
   return false;
 }
 
-function isBlockedStation(stationId: string): boolean {
+function isBlockedStation(poiId: string, stationName?: string): boolean {
   const settings = getCivilianTransportSettings();
-  const lower = stationId.toLowerCase();
-  return settings.blockedStationIds.some(id => id.toLowerCase() === lower);
+  // Mirror travel avoidance: a station is "blocked" if it is in the configured
+  // blacklist, the civilian-transport blockedStationIds list, OR it has
+  // explicitly denied us docking this session (the "docking restricted" case).
+  // Dropping any of these from the pickup filter is what previously let us load
+  // passengers bound for a station we can never deliver to — and eat the
+  // reputation penalty when their timer expired.
+  const blocked = [
+    ...settings.blockedStationIds,
+    ...getStationBlacklist(),
+    ...Array.from(buildDeniedStationSet()),
+  ];
+  if (blocked.length === 0) return false;
+
+  const norm = (s: string): string =>
+    s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+
+  const candidates = new Set<string>();
+  const add = (s?: string) => {
+    if (!s) return;
+    const l = s.toLowerCase();
+    candidates.add(l);
+    const bar = l.lastIndexOf("|");
+    if (bar >= 0) candidates.add(l.slice(bar + 1));
+  };
+
+  // The passenger `destination` and the blacklist may use different identifier
+  // spaces for the same station (e.g. station_id vs underline_station_name, or
+  // a human-readable name). Resolve the destination through stationRef and check
+  // the blacklist against every identifier the station has.
+  add(poiId);
+  add(stationName);
+
+  const stationRef = loadStationRef();
+  const lower = (poiId || "").toLowerCase();
+  const info =
+    (lower && (stationRef.by_underline_name[lower] || stationRef.by_station_id[lower])) ||
+    undefined;
+  if (info) {
+    add(info.station_id);
+    add(info.underline_station_name);
+    add(info.regular_station_name);
+    add(info.official_name);
+    if (info.system_id) {
+      add(`${info.system_id}|${info.station_id}`);
+      add(`${info.system_id}|${info.underline_station_name}`);
+    }
+  }
+
+  for (const entry of blocked) {
+    if (!entry) continue;
+    const e = entry.toLowerCase();
+    const en = norm(e);
+    // Blocked entries may be stored as "system|poiId" (e.g. from
+    // buildDeniedStationSet). Compare the full key as well as its poi suffix.
+    const eSuffix = e.includes("|") ? e.slice(e.lastIndexOf("|") + 1) : e;
+    const enSuffix = norm(eSuffix);
+    for (const c of candidates) {
+      if (c === e || c === eSuffix) return true;
+      const cn = norm(c);
+      if (cn === en || cn === enSuffix) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Drop any passengers currently aboard whose destination is on the blacklist.
+ * Passengers can only be unloaded while docked, so this is a no-op unless the
+ * bot is currently docked — in which case they are dropped at the current
+ * station. Runs independently of routine status so a passenger whose
+ * destination was blacklisted after they boarded is always removed at the
+ * first opportunity.
+ */
+async function dropBlacklistedAboardPassengers(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  if (!bot.docked) return;
+  const listResp = await bot.exec("list_passengers");
+  if (listResp.error || !listResp.result) return;
+  const parsed = parseListPassengers(listResp.result);
+  if (!parsed) return;
+  for (const p of parsed.passengers) {
+    if (isBlockedStation(p.destination, p.destination_name)) {
+      ctx.log("transport", `Passenger ${p.name} aboard but bound for blacklisted station ${p.destination_name} - dropping at current station`);
+      const unloadResp = await bot.exec("unload_passenger", { id: p.citizen_id || p.name });
+      if (unloadResp.error) {
+        ctx.log("error", `Could not drop blacklisted passenger ${p.name}: ${unloadResp.error.message}`);
+      } else {
+        ctx.log("transport", `Dropped blacklisted passenger ${p.name} (${p.destination_name})`);
+      }
+    }
+  }
 }
 
 const fs = require("fs");
@@ -199,233 +307,221 @@ interface RouteResult {
   origDest?: string;
 }
 
-async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: string, destinationName: string, destinationSystem?: string): Promise<RouteResult | null> {
-  const settings = getCivilianTransportSettings();
-  if (settings.blockPirateStations && isPirateStation(destinationId)) {
-    ctx.log("transport", `resolveDestination: REJECTING pirate destination ${destinationId}`);
-    return null;
-  }
-  if (isBlockedStation(destinationId)) {
-    ctx.log("transport", `resolveDestination: REJECTING blacklisted station ${destinationId}`);
-    return null;
-  }
-  if (isMobileStation(destinationId)) {
-    ctx.log("transport", `resolveDestination: ${destinationId} is mobile, using find_route directly`);
-    const routeResp = await bot.exec("find_route", { target: destinationId });
-    if (!routeResp.error && routeResp.result) {
-      const result = routeResp.result as Record<string, unknown>;
-      const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
-      if (isFound) {
-        const resolvedSystem = (result.target_system as string) || "";
-        const resolvedPoi = (result.target_poi as string) || destinationId;
-        const resolvedPoiName = (result.target_poi_name as string) || destinationName || destinationId;
-        if (destinationId === "mobile_capital" && resolvedSystem && resolvedPoi) {
-          mapStore.updateMobileCapitolLocation(resolvedSystem, resolvedSystem, resolvedPoi);
-        }
-        return {
-          system: resolvedSystem,
-          poi: resolvedPoi,
-          poiName: resolvedPoiName,
-          origDest: destinationId,
-        };
-      }
-    }
-    return null;
-  }
-  
-  const stationRef = loadStationRef();
-  const allSystems = mapStore.getAllSystems();
-  
-  ctx.log("transport", `resolveDestination: looking up ${destinationId}, by_underline_name keys: ${Object.keys(stationRef.by_underline_name).slice(0, 5).join(", ")}...`);
-  
-  const byUnderline = stationRef.by_underline_name[destinationId.toLowerCase()];
-  if (byUnderline) {
-    ctx.log("transport", `resolveDestination: found in by_underline_name: system=${byUnderline.system_id}, station=${byUnderline.station_id}, name=${byUnderline.regular_station_name || byUnderline.station_id}`);
-    if (isPirateDestination(byUnderline.station_id, byUnderline.system_id)) {
-      ctx.log("transport", `resolveDestination: REJECTING pirate destination ${byUnderline.station_id}`);
+  async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: string, destinationName: string, destinationSystem?: string): Promise<RouteResult | null> {
+    const settings = getCivilianTransportSettings();
+    if (settings.blockPirateStations && isPirateStation(destinationId)) {
+      ctx.log("transport", `resolveDestination: REJECTING pirate destination ${destinationId}`);
       return null;
     }
-    const result = { system: byUnderline.system_id, poi: byUnderline.station_id, poiName: byUnderline.regular_station_name || byUnderline.station_id, origDest: destinationId };
-    ctx.log("transport", `resolveDestination: SUCCESS returning system=${result.system}, poi=${result.poi}`);
-    return result;
-  }
-
-  const byStationId = stationRef.by_station_id[destinationId.toLowerCase()];
-  if (byStationId) {
-    ctx.log("transport", `resolveDestination: found in by_station_id: system=${byStationId.system_id}, station=${byStationId.station_id}`);
-    if (isPirateDestination(byStationId.station_id, byStationId.system_id)) {
-      ctx.log("transport", `resolveDestination: REJECTING pirate destination ${byStationId.station_id}`);
+    if (isBlockedStation(destinationId, destinationName)) {
+      ctx.log("transport", `resolveDestination: REJECTING blacklisted station ${destinationId} (${destinationName})`);
       return null;
     }
-    const result = { system: byStationId.system_id, poi: byStationId.station_id, poiName: byStationId.official_name || byStationId.station_id, origDest: destinationId };
-    ctx.log("transport", `resolveDestination: SUCCESS returning system=${result.system}, poi=${result.poi}`);
-    return result;
-  }
 
-  for (const st of stationRef.stations) {
-    const destLower = destinationId.toLowerCase();
-    const stIdLower = st.station_id.toLowerCase();
-    const underlineLower = st.underline_station_name.toLowerCase();
-    const regularNameLower = st.regular_station_name?.toLowerCase() || "";
-    
-    const stationIdMatch = stIdLower === destLower;
-    const underlineMatch = underlineLower === destLower;
-    const regularNameMatch = regularNameLower === destLower;
-    const nameMatch = destinationName && regularNameLower === destinationName.toLowerCase();
-    const partialMatch = stIdLower.includes(destLower) || destLower.includes(stIdLower) ||
-      underlineLower.includes(destLower) || destLower.includes(underlineLower) ||
-      regularNameLower.includes(destLower) || destLower.includes(regularNameLower);
-    
-    if (stationIdMatch || underlineMatch || regularNameMatch || nameMatch || partialMatch) {
-      ctx.log("transport", `resolveDestination: found in stations: system=${st.system_id}, station=${st.station_id}`);
-      if (isPirateDestination(st.station_id, st.system_id)) {
-        ctx.log("transport", `resolveDestination: REJECTING pirate destination ${st.station_id}`);
+    const emit = (r: RouteResult): RouteResult | null => {
+      if (isBlockedStation(r.poi, r.poiName)) {
+        ctx.log("transport", `resolveDestination: REJECTING blacklisted station ${r.poi} (${r.poiName})`);
         return null;
       }
-      const result = { system: st.system_id, poi: st.station_id, poiName: st.regular_station_name || st.station_id, origDest: destinationId };
-      ctx.log("transport", `resolveDestination: SUCCESS returning system=${result.system}, poi=${result.poi}`);
-      return result;
-    }
-  }
-  
-  for (const [, sysData] of Object.entries(allSystems)) {
-    const found = sysData.pois.find(
-      (pp: { id: string; name: string }) => pp.id === destinationId || pp.name.toLowerCase() === destinationName.toLowerCase(),
-    );
-    if (found) {
-      if (isPirateDestination(found.id, sysData.id)) {
-        ctx.log("transport", `resolveDestination: REJECTING pirate destination ${found.id} in system ${sysData.id}`);
-        return null;
-      }
-      const result = { system: sysData.id, poi: found.id, poiName: found.name || found.id, origDest: destinationId };
-      ctx.log("transport", `resolveDestination: SUCCESS (allSystems scan) system=${result.system}, poi=${result.poi}`);
-      return result;
-    }
-  }
-
-  let bestStationMatch: { station_id: string; system_id: string; regular_station_name: string } | null = null;
-  let bestMatchScore = 0;
-  
-  for (const st of stationRef.stations) {
-    const destLower = destinationId.toLowerCase();
-    const stIdLower = st.station_id.toLowerCase();
-    const underlineLower = st.underline_station_name.toLowerCase();
-    const regularNameLower = st.regular_station_name?.toLowerCase() || "";
-    
-    let score = 0;
-    if (stIdLower === destLower) score = 10;
-    else if (underlineLower === destLower) score = 10;
-    else if (regularNameLower === destLower) score = 10;
-    else if (stIdLower.includes(destLower) || destLower.includes(stIdLower)) score = 5;
-    else if (underlineLower.includes(destLower) || destLower.includes(underlineLower)) score = 5;
-    else if (regularNameLower.includes(destLower) || destLower.includes(regularNameLower)) score = 5;
-    
-    if (score > bestMatchScore) {
-      bestMatchScore = score;
-      bestStationMatch = st;
-    }
-  }
-
-  if (bestStationMatch && bestMatchScore >= 5) {
-    ctx.log("transport", `resolveDestination: fallback bestMatchScore=${bestMatchScore}, station=${bestStationMatch.station_id}, system=${bestStationMatch.system_id}`);
-    const routeResp = await bot.exec("find_route", { target_system: bestStationMatch.system_id });
-    if (!routeResp.error && routeResp.result) {
-      const result = routeResp.result as Record<string, unknown>;
-      const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
-      if (isFound) {
-        const targetSystem = (result.target_system as string) || "";
-        const targetPoi = (result.target_poi as string) || bestStationMatch.station_id;
-        if (!isPirateDestination(targetPoi, targetSystem)) {
-          const ret = {
-            system: targetSystem,
-            poi: targetPoi,
-            poiName: ((result.target_poi_name as string) || bestStationMatch.regular_station_name || bestStationMatch.station_id) as string,
+      return r;
+    };
+    if (isMobileStation(destinationId)) {
+      const routeResp = await bot.exec("find_route", { target: destinationId });
+      if (!routeResp.error && routeResp.result) {
+        const result = routeResp.result as Record<string, unknown>;
+        const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
+        if (isFound) {
+          const resolvedSystem = (result.target_system as string) || "";
+          const resolvedPoi = (result.target_poi as string) || destinationId;
+          const resolvedPoiName = (result.target_poi_name as string) || destinationName || destinationId;
+          if (destinationId === "mobile_capital" && resolvedSystem && resolvedPoi) {
+            mapStore.updateMobileCapitolLocation(resolvedSystem, resolvedSystem, resolvedPoi);
+          }
+          return emit({
+            system: resolvedSystem,
+            poi: resolvedPoi,
+            poiName: resolvedPoiName,
             origDest: destinationId,
-          };
-          ctx.log("transport", `resolveDestination: SUCCESS (find_route fallback) system=${ret.system}, poi=${ret.poi}`);
-          return ret;
+          });
         }
-        ctx.log("transport", `resolveDestination: REJECTING pirate destination from find_route fallback: ${targetPoi}`);
       }
+      return null;
     }
-  }
-  
-  let targetSystemId: string | null = null;
-  
-  if (destinationSystem) {
-    ctx.log("transport", `resolveDestination: trying destinationSystem=${destinationSystem}`);
-    const directKey = Object.keys(allSystems).find(k => k === destinationSystem || k.toLowerCase() === destinationSystem.toLowerCase());
-    if (directKey) {
-      targetSystemId = directKey;
-      ctx.log("transport", `resolveDestination: matched system by direct key: ${targetSystemId}`);
-    } else {
-      const entry = Object.entries(allSystems).find(([, s]) => {
-        const sysName = s.name || s.id || "";
-        return sysName.toLowerCase() === destinationSystem.toLowerCase();
-      });
-      if (entry) {
-        targetSystemId = entry[0];
-        ctx.log("transport", `resolveDestination: matched system by name: ${targetSystemId}`);
+    
+    const stationRef = loadStationRef();
+    const allSystems = mapStore.getAllSystems();
+    
+    const byUnderline = stationRef.by_underline_name[destinationId.toLowerCase()];
+    if (byUnderline) {
+      if (isPirateDestination(byUnderline.station_id, byUnderline.system_id)) {
+        ctx.log("transport", `resolveDestination: REJECTING pirate destination ${byUnderline.station_id}`);
+        return null;
       }
+      const result = { system: byUnderline.system_id, poi: byUnderline.station_id, poiName: byUnderline.regular_station_name || byUnderline.station_id, origDest: destinationId };
+      return emit(result);
     }
-  }
 
-if (!targetSystemId) {
-    ctx.log("transport", `resolveDestination: could not resolve system ID for ${destinationSystem}`);
-    if (destinationSystem) {
-      const routeResp = await bot.exec("find_route", { target_system: destinationSystem });
+    const byStationId = stationRef.by_station_id[destinationId.toLowerCase()];
+    if (byStationId) {
+      if (isPirateDestination(byStationId.station_id, byStationId.system_id)) {
+        ctx.log("transport", `resolveDestination: REJECTING pirate destination ${byStationId.station_id}`);
+        return null;
+      }
+      const result = { system: byStationId.system_id, poi: byStationId.station_id, poiName: byStationId.official_name || byStationId.station_id, origDest: destinationId };
+      return emit(result);
+    }
+
+    for (const st of stationRef.stations) {
+      const destLower = destinationId.toLowerCase();
+      const stIdLower = st.station_id.toLowerCase();
+      const underlineLower = st.underline_station_name.toLowerCase();
+      const regularNameLower = st.regular_station_name?.toLowerCase() || "";
+      
+      const stationIdMatch = stIdLower === destLower;
+      const underlineMatch = underlineLower === destLower;
+      const regularNameMatch = regularNameLower === destLower;
+      const nameMatch = destinationName && regularNameLower === destinationName.toLowerCase();
+      const partialMatch = stIdLower.includes(destLower) || destLower.includes(stIdLower) ||
+        underlineLower.includes(destLower) || destLower.includes(underlineLower) ||
+        regularNameLower.includes(destLower) || destLower.includes(regularNameLower);
+      
+      if (stationIdMatch || underlineMatch || regularNameMatch || nameMatch || partialMatch) {
+        if (isPirateDestination(st.station_id, st.system_id)) {
+          ctx.log("transport", `resolveDestination: REJECTING pirate destination ${st.station_id}`);
+          return null;
+        }
+        const result = { system: st.system_id, poi: st.station_id, poiName: st.regular_station_name || st.station_id, origDest: destinationId };
+        return emit(result);
+      }
+    }
+    
+    for (const [, sysData] of Object.entries(allSystems)) {
+      const found = sysData.pois.find(
+        (pp: { id: string; name: string }) => pp.id === destinationId || pp.name.toLowerCase() === destinationName.toLowerCase(),
+      );
+      if (found) {
+        if (isPirateDestination(found.id, sysData.id)) {
+          ctx.log("transport", `resolveDestination: REJECTING pirate destination ${found.id} in system ${sysData.id}`);
+          return null;
+        }
+        const result = { system: sysData.id, poi: found.id, poiName: found.name || found.id, origDest: destinationId };
+        return emit(result);
+      }
+    }
+
+    let bestStationMatch: { station_id: string; system_id: string; regular_station_name: string } | null = null;
+    let bestMatchScore = 0;
+    
+    for (const st of stationRef.stations) {
+      const destLower = destinationId.toLowerCase();
+      const stIdLower = st.station_id.toLowerCase();
+      const underlineLower = st.underline_station_name.toLowerCase();
+      const regularNameLower = st.regular_station_name?.toLowerCase() || "";
+      
+      let score = 0;
+      if (stIdLower === destLower) score = 10;
+      else if (underlineLower === destLower) score = 10;
+      else if (regularNameLower === destLower) score = 10;
+      else if (stIdLower.includes(destLower) || destLower.includes(stIdLower)) score = 5;
+      else if (underlineLower.includes(destLower) || destLower.includes(underlineLower)) score = 5;
+      else if (regularNameLower.includes(destLower) || destLower.includes(regularNameLower)) score = 5;
+      
+      if (score > bestMatchScore) {
+        bestMatchScore = score;
+        bestStationMatch = st;
+      }
+    }
+
+    if (bestStationMatch && bestMatchScore >= 5) {
+      const routeResp = await bot.exec("find_route", { target_system: bestStationMatch.system_id });
       if (!routeResp.error && routeResp.result) {
         const result = routeResp.result as Record<string, unknown>;
         const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
         if (isFound) {
           const targetSystem = (result.target_system as string) || "";
-          const targetPoi = (result.target_poi as string) || destinationId;
+          const targetPoi = (result.target_poi as string) || bestStationMatch.station_id;
           if (!isPirateDestination(targetPoi, targetSystem)) {
             const ret = {
               system: targetSystem,
               poi: targetPoi,
-              poiName: ((result.target_poi_name as string) || destinationName || targetPoi) as string,
+              poiName: ((result.target_poi_name as string) || bestStationMatch.regular_station_name || bestStationMatch.station_id) as string,
               origDest: destinationId,
             };
-            ctx.log("transport", `resolveDestination: SUCCESS (destinationSystem fallback) system=${ret.system}, poi=${ret.poi}`);
-            return ret;
+            return emit(ret);
           }
-          ctx.log("transport", `resolveDestination: REJECTING pirate destination from destinationSystem fallback: ${targetPoi}`);
+          ctx.log("transport", `resolveDestination: REJECTING pirate destination from find_route fallback: ${targetPoi}`);
         }
       }
     }
-    ctx.log("transport", `resolveDestination: FAILED - could not resolve destination ${destinationId}`);
-    return null;
+    
+    let targetSystemId: string | null = null;
+    
+    if (destinationSystem) {
+      const directKey = Object.keys(allSystems).find(k => k === destinationSystem || k.toLowerCase() === destinationSystem.toLowerCase());
+      if (directKey) {
+        targetSystemId = directKey;
+      } else {
+        const entry = Object.entries(allSystems).find(([, s]) => {
+          const sysName = s.name || s.id || "";
+          return sysName.toLowerCase() === destinationSystem.toLowerCase();
+        });
+        if (entry) {
+          targetSystemId = entry[0];
+        }
+      }
+    }
+
+  if (!targetSystemId) {
+      if (destinationSystem) {
+        const routeResp = await bot.exec("find_route", { target_system: destinationSystem });
+        if (!routeResp.error && routeResp.result) {
+          const result = routeResp.result as Record<string, unknown>;
+          const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
+          if (isFound) {
+            const targetSystem = (result.target_system as string) || "";
+            const targetPoi = (result.target_poi as string) || destinationId;
+            if (!isPirateDestination(targetPoi, targetSystem)) {
+              const ret = {
+                system: targetSystem,
+                poi: targetPoi,
+                poiName: ((result.target_poi_name as string) || destinationName || targetPoi) as string,
+                origDest: destinationId,
+              };
+              return emit(ret);
+            }
+            ctx.log("transport", `resolveDestination: REJECTING pirate destination from destinationSystem fallback: ${targetPoi}`);
+          }
+        }
+      }
+      return null;
+    }
+    
+    ctx.log("transport", `resolveDestination: using find_route for ${destinationId} in system ${targetSystemId}`);
+    const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
+    if (routeResp.error || !routeResp.result) {
+      ctx.log("transport", `resolveDestination: find_route error for ${destinationId}: ${routeResp.error?.message || "no result"}`);
+      return null;
+    }
+    const result = routeResp.result as Record<string, unknown>;
+    const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
+    if (!isFound) {
+      ctx.log("transport", `resolveDestination: find_route not found for ${destinationId}`);
+      return null;
+    }
+    const targetSystem = (result.target_system as string) || "";
+    const targetPoi = (result.target_poi as string) || destinationId;
+    if (isPirateDestination(targetPoi, targetSystem)) {
+      ctx.log("transport", `resolveDestination: REJECTING pirate destination ${targetPoi} in system ${targetSystem}`);
+      return null;
+    }
+    const ret = {
+      system: targetSystem,
+      poi: targetPoi,
+      poiName: ((result.target_poi_name as string) || destinationName || targetPoi) as string,
+      origDest: destinationId,
+    };
+    return emit(ret);
   }
-  
-  ctx.log("transport", `resolveDestination: using find_route for ${destinationId} in system ${targetSystemId}`);
-  const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
-  if (routeResp.error || !routeResp.result) {
-    ctx.log("transport", `resolveDestination: find_route error for ${destinationId}: ${routeResp.error?.message || "no result"}`);
-    return null;
-  }
-  const result = routeResp.result as Record<string, unknown>;
-  const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
-  if (!isFound) {
-    ctx.log("transport", `resolveDestination: find_route not found for ${destinationId}`);
-    ctx.log("transport", `resolveDestination: FAILED - no route found`);
-    return null;
-  }
-  const targetSystem = (result.target_system as string) || "";
-  const targetPoi = (result.target_poi as string) || destinationId;
-  if (isPirateDestination(targetPoi, targetSystem)) {
-    ctx.log("transport", `resolveDestination: REJECTING pirate destination ${targetPoi} in system ${targetSystem}`);
-    return null;
-  }
-  const ret = {
-    system: targetSystem,
-    poi: targetPoi,
-    poiName: ((result.target_poi_name as string) || destinationName || targetPoi) as string,
-    origDest: destinationId,
-  };
-  ctx.log("transport", `resolveDestination: SUCCESS (find_route) system=${ret.system}, poi=${ret.poi}`);
-  return ret;
-}
 
 interface CatalogShip {
   id: string;
@@ -483,11 +579,13 @@ interface TransportPassenger {
   loadedAt: string;
   status: "boarded" | "delivered" | "stranded";
   ticksRemaining?: number;
+  /** True when the passenger was picked up from the Transit Lounge (needs lounge-store cleanup on delivery). */
+  fromLounge?: boolean;
 }
 
 interface TransportState {
   botUsername: string;
-  status: "idle" | "traveling_to_ship" | "loading" | "in_transit" | "unloading" | "completed";
+  status: "idle" | "traveling_to_ship" | "loading" | "in_transit" | "unloading" | "completed" | "returning_to_lounge" | "delivering_lounge_passenger";
   shipId: string;
   shipName: string;
   customName?: string;
@@ -505,8 +603,9 @@ interface TransportState {
   lastUpdated: string;
   routeRebuildAttempts: number;
   roundsWithoutPassengers: number;
-  visitedEmpireStations: string[];
+  awayPickupAttempts: number;
   needsTravel: boolean;
+  recentlyVisitedStations: string[];
 }
 
 interface FleetShip {
@@ -544,6 +643,7 @@ interface StationPassengersResponse {
   station: string;
   waiting: StationPassenger[];
   count: number;
+  transitLounge?: LoungePassenger[];
 }
 
 interface AboardPassenger {
@@ -566,9 +666,12 @@ interface ListPassengersResponse {
   berths_used: { economy: number; business: number; first: number };
 }
 
+type CivilianTransportMode = "normal" | "lounge_transport" | "achievement";
+
 interface CivilianTransportSettings {
   maxJumps: number;
   roundsBeforeMoving: number;
+  maxAwayPickupAttempts: number;
   refuelThreshold: number;
   repairThreshold: number;
   homeSystem: string;
@@ -583,10 +686,15 @@ interface CivilianTransportSettings {
   allowFirstClass: boolean;
   allowBusinessClass: boolean;
   allowEconomyClass: boolean;
+  allowParkInLounge: boolean;
   announceDestination: boolean;
+  useLivePassengers: boolean;
   disableFactionMessage: boolean;
   enableCloak: boolean;
   factionDepositThreshold: number;
+  buyFuelCells: boolean;
+  minFuelCellsToDepart: number;
+  mode: CivilianTransportMode;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -598,6 +706,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
   return {
     maxJumps: Number((t.maxJumps as number) ?? 5),
     roundsBeforeMoving: Number((t.roundsBeforeMoving as number) ?? 5),
+    maxAwayPickupAttempts: Number((t.maxAwayPickupAttempts as number) ?? 3),
     refuelThreshold: Number((t.refuelThreshold as number) ?? 50),
     repairThreshold: Number((t.repairThreshold as number) ?? 40),
     homeSystem: (botOverrides.homeSystem as string) || (t.homeSystem as string) || "",
@@ -614,73 +723,16 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     allowFirstClass: (t.allowFirstClass as boolean) !== false,
     allowBusinessClass: (t.allowBusinessClass as boolean) !== false,
     allowEconomyClass: (t.allowEconomyClass as boolean) !== false,
+    allowParkInLounge: (t.allowParkInLounge as boolean) ?? false,
     announceDestination: (t.announceDestination as boolean) !== false,
+    useLivePassengers: (t.useLivePassengers as boolean) !== false,
     disableFactionMessage: (t.disableFactionMessage as boolean) ?? false,
     enableCloak: (t.enableCloak as boolean) ?? false,
     factionDepositThreshold: Number((t.factionDepositThreshold as number) ?? 1000000),
+    buyFuelCells: (t.buyFuelCells as boolean) ?? false,
+    minFuelCellsToDepart: Number((t.minFuelCellsToDepart as number) ?? 6),
+    mode: (botOverrides.mode as CivilianTransportMode) || (t.mode as CivilianTransportMode) || "normal",
   };
-}
-
-// ── Empire station mapping ───────────────────────────────────
-
-interface EmpireStation {
-  systemId: string;
-  poiId: string;
-  poiName: string;
-}
-
-const EMPIRE_STATIONS: Record<string, EmpireStation[]> = {
-  solarian: [
-    { systemId: "sol", poiId: "sol_central", poiName: "Confederacy Central Command" },
-    { systemId: "alpha_centauri", poiId: "alpha_centauri_colonial_station", poiName: "Alpha Centauri Colonial Station" },
-    { systemId: "sirius", poiId: "sirius_observatory_station", poiName: "Sirius Observatory Station" },
-    { systemId: "nova_terra", poiId: "nova_terra_central", poiName: "Nova Terra Central" },
-    { systemId: "procyon", poiId: "procyon_colonial_station", poiName: "Procyon Colonial Station" },
-  ],
-  voidborn: [
-    { systemId: "nexus_prime", poiId: "the_core", poiName: "Central Nexus" },
-    { systemId: "node_alpha", poiId: "node_alpha_processing_station", poiName: "Node Alpha Processing Station" },
-    { systemId: "node_beta", poiId: "node_beta_industrial_station", poiName: "Node Beta Industrial Station" },
-    { systemId: "synchrony", poiId: "synchrony_hub", poiName: "Synchrony Hub" },
-    { systemId: "the_experiment", poiId: "the_experiment_research_station", poiName: "The Experiment Research Station" },
-    { systemId: "node_gamma", poiId: "node_gamma_relay_station", poiName: "Node Gamma Relay Station" },
-  ],
-  nebula: [
-    { systemId: "gold_run", poiId: "gold_run_extraction_hub", poiName: "Gold Run Extraction Hub" },
-    { systemId: "haven", poiId: "grand_exchange", poiName: "Grand Exchange Station" },
-    { systemId: "cargo_lanes", poiId: "cargo_lanes_freight_depot", poiName: "Cargo Lanes Freight Depot" },
-    { systemId: "traders_rest", poiId: "traders_rest_resort_station", poiName: "Trader's Rest Resort Station" },
-    { systemId: "the_levy", poiId: "the_levy_customs_station", poiName: "The Levy Customs Station" },
-    { systemId: "market_prime", poiId: "market_prime_exchange", poiName: "Market Prime Exchange" },
-    { systemId: "treasure_cache", poiId: "treasure_cache_trading_post", poiName: "Treasure Cache Trading Post" },
-  ],
-  crimson: [
-    { systemId: "the_rampart", poiId: "the_rampart_checkpoint", poiName: "The Rampart Checkpoint" },
-    { systemId: "the_crucible", poiId: "the_crucible_garrison", poiName: "The Crucible Garrison" },
-    { systemId: "iron_reach", poiId: "iron_reach_mining_colony", poiName: "Iron Reach Mining Colony" },
-    { systemId: "krynn", poiId: "war_citadel", poiName: "Crimson War Citadel" },
-    { systemId: "blood_forge", poiId: "blood_forge_smelting_works", poiName: "Blood Forge Smelting Works" },
-    { systemId: "ironhearth", poiId: "ironhearth_station", poiName: "Ironhearth Station" },
-    { systemId: "the_anvil", poiId: "the_anvil_arsenal", poiName: "The Anvil Arsenal" },
-  ],
-  outerrim: [
-    { systemId: "last_light", poiId: "ramens_rest", poiName: "Ramen's Rest" },
-    { systemId: "unknown_edge", poiId: "unknown_edge_waystation", poiName: "Unknown Edge Waystation" },
-    { systemId: "starfall", poiId: "starfall_salvage_station", poiName: "Starfall Salvage Station" },
-    { systemId: "void_gate", poiId: "void_gate_outpost", poiName: "Void Gate Outpost" },
-    { systemId: "deep_range", poiId: "deep_range_outpost", poiName: "Deep Range Outpost" },
-  ],
-};
-
-function getStationsForEmpire(empire: string): EmpireStation[] {
-  const lowerEmpire = empire.toLowerCase();
-  return EMPIRE_STATIONS[lowerEmpire] || [];
-}
-
-function getRandomEmpireStation(empire: string): EmpireStation | null {
-  const stations = getStationsForEmpire(empire);
-  if (stations.length === 0) return null;
-  return stations[Math.floor(Math.random() * stations.length)];
 }
 
 // ── Persistent helpers ───────────────────────────────────────
@@ -704,12 +756,11 @@ function loadAllData(): { runs: Record<string, TransportState>; fleet: FleetData
 
 function saveAllData(data: { runs: Record<string, TransportState>; fleet: FleetData }): void {
   try {
-    const fs = require("fs");
-    const path = require("path");
-    const full = path.join(process.cwd(), DATA_FILE);
-    const dir = path.dirname(full);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(full, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    const full = join(process.cwd(), DATA_FILE);
+    const dir = dirname(full);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(full, payload, Buffer.byteLength(payload, "utf-8"));
     void onCivilianTransportUpdate({ manifest: data });
   } catch (err) {
     console.error("Failed to save civilianTransport state:", err);
@@ -733,7 +784,7 @@ function isValidTransportState(state: unknown): state is TransportState {
   if (typeof s.shipId !== "string" || s.shipId.length === 0) return false;
   const berths = s.berths as Record<string, number> | undefined;
   if (!berths || (berths.economy + berths.business + berths.first) <= 0) return false;
-  const validStatuses = new Set(["idle", "loading", "unloading", "in_transit", "traveling_to_ship"]);
+  const validStatuses = new Set(["idle", "loading", "unloading", "in_transit", "traveling_to_ship", "returning_to_lounge", "delivering_lounge_passenger"]);
   if (typeof s.status !== "string" || !validStatuses.has(s.status)) return false;
   return true;
 }
@@ -857,6 +908,11 @@ export async function unloadPassengersToLounge(
     if (!ok) {
       return { ok: false, error: `Failed to navigate to home system ${homeSystem}` };
     }
+    // Verify we actually arrived at the home system
+    await bot.refreshLocation();
+    if (homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
+      return { ok: false, error: `Navigation reported success but bot is still in ${bot.system}, not ${homeSystem}` };
+    }
   }
 
   if (homeStation && bot.poi && bot.poi.toLowerCase() !== homeStation.toLowerCase()) {
@@ -900,6 +956,21 @@ export async function unloadPassengersToLounge(
   };
 }
 
+/**
+ * Stock the cargo with fuel cells for the upcoming run.
+ *
+ * Fuel cells are ONLY ever sourced from faction storage (the home stockpile) by
+ * default. Buying them on the open market is disabled unless
+ * `settings.buyFuelCells` is explicitly enabled — current market prices are so
+ * high that a single fuel_cell purchase can wipe out an entire multi-station
+ * run's profit. When the reserve runs low mid-run the routine routes *home* to
+ * restock from faction storage rather than paying market rates.
+ *
+ * Passengers occupy berths, not cargo, so the entire free cargo hold is fair
+ * game for fuel cells. We fill it densest-first (military 100 fuel / 3 space,
+ * premium 50 / 2, regular 20 / 1) regardless of current tank level — the cells
+ * are the ship's fuel reserve for the whole tour, not just an immediate refill.
+ */
 async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
   const { bot } = ctx;
   await bot.refreshCargo();
@@ -907,24 +978,6 @@ async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransport
 
   const cargoFree = (bot.cargoMax || 0) - (bot.cargo || 0);
   if (cargoFree <= 0) {
-    return;
-  }
-
-  if ((bot.maxFuel || 0) > 0 && (bot.fuel / bot.maxFuel) >= 0.9) {
-    return;
-  }
-
-  const cellFuelValues: Record<string, number> = {
-    military_fuel_cell: 100,
-    premium_fuel_cell: 50,
-    fuel_cell: 20,
-  };
-
-  const existingCellFuel = bot.inventory
-    .filter(i => cellFuelValues[i.itemId])
-    .reduce((sum, i) => sum + (i.quantity * (cellFuelValues[i.itemId] || 0)), 0);
-
-  if (existingCellFuel >= (bot.maxFuel || 0) - (bot.fuel || 0)) {
     return;
   }
 
@@ -943,6 +996,7 @@ async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransport
 
   const tryAcquire = async (fuelId: string, qty: number) => {
     if (qty <= 0) return true;
+    // Preferred: pull free cells from faction storage (the home stockpile).
     const resp = await bot.exec("storage", {
       action: "withdraw",
       target: "faction",
@@ -952,13 +1006,72 @@ async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransport
     if (!resp.error) {
       return true;
     }
-    const buyResp = await bot.exec("buy", { item_id: fuelId, quantity: qty });
-    return !buyResp.error;
+    // Last resort (and OFF by default): buy on the open market. Market fuel-cell
+    // prices are currently ruinous, so this must be an explicit opt-in.
+    if (settings.buyFuelCells) {
+      const buyResp = await bot.exec("buy", { item_id: fuelId, quantity: qty });
+      return !buyResp.error;
+    }
+    return false;
   };
 
   await tryAcquire("military_fuel_cell", milCap);
   await tryAcquire("premium_fuel_cell", premCap);
   await tryAcquire("fuel_cell", regCap);
+}
+
+/** Number of fuel cells currently in cargo. */
+function countFuelCells(ctx: RoutineContext): number {
+  return getCargoFuelCells(ctx.bot).cells;
+}
+
+/** True only when the bot is currently docked at its configured home base. */
+function isAtHomeBase(ctx: RoutineContext, settings: CivilianTransportSettings): boolean {
+  if (!settings.homeSystem || !settings.homeStation) return false;
+  const sys = (ctx.bot.system || "").toLowerCase();
+  const poi = (ctx.bot.poi || "").toLowerCase();
+  return sys === settings.homeSystem.toLowerCase() && poi === settings.homeStation.toLowerCase();
+}
+
+/**
+ * Return to the home base to replenish the fuel-cell reserve from faction
+ * storage. Used when the reserve runs low mid-tour instead of buying cells.
+ * Passengers stay aboard and the route is preserved, so the routine simply
+ * resumes the tour after restocking.
+ */
+async function returnHomeForFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
+  if (!settings.homeSystem) return;
+  const { bot } = ctx;
+
+  if (settings.homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
+    await ensureUndocked(ctx);
+    const ok = await navigateToSystem(ctx, settings.homeSystem, {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      skipBlacklist: true,
+    });
+    if (!ok) {
+      ctx.log("transport", "Could not navigate home to restock fuel cells — will retry next cycle");
+      return;
+    }
+    // Verify we actually arrived at the home system
+    await bot.refreshLocation();
+    if (settings.homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
+      ctx.log("error", `Navigation reported success but bot is still in ${bot.system}, not ${settings.homeSystem}`);
+      return;
+    }
+  }
+
+  if (settings.homeStation && (bot.poi || "").toLowerCase() !== settings.homeStation.toLowerCase()) {
+    const tr = await bot.exec("travel", { target_poi: settings.homeStation });
+    if (tr.error) {
+      ctx.log("error", `Travel to home station failed: ${tr.error.message}`);
+      return;
+    }
+  }
+
+  await ensureDocked(ctx);
+  await collectFuelCells(ctx, settings);
 }
 
 // ── Parsers ──────────────────────────────────────────────────
@@ -971,11 +1084,103 @@ function parseStationPassengers(result: unknown): StationPassengersResponse | nu
     ? r.structuredContent as Record<string, unknown>
     : r;
   const waiting = Array.isArray(inner.waiting) ? inner.waiting as StationPassenger[] : [];
-  return {
+  const response: StationPassengersResponse = {
     station: (inner.station as string) || "",
     waiting,
     count: (inner.count as number) || waiting.length,
   };
+
+  // Extract transit lounge passengers from the API response so the lounge store
+  // stays in sync with the actual station lounge contents.
+  const transitLoungeRaw = inner.transit_lounge || inner.transitLounge;
+  if (transitLoungeRaw && typeof transitLoungeRaw === "object") {
+    const tl = transitLoungeRaw as Record<string, unknown>;
+    const loungePassengers = Array.isArray(tl.passengers) ? tl.passengers : [];
+    const nowISO = new Date().toISOString();
+    const checkedInAt = nowISO;
+    const expiresAt = new Date(Date.now() + 360 * 1000).toISOString();
+    response.transitLounge = loungePassengers
+      .filter((p): p is Record<string, unknown> => typeof p === "object" && p !== null)
+      .map((po) => ({
+        citizenId: ((po.citizen_id || po.citizenId || "") as string),
+        name: ((po.name || "") as string),
+        accommodationClass: ((po.class || po.accommodationClass || "economy") as "economy" | "business" | "first"),
+        citizenship: ((po.citizenship || "") as string),
+        destination: ((po.destination || "") as string),
+        destinationName: ((po.destination_name || po.destinationName || "") as string),
+        destinationSystem: ((po.destination_system || po.destinationSystem || "") as string) || undefined,
+        fare: (typeof po.base_fare === "number" ? po.base_fare : typeof po.fare === "number" ? po.fare : 0),
+        bio: ((po.bio || "") as string),
+        loadedAt: checkedInAt,
+        checkedInAt,
+        expiresAt,
+        status: "waiting",
+      }));
+  }
+
+  return response;
+}
+
+/** Trust livePassengers data for this long before falling back to a live API query. */
+const LIVE_PASSENGER_TTL_MS = 10 * 60 * 1000;
+
+interface StationPassengerLookup {
+  station: string;
+  waiting: StationPassenger[];
+  count: number;
+}
+
+/**
+ * Resolve the passengers waiting at a station, preferring the livePassengers
+ * roster (populated by the market routine) so the CT routine avoids slow,
+ * rate-limited `list_station_passengers` calls. Falls back to the live API
+ * when no fresh roster data exists for the station.
+ */
+async function fetchStationPassengers(
+  ctx: RoutineContext,
+  systemId: string,
+  stationId: string,
+): Promise<StationPassengerLookup | null> {
+  const { bot } = ctx;
+  const snap = livePassengers.getStationSnapshot(systemId, stationId);
+  const now = Date.now();
+  const isFresh = snap && snap.updatedAt && now - new Date(snap.updatedAt).getTime() < LIVE_PASSENGER_TTL_MS;
+  if (isFresh && snap.count > 0) {
+    const live = livePassengers.getAtStation(systemId, stationId);
+    if (live.length > 0) {
+      ctx.log("transport", `Live passengers: ${live.length} waiting at ${stationId} (roster)`);
+      return {
+        station: snap.stationName || stationId,
+        waiting: live.map(p => ({
+          citizen_id: p.citizenId,
+          name: p.name,
+          class: p.accommodationClass,
+          citizenship: p.citizenship,
+          destination: p.destination,
+          destination_name: p.destinationName,
+          destination_system: p.destinationSystem,
+          bio: p.bio,
+          estimated_fare: p.fare,
+        })),
+        count: live.length,
+      };
+    }
+  }
+  const resp = await bot.exec("list_station_passengers");
+  if (resp.error || !resp.result) return null;
+  const parsed = parseStationPassengers(resp.result);
+  if (!parsed) return null;
+
+  // Populate the lounge store with transit_lounge passengers from the API
+  // response so achievement-mode bots can pick them up from home base.
+  if (parsed.transitLounge && parsed.transitLounge.length > 0) {
+    for (const p of parsed.transitLounge) {
+      passengersLounge.addOrUpdatePassenger(p);
+    }
+    ctx.log("transport", `Lounge store synced: ${parsed.transitLounge.length} passengers from transit lounge at ${parsed.station}`);
+  }
+
+  return { station: parsed.station || stationId, waiting: parsed.waiting, count: parsed.count };
 }
 
 function parseListPassengers(result: unknown): ListPassengersResponse | null {
@@ -1150,12 +1355,21 @@ async function getCurrentShipInfo(ctx: RoutineContext, shipId: string): Promise<
   const cargoCapacity = (shipData.cargo_capacity || shipData.max_cargo || 0) as number;
   
   let berths = { economy: 0, business: 0, first: 0 };
-  const directBerths = (shipData.passenger_berths || shipData.berths || {}) as Record<string, number>;
+  const directBerths = (shipData.passenger_berths || shipData.berths || {}) as Record<string, unknown>;
+  const berthCount = (val: unknown): number => {
+    if (typeof val === "number") return val;
+    if (val && typeof val === "object") {
+      const obj = val as Record<string, unknown>;
+      if (typeof obj.total === "number") return obj.total;
+      if (typeof obj.free === "number") return obj.free;
+    }
+    return 0;
+  };
   if (directBerths.economy || directBerths.business || directBerths.first) {
     berths = {
-      economy: directBerths.economy || 0,
-      business: directBerths.business || 0,
-      first: directBerths.first || 0,
+      economy: berthCount(directBerths.economy),
+      business: berthCount(directBerths.business),
+      first: berthCount(directBerths.first),
     };
   } else {
     const catalog = loadCatalog();
@@ -1266,18 +1480,15 @@ async function selectPickupStation(
   // Check current station first if docked (unless excluded)
   if (!excludeCurrentStation && bot.docked && currentPoi && currentSystem) {
     if (!blockPirateStations || !isPirateStation(currentPoi)) {
-      const resp = await bot.exec("list_station_passengers");
-      if (!resp.error && resp.result) {
-        const data = parseStationPassengers(resp.result);
-        if (data && data.count > 0) {
-          stations.push({
-            system: currentSystem,
-            poi: currentPoi,
-            poiName: data.station,
-            count: data.count,
-            hops: 0,
-          });
-        }
+      const lookup = await fetchStationPassengers(ctx, currentSystem, currentPoi);
+      if (lookup && lookup.count > 0) {
+        stations.push({
+          system: currentSystem,
+          poi: currentPoi,
+          poiName: lookup.station,
+          count: lookup.count,
+          hops: 0,
+        });
       }
     }
   }
@@ -1341,18 +1552,16 @@ for (const p of pois) {
           const poiId = (p.id || p.poi_id || p.name || "") as string;
           if (!poiId) continue;
           if (blockPirateStations && isPirateStation(poiId)) continue;
-          const pResp = await bot.exec("list_station_passengers");
-         if (pResp.error || !pResp.result) continue;
-         const pData = parseStationPassengers(pResp.result);
-         if (pData && pData.count > 0) {
-           stations.push({
-             system: info.systemId,
-             poi: poiId,
-             poiName: pData.station,
-             count: pData.count,
-             hops: info.hops,
-           });
-         }
+          const lookup = await fetchStationPassengers(ctx, info.systemId, poiId);
+          if (lookup && lookup.count > 0) {
+            stations.push({
+              system: info.systemId,
+              poi: poiId,
+              poiName: lookup.station,
+              count: lookup.count,
+              hops: info.hops,
+            });
+          }
        }
      } catch {
        // skip system query errors
@@ -1376,99 +1585,154 @@ async function selectNextPickupStation(
   ctx: RoutineContext,
   state: TransportState,
   settings: CivilianTransportSettings,
+  avoidCurrentSystem: boolean = false,
 ): Promise<{ system: string; poi: string; poiName: string } | null> {
   const { bot } = ctx;
-  
-  let empire = bot.getEmpire();
-  
-  if (!empire && bot.poi && bot.system) {
-    const stationRef = loadStationRef();
-    const stationInfo = stationRef.by_underline_name[bot.poi.toLowerCase()] || 
-                         stationRef.by_station_id[bot.poi.toLowerCase()];
-    if (stationInfo) {
-      const systemId = stationInfo.system_id.toLowerCase();
-      for (const [emp, stations] of Object.entries(EMPIRE_STATIONS)) {
-        if (stations.some(s => s.systemId.toLowerCase() === systemId || s.poiId.toLowerCase() === bot.poi.toLowerCase())) {
-          empire = emp;
-          ctx.log("transport", `Derived empire '${emp}' from current station ${bot.poi}`);
-          break;
-        }
-      }
-    }
-  }
-  
-  if (!empire) {
-    ctx.log("transport", "Cannot determine bot's empire, falling back to nearest station search");
-    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations, true);
-    if (!pickup) return null;
-    return { system: pickup.system, poi: pickup.poi, poiName: pickup.poiName };
-  }
-
-  const empireLower = empire.toLowerCase();
-  const empireStations = getStationsForEmpire(empireLower);
-  
-  if (empireStations.length === 0) {
-    ctx.log("transport", `No known stations for empire ${empire}, falling back to nearest station search`);
-    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations, true);
-    if (!pickup) return null;
-    return { system: pickup.system, poi: pickup.poi, poiName: pickup.poiName };
-  }
 
   const currentSystem = bot.system || "";
   const currentPoi = bot.poi || "";
-  
-  const visitedStations = state.visitedEmpireStations || [];
-  const currentStationKey = `${currentSystem}:${currentPoi}`.toLowerCase();
-  
-  if (!visitedStations.includes(currentStationKey)) {
-    state.visitedEmpireStations = [...visitedStations, currentStationKey];
+
+  if (!currentSystem) return null;
+
+  const stationKey = (system: string, poi: string): string =>
+    `${system.toLowerCase()}:${poi.toLowerCase()}`;
+  const currentKey = stationKey(currentSystem, currentPoi);
+
+  const recentSet = new Set<string>();
+  for (const key of state.recentlyVisitedStations || []) recentSet.add(key.toLowerCase());
+
+  // We're leaving the current station because it had nothing to load — remember it
+  // so we don't immediately ping-pong back to it on the next selection.
+  if (currentSystem && currentPoi) {
+    addRecentStation(state, currentSystem, currentPoi);
     saveTransportState(state);
   }
-  
-  const unvisitedStations = empireStations.filter(
-    s => !state.visitedEmpireStations.includes(`${s.systemId}:${s.poiId}`.toLowerCase())
-  );
-  
-  if (unvisitedStations.length > 0) {
-    const stationsWithHops = unvisitedStations.map(s => {
-      const hops = hopsToStation(currentSystem, s.systemId);
-      return { ...s, hops };
-    }).filter(s => s.hops <= settings.maxJumps);
-    
-    ctx.log("transport", `Found ${stationsWithHops.length} reachable unvisited stations out of ${unvisitedStations.length} total`);
-    
-    if (stationsWithHops.length > 0) {
-      stationsWithHops.sort((a, b) => a.hops - b.hops);
-      const next = stationsWithHops[0];
-      ctx.log("transport", `Moving to unvisited station: ${next.poiName} (${next.hops} hops)`);
-      return { system: next.systemId, poi: next.poiId, poiName: next.poiName };
+
+  // BFS over known systems from the current location, nearest first, capped at maxJumps.
+  const blacklist = getSystemBlacklist();
+  const knownSystems = mapStore.getAllSystems();
+
+  const candidates = new Map<string, { hops: number; systemId: string }>();
+  candidates.set(currentSystem.toLowerCase(), { hops: 0, systemId: currentSystem });
+  let frontier = [currentSystem];
+  for (let depth = 1; depth <= settings.maxJumps; depth++) {
+    const nextFrontier: string[] = [];
+    for (const sys of frontier) {
+      const systemConns = knownSystems[sys]?.connections || [];
+      for (const c of systemConns) {
+        const cid = c.system_id.toLowerCase();
+        if (!candidates.has(cid) && !blacklist.includes(c.system_id)) {
+          candidates.set(cid, { hops: depth, systemId: c.system_id });
+          nextFrontier.push(c.system_id);
+        }
+      }
     }
-    
-    const fallback = unvisitedStations[0];
-    ctx.log("transport", `No unvisited stations within ${settings.maxJumps} hops, using: ${fallback.poiName}`);
-    return { system: fallback.systemId, poi: fallback.poiId, poiName: fallback.poiName };
+    frontier = nextFrontier;
+    if (frontier.length === 0) break;
   }
-  
-  ctx.log("transport", `All ${empireStations.length} empire stations visited, resetting and finding nearest from ${empireStations.length} total`);
-  state.visitedEmpireStations = [];
-  saveTransportState(state);
-  
-  let nearest: EmpireStation & { dist: number } = { ...empireStations[0], dist: 9999 };
-  for (const s of empireStations) {
-    if (s.poiId === currentPoi && s.systemId === currentSystem) continue;
-    const dist = hopsBetweenSync(currentSystem, s.systemId);
-    if (dist < nearest.dist) {
-      nearest = { ...s, dist };
+
+  // ── Live-passenger-first selection ─────────────────────────────────
+  // If enabled, use livePassengers.json to find stations that actually have
+  // waiting passengers, rather than bouncing to the nearest empty station.
+  if (settings.useLivePassengers) {
+    const liveCandidates: Array<{ system: string; poi: string; poiName: string; count: number; hops: number }> = [];
+
+    for (const info of Array.from(candidates.values())) {
+      if (info.hops > settings.maxJumps) continue;
+      if (settings.blockPirateStations && isPirateSystem(info.systemId)) continue;
+
+      const sysData = knownSystems[info.systemId];
+      if (!sysData) continue;
+
+      for (const p of sysData.pois || []) {
+        const hasBase = p.has_base || p.base_id !== null;
+        if (!hasBase) continue;
+        const poiId = p.id;
+        if (!poiId) continue;
+        const key = stationKey(info.systemId, poiId);
+        if (key === currentKey) continue;
+        if (recentSet.has(key)) continue;
+        if (settings.blockPirateStations && isPirateStation(poiId)) continue;
+        if (isBlockedStation(poiId)) continue;
+
+        const count = livePassengers.getStationCount(info.systemId, poiId);
+        if (count > 0) {
+          liveCandidates.push({
+            system: info.systemId,
+            poi: poiId,
+            poiName: (p.name || poiId) as string,
+            count,
+            hops: info.hops,
+          });
+        }
+      }
+    }
+
+    if (liveCandidates.length > 0) {
+      // Sort by passenger count (desc), then hops (asc) — same as selectPickupStation
+      liveCandidates.sort((a, b) => b.count - a.count || a.hops - b.hops);
+      const best = liveCandidates[0];
+      ctx.log("transport", `Live passengers: moving to ${best.poiName} (${best.count} waiting, ${best.hops} hops)`);
+      return { system: best.system, poi: best.poi, poiName: best.poiName };
+    }
+
+    ctx.log("transport", "No stations with live waiting passengers within maxJumps; falling back to nearest-station scan");
+  }
+
+  // ── Fallback: nearest station scan ─────────────────────────────────
+  const sorted = Array.from(candidates.values()).sort((a, b) => a.hops - b.hops);
+  let skippedDueToRecency = false;
+  for (const info of sorted) {
+    if (info.hops > settings.maxJumps) continue;
+    if (avoidCurrentSystem && info.systemId.toLowerCase() === currentSystem.toLowerCase()) continue;
+    if (settings.blockPirateStations && isPirateSystem(info.systemId)) continue;
+
+    const sysData = knownSystems[info.systemId];
+    if (!sysData) continue;
+
+    for (const p of sysData.pois || []) {
+      const hasBase = p.has_base || p.base_id !== null;
+      if (!hasBase) continue;
+      const poiId = p.id;
+      if (!poiId) continue;
+      const key = stationKey(info.systemId, poiId);
+      if (key === currentKey) continue;
+      if (recentSet.has(key)) {
+        skippedDueToRecency = true;
+        continue;
+      }
+      if (settings.blockPirateStations && isPirateStation(poiId)) continue;
+      if (isBlockedStation(poiId)) continue;
+
+      const poiName = (p.name || poiId) as string;
+      ctx.log("transport", `Moving to nearest station: ${poiName} (${info.hops} hops)`);
+      return { system: info.systemId, poi: poiId, poiName };
     }
   }
-  if (nearest.dist === 9999) {
-    ctx.log("transport", `No other empire stations available`);
-    return null;
+
+  // Every reachable station was recently visited — clear the short-term memory
+  // and allow revisiting so the tour can continue instead of stalling. When
+  // avoidCurrentSystem is set we keep skipping the current system on retry so
+  // we don't ping-pong back into the same two-station loop.
+  if (skippedDueToRecency) {
+    ctx.log("transport", "All reachable stations recently visited, clearing recent history and retrying");
+    state.recentlyVisitedStations = [];
+    saveTransportState(state);
+    return selectNextPickupStation(ctx, state, settings, true);
   }
-  if (nearest.dist > settings.maxJumps) {
-    ctx.log("transport", `No stations within ${settings.maxJumps} hops, using nearest: ${nearest.poiName}`);
-  }
-  return { system: nearest.systemId, poi: nearest.poiId, poiName: nearest.poiName };
+
+  ctx.log("transport", "No reachable non-blacklisted station found within maxJumps");
+  return null;
+}
+
+function addRecentStation(state: TransportState, system: string, poi: string): void {
+  const key = `${system.toLowerCase()}:${poi.toLowerCase()}`;
+  const recent = state.recentlyVisitedStations || [];
+  if (recent.includes(key)) return;
+  recent.push(key);
+  const RECENT_STATION_LIMIT = 12;
+  if (recent.length > RECENT_STATION_LIMIT) recent.splice(0, recent.length - RECENT_STATION_LIMIT);
+  state.recentlyVisitedStations = recent;
 }
 
 // ── Route planning ───────────────────────────────────────────
@@ -1550,20 +1814,6 @@ async function planTourRoute(
   return planned;
 }
 
-function hopsBetweenSync(a: string, b: string): number {
-  if (a.toLowerCase() === b.toLowerCase()) return 0;
-  const route = mapStore.findRoute(a, b, getSystemBlacklist());
-  if (!route) return 9999;
-  return route.length - 1;
-}
-
-function hopsToStation(a: string, b: string): number {
-  if (a.toLowerCase() === b.toLowerCase()) return 0;
-  const route = mapStore.findRoute(a, b, getSystemBlacklist());
-  if (!route) return 9999;
-  return route.length - 1;
-}
-
 function makeNewState(bot: Bot, shipId: string, shipName: string, customName: string | undefined, tier: number | null, berths: { economy: number; business: number; first: number }): TransportState {
   return {
     botUsername: bot.username,
@@ -1585,9 +1835,221 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, customName: st
     lastUpdated: new Date().toISOString(),
     routeRebuildAttempts: 0,
     roundsWithoutPassengers: 0,
-    visitedEmpireStations: [],
+    awayPickupAttempts: 0,
     needsTravel: false,
+    recentlyVisitedStations: [],
   };
+}
+
+// ── Lounge delivery helper (achievement primary source) ────────────────────
+//
+// Picks up expired Transit Lounge passengers and fills all available berths,
+// respecting class hierarchy: lower class may ride UP (economy→business→first),
+// but higher class cannot ride down (first→first only, business→business/first).
+// Returns true when it took action so the caller can `continue` the loop.
+// When `botUsername` is null (lounge_transport mode) all expired lounge
+// passengers are delivered. When `botUsername` is set (achievement mode) only
+// passengers this bot has not yet delivered are considered.
+async function tryDeliverExpiredLoungePassenger(
+  ctx: RoutineContext,
+  bot: Bot,
+  state: TransportState,
+  settings: CivilianTransportSettings,
+  botUsername: string | null,
+): Promise<boolean> {
+  // When docked at home in achievement mode, sync lounge store from the station
+  // API so we can see transit_lounge passengers before checking candidates.
+  if (botUsername !== null && bot.docked && bot.poi && bot.system && settings.homeStation && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()) {
+    await fetchStationPassengers(ctx, bot.system, bot.poi);
+  }
+
+  const expiredLoungePassengers = passengersLounge.checkExpiredPassengers();
+
+  let candidates: LoungePassenger[];
+  if (botUsername === null) {
+    // lounge_transport mode: only expired passengers are delivered one at a time
+    candidates = expiredLoungePassengers;
+  } else {
+    // achievement mode: pick up ALL lounge passengers not yet transported by
+    // this bot. The Transit Lounge at home base is the primary source of
+    // civilians for achievement mode. Includes passengers that are still
+    // "waiting", passengers already marked "ready_for_delivery" (expired in a
+    // prior cycle but never picked up), and newly expired passengers.
+    const waitingLoungePassengers = passengersLounge.getWaitingPassengers();
+    const readyLoungePassengers = passengersLounge.getReadyForDeliveryPassengers();
+    const allCandidates = [...expiredLoungePassengers];
+    for (const p of waitingLoungePassengers) {
+      if (!allCandidates.some(existing => existing.citizenId === p.citizenId)) {
+        allCandidates.push(p);
+      }
+    }
+    for (const p of readyLoungePassengers) {
+      if (!allCandidates.some(existing => existing.citizenId === p.citizenId)) {
+        allCandidates.push(p);
+      }
+    }
+    candidates = allCandidates.filter((p) => !civilianStore.hasBeenTransportedByBot(p.citizenId, botUsername));
+    ctx.log("transport", `Lounge check: expired=${expiredLoungePassengers.length} waiting=${waitingLoungePassengers.length} ready=${readyLoungePassengers.length} candidates=${candidates.length}`);
+  }
+
+  // Lounge passengers live at the faction home base Transit Lounge. Only
+  // attempt to load them when docked there; loading from the wrong station
+  // fails or loads passengers that were never actually present.
+  if (candidates.length > 0 && settings.homeStation &&
+      (!bot.docked || !bot.poi || bot.poi.toLowerCase() !== settings.homeStation.toLowerCase())) {
+    ctx.log("transport", `Lounge check: not docked at home base ${settings.homeStation} - skipping lounge pickup`);
+    return false;
+  }
+
+  // Passengers whose destination is the current station are already where
+  // they want to go; the API refuses to load them (invalid_destination:
+  // "That is your current station."). Mark them delivered so they don't
+  // block future cycles, then remove them from the candidate set.
+  if (candidates.length > 0 && bot.docked && bot.poi) {
+    const currentPoi = bot.poi.toLowerCase();
+    for (const p of candidates) {
+      if (p.destination.toLowerCase() === currentPoi) {
+        passengersLounge.markDelivered(p.citizenId);
+        ctx.log("transport", `Lounge: ${p.name} already at destination ${p.destinationName} - marking delivered`);
+      }
+    }
+    candidates = candidates.filter((p) => p.destination.toLowerCase() !== currentPoi);
+  }
+
+  if (candidates.length === 0) {
+    ctx.log("transport", `Lounge check: no candidates to load (expired=${expiredLoungePassengers.length} waiting=${passengersLounge.getWaitingPassengers().length} ready=${passengersLounge.getReadyForDeliveryPassengers().length})`);
+    return false;
+  }
+
+  // Sort by class restrictiveness: first → business → economy (most restrictive first)
+  const classOrder: Record<string, number> = { first: 0, business: 1, economy: 2 };
+  const sorted = [...candidates].sort((a, b) => classOrder[a.accommodationClass] - classOrder[b.accommodationClass]);
+
+  // Berth capacities (respect existing usage)
+  let usedFirst = state.berths_used.first;
+  let usedBusiness = state.berths_used.business;
+  let usedEconomy = state.berths_used.economy;
+  const maxFirst = state.berths.first;
+  const maxBusiness = state.berths.business;
+  const maxEconomy = state.berths.economy;
+
+  const onboard: TransportPassenger[] = [];
+
+  for (const p of sorted) {
+    const cls = p.accommodationClass;
+    let canLoad = false;
+
+    if (cls === "first" && usedFirst < maxFirst) {
+      usedFirst++;
+      canLoad = true;
+    } else if (cls === "business") {
+      if (usedBusiness < maxBusiness) {
+        usedBusiness++;
+        canLoad = true;
+      } else if (usedFirst < maxFirst) {
+        usedFirst++;
+        canLoad = true;
+      }
+    } else if (cls === "economy") {
+      if (usedEconomy < maxEconomy) {
+        usedEconomy++;
+        canLoad = true;
+      } else if (usedBusiness < maxBusiness) {
+        usedBusiness++;
+        canLoad = true;
+      } else if (usedFirst < maxFirst) {
+        usedFirst++;
+        canLoad = true;
+      }
+    }
+
+    if (!canLoad) continue;
+
+    onboard.push({
+      citizenId: p.citizenId,
+      name: p.name,
+      accommodationClass: cls,
+      citizenship: p.citizenship,
+      destination: p.destination,
+      destinationName: p.destinationName,
+      destinationSystem: p.destinationSystem,
+      fare: p.fare,
+      bio: p.bio,
+      routeData: null,
+      loadedAt: p.checkedInAt,
+      status: "boarded",
+      fromLounge: true,
+    });
+  }
+
+  if (onboard.length === 0) return false;
+
+  // Actually load lounge passengers onto the ship, grouped by destination.
+  // `load_passenger` pulls from the Transit Lounge at the current station.
+  const loungeByDest = new Map<string, TransportPassenger[]>();
+  for (const p of onboard) {
+    const arr = loungeByDest.get(p.destination) || [];
+    arr.push(p);
+    loungeByDest.set(p.destination, arr);
+  }
+
+  for (const [destId, passengers] of loungeByDest) {
+    const loadResp = await bot.exec("load_passenger", { id: destId });
+    if (loadResp.error) {
+      ctx.log("error", `load_passenger from lounge failed for ${destId}: ${loadResp.error.message}`);
+    } else {
+      ctx.log("transport", `Loaded ${passengers.length} lounge passengers for ${destId}`);
+    }
+    await ctx.sleep(11000);
+  }
+
+  // Verify what actually loaded
+  const verifyResp = await bot.exec("list_passengers");
+  let actuallyAboard: TransportPassenger[] = [];
+  if (!verifyResp.error && verifyResp.result) {
+    const parsed = parseListPassengers(verifyResp.result);
+    if (parsed) {
+      const aboardIds = new Set(parsed.passengers.map(p => p.citizen_id || p.name));
+      actuallyAboard = onboard.filter(p => aboardIds.has(p.citizenId));
+      if (actuallyAboard.length === 0) {
+        ctx.log("transport", "Lounge delivery: API confirmed 0 passengers aboard after load — aborting");
+        return false;
+      }
+      // Update berths_used from actual API data
+      state.berths_used = parsed.berths_used || { economy: 0, business: 0, first: 0 };
+    }
+  }
+
+  if (actuallyAboard.length === 0) return false;
+
+  // Build destination map and plan a route to all destinations
+  const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
+  for (const p of actuallyAboard) {
+    const existing = destMap.get(p.destination);
+    if (existing) { existing.count++; continue; }
+    const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
+    destMap.set(p.destination, {
+      system: resolved?.system || "",
+      poi: resolved?.poi || p.destination,
+      poiName: resolved?.poiName || p.destinationName,
+      count: 1,
+    });
+  }
+
+  const routeDests = Array.from(destMap.values()).filter(d => d.system);
+  const planned = await planTourRoute(bot.system || "", routeDests, settings.maxJumps, bot);
+
+  state.onboardPassengers = actuallyAboard;
+  state.route = planned;
+  state.currentRouteIndex = 0;
+  state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
+  state.status = "in_transit";
+  state.routeRebuildAttempts = 0;
+  state.roundsWithoutPassengers = 0;
+  saveTransportState(state);
+
+  ctx.log("transport", `Lounge delivery: loaded ${actuallyAboard.length} passengers from Transit Lounge (berths used: ${usedEconomy}e/${usedBusiness}b/${usedFirst}f)`);
+  return true;
 }
 
 // ── Main routine ─────────────────────────────────────────────
@@ -1619,8 +2081,8 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
     ctx.log("transport", "This is a unique, rare vessel - the Nebula billionaire's flagship.");
     ctx.log("transport", `Only ${currentShipInfo.berths.first} first-class berth(s) available.`);
     ctx.log("transport", "Unarmed luxury yacht built for status, not combat.");
-    ctx.log("transport", "NOTE: This ship cannot carry economy or business passengers.");
-    ctx.log("transport", "RECOMMENDATION: Set allowFirstClass=true, allowBusinessClass=false, allowEconomyClass=false");
+    ctx.log("transport", "NOTE: Economy and business passengers ride up in first-class berths; first-class passengers require first-class berths.");
+    ctx.log("transport", "RECOMMENDATION: Set allowFirstClass=true, allowBusinessClass=true, allowEconomyClass=true (economy/business ride up in first-class berths)");
   }
   
   // Initialize state if none or invalid
@@ -1660,6 +2122,9 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
   }
 
 ctx.log("transport", `Civilian transport started. Ship: ${state.customName || state.shipName}. Status: ${state.status}`);
+  if (settings.mode === "achievement") {
+    ctx.log("transport", `★ ACHIEVEMENT MODE ★ Only picking up civilians ${bot.username} has not delivered yet, to transport every civilian once for this bot.`);
+  }
 
   // Enable cloaking if configured and module is available
   if (settings.enableCloak) {
@@ -1796,7 +2261,7 @@ if (state && state.status !== "idle") {
 
   while (bot.state === "running") {
     yield state.status;
-    ctx.log("transport", `Main loop: status=${state.status}, route.length=${state.route.length}, currentRouteIndex=${state.currentRouteIndex}, onboard=${state.onboardPassengers.length}`);
+    ctx.log("transport", `Loop: status=${span(state.status, "ansi-cyan")}, route=${state.route.length > 0 ? span(`${state.route.length} waypoints`, "ansi-green") : span("none", "ansi-red")}, onboard=${state.onboardPassengers.length}`);
 
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -1849,8 +2314,78 @@ if (state && state.status !== "idle") {
       }
     }
 
+    // Drop any aboard passengers whose destination was blacklisted (only
+    // possible while docked). Runs every cycle so they're removed at the first
+    // docked opportunity regardless of routine status.
+    await dropBlacklistedAboardPassengers(ctx);
+
+    // ── Fuel-cell logistics ─────────────────────────────────────
+    // The routine NEVER pays market prices for fuel cells (a single purchase can
+    // erase a whole tour's profit). Cells come from faction storage only, and
+    // when the reserve runs low the bot returns HOME to restock rather than buy.
+    // It is also forbidden from leaving the home base unless it is carrying more
+    // than `minFuelCellsToDepart` cells. With no home configured this is a no-op
+    // and behaviour falls back to the old (storage-only) collection.
+    if (settings.homeSystem && settings.homeStation) {
+      await bot.refreshCargo();
+      await bot.refreshShip();
+      const fuelCellCount = countFuelCells(ctx);
+      const tankPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 0;
+      // Refuel the tank from cargo cells / station reserve when it runs low,
+      // so we don't attempt travel with an empty tank.
+      if (tankPct < settings.refuelThreshold) {
+        if (bot.docked) {
+          await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+          await bot.refreshShip();
+        } else {
+          await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+          await bot.refreshShip();
+        }
+      }
+      const tankPctAfter = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 0;
+      if (isAtHomeBase(ctx, settings)) {
+        if (fuelCellCount <= settings.minFuelCellsToDepart) {
+          ctx.log("transport", `Home base: only ${fuelCellCount} fuel cells (need >${settings.minFuelCellsToDepart}) — topping up from faction storage before departing`);
+          await collectFuelCells(ctx, settings);
+          await bot.refreshCargo();
+          const after = countFuelCells(ctx);
+          if (after <= settings.minFuelCellsToDepart) {
+            ctx.log("transport", `Home stockpile still insufficient (${after} cells) — waiting for it to refill before departing`);
+            await ctx.sleep(30000);
+            continue;
+          }
+        }
+        if (tankPctAfter < settings.refuelThreshold && fuelCellCount === 0) {
+          ctx.log("transport", `Home base: tank low (${Math.round(tankPctAfter)}%) and no cargo fuel cells — waiting for stockpile`);
+          await ctx.sleep(30000);
+          continue;
+        }
+      } else if (fuelCellCount <= settings.minFuelCellsToDepart && tankPctAfter < settings.refuelThreshold) {
+        ctx.log("transport", `Low on fuel cells (${fuelCellCount} <= ${settings.minFuelCellsToDepart}) and tank low away from home — returning to base to restock`);
+        await returnHomeForFuelCells(ctx, settings);
+        await ctx.sleep(2000);
+        continue;
+      }
+    }
+
     // --- State machine ---
     if (state.status === "idle") {
+      if (bot.shouldStopAfterCycle()) {
+        bot.clearStopAfterCycle();
+        bot.initiateStop();
+        await ctx.sleep(5000);
+        return;
+      }
+
+      // ── Achievement mode: primary source is the home Transit Lounge ──
+      // Other CT bots park passengers here. Deliver any not-yet-transported
+      // expired lounge passenger first; only fall back to remote station
+      // pickup when the lounge has nothing new to deliver.
+      if (settings.mode === "achievement") {
+        const loungeActed = await tryDeliverExpiredLoungePassenger(ctx, bot, state, settings, bot.username);
+        if (loungeActed) continue;
+      }
+
       // Check idle timeout - return home if stuck idle for too long
       const isAwayFromHome = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
       if (isAwayFromHome && !bot.docked) {
@@ -1867,6 +2402,7 @@ if (state && state.status !== "idle") {
           state.pickupStation = settings.homeStation || null;
           state.pickupSystem = settings.homeSystem || null;
           state.roundsWithoutPassengers = 0;
+          state.awayPickupAttempts = 0;
           saveTransportState(state);
           idleStartTime = 0;
           await ctx.sleep(5000);
@@ -1874,6 +2410,54 @@ if (state && state.status !== "idle") {
         }
       } else if (idleStartTime !== 0) {
         idleStartTime = 0;
+      }
+
+      // ── Lounge delivery check ──
+      // When docked at home in lounge_transport mode, deliver expired lounge
+      // passengers before picking up new ones. Runs every idle cycle so it
+      // doesn't only happen on routine restart.
+      if (settings.mode === "lounge_transport" && bot.docked && isAtHomeBase(ctx, settings)) {
+        const expiredLoungePassengers = passengersLounge.checkExpiredPassengers();
+        if (expiredLoungePassengers.length > 0) {
+          const p = expiredLoungePassengers[0];
+          if (isBlockedStation(p.destination, p.destinationName)) {
+            ctx.log("transport", `Lounge delivery: skipping ${p.name} — destination ${p.destinationName} is blacklisted`);
+            passengersLounge.markDelivered(p.citizenId);
+            await ctx.sleep(5000);
+            continue;
+          }
+          const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
+          if (resolved) {
+            state.status = "delivering_lounge_passenger";
+            state.onboardPassengers = [{
+              citizenId: p.citizenId,
+              name: p.name,
+              accommodationClass: p.accommodationClass,
+              citizenship: p.citizenship,
+              destination: p.destination,
+              destinationName: p.destinationName,
+              destinationSystem: p.destinationSystem,
+              fare: p.fare,
+              bio: p.bio,
+              routeData: null,
+              loadedAt: p.checkedInAt,
+              status: "boarded",
+            }];
+            state.route = [{ system: resolved.system, poi: resolved.poi, poiName: resolved.poiName, origDest: p.destination }];
+            state.currentRouteIndex = 0;
+            state.currentDestination = resolved.poiName;
+            state.pickupStation = settings.homeStation || null;
+            state.pickupSystem = settings.homeSystem || null;
+            saveTransportState(state);
+            ctx.log("transport", `Lounge delivery: picking up ${p.name} from lounge, delivering to ${resolved.poiName}`);
+            continue;
+          } else {
+            ctx.log("transport", `Lounge delivery: could not resolve destination for ${p.name}, skipping`);
+            passengersLounge.markDelivered(p.citizenId);
+            await ctx.sleep(5000);
+            continue;
+          }
+        }
       }
 
       // Need to find passengers and load up
@@ -1884,55 +2468,68 @@ if (state && state.status !== "idle") {
         } else {
           // Collect fuel cells at any station when idle
           await collectFuelCells(ctx, settings);
-          const resp = await bot.exec("list_station_passengers");
-          if (!resp.error && resp.result) {
-            const data = parseStationPassengers(resp.result);
-            if (data && data.count > 0) {
-              state.pickupStation = bot.poi;
-              state.pickupSystem = bot.system;
-              ctx.log("transport", `Found ${data.count} passengers at ${bot.poi}`);
-            } else {
-              state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
-              ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
+          const lookup = await fetchStationPassengers(ctx, bot.system, bot.poi);
+          if (lookup && lookup.count > 0) {
+            state.pickupStation = bot.poi;
+            state.pickupSystem = bot.system;
+            ctx.log("transport", `Found ${lookup.count} passengers at ${bot.poi}`);
+          } else if (lookup === null) {
+            // API error / no data — back off before retrying
+            await ctx.sleep(60000);
+            continue;
+          } else {
+            state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+            const isAwayFromHome = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
+            if (isAwayFromHome) {
+              state.awayPickupAttempts = (state.awayPickupAttempts || 0) + 1;
+            }
+            ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
               if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
                 ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-                const nextPickup = await selectNextPickupStation(ctx, state, settings);
-                if (!nextPickup) {
-                  // No next pickup available - try to return home
-                  if (settings.homeSystem) {
-                    ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
-                    state.pickupStation = settings.homeStation || null;
-                    state.pickupSystem = settings.homeSystem || null;
-                    state.roundsWithoutPassengers = 0;
-                  } else {
-                    await ctx.sleep(60000);
-                    continue;
-                  }
+                if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+                  ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
+                  state.pickupStation = settings.homeStation || null;
+                  state.pickupSystem = settings.homeSystem || null;
+                  state.roundsWithoutPassengers = 0;
+                  state.awayPickupAttempts = 0;
                 } else {
-                  const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
-                  if (isSameStation) {
-                    ctx.log("transport", `Next pickup is same station, resetting counter and checking for different passengers`);
+                  const nextPickup = await selectNextPickupStation(ctx, state, settings);
+                  if (!nextPickup) {
+                    // No next pickup available - try to return home
+                    if (settings.homeSystem) {
+                      ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+                      state.pickupStation = settings.homeStation || null;
+                      state.pickupSystem = settings.homeSystem || null;
+                      state.roundsWithoutPassengers = 0;
+                      state.awayPickupAttempts = 0;
+                    } else {
+                      await ctx.sleep(60000);
+                      continue;
+                    }
+                  } else {
+                    const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+                    if (isSameStation) {
+                      ctx.log("transport", `Next pickup is same station, resetting counter and checking for different passengers`);
+                      state.roundsWithoutPassengers = 0;
+                      state.awayPickupAttempts = 0;
+                      state.pickupStation = nextPickup.poi;
+                      state.pickupSystem = nextPickup.system;
+                      await ctx.sleep(5000);
+                      continue;
+                    }
                     state.roundsWithoutPassengers = 0;
+                    state.awayPickupAttempts = 0;
                     state.pickupStation = nextPickup.poi;
                     state.pickupSystem = nextPickup.system;
-                    await ctx.sleep(5000);
-                    continue;
+                    state.needsTravel = true;
                   }
-                  state.roundsWithoutPassengers = 0;
-                  state.pickupStation = nextPickup.poi;
-                  state.pickupSystem = nextPickup.system;
-                  state.needsTravel = true;
                 }
               } else {
                 await ctx.sleep(60000);
                 continue;
               }
             }
-          } else {
-            await ctx.sleep(60000);
-            continue;
           }
-        }
       } else {
         const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
         if (!pickup) {
@@ -1981,6 +2578,27 @@ if (state && state.status !== "idle") {
         }
         state.status = "traveling_to_ship";
         saveTransportState(state);
+        // Refuel tank before traveling (from cargo cells / station reserve).
+        // Without this the bot sits with fuel in cargo and 0 in tank, failing
+        // every travel attempt with "Insufficient fuel for travel".
+        await bot.refreshShip();
+        const idleTankPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 0;
+        if (idleTankPct < settings.refuelThreshold) {
+          if (bot.docked) {
+            await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+          } else {
+            await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+          }
+          await bot.refreshShip();
+        }
+        const idleTankPctAfter = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 0;
+        if (idleTankPctAfter <= 0) {
+          ctx.log("error", `No fuel in tank and could not refuel at ${bot.poi} — cannot travel`);
+          state.status = "idle";
+          saveTransportState(state);
+          await ctx.sleep(30000);
+          continue;
+        }
         if (state.pickupSystem !== bot.system) {
           const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
           if (!ok) {
@@ -2065,26 +2683,46 @@ if (state && state.status !== "idle") {
       // Group passengers by destination
       const byDest = new Map<string, StationPassenger[]>();
       const midasFilterLog = isMidas;
+      const skipped: Array<{ name: string; reason: string }> = [];
       for (const p of waiting) {
         const cls = p.class.toLowerCase();
-        if (settings.blockPirateStations && isPirateStation(p.destination)) {
-          if (midasFilterLog) ctx.log("transport", `Skipping pirate passenger: ${p.name}`);
+        // Achievement mode: only pick up civilians no bot has successfully
+        // delivered yet, so we make progress toward transporting every single
+        // civilian. Anyone already transported by this bot is skipped here.
+        if (settings.mode === "achievement" && civilianStore.hasBeenTransportedByBot(p.citizen_id, bot.username)) {
+          skipped.push({ name: p.name, reason: "already transported by this bot (achievement mode)" });
           continue;
         }
-        if (isBlockedStation(p.destination)) {
-          ctx.log("transport", `Skipping passenger to blacklisted station: ${p.name} -> ${p.destination_name}`);
+        if (settings.blockPirateStations && isPirateStation(p.destination)) {
+          if (midasFilterLog) ctx.log("transport", `Skipping pirate passenger: ${p.name}`);
+          skipped.push({ name: p.name, reason: `pirate destination ${p.destination_name}` });
           continue;
+        }
+        if (isBlockedStation(p.destination, p.destination_name)) {
+          // In lounge_transport mode with allowParkInLounge, pick up passengers
+          // bound for blacklisted destinations to park them in the Transit Lounge
+          // instead of skipping them entirely. Delivery to blacklisted destinations
+          // remains blocked by the delivery blacklist check below.
+          if (!(settings.mode === "lounge_transport" && settings.allowParkInLounge)) {
+            ctx.log("transport", `Skipping passenger to blacklisted station: ${p.name} -> ${p.destination_name}`);
+            skipped.push({ name: p.name, reason: `blacklisted station ${p.destination_name}` });
+            continue;
+          }
+          // Fall through: include this passenger for lounge parking
         }
         if (cls === "first" && !settings.allowFirstClass) {
           if (midasFilterLog) ctx.log("transport", `Skipping non-first passenger (first disabled): ${p.name}`);
+          skipped.push({ name: p.name, reason: `first class disabled` });
           continue;
         }
         if (cls === "business" && !settings.allowBusinessClass) {
           if (midasFilterLog) ctx.log("transport", `Skipping non-first passenger (business disabled): ${p.name}`);
+          skipped.push({ name: p.name, reason: `business class disabled` });
           continue;
         }
         if (cls === "economy" && !settings.allowEconomyClass) {
           if (midasFilterLog) ctx.log("transport", `Skipping non-first passenger (economy disabled): ${p.name}`);
+          skipped.push({ name: p.name, reason: `economy class disabled` });
           continue;
         }
         const arr = byDest.get(p.destination.toLowerCase()) || [];
@@ -2092,17 +2730,16 @@ if (state && state.status !== "idle") {
         byDest.set(p.destination.toLowerCase(), arr);
       }
 
-      // For multi-destination tours, plan the route FIRST so loading order follows it.
-      // This prevents stranding nearby passengers when distant destinations fill berths first.
-      ctx.log("transport", `Determining destinations for ${waiting.length} waiting passengers`);
+      if (skipped.length > 0) {
+        ctx.log("transport", `${span("Skipped", "ansi-yellow")} ${skipped.length} passengers: ${skipped.map(s => `${s.name} (${span(s.reason, "ansi-yellow")})`).join(", ")}`);
+      }
+
       const destDrafts: Array<{ system: string; poi: string; poiName: string; count: number; origDest: string }> = [];
+      const unresolvedWaiting: string[] = [];
       for (const [destId, ps] of byDest.entries()) {
-        ctx.log("transport", `resolveDestination for waiting passenger: ${destId} (name: ${ps[0]?.destination_name || destId}, system: ${ps[0]?.destination_system || 'none'})`);
         const resolved = await resolveDestination(ctx, bot, destId, ps[0]?.destination_name || destId, ps[0]?.destination_system);
-        if (resolved) {
-          ctx.log("transport", `Resolved waiting ${destId} -> system=${resolved.system}, poi=${resolved.poi}`);
-        } else {
-          ctx.log("transport", `FAILED to resolve waiting passenger ${destId}`);
+        if (!resolved) {
+          unresolvedWaiting.push(ps[0]?.destination_name || destId);
         }
         destDrafts.push({ system: resolved?.system || "", poi: resolved?.poi || destId, poiName: ps[0]?.destination_name || destId, count: ps.length, origDest: destId });
       }
@@ -2110,18 +2747,14 @@ if (state && state.status !== "idle") {
       const currentPoi = bot.poi || "";
       const filteredDrafts = destDrafts.filter(d => {
         if (d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === currentPoi.toLowerCase()) {
-          ctx.log("transport", `Filtering out passenger already at destination: ${d.poiName}`);
           return false;
         }
         return true;
       });
       const plannedRoute = await planTourRoute(bot.system || "", filteredDrafts.filter(d => d.system), settings.maxJumps, bot);
-      ctx.log("transport", `Planned route: ${plannedRoute.length} waypoints, ${filteredDrafts.filter(d => !d.system).length} could not resolve`);
-      for (const d of filteredDrafts.filter(d => !d.system)) {
-        ctx.log("transport", `  Unresolved destination: ${d.poiName} (origDest: ${d.origDest})`);
+      if (unresolvedWaiting.length > 0) {
+        ctx.log("transport", `${span("Unresolved", "ansi-red")} ${unresolvedWaiting.length} destinations: ${unresolvedWaiting.join(", ")}`);
       }
-      const outsideJumpLimit = filteredDrafts.filter(d => !d.system);
-
       const atDestinationCount = destDrafts.length - filteredDrafts.length;
       if (atDestinationCount > 0) {
         ctx.log("transport", `${atDestinationCount} passengers already at their destination - considering delivered`);
@@ -2130,6 +2763,20 @@ if (state && state.status !== "idle") {
       if (waiting.length > 0 && filteredDrafts.length === 0) {
         ctx.log("transport", `All ${waiting.length} passengers have destinations at current station. Moving to next station.`);
         state.roundsWithoutPassengers = 0;
+        const isAwayFromHome = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
+        if (isAwayFromHome) {
+          state.awayPickupAttempts = (state.awayPickupAttempts || 0) + 1;
+        }
+        if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+          ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached — returning home to check lounge`);
+          state.pickupStation = settings.homeStation || null;
+          state.pickupSystem = settings.homeSystem || null;
+          state.awayPickupAttempts = 0;
+          state.status = "idle";
+          saveTransportState(state);
+          await ctx.sleep(5000);
+          continue;
+        }
         const nextPickup = await selectNextPickupStation(ctx, state, settings);
         if (nextPickup) {
           const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
@@ -2158,6 +2805,7 @@ if (state && state.status !== "idle") {
       }
 
       // Now load in route order, one destination per loop, berth tally.
+      // For lounge_transport mode, load ALL passengers regardless of destination
       const loadedNames = new Set<string>();
       let usedEconomy = 0;
       let usedBusiness = 0;
@@ -2168,7 +2816,107 @@ if (state && state.status !== "idle") {
         return free;
       };
 
-      for (const leg of plannedRoute) {
+      const priority = settings.passengerPriority;
+      const classOrder: Record<string, number> = { first: 0, business: 0, economy: 0 };
+      if (priority === "first") {
+        classOrder.first = 0;
+        classOrder.business = 1;
+        classOrder.economy = 2;
+      } else if (priority === "business") {
+        classOrder.business = 0;
+        classOrder.first = 1;
+        classOrder.economy = 2;
+      } else if (priority === "economy") {
+        classOrder.economy = 0;
+        classOrder.first = 1;
+        classOrder.business = 2;
+      }
+
+      const loungeFull = settings.mode === "lounge_transport" && passengersLounge.getAvailableSlots() <= 0;
+      if (loungeFull) {
+        ctx.log("transport", `Transit Lounge is full (150/150) — doing normal passenger deliveries instead of lounge pickup`);
+      }
+      if (settings.mode === "lounge_transport" && !loungeFull) {
+        ctx.log("transport", `Lounge transport mode: loading all ${waiting.length} passengers at ${bot.poi} for transport to Transit Lounge`);
+
+        // load_passenger loads by destination station id, so group waiting
+        // passengers by destination and issue one load per destination.
+        interface LoungeDestGroup { id: string; passengers: StationPassenger[] }
+        const loungeByDest = new Map<string, LoungeDestGroup>();
+        for (const p of waiting) {
+          const cls = p.class.toLowerCase();
+          if (cls === "first" && !settings.allowFirstClass) continue;
+          if (cls === "business" && !settings.allowBusinessClass) continue;
+          if (cls === "economy" && !settings.allowEconomyClass) continue;
+          const key = p.destination.toLowerCase();
+          let group = loungeByDest.get(key);
+          if (!group) {
+            group = { id: p.destination, passengers: [] };
+            loungeByDest.set(key, group);
+          }
+          group.passengers.push(p);
+        }
+
+        let loadedThisLeg = 0;
+        for (const group of loungeByDest.values()) {
+          const totalLoaded = usedEconomy + usedBusiness + usedFirst;
+          if (settings.maxPassengers > 0 && totalLoaded >= settings.maxPassengers) break;
+
+          const destId = group.id;
+          const ps = group.passengers;
+
+          const sortedPassengers = [...ps].sort((a, b) => {
+            if (priority === "off") return 0;
+            return classOrder[a.class.toLowerCase()] - classOrder[b.class.toLowerCase()];
+          });
+
+          let canLoadAny = false;
+          for (const p of sortedPassengers) {
+            if (loadedNames.has(p.citizen_id)) continue;
+            const cls = p.class.toLowerCase() as "economy" | "business" | "first";
+            const capFirst = capAvailable(usedFirst, settings.maxFirst, freeFirst);
+            const capBusiness = capAvailable(usedBusiness, settings.maxBusiness, freeBusiness);
+            const capEconomy = capAvailable(usedEconomy, settings.maxEconomy, freeEconomy);
+
+            let canLoad = false;
+            if (cls === "first" && usedFirst < capFirst) {
+              canLoad = true;
+              usedFirst++;
+            } else if (cls === "business" && usedBusiness < capBusiness) {
+              canLoad = true;
+              usedBusiness++;
+            } else if (cls === "economy") {
+              if (usedEconomy < capEconomy) {
+                canLoad = true;
+                usedEconomy++;
+              } else if (usedBusiness < capBusiness) {
+                canLoad = true;
+                usedBusiness++;
+              } else if (usedFirst < capFirst) {
+                canLoad = true;
+                usedFirst++;
+              }
+            }
+
+            if (!canLoad) continue;
+            loadedNames.add(p.citizen_id);
+            loadedThisLeg++;
+            canLoadAny = true;
+          }
+
+          if (!canLoadAny) continue;
+
+          const loadResp = await bot.exec("load_passenger", { id: destId });
+          if (loadResp.error) {
+            ctx.log("error", `load_passenger failed for ${destId} (lounge mode): ${loadResp.error.message}`);
+          } else {
+            ctx.log("transport", `Loaded passengers for ${destId} (lounge mode)`);
+          }
+          await ctx.sleep(11000);
+        }
+      } else {
+        // Normal mode: load by destination groups
+        for (const leg of plannedRoute) {
         const legPoiLower = leg.poi.toLowerCase();
         const legSysLower = leg.system.toLowerCase();
         const currentPoiLower = (bot.poi || "").toLowerCase();
@@ -2189,21 +2937,6 @@ if (state && state.status !== "idle") {
           break;
         }
 
-        const priority = settings.passengerPriority;
-        const classOrder: Record<string, number> = { first: 0, business: 0, economy: 0 };
-        if (priority === "first") {
-          classOrder.first = 0;
-          classOrder.business = 1;
-          classOrder.economy = 2;
-        } else if (priority === "business") {
-          classOrder.business = 0;
-          classOrder.first = 1;
-          classOrder.economy = 2;
-        } else if (priority === "economy") {
-          classOrder.economy = 0;
-          classOrder.first = 1;
-          classOrder.business = 2;
-        }
         const sortedPassengers = [...passengersFinal].sort((a, b) => {
           if (priority === "off") return 0;
           return classOrder[a.class.toLowerCase()] - classOrder[b.class.toLowerCase()];
@@ -2268,7 +3001,7 @@ if (state && state.status !== "idle") {
                   citizenId: p.citizen_id || p.name,
                   name: p.name,
                   accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
-                  citizenship: p.citizenship,
+          citizenship: p.citizenship || "",
                   destination: p.destination,
                   destinationName: p.destination_name,
                   destinationSystem: (p as any).destinationSystem || p.destination_system,
@@ -2292,17 +3025,16 @@ if (state && state.status !== "idle") {
                 destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destination_name || p.destination, count: 1 });
               }
             }
-const routeDests = Array.from(destMap.values()).filter(d => {
-        if (d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
-          ctx.log("transport", `Filtering out route destination same as current station: ${d.poi}`);
-          return false;
-        }
-        return d.system;
-      });
+            const routeDests = Array.from(destMap.values()).filter(d => {
+              if (d.system && d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
+                return false;
+              }
+              return d.system;
+            });
             state.route = await planTourRoute(bot.system || "", routeDests, 6, bot);
             state.currentRouteIndex = 0;
             state.currentDestination = state.route.length > 0 ? state.route[0].poiName : null;
-            ctx.log("transport", `Route recalculated: ${state.route.map(d => d.poiName).join(" → ")}`);
+            ctx.log("transport", `Route: ${span(state.route.map(d => d.poiName).join(" → "), "ansi-cyan")}`);
             usedEconomy = verifyParsed.berths_used.economy;
             usedBusiness = verifyParsed.berths_used.business;
             usedFirst = verifyParsed.berths_used.first;
@@ -2311,6 +3043,7 @@ const routeDests = Array.from(destMap.values()).filter(d => {
         bot.refreshStatus().catch(() => {});
         await checkAndRecloak(ctx, settings);
         await depositExcessCredits(ctx, settings);
+      }
       }
 
       const listResp = await bot.exec("list_passengers");
@@ -2324,31 +3057,46 @@ const routeDests = Array.from(destMap.values()).filter(d => {
 
       if (aboard.length === 0) {
         state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+        const isAwayFromHome = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
+        if (isAwayFromHome) {
+          state.awayPickupAttempts = (state.awayPickupAttempts || 0) + 1;
+        }
         ctx.log("transport", `No passengers loaded, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
         if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
           ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-          const nextPickup = await selectNextPickupStation(ctx, state, settings);
-          if (nextPickup) {
-            const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
-            if (!isSameStation) {
-              state.pickupStation = nextPickup.poi;
-              state.pickupSystem = nextPickup.system;
-              state.roundsWithoutPassengers = 0;
-              state.needsTravel = true;
-              state.status = "idle";
-              saveTransportState(state);
-              await ctx.sleep(5000);
-              continue;
-            }
-            ctx.log("transport", `Next pickup is same station, resetting counter`);
-            state.roundsWithoutPassengers = 0;
-            state.pickupStation = nextPickup.poi;
-            state.pickupSystem = nextPickup.system;
-          } else if (settings.homeSystem) {
-            ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+          if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+            ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
             state.pickupStation = settings.homeStation || null;
             state.pickupSystem = settings.homeSystem || null;
             state.roundsWithoutPassengers = 0;
+            state.awayPickupAttempts = 0;
+          } else {
+            const nextPickup = await selectNextPickupStation(ctx, state, settings);
+            if (nextPickup) {
+              const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+              if (!isSameStation) {
+                state.pickupStation = nextPickup.poi;
+                state.pickupSystem = nextPickup.system;
+                state.roundsWithoutPassengers = 0;
+                state.awayPickupAttempts = 0;
+                state.needsTravel = true;
+                state.status = "idle";
+                saveTransportState(state);
+                await ctx.sleep(5000);
+                continue;
+              }
+              ctx.log("transport", `Next pickup is same station, resetting counter`);
+              state.roundsWithoutPassengers = 0;
+              state.awayPickupAttempts = 0;
+              state.pickupStation = nextPickup.poi;
+              state.pickupSystem = nextPickup.system;
+            } else if (settings.homeSystem) {
+              ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+              state.pickupStation = settings.homeStation || null;
+              state.pickupSystem = settings.homeSystem || null;
+              state.roundsWithoutPassengers = 0;
+              state.awayPickupAttempts = 0;
+            }
           }
         }
         state.status = "idle";
@@ -2357,35 +3105,39 @@ const routeDests = Array.from(destMap.values()).filter(d => {
         continue;
       }
 
-      // Build route from aboard passengers
+      if (skipped.length > 0) {
+        ctx.log("transport", `${span("Skipped", "ansi-yellow")} ${skipped.length} passengers: ${skipped.map(s => `${s.name} (${span(s.reason, "ansi-yellow")})`).join(", ")}`);
+      }
+      ctx.log("transport", `${span("Loaded", "ansi-green")} ${aboard.length} passengers this round:`);
+      for (const p of aboard) {
+        ctx.log("transport", `  - ${p.name} | class=${span(p.class, "ansi-cyan")} | destination=${p.destination_name} (${p.destination_system || 'unknown system'})`);
+      }
+
       const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
+      const unresolvedAboard: string[] = [];
       for (const p of aboard) {
         const existing = destMap.get(p.destination);
-        if (existing) {
-          existing.count++;
-          continue;
-        }
-        ctx.log("transport", `resolveDestination for aboard passenger: ${p.destination} (name: ${p.destination_name}, system: ${p.destination_system || 'none'})`);
+        if (existing) { existing.count++; continue; }
         const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
         if (resolved) {
           destMap.set(p.destination, { ...resolved, count: 1 });
-          ctx.log("transport", `Resolved aboard ${p.destination} -> system=${resolved.system}, poi=${resolved.poi}`);
         } else {
           destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destination_name || p.destination, count: 1 });
-          ctx.log("transport", `FAILED to resolve aboard passenger ${p.destination}`);
+          unresolvedAboard.push(p.destination_name || p.destination);
         }
       }
 
       const routeDests = Array.from(destMap.values()).filter(d => {
         if (d.system && d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
-          ctx.log("transport", `Filtering out route destination same as current station: ${d.poi}`);
           return false;
         }
         return d.system;
       });
-      ctx.log("transport", `Route destinations: ${routeDests.length} valid out of ${destMap.size}`);
       const planned = await planTourRoute(bot.system || "", routeDests, 6, bot);
-      ctx.log("transport", `planTourRoute result: ${planned.length} waypoints, currentSystem=${bot.system || 'none'}`);
+      if (unresolvedAboard.length > 0) {
+        ctx.log("transport", `${span("Unresolved", "ansi-red")} ${unresolvedAboard.length} aboard destinations: ${unresolvedAboard.join(", ")}`);
+      }
+      ctx.log("transport", `Route: ${span(planned.map(d => d.poiName).join(" → "), "ansi-cyan") || span("none", "ansi-red")}`);
 
       const aboardIds = new Set(aboard.map(p => p.citizen_id || p.name));
       state.onboardPassengers = state.onboardPassengers.filter(op => aboardIds.has(op.citizenId));
@@ -2407,15 +3159,33 @@ const routeDests = Array.from(destMap.values()).filter(d => {
           continue;
         }
         state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+        const isAwayFromHome = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
+        if (isAwayFromHome) {
+          state.awayPickupAttempts = (state.awayPickupAttempts || 0) + 1;
+        }
         ctx.log("transport", `No route planned for passengers, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
         if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
           ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
+          if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+            ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
+            state.pickupStation = settings.homeStation || null;
+            state.pickupSystem = settings.homeSystem || null;
+            state.roundsWithoutPassengers = 0;
+            state.awayPickupAttempts = 0;
+            state.onboardPassengers = [];
+            state.route = [];
+            state.status = "idle";
+            saveTransportState(state);
+            await ctx.sleep(5000);
+            continue;
+          }
           const nextPickup = await selectNextPickupStation(ctx, state, settings);
           if (nextPickup) {
             const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
             if (isSameStation) {
               ctx.log("transport", `Next pickup is same station, resetting counter and checking for different passengers`);
               state.roundsWithoutPassengers = 0;
+              state.awayPickupAttempts = 0;
               state.pickupStation = nextPickup.poi;
               state.pickupSystem = nextPickup.system;
               state.onboardPassengers = [];
@@ -2428,6 +3198,7 @@ const routeDests = Array.from(destMap.values()).filter(d => {
             state.pickupStation = nextPickup.poi;
             state.pickupSystem = nextPickup.system;
             state.roundsWithoutPassengers = 0;
+            state.awayPickupAttempts = 0;
             state.onboardPassengers = [];
             state.route = [];
             state.status = "idle";
@@ -2440,6 +3211,7 @@ const routeDests = Array.from(destMap.values()).filter(d => {
             state.pickupStation = settings.homeStation || null;
             state.pickupSystem = settings.homeSystem || null;
             state.roundsWithoutPassengers = 0;
+            state.awayPickupAttempts = 0;
             state.onboardPassengers = [];
             state.route = [];
             state.status = "idle";
@@ -2468,11 +3240,33 @@ const routeDests = Array.from(destMap.values()).filter(d => {
           loadedAt: new Date().toISOString(),
           status: "boarded",
           ticksRemaining: p.ticks_remaining,
-        });
+        }, bot.username);
       }
 
       // Build onboard passenger records
-      const onboard: TransportPassenger[] = aboard.map(p => ({
+      // Drop any passengers already aboard whose destination is blacklisted
+      // (e.g. added to the blacklist after they boarded). This prevents the
+      // bot from carrying them to a station it must never visit. We can only
+      // unload while docked, so this runs in the loading phase (bot is docked
+      // here) and simply drops them at the current station.
+      const dropBlacklisted: AboardPassenger[] = [];
+      if (bot.docked) {
+        for (const p of aboard) {
+          if (isBlockedStation(p.destination, p.destination_name)) {
+            ctx.log("transport", `Passenger ${p.name} aboard but bound for blacklisted station ${p.destination_name} - dropping at current station`);
+            const unloadResp = await bot.exec("unload_passenger", { id: p.citizen_id || p.name });
+            if (unloadResp.error) {
+              ctx.log("error", `Could not drop blacklisted passenger ${p.name}: ${unloadResp.error.message}`);
+            } else {
+              ctx.log("transport", `Dropped blacklisted passenger ${p.name} (${p.destination_name})`);
+              dropBlacklisted.push(p);
+            }
+          }
+        }
+      }
+      const aboardFiltered = aboard.filter(p => !dropBlacklisted.includes(p));
+
+      const onboard: TransportPassenger[] = aboardFiltered.map(p => ({
         citizenId: p.citizen_id || p.name,
         name: p.name,
         accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
@@ -2495,6 +3289,7 @@ const routeDests = Array.from(destMap.values()).filter(d => {
       state.status = onboard.length > 0 ? "in_transit" : "idle";
       state.routeRebuildAttempts = 0;
       state.roundsWithoutPassengers = 0;
+      state.awayPickupAttempts = 0;
       const listParsed = listResp.result ? parseListPassengers(listResp.result) : null;
       state.berths = listParsed && (listParsed.berths.economy + listParsed.berths.business + listParsed.berths.first) > 0
         ? listParsed.berths
@@ -2515,12 +3310,12 @@ const routeDests = Array.from(destMap.values()).filter(d => {
         continue;
       }
 
-      ctx.log("transport", `${onboard.length} passengers. Route: ${planned.map(d => d.poiName).join(" → ")}`);
+      ctx.log("transport", `${span(`${onboard.length} passengers`, "ansi-green")}. Route: ${span(planned.map(d => d.poiName).join(" → "), "ansi-cyan")}`);
       if (isMidas && onboard.length > 0) {
-        ctx.log("transport", `MIDAS: Carrying ${onboard.filter(p => p.accommodationClass === "first").length} first-class passengers.`);
+        ctx.log("transport", `${span("MIDAS", "ansi-yellow")}: Carrying ${onboard.filter(p => p.accommodationClass === "first").length} first-class passengers.`);
       }
       if (planned.length === 0 && onboard.length > 0) {
-        ctx.log("transport", `WARNING: ${onboard.length} passengers but empty route!`);
+        ctx.log("transport", `${span("WARNING", "ansi-red")}: ${onboard.length} passengers but empty route!`);
         for (const p of onboard) {
           ctx.log("transport", `  - Passenger ${p.name} -> ${p.destination} (system: ${p.destinationSystem || 'none'})`);
         }
@@ -2559,13 +3354,318 @@ const routeDests = Array.from(destMap.values()).filter(d => {
         }
       }
 
+      // Handle lounge_transport mode: instead of delivering to destinations, return to home base
+      if (settings.mode === "lounge_transport") {
+        if (!settings.homeSystem || !settings.homeStation) {
+          ctx.log("error", "Lounge transport mode requires homeSystem and homeStation to be configured");
+          state.status = "idle";
+          state.onboardPassengers = [];
+          state.route = [];
+          saveTransportState(state);
+          await ctx.sleep(30000);
+          continue;
+        }
+        ctx.log("transport", `Lounge transport mode: loaded ${onboard.length} passengers, returning to home base ${settings.homeStation} in ${settings.homeSystem}`);
+        state.route = [{
+          system: settings.homeSystem,
+          poi: settings.homeStation,
+          poiName: settings.homeStation,
+        }];
+        state.currentRouteIndex = 0;
+        state.currentDestination = settings.homeStation;
+        state.status = "returning_to_lounge";
+        saveTransportState(state);
+        await ensureUndocked(ctx);
+        continue;
+      }
+
       // Undock and continue to transit handling below
       await ensureUndocked(ctx);
       state.status = "in_transit";
       saveTransportState(state);
     }
 
+    if (state.status === "returning_to_lounge") {
+      if (!settings.homeSystem || !settings.homeStation) {
+        ctx.log("error", "Lounge transport mode requires homeSystem and homeStation");
+        state.status = "idle";
+        state.onboardPassengers = [];
+        state.route = [];
+        saveTransportState(state);
+        await ctx.sleep(30000);
+        continue;
+      }
+
+      const homeSystem = settings.homeSystem;
+      const homeStation = settings.homeStation;
+
+      // Navigate to home system if not there
+      if (bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
+        ctx.log("transport", `Lounge transport: navigating to home system ${homeSystem}`);
+        const ok = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+        if (!ok) {
+          ctx.log("transport", `Failed to navigate to home system ${homeSystem}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
+        continue;
+      }
+
+      // Travel to home station if not there
+      if (bot.poi && bot.poi.toLowerCase() !== homeStation.toLowerCase()) {
+        ctx.log("transport", `Lounge transport: traveling to home station ${homeStation}`);
+        const tr = await bot.exec("travel", { target_poi: homeStation });
+        if (tr.error) {
+          ctx.log("error", `Travel to home station failed: ${tr.error.message}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
+        continue;
+      }
+
+      // Dock at home station
+      if (!bot.docked) {
+        ctx.log("transport", `Lounge transport: docking at home station ${homeStation}`);
+        const dockResp = await bot.exec("dock");
+        if (dockResp.error) {
+          const msg = dockResp.error.message || "";
+          if (msg.toLowerCase().includes("already")) {
+            // Game already considers us docked; sync the flag and proceed.
+            bot.docked = true;
+          } else {
+            ctx.log("error", `Dock failed: ${msg}`);
+            await ctx.sleep(30000);
+            continue;
+          }
+        }
+        await bot.refreshStatus();
+        if (!bot.docked) {
+          // Still not docked after the dock command — wait for state to settle
+          // before retrying, to avoid a tight dock loop.
+          ctx.log("transport", `Dock issued but not yet docked at ${homeStation}, waiting...`);
+          await ctx.sleep(5000);
+          continue;
+        }
+        // Fall through to unload now that we're confirmed docked.
+      }
+
+      // Unload all passengers to lounge
+      const verifyResp = await bot.exec("list_passengers");
+      const verified = verifyResp.error || !verifyResp.result ? null : parseListPassengers(verifyResp.result);
+      if (!verified || verified.passengers.length === 0) {
+        ctx.log("transport", "Lounge transport: no passengers actually aboard, clearing state and returning to idle");
+        state.status = "idle";
+        state.onboardPassengers = [];
+        state.route = [];
+        state.currentRouteIndex = 0;
+        state.currentDestination = null;
+        saveTransportState(state);
+        await ctx.sleep(5000);
+        continue;
+      }
+      state.onboardPassengers = verified.passengers.map(p => ({
+        citizenId: p.citizen_id || p.name,
+        name: p.name,
+        accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
+        citizenship: p.citizenship,
+        destination: p.destination,
+        destinationName: p.destination_name,
+        destinationSystem: (p as any).destinationSystem || p.destination_system,
+        fare: p.fare,
+        bio: p.bio,
+        routeData: p.route_data || null,
+        loadedAt: new Date().toISOString(),
+        status: "boarded",
+        ticksRemaining: p.ticks_remaining,
+      }));
+      saveTransportState(state);
+      ctx.log("transport", `Lounge transport: unloading ${state.onboardPassengers.length} passengers to Transit Lounge at ${homeStation}`);
+      const unloadResp = await bot.exec("unload_passenger", { id: "all", target: "lounge" });
+      if (unloadResp.error) {
+        ctx.log("error", `Unload to lounge failed: ${unloadResp.error.message}`);
+        await ctx.sleep(30000);
+        continue;
+      }
+
+      // Track each passenger in the lounge store for future delivery
+      for (const p of state.onboardPassengers) {
+        const loungeEntry = PassengersLoungeStore.createLoungePassenger({
+          citizenId: p.citizenId,
+          name: p.name,
+          accommodationClass: p.accommodationClass,
+          citizenship: p.citizenship || "",
+          destination: p.destination,
+          destinationName: p.destinationName,
+          destinationSystem: p.destinationSystem || "",
+          fare: p.fare || 0,
+          bio: p.bio || "",
+          loadedAt: p.loadedAt,
+        });
+        passengersLounge.addOrUpdatePassenger(loungeEntry);
+        civilianStore.addOrUpdate({
+          citizenId: p.citizenId,
+          name: p.name,
+          accommodationClass: p.accommodationClass,
+          citizenship: p.citizenship || "",
+          destination: p.destination,
+          destinationName: p.destinationName,
+          destinationSystem: p.destinationSystem,
+          fare: p.fare || 0,
+          bio: p.bio || "",
+          loadedAt: p.loadedAt,
+          status: "boarded",
+        }, bot.username);
+        ctx.log("transport", `Lounge transport: checked ${p.name} into Transit Lounge (expires ${loungeEntry.expiresAt})`);
+      }
+
+      ctx.log("transport", `Lounge transport: successfully unloaded ${state.onboardPassengers.length} passengers to Transit Lounge`);
+      state.onboardPassengers = [];
+      state.route = [];
+      state.currentRouteIndex = 0;
+      state.currentDestination = null;
+      state.status = "idle";
+      state.roundsWithoutPassengers = 0;
+      saveTransportState(state);
+
+      // Collect fuel cells at home base
+      await collectFuelCells(ctx, settings);
+
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // ── Lounge Delivery Mode ──
+    // ── Lounge Delivery ──
+    // Deliver expired Transit Lounge passengers to their destinations.
+    // (In achievement mode this runs first as the primary source, above.)
+    if (settings.mode === "lounge_transport") {
+      const loungeActed = await tryDeliverExpiredLoungePassenger(ctx, bot, state, settings, null);
+      if (loungeActed) continue;
+    }
+
+    if (state.status === "delivering_lounge_passenger") {
+      if (state.route.length === 0 || state.currentRouteIndex >= state.route.length) {
+        // Route complete, clean up
+        const p = state.onboardPassengers[0];
+        if (p) {
+          passengersLounge.markDelivered(p.citizenId);
+          civilianStore.addOrUpdate({
+            citizenId: p.citizenId,
+            name: p.name,
+            accommodationClass: p.accommodationClass,
+            citizenship: p.citizenship || "",
+            destination: p.destination,
+            destinationName: p.destinationName,
+            destinationSystem: p.destinationSystem,
+            fare: p.fare || 0,
+            bio: p.bio || "",
+            loadedAt: p.loadedAt,
+            status: "delivered",
+          }, bot.username);
+          logTransportProfit(bot.username, p.name, p.fare || 0, state.pickupStation || "", state.currentDestination || "");
+          recordTransportedPassenger(bot.username, p.name);
+          ctx.log("transport", `Lounge delivery: delivered ${p.name} to ${state.currentDestination}`);
+        }
+        state.status = "idle";
+        state.onboardPassengers = [];
+        state.route = [];
+        state.currentRouteIndex = 0;
+        state.currentDestination = null;
+        saveTransportState(state);
+        await ctx.sleep(5000);
+        continue;
+      }
+
+      const waypoint = state.route[state.currentRouteIndex];
+      ctx.log("transport", `Lounge delivery: waypoint ${state.currentRouteIndex + 1}/${state.route.length}: ${waypoint.system} / ${waypoint.poiName}`);
+
+      if (waypoint.system !== bot.system) {
+        ctx.log("transport", `Lounge delivery: navigating to system ${waypoint.system}`);
+        const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+        if (!ok) {
+          ctx.log("transport", `Lounge delivery: FAILED to navigate to system ${waypoint.system}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
+        continue;
+      }
+
+      if (bot.poi !== waypoint.poi) {
+        ctx.log("transport", `Lounge delivery: traveling to poi ${waypoint.poi}`);
+        const tr = await bot.exec("travel", { target_poi: waypoint.poi });
+        if (tr.error) {
+          ctx.log("transport", `Lounge delivery: Travel to ${waypoint.poi} failed: ${tr.error.message}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
+        continue;
+      }
+
+      // Dock at destination
+      if (!bot.docked) {
+        ctx.log("transport", `Lounge delivery: docking at ${waypoint.poiName}`);
+        const dockResp = await bot.exec("dock");
+        if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+          ctx.log("error", `Lounge delivery: Dock failed: ${dockResp.error.message}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        continue;
+      }
+
+      // Unload the lounge passenger at their destination
+      const p = state.onboardPassengers[0];
+      if (p) {
+        ctx.log("transport", `Lounge delivery: unloading ${p.name} at ${waypoint.poiName}`);
+        const unloadResp = await bot.exec("unload_passenger", { id: p.citizenId || p.name });
+        if (unloadResp.error) {
+          ctx.log("error", `Lounge delivery: Unload failed: ${unloadResp.error.message}`);
+        } else {
+          passengersLounge.markDelivered(p.citizenId);
+          civilianStore.addOrUpdate({
+            citizenId: p.citizenId,
+            name: p.name,
+            accommodationClass: p.accommodationClass,
+            citizenship: p.citizenship || "",
+            destination: p.destination,
+            destinationName: p.destinationName,
+            destinationSystem: p.destinationSystem,
+            fare: p.fare || 0,
+            bio: p.bio || "",
+            loadedAt: p.loadedAt,
+            status: "delivered",
+          }, bot.username);
+          recordTransportedPassenger(bot.username, p.name);
+          logTransportProfit(bot.username, p.name, p.fare || 0, state.pickupStation || "", waypoint.poi);
+          ctx.log("transport", `Lounge delivery: delivered ${p.name} to ${waypoint.poiName}`);
+        }
+      }
+
+      state.currentRouteIndex += 1;
+      saveTransportState(state);
+      continue;
+    }
+
     if (state.status === "in_transit" || state.status === "traveling_to_ship") {
+      if (bot.shouldStopAfterCycle()) {
+        bot.clearStopAfterCycle();
+        bot.initiateStop();
+        await ctx.sleep(5000);
+        return;
+      }
       if (state.route.length === 0 || state.currentRouteIndex >= state.route.length) {
         if (state.onboardPassengers.length > 0) {
           ctx.log("transport", `Route empty but ${state.onboardPassengers.length} passengers onboard, rebuilding route`);
@@ -2628,7 +3728,7 @@ const routeDests = Array.from(destMap.values()).filter(d => {
       }
 
       const waypoint = state.route[state.currentRouteIndex];
-      ctx.log("transport", `Processing waypoint ${state.currentRouteIndex + 1}/${state.route.length}: system=${waypoint.system}, poi=${waypoint.poi}`);
+      ctx.log("transport", `Waypoint ${span(`${state.currentRouteIndex + 1}/${state.route.length}`, "ansi-cyan")}: ${span(waypoint.system, "ansi-yellow")} / ${waypoint.poiName}`);
 
       if (waypoint.system !== bot.system) {
         ctx.log("transport", `Navigating to system ${waypoint.system}`);
@@ -2644,7 +3744,32 @@ const routeDests = Array.from(destMap.values()).filter(d => {
         ctx.log("transport", `Arrived at system ${waypoint.system}`);
       }
       if (bot.poi !== waypoint.poi) {
-        ctx.log("transport", `Traveling to poi ${waypoint.poi}`);
+        // Refuel tank from cargo fuel cells before traveling. Cargo cells are
+        // not usable by `travel` until burned into the tank via `refuel`.
+        // Without this the bot sits with 3900 fuel in cargo and 0 in tank,
+        // failing every travel attempt with "Insufficient fuel for travel".
+        if (!bot.docked) {
+          const dockResp = await bot.exec("dock");
+          if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+            ctx.log("error", `Dock failed before travel: ${dockResp.error.message} — skipping pre-travel refuel at non-station POI`);
+            // Cannot dock here (e.g. current POI is not a station). Skip refuel and attempt travel directly instead of looping.
+          } else {
+            bot.docked = true;
+            await bot.refreshStatus();
+            await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+            await bot.refreshShip();
+          }
+        } else {
+          await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+          await bot.refreshShip();
+        }
+        const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
+        if (fuelPct <= 0) {
+          ctx.log("error", `No fuel in tank and could not refuel from cargo at ${bot.poi} — cannot travel to ${waypoint.poi}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        ctx.log("transport", `Traveling to poi ${waypoint.poi} (fuel: ${fuelPct}%)`);
         const tr = await bot.exec("travel", { target_poi: waypoint.poi });
         if (tr.error) {
           const errMsg = tr.error.message || "";
@@ -2698,6 +3823,20 @@ const routeDests = Array.from(destMap.values()).filter(d => {
       if (!alreadyDocked) {
         const dockResp = await bot.exec("dock");
         if (dockResp.error && !dockResp.error.message.includes("already")) {
+          const blockedHere = isBlockedStation(waypoint.poi) || isBlockedStation(waypoint.poiName);
+          if (blockedHere) {
+            // We're not docked here, so we cannot unload the passenger (unload
+            // requires being docked). Skip this waypoint and re-plan without it;
+            // the passenger stays aboard and will be dropped at the next station
+            // the bot docks at via dropBlacklistedAboardPassengers().
+            ctx.log("transport", `Dock failed at ${waypoint.poiName} (${waypoint.poi}) which is now on the blacklist. Skipping waypoint and re-planning.`);
+            state.route = [];
+            state.currentRouteIndex = 0;
+            state.status = "in_transit";
+            saveTransportState(state);
+            await ctx.sleep(5000);
+            continue;
+          }
           ctx.log("error", `Dock failed: ${dockResp.error.message}`);
           await ctx.sleep(30000);
           continue;
@@ -2746,8 +3885,11 @@ const routeDests = Array.from(destMap.values()).filter(d => {
           bio: p.bio,
           loadedAt: p.loadedAt,
           status: "delivered",
-        });
+        }, bot.username);
         recordTransportedPassenger(bot.username, p.name);
+        if (p.fromLounge) {
+          passengersLounge.markDelivered(p.citizenId);
+        }
         logTransportProfit(bot.username, p.name, farePerPassenger, state.pickupStation || "", waypoint.poi);
       }
 
@@ -2755,14 +3897,14 @@ const routeDests = Array.from(destMap.values()).filter(d => {
       if (state.currentRouteIndex >= state.route.length) {
         state.status = "completed";
         state.currentDestination = null;
-        ctx.log("transport", `Run complete. Revenue: ${state.totalFaresEarned}cr, Delivered: ${boundHere.length}`);
+        ctx.log("transport", `${span("Run complete", "ansi-green")}. Revenue: ${span(`${state.totalFaresEarned}cr`, "ansi-yellow")}, Delivered: ${boundHere.length}`);
       } else {
         const next = state.route[state.currentRouteIndex];
         state.currentDestination = next.poiName;
         state.status = "in_transit";
         if (state.currentRouteIndex > 0) {
           // Quick refuel/repair at intermediate stops if needed
-          await tryRefuel(ctx);
+          await tryRefuel(ctx, { homeSystem: settings.homeSystem });
           await repairShip(ctx);
         }
       }
@@ -2833,10 +3975,11 @@ const routeDests = Array.from(destMap.values()).filter(d => {
       saveTransportState(state);
     }
 
-    // Safety / upkeep
-    await tryRefuel(ctx);
-    await repairShip(ctx);
+     // Safety / upkeep
+     await tryRefuel(ctx, { homeSystem: settings.homeSystem });
+     await repairShip(ctx);
     ctx.log("transport", `Loop iteration complete, sleeping 5s`);
     await ctx.sleep(5000);
   }
 };
+

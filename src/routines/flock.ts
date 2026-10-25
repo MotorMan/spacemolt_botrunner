@@ -1,5 +1,6 @@
 // flock.ts - Generic flock coordination system
 import type { RoutineContext } from "../bot.js";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 
 export interface FlockSettings {
   flockGroups: FlockGroupConfig[];
@@ -25,7 +26,8 @@ export async function writeFlockSettings(s: FlockSettings): Promise<void> {
   const { join } = await import("path");
   const dir = join(process.cwd(), "data");
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "flock.json"), JSON.stringify(s, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(s, null, 2) + "\n";
+  safeWriteFileSync(join(dir, "flock.json"), payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 // ── Generic Flock State ─────────────────────────────────────────
@@ -109,7 +111,8 @@ export async function writeFlockState(flockName: string, state: FlockState): Pro
 
   const flockPath = await getFlockStatePath(flockName);
   state.lastUpdate = Date.now();
-  writeFileSync(flockPath, JSON.stringify(state, null, 2));
+  const payload = JSON.stringify(state, null, 2);
+  safeWriteFileSync(flockPath, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 /**
@@ -301,7 +304,8 @@ export async function updateFlockPhase(
 
   existingState.phase = phase;
   existingState.lastUpdate = Date.now();
-  writeFileSync(flockPath, JSON.stringify(existingState, null, 2));
+  const payload = JSON.stringify(existingState, null, 2);
+  safeWriteFileSync(flockPath, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 // ── Salvage-Specific Functions ─────────────────────────────────

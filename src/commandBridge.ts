@@ -84,21 +84,23 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   'abandon_mission': 'spacemolt',
   'decline_mission': 'spacemolt',
 
-  // Ship commands
-  'browse_ships': 'spacemolt_ship',
-  'buy_listed_ship': 'spacemolt_ship',
-  'list_ships': 'spacemolt_ship',
-  'switch_ship': 'spacemolt_ship',
-  'sell_ship': 'spacemolt_ship',
-   'commission_ship': 'spacemolt_ship',
-   'commission_status': 'spacemolt_ship',
-  'cancel_commission': 'spacemolt_ship',
-  'list_ship_for_sale': 'spacemolt_ship',
-  'cancel_ship_listing': 'spacemolt_ship',
-  'commission_quote': 'spacemolt_ship',
-  'refit_ship': 'spacemolt_ship',
-  'rename_ship': 'spacemolt_ship',
-  'supply_commission': 'spacemolt_ship',
+   // Ship commands
+   'browse_ships': 'spacemolt_ship',
+   'buy_listed_ship': 'spacemolt_ship',
+   'list_ships': 'spacemolt_ship',
+   'switch_ship': 'spacemolt_ship',
+   'sell_ship': 'spacemolt_ship',
+    'commission_ship': 'spacemolt_ship',
+    'commission_status': 'spacemolt_ship',
+   'cancel_commission': 'spacemolt_ship',
+   'list_ship_for_sale': 'spacemolt_ship',
+   'cancel_ship_listing': 'spacemolt_ship',
+   'commission_quote': 'spacemolt_ship',
+    'refit_ship': 'spacemolt_ship',
+    'rename_ship': 'spacemolt_ship',
+    'supply_commission': 'spacemolt_ship',
+    'treat_personnel': 'spacemolt_ship',
+    'recruit_personnel': 'spacemolt_ship',
 
   // Storage commands (actions differ from command names)
    'deposit_items': 'spacemolt_storage',
@@ -202,12 +204,15 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   // Facility (special: uses /tool/{action} pattern)
   'facility': 'spacemolt_facility',
 
-   // Battle
+  // Battle
    'battle': 'spacemolt_battle',
    'get_battle_status': 'spacemolt_battle',
    'reload': 'spacemolt_battle',
 
-   // Observation
+   // Arena
+   'arena': 'spacemolt_arena',
+
+    // Observation
    'subscribe_observation': 'spacemolt',
 
   // Salvage
@@ -221,7 +226,9 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   'claim_insurance': 'spacemolt_salvage',
   'get_insurance_quote': 'spacemolt_salvage',
   'view_insurance': 'spacemolt_salvage',
-  'set_home_base': 'spacemolt_salvage',
+   'set_home_base': 'spacemolt_salvage',
+   'claim_prize': 'spacemolt_salvage',
+   'service_prize': 'spacemolt_salvage',
 
   // Fleet
   'fleet': 'spacemolt_fleet',
@@ -309,7 +316,7 @@ export const COMMAND_ACTION_MAP: Record<string, string> = {
  };
 
 // Commands that use payload.action for the action (like facility and battle)
-export const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet']);
+export const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet', 'arena']);
 
 /**
  * Normalize a library command result into the bare `{ result }` envelope the
@@ -471,11 +478,6 @@ export async function libExecute(
   if (COMMAND_TOOL_MAP[command] === "spacemolt_auth") {
     return { result: { ok: true }, error: undefined, notifications: [] };
   }
-  // Notifications arrive via event subscriptions, not as a query result.
-  if (command === "get_notifications") {
-    return { result: { notifications: [] }, error: undefined, notifications: [] };
-  }
-
   const { tool, action, body } = buildLibDispatch(command, payload);
 
   let lastErr: Error | null = null;

@@ -1,12 +1,13 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { Bot, type Routine, type BotStatus } from "./bot.js";
 import { minerRoutine } from "./routines/miner.js";
-import { explorerRoutine } from "./routines/explorer.js";
+import { explorerRoutine, fixedRouteRoutine } from "./routines/explorer.js";
 import { crafterRoutine } from "./routines/crafter.js";
 import { rescueRoutine } from "./routines/rescue.js";
 import { coordinatorRoutine } from "./routines/coordinator.js";
 import { traderRoutine } from "./routines/trader.js";
+import { liveTraderRoutine } from "./routines/liveTrader.js";
 import { salvagerRoutine } from "./routines/salvager.js";
 import { hunterRoutine } from "./routines/hunter.js";
 import { factionTraderRoutine } from "./routines/faction_trader.js";
@@ -16,20 +17,23 @@ import { cleanupRoutine } from "./routines/cleanup.js";
 import { aiRoutine } from "./routines/ai.js";
 import { cargoMoverRoutine } from "./routines/cargo_mover.js";
 import { returnHomeRoutine } from "./routines/return_home.js";
+import { goToRoutine } from "./routines/goto.js";
 import { commandReceiverRoutine } from "./routines/command_receiver.js";
 import { fleetHunterCommanderRoutine } from "./routines/fleet_hunter_commander.js";
 import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordinate.js";
 import { escortRoutine } from "./routines/escort-fleet.js";
 import { escortFlockRoutine } from "./routines/escort-flock.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
+import { lexSellerRoutine } from "./routines/lex_seller.js";
 import { fuelTransportRoutine } from "./routines/fuelTransfer.js";
 import { civilianTransportRoutine, unloadPassengersToLounge } from "./routines/civilianTransport.js";
-import { pathfinderTestRoutine } from "./routines/pathfinder_test.js";
+import { pathfinderRoutine } from "./routines/pathfinder.js";
 import { moduleSellerRoutine } from "./routines/moduleSeller.js";
 import { fuelServiceRoutine } from "./routines/fuelService.js";
 import { stealthSkillGrindRoutine } from "./routines/stealthSkillGrind.js";
 import { idleRoutine } from "./routines/1-idle.js";
 import { marketRoutine } from "./routines/market.js";
+import { lbCRefRoutine } from "./routines/lb-c-ref.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { wildlifeStore } from "./wildlivestore.js";
@@ -39,6 +43,7 @@ import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
 import { flushStationFacilityCache } from "./stationFacilityCache.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings, saveSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState, getClerkApiKeys, getClerkConfig, setClerkConfig } from "./web/server.js";
+import { startMonitoring as startDiskSpaceMonitoring, setAlertCallback as setDiskSpaceAlertCallback, setEmergencyCallback as setDiskSpaceEmergencyCallback, refreshDiskSpaceState, setThreshold as setDiskSpaceThreshold, formatBytes, retryBufferedWrites, discardAllWrites, getPendingWrites, discardWrite } from "./diskSpaceGuard.js";
 import { ChatWebServer } from "./web/chatserver.js";
 import { StationWebServer } from "./web/stationserver.js";
 import { chatBuffer } from "./chatbuffer.js";
@@ -381,6 +386,34 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
     // fall back to local-only fleet
   }
 
+  // Robust fallback: the dashboard reaches the master's /api/client-sync/bots
+  // (which returns the combined fleet) even when the in-process sync pull came
+  // back empty — e.g. this node just started, the master was restarted, or
+  // fleet-poll returned nothing. If we still have no remote bots, try the /bots
+  // endpoint directly so the rescue routine sees the WHOLE connected fleet
+  // instead of just this client's own bots. Never throws.
+  if (remote.length === 0) {
+    const masterUrl: string =
+      ((light as unknown as { settings?: { masterUrl?: string } })?.settings?.masterUrl)
+      || ((slave as unknown as { settings?: { masterUrl?: string } })?.settings?.masterUrl)
+      || (globalThis as { clientSyncMasterUrl?: string }).clientSyncMasterUrl
+      || "";
+    if (masterUrl) {
+      try {
+        const r = await fetch(masterUrl.replace(/\/+$/, "") + "/api/client-sync/bots");
+        if (r.ok) {
+          const j = (await r.json()) as Array<Record<string, unknown>>;
+          if (Array.isArray(j) && j.length > 0) {
+            remote = j;
+            pullError = null;
+          }
+        }
+      } catch (err) {
+        pullError = pullError || `direct /bots fetch failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+  }
+
   // Surface a cross-client pull failure to the rescue routine's log so a
   // connectivity problem is visible where the user is actually looking (the
   // rescue scan), not only on this node's console.
@@ -486,10 +519,12 @@ export function sendBotChatMessage(
 const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   miner: { name: "Miner", fn: minerRoutine },
   explorer: { name: "Explorer", fn: explorerRoutine },
+  fixed_route: { name: "Explorer (Fixed Route)", fn: fixedRouteRoutine },
   crafter: { name: "Crafter", fn: crafterRoutine },
   rescue: { name: "FuelRescue", fn: rescueRoutine },
   coordinator: { name: "Coordinator", fn: coordinatorRoutine },
   trader: { name: "Trader", fn: traderRoutine },
+  live_trader: { name: "Live Trader", fn: liveTraderRoutine },
   salvager: { name: "Salvager", fn: salvagerRoutine },
   hunter: { name: "Hunter", fn: hunterRoutine },
   fleet_hunter_commander: { name: "FleetHunterCmd", fn: fleetHunterCommanderRoutine },
@@ -498,21 +533,24 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   craft_trade: { name: "CraftTrade", fn: craftTradeRoutine },
   trade_buyer: { name: "TradeBuyer", fn: tradeBuyerRoutine },
   fuel_cell_seller: { name: "FuelCellSeller", fn: fuelCellSellerRoutine },
+  lex_seller: { name: "LExSeller", fn: lexSellerRoutine },
   fuel_transport: { name: "FuelTransport", fn: fuelTransportRoutine },
   cleanup: { name: "Cleanup", fn: cleanupRoutine },
   ai: { name: "AI", fn: aiRoutine },
   cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },
   return_home: { name: "ReturnHome", fn: returnHomeRoutine },
+  goto: { name: "GoTo", fn: goToRoutine },
   command_receiver: { name: "CommandReceiver", fn: commandReceiverRoutine },
   escort: { name: "Escort (Fleet)", fn: escortRoutine },
   escort_flock: { name: "Escort (Flock)", fn: escortFlockRoutine },
-  pathfinder_test: { name: "PathfinderTest", fn: pathfinderTestRoutine },
+  pathfinder: { name: "Pathfinder", fn: pathfinderRoutine },
   civilian_transport: { name: "CivilianTransport", fn: civilianTransportRoutine },
   module_seller: { name: "ModuleSeller", fn: moduleSellerRoutine },
   fuel_service: { name: "FuelService", fn: fuelServiceRoutine },
   stealth_skill_grind: { name: "StealthSkillGrind", fn: stealthSkillGrindRoutine },
   "1-idle": { name: "1-Idle", fn: idleRoutine },
   market: { name: "Market", fn: marketRoutine },
+  lb_c_ref: { name: "LB-C-ReF", fn: lbCRefRoutine },
 };
 
 /** Categories that go to the broadcast panel instead of bot log. */
@@ -1303,6 +1341,14 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleSetPerformanceMonitoring(action);
     case "bulkSetHunterMode":
       return handleBulkSetHunterMode(action);
+    case "checkDiskSpace":
+      return handleCheckDiskSpace();
+    case "discardPendingWrite":
+      return handleDiscardPendingWrite(action);
+    case "retryPendingWrites":
+      return handleRetryPendingWrites();
+    case "setDiskSpaceThreshold":
+      return handleSetDiskSpaceThreshold(action);
     default:
       return { ok: false, error: `Unknown action: ${(action as any).type}` };
   }
@@ -1361,7 +1407,9 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
     const current = existsSync(flockFile) ? JSON.parse(require("fs").readFileSync(flockFile, "utf-8")) : { flockGroups: [], assignments: {} };
     if (s.flockGroups !== undefined) current.flockGroups = s.flockGroups;
     if (s.assignments !== undefined) current.assignments = s.assignments;
-    writeFileSync(flockFile, JSON.stringify(current, null, 2) + "\n", "utf-8");
+    const payload = JSON.stringify(current, null, 2) + "\n";
+    const { safeWriteFileSync } = await import("./diskSpaceGuard.js");
+    safeWriteFileSync(flockFile, payload, Buffer.byteLength(payload, "utf-8"));
     server.logSystem(`Flock settings saved`);
     return { ok: true, message: `flock settings saved` };
   }
@@ -1492,6 +1540,66 @@ async function handleBulkSetHunterMode(action: WebAction): Promise<WebActionResu
   saveSettings(server.settings);
   server.logSystem(`Bulk set hunter mode to "${mode}" for ${allBots.length} bot(s)`);
   return { ok: true, message: `Updated hunter mode to "${mode}" for ${allBots.length} bot(s)` };
+}
+
+async function handleCheckDiskSpace(): Promise<WebActionResult> {
+  const state = refreshDiskSpaceState(BASE_DIR);
+  server.broadcastJson({
+    type: "diskSpaceAlert",
+    freeBytes: state.freeBytes,
+    totalBytes: state.totalBytes,
+    isLow: state.isLow,
+    thresholdBytes: state.thresholdBytes,
+    formattedFree: formatBytes(state.freeBytes),
+    formattedThreshold: formatBytes(state.thresholdBytes),
+    pendingWrites: getPendingWrites().length,
+  });
+  return {
+    ok: true,
+    message: `Free space: ${formatBytes(state.freeBytes)} (threshold: ${formatBytes(state.thresholdBytes)})`,
+    data: {
+      freeBytes: state.freeBytes,
+      totalBytes: state.totalBytes,
+      isLow: state.isLow,
+      thresholdBytes: state.thresholdBytes,
+      formattedFree: formatBytes(state.freeBytes),
+      formattedThreshold: formatBytes(state.thresholdBytes),
+      pendingWrites: getPendingWrites().length,
+    },
+  };
+}
+
+async function handleDiscardPendingWrite(action: WebAction): Promise<WebActionResult> {
+  const key = (action as any).writeKey as string | undefined;
+  if (!key) return { ok: false, error: "writeKey required" };
+  if (key === "__all__") {
+    const count = discardAllWrites();
+    server.logSystem(`Discarded ALL pending disk-space writes (${count} entries)`);
+    return { ok: true, message: `Discarded ${count} pending writes` };
+  }
+  const removed = discardWrite(key);
+  server.logSystem(`Discarded pending disk-space write: ${key} (removed: ${removed})`);
+  return { ok: true, message: removed ? "Pending write discarded" : "Pending write not found" };
+}
+
+async function handleRetryPendingWrites(): Promise<WebActionResult> {
+  const result = await retryBufferedWrites();
+  server.logSystem(`Retried pending writes: ${result.succeeded.length} succeeded, ${result.failed.length} still pending`);
+  return {
+    ok: true,
+    message: `Retried: ${result.succeeded.length} succeeded, ${result.failed.length} still pending`,
+    data: { succeeded: result.succeeded, failed: result.failed },
+  };
+}
+
+async function handleSetDiskSpaceThreshold(action: WebAction): Promise<WebActionResult> {
+  const threshold = (action as any).thresholdBytes as number | undefined;
+  if (typeof threshold !== "number" || threshold < 0) {
+    return { ok: false, error: "thresholdBytes must be a non-negative number" };
+  }
+  setDiskSpaceThreshold(threshold);
+  server.logSystem(`Disk space threshold set to ${formatBytes(threshold)}`);
+  return { ok: true, message: `Disk space threshold set to ${formatBytes(threshold)}` };
 }
 
 async function handleManualRescueRequest(action: WebAction): Promise<WebActionResult> {
@@ -1977,7 +2085,7 @@ export async function handleStart(action: WebAction): Promise<WebActionResult> {
     (bot as unknown as Record<string, unknown>).routineParams = action.params;
   }
 
-  const startOpts = (routineKey === "rescue" || routineKey === "coordinator" || routineKey === "escort")
+  const startOpts = (routineKey === "rescue" || routineKey === "coordinator" || routineKey === "escort" || routineKey === "hunter")
     ? {
         getFleetStatus: () => [...bots.values()].map(b => b.status()),
         getFleetStatusAsync: () => getCombinedFleetStatus(),
@@ -2427,8 +2535,12 @@ const skillsObj: Record<string, unknown> | null =
     "refuel", "repair", "deposit_items", "withdraw_items", "faction_deposit_items", "faction_withdraw_items", "jettison",
     "attack", "loot_wreck", "salvage_wreck", "send_gift", "craft",
     "accept_mission", "complete_mission", "abandon_mission",
-    "buy_ship", "sell_ship", "switch_ship", "install_mod", "uninstall_mod", "set_colors",
+    "buy_ship", "sell_ship", "switch_ship",     "install_mod", "uninstall_mod", "set_colors",
     "set_home_base",
+    "treat_personnel",
+    // use_item consumes cargo and can also move the ship (emergency warp
+    // device) or change hull/shield/buffs, so cached state must be resynced.
+    "use_item",
   ]);
   const stateRefreshCommands = new Set(["get_cargo", "get_ship", "get_location", "view_storage", "view_faction_storage"]);
   
@@ -2562,6 +2674,28 @@ async function main(): Promise<void> {
   server = new WebServer(port);
   server.routines = Object.keys(ROUTINES).sort();
   server.onAction = handleAction;
+
+  const generalSettingsForDisk = (loadSettings().general as Record<string, unknown>) || {};
+  const diskThreshold = typeof generalSettingsForDisk.diskSpaceThresholdMB === "number"
+    ? (generalSettingsForDisk.diskSpaceThresholdMB as number) * 1024 * 1024
+    : 100 * 1024 * 1024;
+  setDiskSpaceThreshold(diskThreshold);
+  setDiskSpaceAlertCallback((state) => {
+    server?.broadcastDiskSpaceAlert(state);
+    server?.logSystem(`LOW DISK SPACE: ${formatBytes(state.freeBytes)} free (threshold: ${formatBytes(state.thresholdBytes)})`);
+  });
+  setDiskSpaceEmergencyCallback(async (state) => {
+    server.logSystem(`CRITICAL DISK SPACE: ${formatBytes(state.freeBytes)} free — initiating emergency return home + shutdown`);
+    server.broadcastDiskSpaceAlert(state);
+    const result = await handleEmergencyReturn();
+    server.logSystem(`Emergency return home completed: ${result.message}`);
+    await new Promise((r) => setTimeout(r, 5000));
+    server.logSystem("Shutting down due to critically low disk space");
+    gracefulShutdown("low_disk_space");
+  });
+  startDiskSpaceMonitoring(BASE_DIR, 60_000);
+  server.logSystem(`Disk space monitoring started (threshold: ${formatBytes(diskThreshold)})`);
+
   server.logSystem(
     `Routine resume mode resolved: ${instantResumeEnabled ? "instant (resume each bot on its own login)" : "wait-for-all (resume after every bot connects)"}. ` +
     `Change it in Settings → General → Routine Resume.`,
@@ -2643,6 +2777,12 @@ async function main(): Promise<void> {
       selfUrl: (csSettings.selfUrl as string) || "",
       disabledSyncFiles: Array.isArray(csSettings.disabledSyncFiles) ? (csSettings.disabledSyncFiles as string[]) : [],
     };
+    if (clientSyncSettings.enabled && clientSyncSettings.masterUrl) {
+      // Expose the configured master URL globally so cross-client fleet helpers
+      // (e.g. getCombinedFleetStatus) can reach the master's /api/client-sync/bots
+      // directly even when the in-process sync pull returns nothing.
+      (globalThis as { clientSyncMasterUrl?: string }).clientSyncMasterUrl = clientSyncSettings.masterUrl;
+    }
     if (clientSyncSettings.enabled && clientSyncSettings.mode === "slave" && clientSyncSettings.masterUrl) {
       const syncSlave = new ClientSyncSlave(clientSyncSettings);
       syncSlave.start();
@@ -2709,9 +2849,10 @@ async function main(): Promise<void> {
 
   // Set up bot-to-bot chat channel logging
   botChatChannel.onGlobalMessage((msg: BotChatMessage) => {
+    if (msg.channel === "coordination") return;
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
-    const recipientInfo = msg.recipients.length > 0 
-      ? ` -> ${msg.recipients.join(", ")}` 
+    const recipientInfo = msg.recipients.length > 0
+      ? ` -> ${msg.recipients.join(", ")}`
       : " -> [broadcast]";
     const line = `${timestamp} [BOT_CHAT] [${msg.channel}] ${msg.sender}${recipientInfo}: ${msg.content}`;
     server.logSystem(line);
@@ -3037,6 +3178,7 @@ async function main(): Promise<void> {
         debugLogForBot("SYSTEM", "periodic:keepalive", `Session keep-alive for ${keepAliveCount} idle bot(s)`);
       }
       await Promise.allSettled(keepAlivePromises);
+      refreshStatusTable();
     } catch (err) {
       console.error('Error in periodic session keep-alive:', err);
     }

@@ -61,4 +61,22 @@ describe('Hunter Settings', () => {
 
     expect(settings.disableWreckSalvaging).toBe(true);
   });
+
+  test('getHunterSettings defaults targetRandomly to false', () => {
+    (readSettings as any).mockReturnValue({});
+
+    const settings = getHunterSettings();
+
+    expect(settings.targetRandomly).toBe(false);
+  });
+
+  test('getHunterSettings reads targetRandomly from settings', () => {
+    (readSettings as any).mockReturnValue({
+      hunter: { targetRandomly: true }
+    });
+
+    const settings = getHunterSettings();
+
+    expect(settings.targetRandomly).toBe(true);
+  });
 });

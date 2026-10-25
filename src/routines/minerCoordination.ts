@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { getBotChatChannel } from "../botmanager.js";
 import type { BotChatMessage } from "../bot_chat_channel.js";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 
 /**
  * Miner coordination state stored in minerCoordination.json
@@ -49,7 +50,8 @@ export function saveMinerCoordination(state: MinerCoordinationState): void {
   try {
     const dir = join(process.cwd(), "data");
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    writeFileSync(COORDINATION_FILE, JSON.stringify(state, null, 2), "utf-8");
+    const payload = JSON.stringify(state, null, 2);
+    safeWriteFileSync(COORDINATION_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("[MinerCoordination] Failed to save coordination state:", err);
   }

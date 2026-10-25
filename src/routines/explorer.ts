@@ -4,6 +4,7 @@ import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "../bot_chat_channel.js";
 import type { FaintSignature } from "../wildlivestore.js";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
   type SystemPOI,
   type Connection,
@@ -25,6 +26,7 @@ import {
   detectAndRecoverFromDeath,
   readSettings,
   writeSettings,
+  getGlobalHomeBase,
   isPirateSystem,
   checkCustomsInspection,
   checkAndFleeFromPirates,
@@ -34,10 +36,17 @@ import {
   getBattleStatus,
   type BattleState,
   getItemSize,
+  getCargoFuelCells,
 } from "./common.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { marketDetailsStore, type MarketItemObservation } from "../marketdetailsstore.js";
+import { explorerHistoryStore } from "../explorerhistorystore.js";
+import { explorerAssignmentStore } from "../explorerassignmentstore.js";
+import { explorerFixedPathStore, type ExplorerFixedPath, type FixedPathRouteEntry } from "../explorerFixedPathStore.js";
+import {
+  updateShipListings,
+} from "../shipsforsale.js";
 
 /** Minimum fuel % before heading back to refuel. */
 const FUEL_SAFETY_PCT = 40;
@@ -45,38 +54,7 @@ const FUEL_SAFETY_PCT = 40;
 // ── Market Details Storage ──────────────────────────────────
 
 const DATA_DIR = join(process.cwd(), "data");
-const SHIPS_FOR_SALE_FILE = join(DATA_DIR, "shipsForSale.json");
 const RAW_MISSIONS_FILE = join(DATA_DIR, "rawMissions.json");
-
-interface ShipListing {
-  systemId: string;
-  stationPoiId: string;
-  stationName: string;
-  listing_id: string;
-  ship_id: string;
-  class_id: string;
-  price: number;
-  listed_at: string;
-  seller: string;
-  ship_name: string;
-  tier: number;
-  hull: number;
-  max_hull: number;
-  shield: number;
-  modules_count: number;
-  scale: number;
-  category: string;
-  custom_name?: string;
-  last_updated: string;
-}
-
-/** Threshold in days for considering a ship listing stale and removing it. */
-const SHIP_LISTING_EXPIRY_DAYS = 30;
-
-interface ShipsForSaleData {
-  lastSaved: string;
-  listings: Record<string, ShipListing>;
-}
 
 interface RawMissionRecord {
   missionId: string;
@@ -94,48 +72,6 @@ interface RawMissionRecord {
 interface RawMissionsData {
   lastSaved: string;
   missions: Record<string, RawMissionRecord>; // key: mission_id
-}
-
-function loadShipsForSale(log?: (cat: string, msg: string) => void): ShipsForSaleData {
-  if (!existsSync(DATA_DIR)) {
-    mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (existsSync(SHIPS_FOR_SALE_FILE)) {
-    try {
-      const raw = readFileSync(SHIPS_FOR_SALE_FILE, "utf-8");
-      const data = JSON.parse(raw) as ShipsForSaleData;
-      const removed = cleanupExpiredShipListings(data);
-      if (removed > 0 && log) {
-        log("info", `Removed ${removed} expired ship listing(s) from shipsForSale.json`);
-        saveShipsForSale(data);
-      }
-      return data;
-    } catch {
-      // Corrupt file — start fresh
-    }
-  }
-  return { lastSaved: now(), listings: {} };
-}
-
-function saveShipsForSale(data: ShipsForSaleData): void {
-  if (!existsSync(DATA_DIR)) {
-    mkdirSync(DATA_DIR, { recursive: true });
-  }
-  data.lastSaved = now();
-  writeFileSync(SHIPS_FOR_SALE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
-}
-
-function cleanupExpiredShipListings(data: ShipsForSaleData): number {
-  const cutoff = Date.now() - SHIP_LISTING_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
-  let removed = 0;
-  for (const [listingId, listing] of Object.entries(data.listings)) {
-    const lastUpdated = new Date(listing.last_updated).getTime();
-    if (isNaN(lastUpdated) || lastUpdated < cutoff) {
-      delete data.listings[listingId];
-      removed++;
-    }
-  }
-  return removed;
 }
 
 function loadRawMissions(): RawMissionsData {
@@ -158,7 +94,8 @@ function saveRawMissions(data: RawMissionsData): void {
     mkdirSync(DATA_DIR, { recursive: true });
   }
   data.lastSaved = now();
-  writeFileSync(RAW_MISSIONS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(data, null, 2) + "\n";
+  safeWriteFileSync(RAW_MISSIONS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 function now(): string {
@@ -261,7 +198,7 @@ const RESOURCE_REFRESH_MINS = 120;
 
 // ── Per-bot settings ─────────────────────────────────────────
 
-export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all" | "achievement";
+export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all" | "achievement" | "fixed_route";
 
 function getExplorerSettings(username?: string): {
   mode: ExplorerMode;
@@ -280,6 +217,7 @@ function getExplorerSettings(username?: string): {
   ignoreBlacklistWhenCloaked: boolean;
   ignorePirateFleeWhenCloaked: boolean;
   coordinateExplorers: boolean;
+  explorerSystemTimeout: number;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -373,8 +311,11 @@ function getExplorerSettings(username?: string): {
       ? Boolean(e.coordinateExplorers)
       : true;
 
+  // System exploration timeout (minutes): global explorer only, default 60
+  const explorerSystemTimeout = Number(e.explorerSystemTimeout) || 60;
+
   return {
-    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : mode === "achievement" ? "achievement" : "explore") as ExplorerMode,
+    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : mode === "achievement" ? "achievement" : mode === "fixed_route" ? "fixed_route" : "explore") as ExplorerMode,
     acceptMissions,
     focusAreaSystem,
     maxJumps,
@@ -390,6 +331,7 @@ function getExplorerSettings(username?: string): {
     ignoreBlacklistWhenCloaked,
     ignorePirateFleeWhenCloaked,
     coordinateExplorers,
+    explorerSystemTimeout,
   };
 }
 
@@ -418,6 +360,13 @@ export function setExplorerVisitAll(username: string, enabled: boolean): void {
 export function setExplorerAchievement(username: string, enabled: boolean): void {
   writeSettings({
     [username]: { explorerMode: enabled ? "achievement" : "explore" },
+  });
+}
+
+/** Persist fixed_route mode setting for a specific bot. */
+export function setExplorerFixedRoute(username: string, enabled: boolean): void {
+  writeSettings({
+    [username]: { explorerMode: enabled ? "fixed_route" : "explore" },
   });
 }
 
@@ -527,6 +476,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     yield* achievementRoutine(ctx);
     return;
   }
+  if (initialSettings.mode === "fixed_route") {
+    yield* fixedRouteRoutine(ctx);
+    return;
+  }
 
   // ── Setup exploration coordination ──
   let sendBotChat: ((content: string, channel: BotChatChannel, recipients?: string[], metadata?: Record<string, unknown>) => void) | undefined;
@@ -570,7 +523,104 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("warn", "Could not fetch map data — visited status may be incomplete");
   }
 
+  // ── Assign starting system for systematic exploration ──
+  // Each explorer picks a system far from other explorers' starting systems for galaxy-wide coverage
+  const blacklist = getSystemBlacklist();
+  const startupSettings = getExplorerSettings(bot.username);
+  const existingAssignment = explorerAssignmentStore.getAssignment(bot.username);
+  let assignedStartSystem: { id: string; name: string } | null = null;
+  
+  if (!existingAssignment) {
+    // No assignment yet - pick a system far from other explorers using local BFS
+    const otherAssignments = explorerAssignmentStore.getAllAssignments()
+      .filter(a => a.botName !== bot.username)
+      .map(a => a.startingSystem);
+    
+    // Get all candidate distant systems (top 10 farthest from other explorers)
+    const allSystems = mapStore.getSystems();
+    const blacklistSet = new Set(blacklist.map(b => b.toLowerCase()));
+    const fledSet = new Set(Array.from(fledFromSystems).map(s => s.toLowerCase()));
+    const otherStartsSet = new Set(otherAssignments.map(s => s.toLowerCase()));
+    
+    // Pre-calculate distances from each other explorer's starting system
+    const otherStartDistances = new Map<string, Map<string, number>>();
+    for (const otherStart of otherAssignments) {
+      const distances = calculateLocalDistances(otherStart, blacklist, fledFromSystems, startupSettings.ignoreBlacklistWhenCloaked, bot.isCloaked);
+      const distMap = new Map<string, number>();
+      for (const [sysId, info] of distances.entries()) {
+        distMap.set(sysId, info.distance);
+      }
+      otherStartDistances.set(otherStart.toLowerCase(), distMap);
+    }
+    
+    const candidates: Array<{ id: string; name: string; minDistToOthers: number }> = [];
+    for (const sys of allSystems) {
+      const sysLower = sys.id.toLowerCase();
+      if (!bot.isCloaked || !startupSettings.ignoreBlacklistWhenCloaked) {
+        if (blacklistSet.has(sysLower)) continue;
+      }
+      if (isTemporarilyBlacklisted(sys.id)) continue;
+      if (fledSet.has(sysLower)) continue;
+      if (otherStartsSet.has(sysLower)) continue;
+      if (sysLower === (bot.system || "").toLowerCase()) continue;
+      
+      let minDistToOthers = Infinity;
+      if (otherAssignments.length > 0) {
+        for (const otherStart of otherAssignments) {
+          const distMap = otherStartDistances.get(otherStart.toLowerCase());
+          if (distMap) {
+            const dist = distMap.get(sys.id);
+            if (dist !== undefined && dist < minDistToOthers) {
+              minDistToOthers = dist;
+            }
+          }
+        }
+      } else {
+        // No other explorers assigned yet — every system is equally "distant",
+        // so treat them as candidates instead of filtering them all out.
+        // The first few get reserved in mapStore order, giving later starters
+        // something to spread away from.
+        minDistToOthers = FAR_FROM_OTHERS_DISTANCE;
+      }
+      
+      if (minDistToOthers !== Infinity) {
+        candidates.push({ id: sys.id, name: sys.name || sys.id, minDistToOthers });
+      }
+    }
+    
+    if (candidates.length > 0) {
+      // Sort by distance from others (farthest first)
+      candidates.sort((a, b) => b.minDistToOthers - a.minDistToOthers);
+      
+      // Pick the first available candidate (don't navigate yet - will do after startup prep)
+      for (let i = 0; i < Math.min(5, candidates.length); i++) {
+        const candidate = candidates[i];
+        const assigned = explorerAssignmentStore.assignStartingSystem(bot.username, candidate.id, candidate.name);
+        if (!assigned) continue; // Another bot got it
+        
+        ctx.log("exploration", `Assigned starting system: ${candidate.name} (${candidate.id}) - distance from others: ${candidate.minDistToOthers}`);
+        assignedStartSystem = candidate;
+        break;
+      }
+      
+      if (!assignedStartSystem) {
+        ctx.log("exploration", "All distant starting systems taken by other bots, using current location");
+      }
+    } else {
+      ctx.log("exploration", "Could not find distant starting system, using current location");
+    }
+  } else {
+    ctx.log("exploration", `Resuming from assigned starting system: ${existingAssignment.startingSystemName} (${existingAssignment.startingSystem})`);
+    ctx.log("exploration", `Completed ${existingAssignment.completedSystems.length} systems so far`);
+    assignedStartSystem = { id: existingAssignment.startingSystem, name: existingAssignment.startingSystemName };
+    // Add previously completed systems to visited set
+    for (const sysId of existingAssignment.completedSystems) {
+      visitedSystems.add(sysId);
+    }
+  }
+
   // ── Startup: dock at local station to clear cargo & refuel ──
+  // This MUST happen BEFORE navigating to assigned starting system
   yield "startup_prep";
   await bot.refreshStatus();
   const { pois: startPois } = await getSystemInfo(ctx);
@@ -638,7 +688,6 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // Load fuel cells to max cargo (explorer long-range mode)
-      const startupSettings = getExplorerSettings(bot.username);
       if (startupSettings.loadFuelCellsAtHome) {
         yield "startup_load_fuel_cells";
         await loadFuelCellsToMax(ctx);
@@ -655,6 +704,23 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("system", "No station in current system — skipping startup prep");
   }
 
+  // ── Navigate to assigned starting system (AFTER startup prep for full fuel) ──
+  if (assignedStartSystem && assignedStartSystem.id.toLowerCase() !== (bot.system || "").toLowerCase()) {
+    ctx.log("travel", `Navigating to assigned starting system ${assignedStartSystem.name}...`);
+    await ensureUndocked(ctx);
+    const arrived = await navigateToSystem(ctx, assignedStartSystem.id, { 
+      fuelThresholdPct: startupSettings.refuelThreshold, 
+      hullThresholdPct: 30, 
+      skipBlacklist: startupSettings.ignoreBlacklistWhenCloaked && bot.isCloaked 
+    });
+    if (!arrived) {
+      ctx.log("warn", `Could not reach assigned starting system ${assignedStartSystem.name}, will explore from current location`);
+      explorerAssignmentStore.clearAssignment(bot.username);
+    } else {
+      ctx.log("travel", `Arrived at assigned starting system ${assignedStartSystem.name}`);
+    }
+  }
+
   // Persistent battle state across cycles
   const battleState: BattleState = {
     inBattle: false,
@@ -664,6 +730,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     isFleeing: false,
     lastFleeTime: undefined,
   };
+
+  // Persistent counter for consecutive picks where every candidate was
+  // occupied by another explorer (shared with the coordination helper)
+  const occupiedWaitState: ExplorerWaitState = { blockedCount: 0 };
 
   // Track if we've already enabled cloak (mutation command - don't re-issue)
   let cloakEnabled = false;
@@ -751,22 +821,32 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const modeCheck = getExplorerSettings(bot.username);
     if (modeCheck.mode === "trade_update") {
       ctx.log("system", "Mode changed to trade_update — switching routines...");
+      clearExplorerPosition(bot.username);
       yield* tradeUpdateRoutine(ctx);
       return;
     }
     if (modeCheck.mode === "deep_core_scan") {
       ctx.log("system", "Mode changed to deep_core_scan — switching routines...");
+      clearExplorerPosition(bot.username);
       yield* deepCoreScanRoutine(ctx);
       return;
     }
     if (modeCheck.mode === "visit_all") {
       ctx.log("system", "Mode changed to visit_all — switching routines...");
+      clearExplorerPosition(bot.username);
       yield* visitAllRoutine(ctx);
       return;
     }
     if (modeCheck.mode === "achievement") {
       ctx.log("system", "Mode changed to achievement — switching routines...");
+      clearExplorerPosition(bot.username);
       yield* achievementRoutine(ctx);
+      return;
+    }
+    if (modeCheck.mode === "fixed_route") {
+      ctx.log("system", "Mode changed to fixed_route — switching routines...");
+      clearExplorerPosition(bot.username);
+      yield* fixedRouteRoutine(ctx);
       return;
     }
 
@@ -786,6 +866,8 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     visitedSystems.add(systemId);
     visitedSystemTimes.set(systemId, Date.now());
     mapStore.markSystemVisited(systemId);
+    explorerHistoryStore.recordVisit(bot.username, systemId);
+    updateExplorerPosition(bot.username, systemId, bot.poi);
     if (path.length === 0) {
       path.push(systemId); // Initialize path with starting system
     }
@@ -1062,6 +1144,9 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     let wormholeJumped = false;
     for (const { poi, reason } of toVisit) {
       if (bot.state !== "running") break;
+      // Keep the live-position heartbeat fresh during long POI tours so
+      // other explorers keep seeing us as "in this system".
+      updateExplorerPosition(bot.username, systemId, poi.id);
 
       const isMinable = isMinablePoi(poi.type);
       const isStation = isStationPoi(poi);
@@ -1103,38 +1188,42 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("info", `🌌 Testing wormhole ${poi.id}...`);
         yield `test_wormhole_${poi.id}`;
         const jumpResp = await bot.exec("jump", { target_poi: poi.id });
-        if (!jumpResp.error) {
-          const r = jumpResp.result as Record<string, unknown> | undefined;
-          if (r && r.action === "jumped") {
-            // from_system/system are display names ("Alzirr"); the map is keyed
-            // by ids ("alzirr"), so never feed a name in as a system id.
-            const fromSystemName = (r.from_system as string) || systemId;
-            const exitPoi = (r.poi as string) || poi.id;
-            const destSystemName = (r.system as string) || "";
-            // bot.system is already updated to the arrival system by the jump.
-            const destSystemId = (r.system_id as string)
-              || (bot.system && bot.system !== systemId ? bot.system : "");
-            ctx.log("info", `🌌 Wormhole jumped: ${fromSystemName} -> ${destSystemName || destSystemId} (${exitPoi})`);
-            if (destSystemId) {
-              mapStore.registerWormhole(destSystemId, {
-                id: exitPoi,
-                name: exitPoi,
-                exit_system_id: destSystemId,
-                exit_system_name: destSystemName || destSystemId,
-                exit_poi_id: exitPoi,
-                exit_poi_name: exitPoi,
-                // The entrance is the system we just left, not wherever the
-                // bot happens to be standing now.
-                destination_system_id: systemId,
-                destination_system_name: fromSystemName,
-              });
-            } else {
-              ctx.log("warn", `Wormhole ${poi.id} jumped but no destination system id was reported — not recording it`);
-            }
-            // Mark both entrance and exit POIs explored
-            mapStore.markExplored(systemId, poi.id);
-            if (destSystemId) mapStore.markExplored(destSystemId, exitPoi);
+        if (jumpResp.error) {
+          ctx.log("warn", `Wormhole ${poi.id} jump failed: ${jumpResp.error.message} — marking POI explored and moving on`);
+          mapStore.markExplored(systemId, poi.id);
+          await bot.refreshLocation();
+          continue;
+        }
+        const r = jumpResp.result as Record<string, unknown> | undefined;
+        if (r && r.action === "jumped") {
+          // from_system/system are display names ("Alzirr"); the map is keyed
+          // by ids ("alzirr"), so never feed a name in as a system id.
+          const fromSystemName = (r.from_system as string) || systemId;
+          const exitPoi = (r.poi as string) || poi.id;
+          const destSystemName = (r.system as string) || "";
+          // bot.system is already updated to the arrival system by the jump.
+          const destSystemId = (r.system_id as string)
+            || (bot.system && bot.system !== systemId ? bot.system : "");
+          ctx.log("info", `🌌 Wormhole jumped: ${fromSystemName} -> ${destSystemName || destSystemId} (${exitPoi})`);
+          if (destSystemId) {
+            mapStore.registerWormhole(destSystemId, {
+              id: exitPoi,
+              name: exitPoi,
+              exit_system_id: destSystemId,
+              exit_system_name: destSystemName || destSystemId,
+              exit_poi_id: exitPoi,
+              exit_poi_name: exitPoi,
+              // The entrance is the system we just left, not wherever the
+              // bot happens to be standing now.
+              destination_system_id: systemId,
+              destination_system_name: fromSystemName,
+            });
+          } else {
+            ctx.log("warn", `Wormhole ${poi.id} jumped but no destination system id was reported — not recording it`);
           }
+          // Mark both entrance and exit POIs explored
+          mapStore.markExplored(systemId, poi.id);
+          if (destSystemId) mapStore.markExplored(destSystemId, exitPoi);
         }
         // Refresh location after wormhole jump
         await bot.refreshLocation();
@@ -1167,7 +1256,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         yield* visitOtherPoi(ctx, systemId, poi, fledFromSystems);
       }
 
-      // ── Check cargo — if full with non-fuel-cell items, return to Sol Central to deposit ──
+      // ── Check cargo — if full with non-fuel-cell items, return to the home base to deposit ──
       await bot.refreshCargoAndStorage();
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
         // Check if cargo is full of only fuel cells (intentional for exploration)
@@ -1267,20 +1356,28 @@ yield "deposit_cargo";
           }
         }
         
-        // Load fuel cells if cargo space available
+        // Load fuel cells only if we're actually running low — the bot already
+        // stocked up at home. Buying/loading more at every station is wasteful
+        // when fuel cells are free at home.
         if (bot.cargoMax > 0 && bot.cargo < bot.cargoMax) {
-          yield "load_fuel_cells";
-          const stationForFuel = findStation(pois);
-          if (stationForFuel) {
-            // Travel to station if not already there
-            if (bot.poi !== stationForFuel.id) {
-              await ensureUndocked(ctx);
-              const tResp = await bot.exec("travel", { target_poi: stationForFuel.id });
-              if (!tResp.error || tResp.error.message.includes("already")) {
-                bot.poi = stationForFuel.id;
+          await bot.refreshCargo();
+          const cargoCells = getCargoFuelCells(bot);
+          if (cargoCells.fuel > 0) {
+            ctx.log("info", `Already carrying ${cargoCells.cells} fuel cell(s) (${cargoCells.fuel} fuel) — skipping remote loading (free at home)`);
+          } else {
+            yield "load_fuel_cells";
+            const stationForFuel = findStation(pois);
+            if (stationForFuel) {
+              // Travel to station if not already there
+              if (bot.poi !== stationForFuel.id) {
+                await ensureUndocked(ctx);
+                const tResp = await bot.exec("travel", { target_poi: stationForFuel.id });
+                if (!tResp.error || tResp.error.message.includes("already")) {
+                  bot.poi = stationForFuel.id;
+                }
               }
+              await loadFuelCells(ctx);
             }
-            await loadFuelCells(ctx);
           }
         }
         
@@ -1356,218 +1453,126 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
          }
          lastSystem = systemId;
          continue;
-       } else {
-         ctx.log("info", "Direct-to-Unknown: No unknown systems found — using normal exploration");
-       }
+} else {
+          ctx.log("info", "Direct-to-Unknown: No unknown systems found — using systematic exploration");
+        }
     }
 
-    // ALWAYS ensure fueled before jumping — will navigate to nearest station if needed
-    yield "pre_jump_fuel";
-    const jumpFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
-    if (!jumpFueled) {
-      ctx.log("error", "Could not refuel before jump — waiting 30s...");
+    // ── Systematic Exploration: find all systems needing exploration via BFS ──
+    yield "find_systems_to_explore";
+    
+    const blacklist = getSystemBlacklist();
+    const systemsNeedingExploration = await findSystemsNeedingExploration(
+      ctx,
+      blacklist,
+      fledFromSystems,
+      visitedSystems,
+      currentSettings.ignoreBlacklistWhenCloaked,
+      bot.isCloaked,
+      lastSystem
+    );
+
+    if (systemsNeedingExploration.length === 0) {
+      ctx.log("info", "All reachable systems explored! Waiting for new systems to become stale...");
+      await ctx.sleep(60000);
+      continue;
+    }
+
+    // Pick the nearest system needing exploration — but never tailgate another
+    // explorer: skip systems they currently occupy, skip systems they have
+    // claimed, and re-roll to an isolated region if everything nearby is taken.
+    const occupiedSystems = getOccupiedExplorerSystems(bot.username);
+    const claimedTargets = currentSettings.coordinateExplorers ? getClaimedTargetMap() : null;
+    const pick = pickCoordinatedSystemTarget(systemsNeedingExploration, {
+      occupied: occupiedSystems,
+      claimed: claimedTargets,
+      blacklist,
+      excludeBot: bot.username,
+      keyOf: s => s.id,
+      waitState: occupiedWaitState,
+      maxWaitAttempts: 3,
+      log: msg => ctx.log("exploration", msg),
+    });
+
+    if (pick.shouldWait) {
       await ctx.sleep(30000);
       continue;
     }
 
-    const validConns = connections.filter(c => c.id);
-
-    // DEBUG: Check for any blacklisted systems in connections
-    const blacklist = getSystemBlacklist();
-    const blacklistedInConnections = validConns.filter(c => blacklist.some(b => b.toLowerCase() === c.id.toLowerCase()));
-    if (blacklistedInConnections.length > 0) {
-      ctx.log("warning", `Found ${blacklistedInConnections.length} blacklisted systems in current connections: ${blacklistedInConnections.map(c => c.id).join(', ')}`);
+    const target = pick.target;
+    if (!target) {
+      ctx.log("warn", "No exploration target available — waiting before re-evaluating");
+      await ctx.sleep(30000);
+      continue;
     }
+    const priorityLabel = target.priority === "unvisited" ? "unvisited" : "revisit";
+    ctx.log("exploration", `Systematic explore: Found ${systemsNeedingExploration.length} system(s) needing exploration, targeting nearest ${priorityLabel}: ${target.name} (${target.distance} jumps away)`);
 
-    // ── Coordination: avoid systems other active explorers are targeting ──
-    const claimedTargets = currentSettings.coordinateExplorers ? getClaimedTargets() : null;
-
-    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems, path, bot.isCloaked, currentSettings.ignoreBlacklistWhenCloaked, claimedTargets);
-
-    // ── Coordination: Announce our target to other explorers ──
-    if (currentSettings.coordinateExplorers && sendBotChat && getAllBotNames && nextSystem) {
+    // Announce our target to other explorers via bot chat
+    if (currentSettings.coordinateExplorers && sendBotChat && getAllBotNames) {
       const allBots = getAllBotNames();
       const otherBots = allBots.filter(name => name !== bot.username);
       if (otherBots.length > 0) {
-        announceExplorationTarget(ctx, nextSystem.id);
+        announceExplorationTarget(ctx, target.id);
       }
     }
-    
-    if (!nextSystem) {
-      ctx.log("info", "All connected systems explored! Picking a random connection...");
-      if (validConns.length > 0) {
-        // Ensure fuel before random jump
-        const rndFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
-        if (!rndFueled) {
-          ctx.log("error", "Cannot refuel for random jump — waiting 30s...");
-          await ctx.sleep(30000);
-          continue;
-        }
-        // Smart selection: avoid dead-ends and pirate systems
-        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems, path, bot.isCloaked, currentSettings.ignoreBlacklistWhenCloaked);
-        if (!random) {
-          ctx.log("error", "No valid non-blacklisted connections available! Explorer is trapped. Attempting to backtrack...");
-          if (path.length >= 2) {
-            const backtrackTarget = path[path.length - 2];
-            const currentSystem = path[path.length - 1];
-            ctx.log("system", `Backtracking from ${currentSystem} to ${backtrackTarget}...`);
-            path.pop();
-            await ensureUndocked(ctx);
-            const backtrackResp = await bot.exec("jump", { target_system: backtrackTarget });
-            if (backtrackResp.error) {
-              ctx.log("error", `Backtrack failed: ${backtrackResp.error.message}`);
-              await ctx.sleep(60000);
-            } else {
-              ctx.log("travel", `Backtracked to ${backtrackTarget}`);
-              bot.stats.totalSystems++;
-              lastSystem = currentSystem;
-              await ctx.sleep(5000);
-            }
-            continue;
-          } else {
-            ctx.log("error", "No path to backtrack - explorer is completely trapped. Waiting before retry...");
-            await ctx.sleep(60000);
-            continue;
-          }
-        }
-        await ensureUndocked(ctx);
-        ctx.log("travel", `Jumping to ${random.name || random.id}...`);
-        const jumpResp = await bot.exec("jump", { target_system: random.id });
-        if (jumpResp.error) {
-          if (!jumpResp.error.message) {
-            ctx.log("error", `Jump response has undefined/null error message`);
-            await ctx.sleep(10000);
-            continue;
-          }
-          const msg = jumpResp.error.message.toLowerCase();
-          // CRITICAL: Check for battle interrupt error
-          if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
-            ctx.log("combat", `Jump interrupted by battle! ${jumpResp.error.message} - fleeing!`);
-            await fleeFromBattle(ctx);
-            await ctx.sleep(5000);
-            continue;
-          }
-          // Check if we're in battle - need to flee immediately
-          if (msg.includes("battle") || msg.includes("in battle")) {
-            ctx.log("combat", "Cannot jump - in battle! Attempting to flee...");
-            const fled = await fleeFromBattle(ctx);
-            if (!fled) {
-              ctx.log("error", "Flee command failed - battle engagement active");
-            }
-            await ctx.sleep(5000);
-            continue;
-          }
-          ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-          await ctx.sleep(10000);
-          continue;
-        }
-        ctx.log("travel", `Jumped to ${random.name || random.id}`);
-        bot.stats.totalSystems++;
-        path.push(random.id); // Track the new system in path
-        await checkCustomsInspection(ctx, systemId);
-        // Check for pirates
-        const nearbyResp = await bot.exec("get_nearby");
-        if (nearbyResp.result && typeof nearbyResp.result === "object") {
-          // Track wildlife from nearby scan
-          bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
-          
-          // Skip pirate flee if cloaked and ignorePirateFleeWhenCloaked is enabled
-          if (!bot.isCloaked || !currentSettings.ignorePirateFleeWhenCloaked) {
-            const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-            if (fled) {
-              ctx.log("error", "Pirates detected - fled, will retry");
-              fledFromSystems.add(systemId); // Mark this system as hostile
-              await ctx.sleep(30000);
-              continue;
-            }
-          }
-        }
-        lastSystem = systemId;
-        continue;
-      } else {
-        ctx.log("error", "No connections from this system — attempting to backtrack...");
-        if (path.length >= 2) {
-          const backtrackTarget = path[path.length - 2];
-          const currentSystem = path[path.length - 1];
-          ctx.log("system", `Backtracking from ${currentSystem} to ${backtrackTarget}...`);
-          path.pop();
-          await ensureUndocked(ctx);
-          const backtrackResp = await bot.exec("jump", { target_system: backtrackTarget });
-          if (backtrackResp.error) {
-            ctx.log("error", `Backtrack failed: ${backtrackResp.error.message}`);
-            await ctx.sleep(60000);
-          } else {
-            ctx.log("travel", `Backtracked to ${backtrackTarget}`);
-            bot.stats.totalSystems++;
-            lastSystem = currentSystem;
-            await ctx.sleep(5000);
-          }
-          continue;
-        } else {
-          ctx.log("error", "No connections and no path to backtrack - explorer is completely trapped. Waiting 60s...");
-          await ctx.sleep(60000);
-        }
-      }
+
+    // Ensure fueled before navigating
+    yield "pre_navigation_fuel";
+    const navFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
+    if (!navFueled) {
+      ctx.log("error", "Could not refuel for navigation — waiting 30s...");
+      await ctx.sleep(30000);
       continue;
     }
 
-    // Final fuel verify before jumping
-    await bot.refreshShip();
-    const preJumpFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-    if (preJumpFuel < 25) {
-      ctx.log("system", `Fuel too low for jump (${preJumpFuel}%) — refueling first...`);
-      const jf = await ensureFueled(ctx, currentSettings.refuelThreshold);
-      if (!jf) {
-        ctx.log("error", "Cannot refuel — waiting 30s...");
-        await ctx.sleep(30000);
-        continue;
-      }
-    }
-
     await ensureUndocked(ctx);
-    ctx.log("travel", `Jumping to ${nextSystem.name || nextSystem.id}...`);
-    const jumpResp = await bot.exec("jump", { target_system: nextSystem.id });
-    if (jumpResp.error) {
-      if (!jumpResp.error.message) {
-        ctx.log("error", `Jump response has undefined/null error message`);
-        await ctx.sleep(10000);
-        continue;
-      }
-      const msg = jumpResp.error.message.toLowerCase();
-      // CRITICAL: Check for battle interrupt error
-      if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
-        ctx.log("combat", `Jump interrupted by battle! ${jumpResp.error.message} - fleeing!`);
-        await fleeFromBattle(ctx);
-        await ctx.sleep(5000);
-        continue;
-      }
-      // Check if we're in battle - need to flee immediately
-      if (msg.includes("battle") || msg.includes("in battle")) {
-        ctx.log("combat", "Cannot jump - in battle! Attempting to flee...");
-        const fled = await fleeFromBattle(ctx);
-        if (!fled) {
-          ctx.log("error", "Flee command failed - battle engagement active");
-        }
-        await ctx.sleep(5000);
-        continue;
-      }
-      if (msg.includes("fuel")) {
-        ctx.log("error", "Insufficient fuel for jump — will refuel next loop");
-      } else {
-        ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-      }
+
+    // Navigate to target system
+    ctx.log("travel", `Navigating to ${target.name} (${target.id}) - ${target.distance} jumps via route: ${target.route.join(" -> ")}`);
+    const arrived = await navigateToSystem(ctx, target.id, { 
+      fuelThresholdPct: currentSettings.refuelThreshold, 
+      hullThresholdPct: 30, 
+      skipBlacklist: currentSettings.ignoreBlacklistWhenCloaked && bot.isCloaked 
+    });
+    
+    if (!arrived) {
+      ctx.log("error", `Could not reach ${target.name} — will retry next loop`);
       await ctx.sleep(10000);
       continue;
     }
 
-    ctx.log("travel", `Jumped to ${nextSystem.name || nextSystem.id}`);
+    ctx.log("travel", `Arrived at ${target.name}`);
     bot.stats.totalSystems++;
-    path.push(nextSystem.id); // Track the new system in path
+    
+    // Record this system as completed in the assignment store
+    explorerAssignmentStore.recordCompletedSystem(bot.username, target.id);
+    visitedSystems.add(target.id);
+    visitedSystemTimes.set(target.id, Date.now());
+    path.push(target.id);
+    lastSystem = target.id;
 
-    // Check for customs inspection after jump
-    await checkCustomsInspection(ctx, systemId);
-    // Check for pirates
+    // Update visited status from server after arrival
+    yield "update_visited_status";
+    const updateMapResp = await bot.exec("get_map");
+    if (updateMapResp.result && typeof updateMapResp.result === "object") {
+      const mapData = updateMapResp.result as Record<string, unknown>;
+      const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+      for (const sys of systems) {
+        const sysId = (sys.system_id as string) || (sys.id as string);
+        if (sysId) {
+          mapStore.updateSystem(sys);
+        }
+      }
+    }
+
+    // Check for pirates and battle
     const nearbyResp = await bot.exec("get_nearby");
+    if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
+      ctx.log("error", "Battle detected after arrival - fleeing!");
+      await ctx.sleep(30000);
+      continue;
+    }
     if (nearbyResp.result && typeof nearbyResp.result === "object") {
       // Track wildlife from nearby scan
       bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
@@ -1577,15 +1582,18 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
         const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
         if (fled) {
           ctx.log("error", "Pirates detected - fled, will retry");
-          fledFromSystems.add(systemId); // Mark this system as hostile
+          fledFromSystems.add(target.id);
           await ctx.sleep(30000);
           continue;
         }
       }
-    }
-
-    lastSystem = systemId;
+}
+    
+    // Continue to next iteration to explore this system's POIs
+    continue;
   }
+
+  clearExplorerPosition(bot.username);
 };
 
 // ── POI visit sub-routines ───────────────────────────────────
@@ -1843,7 +1851,21 @@ async function* scanStation(
 
         // Memory-only upsert; marketDetailsStore persists on its 2-min cadence
         // (and on shutdown) instead of rewriting the whole ~10MB file here.
-        const detailsUpdated = marketDetailsStore.upsertItems(systemId, poi.id, poi.name, observations) > 0;
+        const isMobileCapital =
+          poi.id === "frontier_station" ||
+          poi.id === "mobile_capital" ||
+          poi.id === "mobile_capitol";
+        const stationKey = isMobileCapital ? "frontier_station" : poi.id;
+
+        if (isMobileCapital) {
+          marketDetailsStore.clearStation(systemId, "frontier_station");
+          marketDetailsStore.clearStation(systemId, "mobile_capital");
+          marketDetailsStore.clearStation(systemId, "mobile_capitol");
+        } else {
+          marketDetailsStore.clearStation(systemId, stationKey);
+        }
+
+        const detailsUpdated = marketDetailsStore.upsertItems(systemId, stationKey, poi.name, observations) > 0;
 
         if (detailsUpdated) {
           ctx.log("info", `Recorded detailed market data for ${items.length} items`);
@@ -2003,61 +2025,7 @@ async function* scanStation(
       ) as Array<Record<string, unknown>>;
 
       if (listings.length > 0) {
-        ctx.log("info", `Saving ${listings.length} ship listings from ${poi.name}...`);
-        const shipsData = loadShipsForSale(ctx.log);
-        let updated = 0;
-        const expiredRemoved = cleanupExpiredShipListings(shipsData);
-
-        const currentListingIds = new Set<string>();
-
-        for (const listing of listings) {
-          const listing_id = (listing.listing_id as string) || "";
-          if (!listing_id) continue;
-          currentListingIds.add(listing_id);
-
-          const shipListing: ShipListing = {
-            systemId: systemId,
-            stationPoiId: poi.id,
-            stationName: poi.name,
-            listing_id,
-            ship_id: (listing.ship_id as string) || "",
-            class_id: (listing.class_id as string) || "",
-            price: (listing.price as number) || 0,
-            listed_at: (listing.listed_at as string) || "",
-            seller: (listing.seller as string) || "",
-            ship_name: (listing.ship_name as string) || "",
-            tier: (listing.tier as number) || 0,
-            hull: (listing.hull as number) || 0,
-            max_hull: (listing.max_hull as number) || 0,
-            shield: (listing.shield as number) || 0,
-            modules_count: (listing.modules_count as number) || 0,
-            scale: (listing.scale as number) || 0,
-            category: (listing.category as string) || "",
-            custom_name: listing.custom_name as string,
-            last_updated: now(),
-          };
-
-          shipsData.listings[listing_id] = shipListing;
-          updated++;
-        }
-
-        let soldRemoved = 0;
-        for (const listingId of Object.keys(shipsData.listings)) {
-          const listing = shipsData.listings[listingId];
-          if (!currentListingIds.has(listingId) && listing.systemId === systemId && listing.stationPoiId === poi.id) {
-            delete shipsData.listings[listingId];
-            soldRemoved++;
-          }
-        }
-
-        if (updated > 0 || soldRemoved > 0 || expiredRemoved > 0) {
-          saveShipsForSale(shipsData);
-          const msgs: string[] = [];
-          if (updated > 0) msgs.push(`${updated} added/updated`);
-          if (soldRemoved > 0) msgs.push(`${soldRemoved} sold/removed`);
-          if (expiredRemoved > 0) msgs.push(`${expiredRemoved} expired`);
-          ctx.log("info", `Saved ship listings to shipsForSale.json (${msgs.join(", ")})`);
-        }
+        updateShipListings(systemId, poi.id, poi.name, listings, ctx.log);
       }
     }
 
@@ -2881,8 +2849,22 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
                 observations.push({ itemId, itemName, buyOrders, sellOrders });
               }
 
+              const isMobileCapital =
+                target.stationPoi === "frontier_station" ||
+                target.stationPoi === "mobile_capital" ||
+                target.stationPoi === "mobile_capitol";
+              const stationKey = isMobileCapital ? "frontier_station" : target.stationPoi;
+
+              if (isMobileCapital) {
+                marketDetailsStore.clearStation(target.systemId, "frontier_station");
+                marketDetailsStore.clearStation(target.systemId, "mobile_capital");
+                marketDetailsStore.clearStation(target.systemId, "mobile_capitol");
+              } else {
+                marketDetailsStore.clearStation(target.systemId, stationKey);
+              }
+
               const detailsUpdated = marketDetailsStore.upsertItems(
-                target.systemId, target.stationPoi, target.stationName, observations,
+                target.systemId, stationKey, target.stationName, observations,
               ) > 0;
 
               if (detailsUpdated) {
@@ -2948,61 +2930,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               ) as Array<Record<string, unknown>>;
 
               if (listings.length > 0) {
-                ctx.log("info", `Saving ${listings.length} ship listings from ${target.stationName}...`);
-                const shipsData = loadShipsForSale(ctx.log);
-                let updated = 0;
-                const expiredRemoved = cleanupExpiredShipListings(shipsData);
-
-                const currentListingIds = new Set<string>();
-
-                for (const listing of listings) {
-                  const listing_id = (listing.listing_id as string) || "";
-                  if (!listing_id) continue;
-                  currentListingIds.add(listing_id);
-
-                  const shipListing: ShipListing = {
-                    systemId: target.systemId,
-                    stationPoiId: target.stationPoi,
-                    stationName: target.stationName,
-                    listing_id,
-                    ship_id: (listing.ship_id as string) || "",
-                    class_id: (listing.class_id as string) || "",
-                    price: (listing.price as number) || 0,
-                    listed_at: (listing.listed_at as string) || "",
-                    seller: (listing.seller as string) || "",
-                    ship_name: (listing.ship_name as string) || "",
-                    tier: (listing.tier as number) || 0,
-                    hull: (listing.hull as number) || 0,
-                    max_hull: (listing.max_hull as number) || 0,
-                    shield: (listing.shield as number) || 0,
-                    modules_count: (listing.modules_count as number) || 0,
-                    scale: (listing.scale as number) || 0,
-                    category: (listing.category as string) || "",
-                    custom_name: listing.custom_name as string,
-                    last_updated: now(),
-                  };
-
-                  shipsData.listings[listing_id] = shipListing;
-                  updated++;
-                }
-
-                let soldRemoved = 0;
-                for (const listingId of Object.keys(shipsData.listings)) {
-                  const listing = shipsData.listings[listingId];
-                  if (!currentListingIds.has(listingId) && listing.systemId === target.systemId && listing.stationPoiId === target.stationPoi) {
-                    delete shipsData.listings[listingId];
-                    soldRemoved++;
-                  }
-                }
-
-                if (updated > 0 || soldRemoved > 0 || expiredRemoved > 0) {
-                  saveShipsForSale(shipsData);
-                  const msgs: string[] = [];
-                  if (updated > 0) msgs.push(`${updated} added/updated`);
-                  if (soldRemoved > 0) msgs.push(`${soldRemoved} sold/removed`);
-                  if (expiredRemoved > 0) msgs.push(`${expiredRemoved} expired`);
-                  ctx.log("info", `Saved ship listings to shipsForSale.json (${msgs.join(", ")})`);
-                }
+                updateShipListings(target.systemId, target.stationPoi, target.stationName, listings, ctx.log);
               }
             }
           }
@@ -3104,6 +3032,8 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
   const fledFromSystems = new Set<string>();
   const path: string[] = [];
   let lastSystem: string | null = null;
+  // Persistent counter shared with the coordination helper
+  const occupiedWaitState: ExplorerWaitState = { blockedCount: 0 };
 
   // Get initial system info
   yield "startup";
@@ -3214,6 +3144,7 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     // Mark this system as visited (both locally and via mapStore)
     visitedSystems.add(systemId);
     mapStore.markSystemVisited(systemId);
+    updateExplorerPosition(bot.username, systemId, bot.poi);
 
     // Get visit stats
     const stats = mapStore.getVisitStats();
@@ -3228,8 +3159,12 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     // Find unvisited systems reachable from current position
     const unvisited = findUnvisitedSystemsByServerFlag(ctx, systemId, blacklist, fledFromSystems);
 
-    // Coordination: avoid systems other active explorers are currently targeting
-    const visitAllClaimed = settings.coordinateExplorers ? getClaimedTargets() : null;
+    // Coordination inputs shared by both pick sites below: systems other
+    // explorers currently occupy, and systems they've claimed as targets.
+    // The pick policy itself lives in pickCoordinatedSystemTarget so every
+    // explorer routine behaves identically.
+    const occupiedSystems = getOccupiedExplorerSystems(bot.username);
+    const claimedTargets = settings.coordinateExplorers ? getClaimedTargetMap() : null;
 
     if (unvisited.length === 0) {
       ctx.log("info", "No unvisited systems in connected region — picking nearest unvisited from map...");
@@ -3260,11 +3195,23 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
         return aDist - bDist;
       });
 
-      const target = pickCoordinatedTarget(allUnvisited, visitAllClaimed, u => u.systemId);
-      if (!target) {
-        ctx.log("info", "All systems visited! Explore mode complete.");
-        return;
+      const pick = pickCoordinatedSystemTarget(allUnvisited, {
+        occupied: occupiedSystems,
+        claimed: claimedTargets,
+        blacklist,
+        excludeBot: bot.username,
+        keyOf: u => u.systemId,
+        waitState: occupiedWaitState,
+        maxWaitAttempts: 3,
+        log: msg => ctx.log("exploration", msg),
+      });
+
+      if (pick.shouldWait || !pick.target) {
+        await ctx.sleep(30000);
+        continue;
       }
+
+      const target = pick.target;
 
       // Announce our target to other explorers for coordination
       if (settings.coordinateExplorers && ctx.sendBotChat && ctx.getAllBotNames) {
@@ -3287,7 +3234,23 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     }
 
     // Jump to nearest unvisited system
-    const target = pickCoordinatedTarget(unvisited, visitAllClaimed, u => u.id);
+    const pick = pickCoordinatedSystemTarget(unvisited, {
+      occupied: occupiedSystems,
+      claimed: claimedTargets,
+      blacklist,
+      excludeBot: bot.username,
+      keyOf: u => u.id,
+      waitState: occupiedWaitState,
+      maxWaitAttempts: 3,
+      log: msg => ctx.log("exploration", msg),
+    });
+
+    if (pick.shouldWait) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    const target = pick.target;
     if (!target) {
       await ctx.sleep(5000);
       continue;
@@ -3349,6 +3312,8 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
   const fledFromSystems = new Set<string>();
   const path: string[] = [];
   let lastSystem: string | null = null;
+  // Persistent counter shared with the coordination helper
+  const occupiedWaitState: ExplorerWaitState = { blockedCount: 0 };
 
   // Get initial system info
   yield "startup";
@@ -3510,9 +3475,12 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const stats = mapStore.getVisitStats();
       if (stats.unvisited === 0 || connections.length === 0) {
         ctx.log("warn", `At pirate system ${bot.system} with no viable route - returning home`);
-        const homeArrived = await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
+        const home = getGlobalHomeBase();
+        const homeSystem = home.system || "sol";
+        const homeName = home.name || "home base";
+        const homeArrived = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true, homeSystem, homeStation: home.station });
         if (homeArrived) {
-          ctx.log("system", "Returned to Sol from pirate system - continuing achievement mode");
+          ctx.log("system", `Returned to ${homeName} from pirate system - continuing achievement mode`);
           await ctx.sleep(5000);
         }
         continue;
@@ -3522,6 +3490,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     // Mark this system as visited locally
     visitedSystems.add(systemId);
     mapStore.markSystemVisited(systemId);
+    updateExplorerPosition(bot.username, systemId, bot.poi);
 
     // Get visit stats from mapStore
     const stats = mapStore.getVisitStats();
@@ -3531,9 +3500,12 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     if (stats.unvisited === 0) {
       ctx.log("info", "All systems visited! Returning home and auto-disabling achievement mode.");
       // Return home first
-      const homeSystem = "sol";
+      const home = getGlobalHomeBase();
+      const homeSystem = home.system || "sol";
+      const homeName = home.name || "home base";
       if (bot.system.toLowerCase() !== homeSystem) {
-        await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
+        ctx.log("system", `Returning to ${homeName} to complete achievement mode`);
+        await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true, homeSystem, homeStation: home.station });
       }
       setExplorerMode(bot.username, "explore");
       return;
@@ -3579,7 +3551,10 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         // Check if we're in a pirate system and need to return
         if (isPirateSystem(bot.system)) {
           ctx.log("warn", "In pirate system with no route to unvisited - returning home");
-          await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
+          const home = getGlobalHomeBase();
+          const homeSystem = home.system || "sol";
+          const homeName = home.name || "home base";
+          await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true, homeSystem, homeStation: home.station });
           await ctx.sleep(5000);
         } else {
           await ctx.sleep(30000);
@@ -3591,7 +3566,32 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     // Sort by distance from current position (nearest first)
     unvisitedSystems.sort((a, b) => a.distance - b.distance);
 
-    const target = unvisitedSystems[0];
+    // Coordination: never tailgate another explorer — skip systems they
+    // currently occupy, skip systems they've claimed, and re-roll to an
+    // isolated region if everything nearby is taken.
+    const occupiedSystems = getOccupiedExplorerSystems(bot.username);
+    const claimedTargets = settings.coordinateExplorers ? getClaimedTargetMap() : null;
+    const pick = pickCoordinatedSystemTarget(unvisitedSystems, {
+      occupied: occupiedSystems,
+      claimed: claimedTargets,
+      blacklist,
+      excludeBot: bot.username,
+      keyOf: s => s.id,
+      waitState: occupiedWaitState,
+      maxWaitAttempts: 3,
+      log: msg => ctx.log("exploration", msg),
+    });
+
+    if (pick.shouldWait) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    const target = pick.target;
+    if (!target) {
+      await ctx.sleep(30000);
+      continue;
+    }
     ctx.log("travel", `Navigating to ${target.name} (${target.id}) - ${target.distance} jumps away, ${unvisitedSystems.length} systems remaining`);
 
     // Ensure fueled
@@ -3822,10 +3822,823 @@ async function findAllUnvisitedSystems(
   return unvisited;
 }
 
+/**
+ * Local BFS pathfinder using mapStore connections.
+ * Calculates shortest path (distance + route) from a start system to all reachable systems.
+ * Does NOT use the API - uses local mapStore graph data.
+ * 
+ * @param startSystem - Starting system ID
+ * @param blacklist - Systems to avoid
+ * @param fledFromSystems - Systems we've fled from
+ * @param ignoreBlacklistWhenCloaked - Whether to ignore blacklist when cloaked
+ * @param isCloaked - Whether bot is cloaked
+ * @param maxDistance - Maximum hops to search (optional)
+ * @returns Map of systemId -> { distance, route }
+ */
+function calculateLocalDistances(
+  startSystem: string,
+  blacklist: string[],
+  fledFromSystems: Set<string>,
+  ignoreBlacklistWhenCloaked: boolean,
+  isCloaked: boolean,
+  maxDistance?: number
+): Map<string, { distance: number; route: string[] }> {
+  const distances = new Map<string, { distance: number; route: string[] }>();
+  const visited = new Set<string>();
+  const queue: Array<{ systemId: string; distance: number; route: string[] }> = [
+    { systemId: startSystem, distance: 0, route: [startSystem] }
+  ];
+  visited.add(startSystem.toLowerCase());
+
+  const blacklistSet = new Set(blacklist.map(b => b.toLowerCase()));
+  const fledSet = new Set(Array.from(fledFromSystems).map(s => s.toLowerCase()));
+
+  while (queue.length > 0) {
+    const { systemId, distance, route } = queue.shift()!;
+    
+    if (maxDistance !== undefined && distance > maxDistance) continue;
+
+    const sys = mapStore.getSystem(systemId);
+    if (!sys || !sys.connections) continue;
+
+    for (const conn of sys.connections) {
+      const connId = conn.system_id;
+      if (!connId) continue;
+      const connLower = connId.toLowerCase();
+      if (visited.has(connLower)) continue;
+
+      // Skip blacklisted/fled systems unless cloaked
+      if (!isCloaked || !ignoreBlacklistWhenCloaked) {
+        if (blacklistSet.has(connLower)) continue;
+        if (isTemporarilyBlacklisted(connId)) continue;
+        if (fledSet.has(connLower)) continue;
+      }
+
+      visited.add(connLower);
+      const newDistance = distance + 1;
+      const newRoute = [...route, connId];
+
+      distances.set(connId, { distance: newDistance, route: newRoute });
+      queue.push({ systemId: connId, distance: newDistance, route: newRoute });
+    }
+  }
+
+  return distances;
+}
+
+// ── Fixed-route (fixed_route mode) TSP generator ───────────────────
+
+/** Cloak module type ids. Inspected at route build time only — the cloak
+ *  command itself is never issued here (that would undock the ship). */
+const CLOAK_MODULE_IDS = [
+  "cloaking_device_i",
+  "cloaking_device_ii",
+  "phase_cloaking_device",
+  "voidborn_phase_cloak",
+  "emergency_cloaking_system",
+];
+
+/** Static wormholes that are always usable as bidirectional routing edges. */
+const STATIC_WORMHOLES: Array<[string, string]> = [
+  ["alzirr", "praecipua"],
+  ["hadar", "gsc_0036"],
+];
+
+/** Route-overlap warning thresholds (non-blocking, log only). */
+const FIXED_ROUTE_OVERLAY_WARN_PCT = 0.25;
+const FIXED_ROUTE_OVERLAY_WARN_COUNT = 5;
+
+/** Inspect equipped modules for a cloak. Returns false if the ship can't be read. */
+async function hasCloakModule(ctx: RoutineContext): Promise<boolean> {
+  const shipResp = await ctx.bot.exec("get_ship");
+  if (shipResp.error || !shipResp.result) return false;
+  const { modules } = extractShipModules(shipResp.result);
+  return modules.some((mod) =>
+    CLOAK_MODULE_IDS.some((id) => moduleHaystack(mod).includes(id)),
+  );
+}
+
+/** Build a local adjacency list (lower-cased system ids) from mapStore
+ *  connections plus the two static wormholes. Dynamic wormholes are
+ *  excluded. Does not mutate mapStore. */
+function buildFixedRouteGraph(cloakAvailable: boolean): Map<string, Set<string>> {
+  const graph = new Map<string, Set<string>>();
+  const addNode = (id: string): void => {
+    const key = id.toLowerCase();
+    if (!graph.has(key)) graph.set(key, new Set());
+  };
+  const addEdge = (a: string, b: string): void => {
+    addNode(a);
+    addNode(b);
+    graph.get(a.toLowerCase())!.add(b.toLowerCase());
+    graph.get(b.toLowerCase())!.add(a.toLowerCase());
+  };
+
+  const blacklistSet = new Set(getSystemBlacklist().map((b) => b.toLowerCase()));
+
+  for (const sys of mapStore.getSystems()) {
+    const sysId = sys.id.toLowerCase();
+    if (!cloakAvailable && blacklistSet.has(sysId)) continue;
+    addNode(sys.id);
+    for (const conn of sys.connections || []) {
+      if (!conn.system_id) continue;
+      if (!cloakAvailable && blacklistSet.has(conn.system_id.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(conn.system_id)) continue;
+      addEdge(sys.id, conn.system_id);
+    }
+  }
+
+  for (const [a, b] of STATIC_WORMHOLES) {
+    addEdge(a, b);
+  }
+
+  return graph;
+}
+
+/** BFS hop distances from `start` over the local fixed-route graph. */
+function graphDistances(graph: Map<string, Set<string>>, start: string): Map<string, number> {
+  const dist = new Map<string, number>();
+  const startLower = start.toLowerCase();
+  if (!graph.has(startLower)) return dist;
+  const visited = new Set<string>([startLower]);
+  const queue: string[] = [startLower];
+  dist.set(startLower, 0);
+  let head = 0;
+  while (head < queue.length) {
+    const cur = queue[head++];
+    const curDist = dist.get(cur)!;
+    for (const nb of graph.get(cur) || []) {
+      if (visited.has(nb)) continue;
+      visited.add(nb);
+      dist.set(nb, curDist + 1);
+      queue.push(nb);
+    }
+  }
+  return dist;
+}
+
+/** Greedy nearest-neighbor TSP over the local graph.
+ *  Random start + random tie-breaking among equidistant unvisited systems
+ *  so bots starting at the same system diverge. Open path (no return). */
+function generateFixedRoute(graph: Map<string, Set<string>>, homeSystem: string): FixedPathRouteEntry[] {
+  const nodes = [...graph.keys()];
+  if (nodes.length === 0) return [];
+
+  const pickRandom = <T>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
+
+  const homeLower = homeSystem.toLowerCase();
+  if (!graph.has(homeLower)) {
+    graph.set(homeLower, new Set());
+    nodes.push(homeLower);
+  }
+
+  const start = pickRandom(nodes).toLowerCase();
+  const unvisited = new Set(nodes.filter((n) => n !== start));
+  const route: FixedPathRouteEntry[] = [];
+  let current = start;
+  let order = 0;
+
+  const addEntry = (sysId: string): void => {
+    const sys = mapStore.getSystem(sysId);
+    route.push({
+      order: order++,
+      systemId: sysId,
+      systemName: sys ? sys.name : sysId,
+      lastExploredAt: null,
+      blockedCount: 0,
+    });
+  };
+
+  addEntry(current);
+
+  while (unvisited.size > 0) {
+    const dists = graphDistances(graph, current);
+    let bestDist = Infinity;
+    const candidates: string[] = [];
+    for (const target of unvisited) {
+      const d = dists.get(target);
+      if (d === undefined) continue;
+      if (d < bestDist) {
+        bestDist = d;
+        candidates.length = 0;
+        candidates.push(target);
+      } else if (d === bestDist) {
+        candidates.push(target);
+      }
+    }
+    if (candidates.length === 0) break;
+    const next = pickRandom(candidates);
+    unvisited.delete(next);
+    current = next;
+    addEntry(current);
+  }
+
+  return route;
+}
+
+/** Log intersection of this bot's route with every other bot's route (non-blocking). */
+function logFixedRouteOverlap(botName: string, route: FixedPathRouteEntry[], ctx: RoutineContext): void {
+  const thisIds = new Set(route.map((e) => e.systemId.toLowerCase()));
+  const others = explorerFixedPathStore.getAllFixedPaths().filter((e) => e.botName !== botName);
+  let maxOverlap = 0;
+  let maxOther = "";
+  for (const other of others) {
+    const otherIds = new Set(other.route.map((e) => e.systemId.toLowerCase()));
+    let inter = 0;
+    for (const id of thisIds) if (otherIds.has(id)) inter++;
+    if (inter > maxOverlap) {
+      maxOverlap = inter;
+      maxOther = other.botName;
+    }
+  }
+  const pct = route.length > 0 ? maxOverlap / route.length : 0;
+  if (others.length > 0) {
+    ctx.log("system", `Fixed route overlap vs ${others.length} other bot(s): max ${maxOverlap} systems (${(pct * 100).toFixed(0)}%) with ${maxOther || "none"}`);
+    if (maxOverlap > FIXED_ROUTE_OVERLAY_WARN_COUNT || pct > FIXED_ROUTE_OVERLAY_WARN_PCT) {
+      ctx.log("warn", `Fixed route HIGH OVERLAP with ${maxOther}: ${maxOverlap} systems (${(pct * 100).toFixed(0)}%)`);
+    }
+  }
+}
+
+/** Full system exploration for one fixed-route target, reusing existing POI
+ *  scanning logic and staleness thresholds (STATION_REFRESH_MINS / RESOURCE_REFRESH_MINS). */
+async function* exploreFixedRouteSystem(ctx: RoutineContext, systemId: string): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+  const explorerSettings = getExplorerSettings(bot.username);
+
+  await bot.refreshLocation();
+  await bot.refreshShip();
+  mapStore.markSystemVisited(systemId);
+  explorerHistoryStore.recordVisit(bot.username, systemId);
+  updateExplorerPosition(bot.username, systemId, null);
+  await fetchSecurityLevel(ctx, systemId);
+
+  let currentFaintSignatures: FaintSignature[] = [];
+  let pois: SystemPOI[] = [];
+
+  if (explorerSettings.scanPois) {
+    yield "survey_system";
+    const surveyResp = await bot.exec("survey_system");
+    if (await checkBattleAfterCommand(ctx, surveyResp.notifications, "survey_system")) {
+      ctx.log("combat", "Battle detected during survey - aborting system scan");
+      return;
+    }
+    if (!surveyResp.error) {
+      const surveyResult = surveyResp.result as Record<string, unknown> | undefined;
+      if (surveyResult && typeof surveyResult === "object") {
+        bot.trackSurveyWildlife(surveyResult);
+        currentFaintSignatures = extractFaintSignatures(surveyResult);
+      }
+      const refreshed = await getSystemInfo(ctx);
+      if (refreshed.pois.length > pois.length) {
+        ctx.log("info", `Survey revealed ${refreshed.pois.length - pois.length} new POI(s) in ${systemId}`);
+      }
+      pois = refreshed.pois;
+    } else {
+      const msg = surveyResp.error.message.toLowerCase();
+      if (!msg.includes("already") && !msg.includes("cooldown")) {
+        ctx.log("info", `Survey: ${surveyResp.error.message}`);
+      }
+    }
+  } else {
+    const info = await getSystemInfo(ctx);
+    pois = info.pois;
+  }
+
+  // ── Classify POIs and determine what needs visiting ──
+  const toVisit: Array<{ poi: SystemPOI; reason: string }> = [];
+  for (const poi of pois) {
+    const isStation = isStationPoi(poi);
+    const isMinable = isMinablePoi(poi.type);
+    const isScenic = isScenicPoi(poi.type);
+    const minutesAgo = mapStore.minutesSinceExplored(systemId, poi.id);
+
+    if (isStation) {
+      if (minutesAgo < STATION_REFRESH_MINS) continue;
+      toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : "refresh" });
+    } else if (isMinable) {
+      const storedPoi = mapStore.getSystem(systemId)?.pois.find((p) => p.id === poi.id);
+      const hasResourceData = (storedPoi?.resources?.length ?? 0) > 0;
+      if (explorerSettings.surveyMode === "quick" && hasResourceData) {
+        if (minutesAgo < RESOURCE_REFRESH_MINS) continue;
+      }
+      if (!hasResourceData) {
+        toVisit.push({ poi, reason: "needs-resource-scan" });
+      } else if (minutesAgo < RESOURCE_REFRESH_MINS) {
+        continue;
+      } else {
+        toVisit.push({ poi, reason: "refresh" });
+      }
+    } else if (isScenic) {
+      if (explorerSettings.surveyMode === "quick") continue;
+      if (minutesAgo < Infinity) continue;
+      toVisit.push({ poi, reason: "new" });
+    } else {
+      if (explorerSettings.surveyMode === "quick") continue;
+      if (minutesAgo < RESOURCE_REFRESH_MINS) continue;
+      toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : "refresh" });
+    }
+  }
+
+  // Chase faint signatures (creature hints)
+  if (currentFaintSignatures.length > 0 && explorerSettings.mode !== "visit_all") {
+    const sigPois = findPoisFromFaintSignatures(currentFaintSignatures, pois);
+    for (const poi of sigPois) {
+      if (!toVisit.some((t) => t.poi.id === poi.id)) {
+        toVisit.push({ poi, reason: "faint-signature" });
+      }
+    }
+    if (sigPois.length > 0) {
+      ctx.log("wildlife", `Following ${sigPois.length} faint signature(s) in ${systemId}: ${sigPois.map((p) => p.name).join(", ")}`);
+    }
+  }
+
+  if (toVisit.length === 0) {
+    ctx.log("info", `${systemId}: all POIs up to date — moving on`);
+    return;
+  }
+  ctx.log("info", `${systemId}: ${toVisit.length} POI(s) to visit`);
+
+  // ── Visit each POI ──
+  for (const { poi } of toVisit) {
+    if (bot.state !== "running") break;
+    updateExplorerPosition(bot.username, systemId, poi.id);
+
+    const isMinable = isMinablePoi(poi.type);
+    const isStation = isStationPoi(poi);
+
+    const poiFueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
+    if (!poiFueled) {
+      ctx.log("error", `Could not refuel at ${systemId} — aborting POI tour`);
+      break;
+    }
+    await bot.refreshLocation();
+    if (bot.system !== systemId) break;
+    await ensureUndocked(ctx);
+
+    yield `visit_${poi.id}`;
+    const travelResp = await bot.exec("travel", { target_poi: poi.id });
+    if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) continue;
+    if (travelResp.error && !travelResp.error.message.includes("already")) continue;
+    bot.poi = poi.id;
+
+    // ── Wormhole test ──
+    const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
+    if (isWormholePoi) {
+      ctx.log("info", `🌌 Testing wormhole ${poi.id}...`);
+      const jumpResp = await bot.exec("jump", { target_poi: poi.id });
+      if (jumpResp.error) {
+        mapStore.markExplored(systemId, poi.id);
+        await bot.refreshLocation();
+        continue;
+      }
+      const r = jumpResp.result as Record<string, unknown> | undefined;
+      if (r && r.action === "jumped") {
+        const destSystemId = (r.system_id as string) || "";
+        mapStore.markExplored(systemId, poi.id);
+        if (destSystemId) mapStore.markExplored(destSystemId, (r.poi as string) || poi.id);
+      }
+      await bot.refreshLocation();
+      if (bot.system && bot.system !== systemId) {
+        ctx.log("info", `Wormhole dropped us in ${bot.system} (off route from ${systemId}) — returning to route target on next cycle`);
+        return;
+      }
+      continue;
+    }
+
+    if (isMinable) {
+      yield* scanResourcePoi(ctx, systemId, poi);
+    } else if (isStation) {
+      yield* scanStation(ctx, systemId, poi);
+    } else {
+      yield* visitOtherPoi(ctx, systemId, poi, new Set<string>());
+    }
+
+    mapStore.markExplored(systemId, poi.id);
+  }
+}
+
+/** Fixed-route explorer: walks a pre-determined route through all known
+ *  systems, fully surveys each, loops home to restock, then restarts. */
+export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+  const FUEL_THRESHOLD_PCT = 30;
+  const BLOCKED_PAUSE_MS = 60_000;
+
+  let sendBotChat: ((content: string, channel: BotChatChannel, recipients?: string[], metadata?: Record<string, unknown>) => void) | undefined;
+  let getAllBotNames: (() => string[]) | undefined;
+  if (ctx.sendBotChat) sendBotChat = ctx.sendBotChat;
+  if (ctx.getAllBotNames) getAllBotNames = ctx.getAllBotNames;
+
+  let consecutiveFailures = 0;
+  let startupPrepped = false;
+
+  while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await ctx.sleep(30000); continue; }
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "fixed_route")) {
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // ── Re-check mode (user may have changed it, or session restarted) ──
+    const modeCheck = getExplorerSettings(bot.username);
+    if (modeCheck.mode !== "fixed_route") {
+      ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving fixed_route...`);
+      explorerFixedPathStore.removeFixedPath(bot.username);
+      return;
+    }
+
+    // ── Load / ensure route ──
+    let fixed = explorerFixedPathStore.getFixedPath(bot.username);
+    if (!fixed) {
+      const cloakAvailable = await hasCloakModule(ctx);
+      const homeBase = getGlobalHomeBase();
+      const homeSystem = homeBase.system || bot.system || "sol";
+      const graph = buildFixedRouteGraph(cloakAvailable);
+      const route = generateFixedRoute(graph, homeSystem);
+      if (route.length === 0) {
+        ctx.log("error", "Fixed route: no reachable systems to route through — retrying in 30s");
+        await ctx.sleep(30000);
+        continue;
+      }
+      const entry: ExplorerFixedPath = {
+        botName: bot.username,
+        routeId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+        createdAt: now(),
+        updatedAt: now(),
+        status: "active",
+        cloakAvailable,
+        homeSystem,
+        currentIndex: 0,
+        route,
+      };
+      explorerFixedPathStore.upsertFixedPath(entry);
+      explorerFixedPathStore.flushSync();
+      fixed = entry;
+      ctx.log("system", `Fixed route built — ${route.length} systems, cloak=${cloakAvailable}, home=${homeSystem}, start=${route[0].systemId}`);
+      logFixedRouteOverlap(bot.username, route, ctx);
+    }
+
+    // ── Startup prep: dock, load fuel cells to max, refuel tank, repair hull ──
+    if (!startupPrepped) {
+      startupPrepped = true;
+      ctx.log("system", "Fixed route: startup prep — docking to load fuel cells, refuel tank, and repair hull...");
+      const { pois: startPois } = await getSystemInfo(ctx);
+      const startStation = findStation(startPois);
+      if (startStation) {
+        if (bot.poi !== startStation.id) {
+          await ensureUndocked(ctx);
+          const tResp = await bot.exec("travel", { target_poi: startStation.id });
+          if (tResp.error && !tResp.error.message.includes("already")) {
+            ctx.log("warn", `Could not reach startup station ${startStation.name}: ${tResp.error.message}`);
+          }
+        }
+        if (!bot.docked) {
+          const dResp = await bot.exec("dock");
+          if (!dResp.error || dResp.error.message.includes("already")) {
+            bot.docked = true;
+          }
+        }
+      }
+      if (bot.docked) {
+        await collectFromStorage(ctx);
+        const settings = getExplorerSettings(bot.username);
+        if (settings.loadFuelCellsAtHome) {
+          await loadFuelCellsToMax(ctx);
+        }
+        await tryRefuel(ctx);
+        await bot.refreshShip();
+        const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        if (hullPct <= 40) {
+          ctx.log("system", `Hull critical (${hullPct}%) — repairing at startup station`);
+          await repairShip(ctx);
+        }
+        await bot.refreshShip();
+        const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        ctx.log("system", `Startup prep complete — Fuel: ${fuelPct}% | Cargo: ${bot.cargo}/${bot.cargoMax} | Hull: ${hullPct}%`);
+      } else {
+        ctx.log("warn", "Fixed route: no station in current system for startup prep — proceeding with current fuel/cargo");
+      }
+      await ensureUndocked(ctx);
+    }
+
+    const homeSystem = fixed.homeSystem || getGlobalHomeBase().system || "sol";
+
+    // ── New-system detection: regenerate if get_map reveals systems not in route ──
+    const mapResp = await bot.exec("get_map");
+    if (mapResp.result && typeof mapResp.result === "object") {
+      const mapData = mapResp.result as Record<string, unknown>;
+      const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+      const routeIds = new Set(fixed.route.map((e) => e.systemId.toLowerCase()));
+      const newSystems: Array<Record<string, unknown>> = [];
+      for (const s of systems) {
+        const id = ((s.system_id as string) || (s.id as string) || "").toLowerCase();
+        if (id && !routeIds.has(id)) newSystems.push(s);
+      }
+      if (newSystems.length > 0) {
+        const names = newSystems.map((s) => (s.name as string) || (s.system_id as string) || (s.id as string)).join(", ");
+        ctx.log("system", `NEW SYSTEM DISCOVERED: ${names} — regenerating fixed route...`);
+        if (sendBotChat && getAllBotNames) {
+          const others = getAllBotNames().filter((n) => n.toLowerCase() !== bot.username.toLowerCase());
+          if (others.length) {
+            sendBotChat(`🗺️ ${bot.username} discovered new system(s): ${names} — regenerating fixed route`, "coordination", others);
+          }
+        }
+        const cloakAvailable = fixed.cloakAvailable ?? (await hasCloakModule(ctx));
+        const graph = buildFixedRouteGraph(cloakAvailable);
+        const route = generateFixedRoute(graph, homeSystem);
+        if (route.length > 0) {
+          const entry: ExplorerFixedPath = {
+            ...fixed,
+            route,
+            currentIndex: Math.min(fixed.currentIndex, Math.max(0, route.length - 1)),
+            updatedAt: now(),
+            status: "active",
+            cloakAvailable,
+          };
+          explorerFixedPathStore.upsertFixedPath(entry);
+          explorerFixedPathStore.flushSync();
+          fixed = entry;
+          ctx.log("system", `Fixed route regenerated — ${route.length} systems`);
+          logFixedRouteOverlap(bot.username, route, ctx);
+        }
+      }
+    }
+
+    // ── Route complete → navigate home, restock fuel cells, restart ──
+    if (fixed.currentIndex >= fixed.route.length) {
+      ctx.log("system", "Fixed route complete — returning home to restock fuel cells...");
+      const homeOk = await returnToHomeBaseForFuelCells(ctx);
+      if (!homeOk) {
+        ctx.log("error", "Fixed route: could not reach home base to restock — waiting 30s");
+        await ctx.sleep(30000);
+        continue;
+      }
+      explorerFixedPathStore.setCurrentIndex(bot.username, 0);
+      explorerFixedPathStore.flushSync();
+      fixed = explorerFixedPathStore.getFixedPath(bot.username)!;
+      fixed.currentIndex = 0;
+      consecutiveFailures = 0;
+      ctx.log("system", "Fixed route complete — restarting from start");
+      continue;
+    }
+
+    const target = fixed.route[fixed.currentIndex];
+
+    // ── Blocked skip: unreachable system ──
+    const blacklistSet = new Set(getSystemBlacklist().map((b) => b.toLowerCase()));
+    const targetBlocked =
+      (!fixed.cloakAvailable && blacklistSet.has(target.systemId.toLowerCase())) ||
+      isTemporarilyBlacklisted(target.systemId) ||
+      target.blockedCount >= 5;
+
+    if (targetBlocked) {
+      explorerFixedPathStore.incrementBlockedCount(bot.username, target.order);
+      explorerFixedPathStore.flushSync();
+      consecutiveFailures++;
+      ctx.log("warn", `Fixed route: skipping blocked system ${target.systemId} (blockedCount=${target.blockedCount + 1})`);
+      if (consecutiveFailures >= 5) {
+        ctx.log("warn", "Fixed route: 5 consecutive failures — pausing 60s");
+        await ctx.sleep(BLOCKED_PAUSE_MS);
+        consecutiveFailures = 0;
+      }
+      fixed.currentIndex++;
+      explorerFixedPathStore.setCurrentIndex(bot.username, fixed.currentIndex);
+      explorerFixedPathStore.flushSync();
+      fixed = explorerFixedPathStore.getFixedPath(bot.username)!;
+      continue;
+    }
+    consecutiveFailures = 0;
+
+    // ── Mid-route fuel check ──
+    const fueled = await ensureFueled(ctx, FUEL_THRESHOLD_PCT);
+    if (!fueled) {
+      ctx.log("system", `Fixed route: low fuel before ${target.systemId} — excursion to home base`);
+      explorerFixedPathStore.flushSync();
+      await returnToHomeBaseForFuelCells(ctx);
+      continue; // resume at same currentIndex
+    }
+
+    // ── Travel to target ──
+    ctx.log("travel", `Fixed route: jumping to ${target.systemId} (${fixed.currentIndex + 1}/${fixed.route.length})`);
+    const arrived = await navigateToSystem(ctx, target.systemId, {
+      fuelThresholdPct: FUEL_THRESHOLD_PCT,
+      hullThresholdPct: 30,
+      skipBlacklist: fixed.cloakAvailable,
+      ignoreBlacklistWhenCloaked: true,
+      ignorePiratesWhenCloaked: true,
+      homeSystem,
+    });
+    if (!arrived) {
+      ctx.log("warn", `Fixed route: could not reach ${target.systemId} — blocking and skipping`);
+      explorerFixedPathStore.incrementBlockedCount(bot.username, target.order);
+      explorerFixedPathStore.flushSync();
+      consecutiveFailures++;
+      fixed.currentIndex++;
+      explorerFixedPathStore.setCurrentIndex(bot.username, fixed.currentIndex);
+      explorerFixedPathStore.flushSync();
+      fixed = explorerFixedPathStore.getFixedPath(bot.username)!;
+      continue;
+    }
+
+    // ── Full system exploration ──
+    yield* exploreFixedRouteSystem(ctx, target.systemId);
+
+    // ── Advance index ──
+    explorerFixedPathStore.markEntryExplored(bot.username, target.order, now());
+    fixed.currentIndex++;
+    explorerFixedPathStore.setCurrentIndex(bot.username, fixed.currentIndex);
+    explorerFixedPathStore.flushSync();
+    fixed = explorerFixedPathStore.getFixedPath(bot.username)!;
+
+    await ctx.sleep(1000);
+  }
+}
+
+  /**
+ * Find systems needing exploration using LOCAL BFS - no API calls.
+ * Returns systems sorted by jump distance (nearest first).
+ * 
+ * Priority:
+ *   1. Unvisited systems (never visited by this bot)
+ *   2. All other systems (for continuous re-exploration like achievement mode)
+ */
+async function findSystemsNeedingExploration(
+  ctx: RoutineContext,
+  blacklist: string[],
+  fledFromSystems: Set<string>,
+  visitedSystems: Set<string>,
+  ignoreBlacklistWhenCloaked: boolean,
+  isCloaked: boolean,
+  lastSystem: string | null
+): Promise<Array<{
+  id: string;
+  name: string;
+  distance: number;
+  priority: "unvisited" | "revisit";
+  route: string[];
+  oldestPoiMins: number;
+}>> {
+  const currentSystem = ctx.bot.system;
+  if (!currentSystem) return [];
+
+  // Refresh map data from server (only get_map, no find_route)
+  const mapResp = await ctx.bot.exec("get_map");
+  if (mapResp.result && typeof mapResp.result === "object") {
+    const mapData = mapResp.result as Record<string, unknown>;
+    const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+    for (const sys of systems) {
+      const sysId = (sys.system_id as string) || (sys.id as string);
+      if (sysId) {
+        mapStore.updateSystem(sys);
+      }
+    }
+  }
+
+  // Calculate distances from current system to ALL reachable systems using local BFS
+  const localDistances = calculateLocalDistances(
+    currentSystem, 
+    blacklist, 
+    fledFromSystems, 
+    ignoreBlacklistWhenCloaked, 
+    isCloaked
+  );
+
+  if (localDistances.size === 0) {
+    ctx.log("warn", "Local BFS found no reachable systems — map may be incomplete");
+    return [];
+  }
+
+  // Get systems recently explored by other bots (5 min cooldown)
+  const recentSystems = explorerHistoryStore.getRecentSystemIds(5 * 60 * 1000);
+  const recentSet = new Set(recentSystems.map(s => s.toLowerCase()));
+
+  // Short cooldown so we don't instantly re-visit the system we just left
+  const RE_VISIT_COOLDOWN_MINS = 5;
+
+  // Get all systems from mapStore
+  const allSystems = mapStore.getSystems();
+
+  // Find candidate systems needing exploration
+  const candidates: Array<{ 
+    id: string; 
+    name: string; 
+    priority: "unvisited" | "revisit"; 
+    distance: number; 
+    route: string[];
+    oldestPoiMins: number;
+  }> = [];
+
+  for (const sys of allSystems) {
+    const sysLower = sys.id.toLowerCase();
+    
+    // Skip current system
+    if (sysLower === currentSystem.toLowerCase()) continue;
+    // Skip the system we just came from (prevents ping-pong between two systems)
+    if (lastSystem && sysLower === lastSystem.toLowerCase()) continue;
+    // Skip systems recently explored by other bots (5 min cooldown)
+    if (!(isCloaked && ignoreBlacklistWhenCloaked)) {
+      if (recentSet.has(sysLower)) continue;
+    }
+
+    // Check if reachable via local BFS
+    const distInfo = localDistances.get(sys.id);
+    if (!distInfo) continue; // Not reachable from current position
+
+    const distance = distInfo.distance;
+    const route = distInfo.route;
+
+    // Check if any POI in this system needs exploring or refreshing
+    const targetSys = mapStore.getSystem(sys.id);
+    const sysPois = targetSys?.pois ?? [];
+    let needsExploration = false;
+    let maxPoiMins = 0; // Track the STALEST POI (max minutes ago)
+
+    if (sysPois.length === 0) {
+      // System has no known POIs — needs exploration
+      needsExploration = true;
+      maxPoiMins = Infinity;
+    } else {
+      for (const poi of sysPois) {
+        const minsAgo = mapStore.minutesSinceExplored(sys.id, poi.id);
+        if (minsAgo === Infinity) {
+          needsExploration = true; // Never explored
+          maxPoiMins = Infinity;
+          break;
+        }
+        if (minsAgo > maxPoiMins) maxPoiMins = minsAgo;
+        const isStation = !!(poi.has_base || poi.base_id || (poi.type || "").toLowerCase() === "station");
+        const threshold = isStation ? STATION_REFRESH_MINS : RESOURCE_REFRESH_MINS;
+        if (minsAgo >= threshold) {
+          needsExploration = true;
+        }
+      }
+    }
+
+    // Skip systems that are fully explored and fresh (and not server-unvisited)
+    if (!needsExploration && sys.visited !== false) continue;
+
+    // Skip systems we visited very recently (cooldown to prevent ping-pong)
+    if (maxPoiMins > 0 && maxPoiMins < RE_VISIT_COOLDOWN_MINS && sys.visited !== false) continue;
+
+    // Determine priority: unvisited first, then all others for revisit
+    let priority: "unvisited" | "revisit";
+    if (sys.visited === false) {
+      priority = "unvisited";
+    } else {
+      priority = "revisit";
+    }
+
+    candidates.push({ 
+      id: sys.id, 
+      name: sys.name || sys.id, 
+      priority, 
+      distance, 
+      route,
+      oldestPoiMins: maxPoiMins
+    });
+  }
+
+  if (candidates.length === 0) {
+    ctx.log("debug", "No candidate systems needing exploration found in mapStore");
+    return [];
+  }
+
+  // Sort: unvisited priority first, then revisit; 
+  // within each tier, most stale POI first (highest oldestPoiMins), then nearest
+  candidates.sort((a, b) => {
+    if (a.priority !== b.priority) {
+      return a.priority === "unvisited" ? -1 : 1;
+    }
+    // Most stale first (Infinity sorts to top)
+    if (b.oldestPoiMins !== a.oldestPoiMins) {
+      return b.oldestPoiMins - a.oldestPoiMins;
+    }
+    return a.distance - b.distance;
+  });
+
+  ctx.log("exploration", `Found ${candidates.length} candidate systems needing exploration (${candidates.filter(c => c.priority === "unvisited").length} unvisited, ${candidates.filter(c => c.priority === "revisit").length} revisit) via local BFS`);
+
+  // Return top candidates (we'll use find_route only when actually navigating)
+  return candidates.slice(0, 100);
+}
+
 // ── Helpers ──────────────────────────────────────────────────
 
 /** Threshold in days for considering POI data stale. */
 const STALE_POI_DAYS = 7;
+
+/**
+ * Stand-in "distance to other explorers" used when no other explorer has an
+ * assignment yet. Large enough to beat any real BFS distance so the candidate
+ * sort keeps working, finite so the candidates list isn't empty on a cold
+ * start (which used to leave the first explorer with no assignment at all).
+ */
+const FAR_FROM_OTHERS_DISTANCE = 10_000;
 
 /**
  * Find systems that need exploration, sorted by priority then distance (nearest first).
@@ -4224,135 +5037,9 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
     return true;
   }
 
-  // If faction withdraw failed, try to buy military fuel cells from station market as fallback
-  ctx.log("warn", `Could not withdraw regular fuel cells: ${withdrawResp.error.message} — trying to buy military fuel cells from market...`);
-  const buyResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: milToWithdraw });
-
-  // Check for battle after buy
-  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
-    ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await ctx.sleep(5000);
-    return false;
-  }
-
-  if (!buyResp.error) {
-    loadedCount = milToWithdraw;
-    const newMil = militaryFuelCells + loadedCount;
-    ctx.log("trade", `Bought ${loadedCount} military fuel cells from market (${newMil} military + ${premiumFuelCells} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
-    return true;
-  }
-
-  // If military buy failed, try premium fuel_cell
-  ctx.log("warn", `Could not buy military fuel cells: ${buyResp.error.message} — trying premium fuel cells...`);
-  const buyPremResp = await bot.exec("buy", { item_id: "premium_fuel_cell", quantity: premToWithdraw });
-
-  // Check for battle after buy
-  if (await checkBattleAfterCommand(ctx, buyPremResp.notifications, "buy")) {
-    ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await ctx.sleep(5000);
-    return false;
-  }
-
-  if (!buyPremResp.error) {
-    loadedCount = premToWithdraw;
-    const newPrem = premiumFuelCells + loadedCount;
-    ctx.log("trade", `Bought ${loadedCount} premium fuel cells from market (${militaryFuelCells} military + ${newPrem} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
-    return true;
-  }
-
-  // If premium buy failed, try regular fuel_cell
-  ctx.log("warn", `Could not buy premium fuel cells: ${buyPremResp.error.message} — trying regular fuel cells...`);
-  const buyRegularResp = await bot.exec("buy", { item_id: "fuel_cell", quantity: maxRegWithdraw });
-
-  // Check for battle after buy
-  if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
-    ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await ctx.sleep(5000);
-    return false;
-  }
-
-  if (!buyRegularResp.error) {
-    loadedCount = maxRegWithdraw;
-    const newRegular = regularFuelCells + loadedCount;
-    ctx.log("trade", `Bought ${loadedCount} regular fuel cells from market (${militaryFuelCells} military + ${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
-    return true;
-  }
-
-  // If buy also failed, try to withdraw credits and retry with military first
-  const buyErrorMsg = (buyRegularResp.error.message || "").toLowerCase();
-  if (buyErrorMsg.includes("credit") || buyErrorMsg.includes("not enough") || buyErrorMsg.includes("insufficient")) {
-    ctx.log("trade", "Not enough credits — withdrawing from storage...");
-    const withdrawCreditsResp = await bot.exec("withdraw_credits");
-
-    // Check for battle after withdraw_credits
-    if (await checkBattleAfterCommand(ctx, withdrawCreditsResp.notifications, "withdraw_credits")) {
-      ctx.log("combat", "Battle detected during credits withdraw - fleeing!");
-      await ctx.sleep(5000);
-      return false;
-    }
-
-    if (!withdrawCreditsResp.error) {
-      await bot.refreshLocation();
-      ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying military fuel cell purchase...`);
-      const retryResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: milToWithdraw });
-
-      // Check for battle after retry buy
-      if (await checkBattleAfterCommand(ctx, retryResp.notifications, "buy")) {
-        ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
-        await ctx.sleep(5000);
-        return false;
-      }
-
-      if (!retryResp.error) {
-        loadedCount = milToWithdraw;
-        const newMil = militaryFuelCells + loadedCount;
-        ctx.log("trade", `Loaded ${loadedCount} military fuel cells (${newMil} military + ${premiumFuelCells} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
-        return true;
-      }
-
-      // If military retry failed, try premium
-      ctx.log("warn", `Could not buy military fuel cells: ${retryResp.error.message} — trying premium...`);
-      const retryPremResp = await bot.exec("buy", { item_id: "premium_fuel_cell", quantity: premToWithdraw });
-
-      // Check for battle after retry buy
-      if (await checkBattleAfterCommand(ctx, retryPremResp.notifications, "buy")) {
-        ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
-        await ctx.sleep(5000);
-        return false;
-      }
-
-      if (!retryPremResp.error) {
-        loadedCount = premToWithdraw;
-        const newPrem = premiumFuelCells + loadedCount;
-        ctx.log("trade", `Loaded ${loadedCount} premium fuel cells (${militaryFuelCells} military + ${newPrem} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
-        return true;
-      }
-
-      // If premium retry failed, try regular
-      ctx.log("warn", `Could not buy premium fuel cells: ${retryPremResp.error.message} — trying regular...`);
-      const retryRegularResp = await bot.exec("buy", { item_id: "fuel_cell", quantity: maxRegWithdraw });
-
-      // Check for battle after retry buy
-      if (await checkBattleAfterCommand(ctx, retryRegularResp.notifications, "buy")) {
-        ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
-        await ctx.sleep(5000);
-        return false;
-      }
-
-      if (!retryRegularResp.error) {
-        loadedCount = maxRegWithdraw;
-        const newRegular = regularFuelCells + loadedCount;
-        ctx.log("trade", `Loaded ${loadedCount} regular fuel cells (${militaryFuelCells} military + ${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
-        return true;
-      }
-      ctx.log("error", `Still could not buy fuel cells: ${retryRegularResp.error.message}`);
-    } else {
-      ctx.log("error", `Could not withdraw credits: ${withdrawCreditsResp.error.message}`);
-    }
-  } else {
-    ctx.log("error", `Could not buy fuel cells: ${buyRegularResp.error.message}`);
-  }
-
+  // Fuel cells are free at home — do NOT buy from market. If faction storage is
+  // empty, the bot should return home to restock rather than spending 10 000+ cr/cell.
+  ctx.log("system", `Could not withdraw fuel cells from faction storage (${withdrawResp.error.message}) — not buying from market (free at home)`);
   return false;
 }
 
@@ -4394,60 +5081,34 @@ async function checkFuelCellInventory(ctx: RoutineContext): Promise<{
 }
 
 /**
- * Return to home base (Sol Central) to reload fuel cells.
- * Navigates to Sol, docks, and loads fuel cells to max cargo.
+ * Return to the configured global home base (Settings → General) to reload fuel
+ * cells. Navigates to the home system, docks at the home station, and loads fuel
+ * cells to max cargo. No longer hardcodes Sol Central / sol_station.
  */
 async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
 
-  ctx.log("system", "Returning to home base (Sol Central) to reload fuel cells...");
+  const home = getGlobalHomeBase();
+  const homeSystem = home.system || "sol";
+  const homeName = home.name || "home base";
 
-  // Navigate to Sol system
-  if (bot.system !== "sol") {
+  ctx.log("system", `Returning to home base (${homeName}) to reload fuel cells...`);
+
+  // Navigate to the configured home system
+  if (bot.system !== homeSystem) {
     await ensureUndocked(ctx);
-    const arrived = await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true });
+    const arrived = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 30, skipBlacklist: true, homeSystem, homeStation: home.station });
     if (!arrived) {
-      ctx.log("error", "Could not reach Sol system — aborting fuel cell reload");
+      ctx.log("error", `Could not reach ${homeSystem} — aborting fuel cell reload`);
       return false;
     }
   }
 
-  // Travel to Sol Central station
-  const stationPoi = "sol_station";
-  if (bot.poi !== stationPoi) {
-    await ensureUndocked(ctx);
-    const tResp = await bot.exec("travel", { target_poi: stationPoi });
-
-    // Check for battle after travel
-    if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
-      ctx.log("combat", "Battle detected during travel - fleeing!");
-      await ctx.sleep(5000);
-      return false;
-    }
-
-    if (tResp.error && !tResp.error.message.includes("already")) {
-      ctx.log("error", `Could not reach Sol Central: ${tResp.error.message}`);
-      return false;
-    }
-    bot.poi = stationPoi;
-  }
-
-  // Dock at station
-  if (!bot.docked) {
-    const dResp = await bot.exec("dock");
-
-    // Check for battle after dock
-    if (await checkBattleAfterCommand(ctx, dResp.notifications, "dock")) {
-      ctx.log("combat", "Battle detected during dock - fleeing!");
-      await ctx.sleep(5000);
-      return false;
-    }
-
-    if (dResp.error && !dResp.error.message.includes("already")) {
-      ctx.log("error", `Could not dock at Sol Central: ${dResp.error.message}`);
-      return false;
-    }
-    bot.docked = true;
+  // Dock at the configured home station (or any station in the system as fallback)
+  const docked = await ensureDocked(ctx, true, 0, home.station ? { targetStationId: home.station } : undefined);
+  if (!docked) {
+    ctx.log("error", `Could not dock at home base (${homeName}) — aborting fuel cell reload`);
+    return false;
   }
 
   // Load fuel cells to max cargo
@@ -4467,10 +5128,11 @@ async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolea
 }
 
 /**
-  * Load cargo hold with fuel cells for long journeys.
-  * Fills cargo to max capacity with fuel cells.
-  * Prioritizes military_fuel_cell (3 space, 100 fuel) over premium_fuel_cell over regular fuel_cell.
-  */
+ * Load cargo hold with fuel cells for long journeys.
+ * Withdraws fuel cells from faction storage (FREE) — never buys from market.
+ * Prioritizes military_fuel_cell (3 space, 100 fuel) over premium_fuel_cell over regular fuel_cell.
+ * Fuel cells are free at home; buying them at 10 000+ cr/cell is wasteful.
+ */
 async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   const { bot, log } = ctx;
 
@@ -4578,68 +5240,38 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   const maxPremWithdraw = Math.floor(availableSpace / premSize);
   const maxRegularWithdraw = availableSpace;
 
-  // Try to buy military fuel cells first (best density)
-  log("trade", `Loading ${maxMilWithdraw} military fuel cells for long journey...`);
-  const buyResp = await bot.exec("buy", {
-    item_id: "military_fuel_cell",
-    quantity: maxMilWithdraw
-  });
+  // Withdraw fuel cells from faction storage (FREE) — never buy from market.
+  // Fuel cells cost 10 000+ cr each on the open market; military MFCs are stocked
+  // at home for free. Buying the cheapest cells at extreme prices is wasteful
+  // when the bot can simply return home to restock.
+  for (const cellId of ["military_fuel_cell", "premium_fuel_cell", "fuel_cell"] as const) {
+    const maxW = cellId === "military_fuel_cell" ? maxMilWithdraw : cellId === "premium_fuel_cell" ? maxPremWithdraw : maxRegularWithdraw;
+    if (maxW <= 0) continue;
 
-  // Check for battle after buy
-  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
-    log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await ctx.sleep(5000);
-    return false;
+    log("trade", `Withdrawing ${maxW} ${cellId} from faction storage for long journey...`);
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: cellId,
+      quantity: maxW,
+    });
+
+    // Check for battle after storage withdraw
+    if (await checkBattleAfterCommand(ctx, wResp.notifications, "storage")) {
+      log("combat", "Battle detected during fuel cell withdraw - fleeing!");
+      await ctx.sleep(5000);
+      return false;
+    }
+
+    if (!wResp.error) {
+      log("trade", `Withdrew ${maxW} ${cellId} from faction storage — continuing exploration`);
+      return true;
+    }
   }
 
-  if (!buyResp.error) {
-    const newMil = militaryFuelCells + maxMilWithdraw;
-    log("trade", `Bought ${maxMilWithdraw} military fuel cells (${newMil} military + ${premiumFuelCells} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
-    return true;
-  }
-
-  // If military buy failed, try premium fuel cells
-  log("warn", `Could not buy military fuel cells: ${buyResp.error.message} — trying premium fuel cells...`);
-  const buyPremResp = await bot.exec("buy", {
-    item_id: "premium_fuel_cell",
-    quantity: maxPremWithdraw
-  });
-
-  // Check for battle after buy
-  if (await checkBattleAfterCommand(ctx, buyPremResp.notifications, "buy")) {
-    log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await ctx.sleep(5000);
-    return false;
-  }
-
-  if (!buyPremResp.error) {
-    const newPrem = premiumFuelCells + maxPremWithdraw;
-    log("trade", `Bought ${maxPremWithdraw} premium fuel cells (${militaryFuelCells} military + ${newPrem} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
-    return true;
-  }
-
-  // If premium buy failed, try regular fuel_cell
-  log("warn", `Could not buy premium fuel cells: ${buyPremResp.error.message} — trying regular fuel cells...`);
-  const buyRegularResp = await bot.exec("buy", {
-    item_id: "fuel_cell",
-    quantity: maxRegularWithdraw
-  });
-
-  // Check for battle after buy
-  if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
-    log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await ctx.sleep(5000);
-    return false;
-  }
-
-  if (buyRegularResp.error) {
-    log("error", `Could not buy fuel cells: ${buyRegularResp.error.message}`);
-    return false;
-  }
-
-  const newRegular = regularFuelCells + maxRegularWithdraw;
-  log("trade", `Bought ${maxRegularWithdraw} regular fuel cells (${militaryFuelCells} military + ${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
-  return true;
+  // Could not withdraw any fuel cells from faction storage — do NOT buy from market.
+  log("system", "Could not withdraw fuel cells from faction storage — not buying from market (free at home)");
+  return false;
 }
 
 /**
@@ -4651,10 +5283,11 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  * Skips pirate systems, blacklisted systems, and systems we've fled from.
  * When cloaked and ignoreBlacklistWhenCloaked is enabled, skips blacklist/flee filtering.
  */
-function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false, claimedTargets: Set<string> | null = null): Connection | null {
+function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false, claimedTargets: Set<string> | null = null, explorerSystemTimeoutMins: number = 60): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
+  const timeoutMs = explorerSystemTimeoutMins * 60 * 1000;
 
   // DEBUG: Log blacklist contents and filtering
   if (blacklist.length > 0) {
@@ -4721,6 +5354,20 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
     }
   }
 
+  // Avoid systems recently visited by any bot (coordination via persistent history)
+  if (timeoutMs > 0) {
+    const recentSystems = explorerHistoryStore.getRecentSystemIds(timeoutMs);
+    if (recentSystems.length > 0) {
+      const notRecent = candidates.filter(c => !recentSystems.includes(c.id.toLowerCase()));
+      if (notRecent.length > 0) {
+        ctx.log("exploration", `History: skipping ${candidates.length - notRecent.length} system(s) visited within last ${explorerSystemTimeoutMins}m`);
+        candidates = notRecent;
+      } else {
+        ctx.log("exploration", `History: all candidate systems were recently visited — proceeding anyway`);
+      }
+    }
+  }
+
   // Priority 1: Systems not in map.json at all (completely unexplored)
   const unmapped = candidates.filter(c => !mapStore.getSystem(c.id));
 
@@ -4760,8 +5407,16 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
   }
 
   // All connected systems have been visited this session or recently
-  // If no valid candidates, fall back to any non-blacklisted connection
-  if (candidates.length === 0 && nonBlacklistedConns.length > 0) {
+  // If no valid candidates, fall back to least-recently-visited non-blacklisted connection
+  if (nonBlacklistedConns.length > 0) {
+    nonBlacklistedConns.sort((a, b) => {
+      const aLast = a.id ? explorerHistoryStore.getLastVisitTime(a.id) : null;
+      const bLast = b.id ? explorerHistoryStore.getLastVisitTime(b.id) : null;
+      if (aLast === null && bLast === null) return 0;
+      if (aLast === null) return -1;
+      if (bLast === null) return 1;
+      return aLast - bLast;
+    });
     return nonBlacklistedConns[0];
   }
   
@@ -4779,10 +5434,11 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
  * 5. Systems with more connections (not a dead-end)
  * 6. Unexplored systems (not in map.json) over explored ones
  */
-function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false): Connection | null {
+function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false, explorerSystemTimeoutMins: number = 60): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
+  const timeoutMs = explorerSystemTimeoutMins * 60 * 1000;
 
   // DEBUG: Log blacklist contents and filtering
   if (blacklist.length > 0) {
@@ -4875,16 +5531,35 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
       score -= 500;
     }
 
+    // Penalty for systems recently visited by any bot (coordination via persistent history)
+    if (timeoutMs > 0) {
+      const lastAnyVisit = conn.id ? explorerHistoryStore.getLastVisitTime(conn.id) : null;
+      if (lastAnyVisit && (now - lastAnyVisit) < timeoutMs) {
+        score -= 500;
+      }
+    }
+
     return { conn, score };
   });
 
   // Sort by score (highest first)
   scored.sort((a, b) => b.score - a.score);
 
-  // Pick from top scored (add some randomness among top candidates)
+  // Pick from top scored — break ties by least-recently-visited first
+  // so we cycle through the full cluster instead of looping on the same system.
   const topScore = scored[0].score;
   const topCandidates = scored.filter(s => s.score === topScore);
-  const chosen = topCandidates[Math.floor(Math.random() * topCandidates.length)];
+  if (topCandidates.length > 1) {
+    topCandidates.sort((a, b) => {
+      const aLast = a.conn.id ? explorerHistoryStore.getLastVisitTime(a.conn.id) : null;
+      const bLast = b.conn.id ? explorerHistoryStore.getLastVisitTime(b.conn.id) : null;
+      if (aLast === null && bLast === null) return 0;
+      if (aLast === null) return -1;
+      if (bLast === null) return 1;
+      return aLast - bLast;
+    });
+  }
+  const chosen = topCandidates[0];
 
   const connInfo = scored.map(s => `${s.conn.name || s.conn.id}: ${s.score}`).join(", ");
   ctx.log("info", `Connection scores: ${connInfo} — picking ${chosen.conn.name || chosen.conn.id}`);
@@ -5026,9 +5701,70 @@ interface ExplorationTarget {
   expiresAt: number;
 }
 
-/** In-memory store of other explorers' current targets (expires after 5 minutes). */
+/** In-memory store of other explorers' current targets. */
 const explorationTargets = new Map<string, ExplorationTarget>();
-const EXPLORATION_TARGET_TTL_MS = 5 * 60 * 1000;
+/** How long an announced target stays claimed. Long enough to cover a
+ *  multi-jump route; once the bot arrives, its live position takes over. */
+const EXPLORATION_TARGET_TTL_MS = 15 * 60 * 1000;
+
+/** Live position of an explorer, refreshed every loop iteration and POI visit. */
+interface ExplorerLivePosition {
+  botName: string;
+  systemId: string;
+  poiId: string | null;
+  timestamp: number;
+}
+
+/** In-memory registry of where every explorer currently is (same process). */
+const explorerLivePositions = new Map<string, ExplorerLivePosition>();
+
+/** How long a position heartbeat stays valid. Covers long system dwells
+ *  (POI tours, dock/refuel/repair) since heartbeats refresh continuously. */
+const EXPLORER_POSITION_TTL_MS = 20 * 60 * 1000;
+
+/** Record this explorer's live position (heartbeat). */
+export function updateExplorerPosition(botName: string, systemId: string, poiId?: string | null): void {
+  if (!botName || !systemId) return;
+  explorerLivePositions.set(botName.toLowerCase(), {
+    botName,
+    systemId,
+    poiId: poiId ?? null,
+    timestamp: Date.now(),
+  });
+}
+
+/** Forget this explorer's live position (routine ended). */
+export function clearExplorerPosition(botName: string): void {
+  explorerLivePositions.delete(botName.toLowerCase());
+}
+
+/** Live positions of OTHER explorers, dropping stale heartbeats. */
+export function getLiveExplorerPositions(excludeBot: string): Array<ExplorerLivePosition> {
+  const now = Date.now();
+  const self = excludeBot.toLowerCase();
+  const live: Array<ExplorerLivePosition> = [];
+  for (const [key, pos] of explorerLivePositions.entries()) {
+    if (key === self) continue;
+    if (now - pos.timestamp > EXPLORER_POSITION_TTL_MS) {
+      explorerLivePositions.delete(key);
+      continue;
+    }
+    live.push(pos);
+  }
+  return live;
+}
+
+/**
+ * Systems currently occupied by OTHER explorers — a hard block on targeting.
+ * If another explorer is sitting in a system, we go somewhere else.
+ */
+export function getOccupiedExplorerSystems(excludeBot: string): Set<string> {
+  const occupied = new Set<string>();
+  for (const pos of getLiveExplorerPositions(excludeBot)) {
+    occupied.add(pos.systemId.toLowerCase());
+  }
+  return occupied;
+}
 
 /**
  * Announce our current target system to other explorers via bot chat.
@@ -5057,7 +5793,7 @@ function announceExplorationTarget(ctx: RoutineContext, targetSystemId: string):
 /**
  * Process an incoming exploration target announcement from another bot.
  */
-function processExplorationTarget(message: BotChatMessage): void {
+export function processExplorationTarget(message: BotChatMessage): void {
   try {
     const data = JSON.parse(message.content);
     if (data.type !== "exploration_target") return;
@@ -5075,21 +5811,19 @@ function processExplorationTarget(message: BotChatMessage): void {
   }
 }
 
-/**
- * Get all currently claimed exploration targets (not expired).
- */
-function getClaimedTargets(): Set<string> {
+/** Claimed targets as systemId(lowercase) -> expiry timestamp (fresh only). */
+export function getClaimedTargetMap(): Map<string, number> {
   const now = Date.now();
-  const claimed = new Set<string>();
-  
+  const claimed = new Map<string, number>();
+
   for (const [botName, target] of explorationTargets.entries()) {
     if (now < target.expiresAt) {
-      claimed.add(target.targetSystemId.toLowerCase());
+      claimed.set(target.targetSystemId.toLowerCase(), target.expiresAt);
     } else {
       explorationTargets.delete(botName);
     }
   }
-  
+
   return claimed;
 }
 
@@ -5106,8 +5840,9 @@ function cleanupExplorationTargets(): void {
 }
 
 /**
- * Find unknown systems to explore, avoiding targets claimed by other explorers.
- * Returns systems sorted by priority then distance (nearest first).
+ * Find unknown systems to explore, avoiding systems occupied by other
+ * explorers and targets they have claimed. Returns systems sorted by
+ * priority then distance (nearest first).
  */
 function findUnknownSystemsWithCoordination(
   ctx: RoutineContext,
@@ -5124,37 +5859,143 @@ function findUnknownSystemsWithCoordination(
   priority: "unknown" | "stale";
   oldestPoiUpdate: string | null;
 }> {
-  const claimedTargets = getClaimedTargets();
   cleanupExplorationTargets();
-  
+
   const unknowns = findUnknownSystems(ctx, currentSystem, blacklist, fledFromSystems, ignoreBlacklistWhenCloaked, isCloaked);
-  
-  // Filter out systems that other explorers are targeting
-  const unclaimed = unknowns.filter(u => !claimedTargets.has(u.id.toLowerCase()));
-  
-  if (unclaimed.length === 0 && unknowns.length > 0) {
-    ctx.log("exploration", `All unknown systems are being targeted by other explorers - selecting nearest available`);
-    // Return the original list - we'll pick the nearest even if targeted
-    return unknowns;
-  }
-  
-  ctx.log("exploration", `Filtered out ${unknowns.length - unclaimed.length} systems being targeted by other explorers`);
-  return unclaimed;
+
+  const pick = pickCoordinatedSystemTarget(unknowns, {
+    occupied: getOccupiedExplorerSystems(ctx.bot.username),
+    claimed: getClaimedTargetMap(),
+    blacklist,
+    excludeBot: ctx.bot.username,
+    keyOf: u => u.id,
+    log: msg => ctx.log("exploration", msg),
+  });
+
+  return pick.target ? [pick.target] : [];
 }
 
 /**
- * From a list of candidate targets, return the first that isn't currently
- * claimed by another explorer. Falls back to the first candidate if every one
- * is claimed, so we never get stuck waiting for a free system.
+ * Pick the candidate farthest (in jumps) from every other live explorer.
+ * Used to re-roll away when every candidate is claimed: instead of
+ * tailgating the nearest claim, go start a new region somewhere else.
  */
-function pickCoordinatedTarget<T>(
+export function pickMostIsolatedCandidate<T>(
   candidates: T[],
-  claimed: Set<string> | null,
+  excludeBot: string,
+  blacklist: string[],
   keyOf: (c: T) => string,
-): T | undefined {
-  if (!claimed || claimed.size === 0 || candidates.length === 0) {
-    return candidates[0];
+): T {
+  const others = getLiveExplorerPositions(excludeBot);
+  if (others.length === 0 || candidates.length === 0) return candidates[0];
+
+  // One BFS per other explorer gives jump-distance from their position.
+  const distMaps = others.map(o =>
+    calculateLocalDistances(o.systemId, blacklist, new Set<string>(), false, false)
+  );
+
+  let best = candidates[0];
+  let bestScore = -1;
+  for (const candidate of candidates) {
+    const id = keyOf(candidate);
+    let minDist = Infinity;
+    for (const distMap of distMaps) {
+      const info = distMap.get(id) ?? distMap.get(id.toLowerCase());
+      if (!info) continue; // unreachable from that explorer
+      if (info.distance < minDist) minDist = info.distance;
+    }
+    // Unreachable from every other explorer = perfectly isolated.
+    const score = minDist === Infinity ? Number.MAX_SAFE_INTEGER : minDist;
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
   }
-  const unclaimed = candidates.filter(c => !claimed.has(keyOf(c).toLowerCase()));
-  return (unclaimed.length > 0 ? unclaimed : candidates)[0];
+  return best;
+}
+
+/** Mutable counter shared across loop iterations to track consecutive
+ *  fully-blocked picks (every candidate occupied by another explorer). */
+export interface ExplorerWaitState {
+  blockedCount: number;
+}
+
+/** Result of a coordinated target pick. */
+interface CoordinatedTargetPick<T> {
+  /** Picked target, or null when there is nothing to pick right now. */
+  target: T | null;
+  /** True when the caller should sleep and retry on the next loop iteration. */
+  shouldWait: boolean;
+}
+
+/**
+ * The single anti-lockstep target-selection policy, shared by every explorer
+ * routine so they can never drift apart:
+ *
+ *  1. Skip systems other explorers currently occupy (hard block).
+ *  2. Skip systems other explorers have claimed as targets (soft block).
+ *  3. When everything nearby is claimed, re-roll to the most isolated
+ *     candidate instead of tailgating the nearest claim.
+ *  4. When everything nearby is occupied, wait up to `maxWaitAttempts`
+ *     loop iterations, then re-roll anyway so we never deadlock.
+ *
+ * All decisions are logged through `log` in one consistent format.
+ */
+export function pickCoordinatedSystemTarget<T>(
+  candidates: T[],
+  opts: {
+    /** Lowercased system ids other explorers currently sit in. */
+    occupied: Set<string>;
+    /** Claimed targets as systemId(lowercase) -> expiry, or null when
+     *  coordination is disabled. */
+    claimed: Map<string, number> | null;
+    blacklist: string[];
+    excludeBot: string;
+    keyOf: (c: T) => string;
+    /** Persistent wait counter; omit for routines that never wait. */
+    waitState?: ExplorerWaitState;
+    /** How many fully-blocked picks to tolerate before forcing a re-roll. */
+    maxWaitAttempts?: number;
+    log?: (msg: string) => void;
+  },
+): CoordinatedTargetPick<T> {
+  const { occupied, claimed, blacklist, excludeBot, keyOf, waitState, log } = opts;
+  const maxWaitAttempts = opts.maxWaitAttempts ?? 3;
+
+  if (candidates.length === 0) return { target: null, shouldWait: false };
+
+  const free = candidates.filter(c => !occupied.has(keyOf(c).toLowerCase()));
+  const skippedOccupied = candidates.length - free.length;
+  const unclaimed = free.filter(c => !claimed || !claimed.has(keyOf(c).toLowerCase()));
+  const skippedClaimed = free.length - unclaimed.length;
+
+  if (skippedOccupied > 0 || skippedClaimed > 0) {
+    log?.(`Coordination: avoiding ${skippedOccupied} occupied and ${skippedClaimed} claimed system(s) — ${unclaimed.length} free candidate(s) remain`);
+  }
+
+  if (unclaimed.length > 0) {
+    if (waitState) waitState.blockedCount = 0;
+    return { target: unclaimed[0], shouldWait: false };
+  }
+
+  if (free.length > 0) {
+    // Everything nearby is claimed — pick a NEW target far from the other
+    // explorers instead of following them around.
+    if (waitState) waitState.blockedCount = 0;
+    log?.(`All ${free.length} candidate system(s) are claimed by other explorers — re-rolling to an isolated region`);
+    return { target: pickMostIsolatedCandidate(free, excludeBot, blacklist, keyOf), shouldWait: false };
+  }
+
+  // Every reachable candidate is currently occupied by another explorer.
+  if (waitState) {
+    waitState.blockedCount++;
+    if (waitState.blockedCount <= maxWaitAttempts) {
+      log?.(`All ${candidates.length} candidate system(s) are occupied by other explorers — waiting before re-evaluating`);
+      return { target: null, shouldWait: true };
+    }
+    log?.(`Still fully blocked after ${waitState.blockedCount} attempts — re-rolling to the most isolated system anyway`);
+  } else {
+    log?.(`All ${candidates.length} candidate system(s) are occupied by other explorers — re-rolling to an isolated region`);
+  }
+  return { target: pickMostIsolatedCandidate(candidates, excludeBot, blacklist, keyOf), shouldWait: false };
 }

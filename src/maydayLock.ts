@@ -19,6 +19,7 @@
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync, openSync, closeSync, mkdirSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 const LOCK_DIR = join(process.cwd(), "data", "mayday_locks");
 const LOCK_TTL_MS = 2 * 60 * 1000; // 2 minutes
@@ -87,9 +88,10 @@ export function tryClaimMayday(
   }
 
   try {
-    const fd = openSync(lp, "wx"); // Atomic: fails if the file already exists.
+    const fd = openSync(lp, "wx");
     closeSync(fd);
-    writeFileSync(lp, JSON.stringify({ botName, claimedAt: Date.now() } as LockRecord));
+    const payload = JSON.stringify({ botName, claimedAt: Date.now() } as LockRecord);
+    safeWriteFileSync(lp, payload, Buffer.byteLength(payload, "utf-8"));
     return true;
   } catch {
     // EEXIST or other error - another process won the race.

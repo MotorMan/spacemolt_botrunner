@@ -10,6 +10,49 @@
 
 import { readSettings } from "./common.js";
 
+// Minimal structural type for settings signature computation.
+// CrafterSettings (from crafter.ts) is structurally compatible with this,
+// but we define it here so this pure-logic module has no runtime dependency
+// on the heavy bot runtime pulled in by crafter.ts.
+interface SettingsForSignature {
+  crafters: Array<{ name: string; craftLimits: unknown; recipeTriggers?: unknown }>;
+  botQuotaOverrides: Record<string, Record<string, number>>;
+  categoryAssignments: Record<string, string[]>;
+  enabledCategories: string[];
+  craftingHomeBase: string;
+  recipeFacilityLinks: Record<string, string[]>;
+  forceOwnFacility: boolean;
+}
+
+/**
+ * Compact signature of the settings fields that determine crafting goals
+ * (quotas, limits, facility links, triggers, home base, etc.). Used to detect
+ * when the operator changes the loadout mid-run. When the inner plan loop in
+ * executeCraftingPlan sees a change it breaks so the outer routine re-derives
+ * goals from scratch — a "fresh start" per cycle — rather than planning
+ * against a stale snapshot for hours.
+ *
+ * Non-goal fields (preset, cycle time) are deliberately excluded because they
+ * are already picked up by the in-place `settings` refresh and do not
+ * invalidate the current goal set.
+ */
+export function settingsGoalSignature(settings: SettingsForSignature | null): string {
+  if (!settings) return "null";
+  return JSON.stringify({
+    crafters: settings.crafters.map(c => ({
+      name: c.name,
+      craftLimits: c.craftLimits,
+      recipeTriggers: c.recipeTriggers,
+    })),
+    botQuotaOverrides: settings.botQuotaOverrides,
+    categoryAssignments: settings.categoryAssignments,
+    enabledCategories: settings.enabledCategories,
+    craftingHomeBase: settings.craftingHomeBase,
+    recipeFacilityLinks: settings.recipeFacilityLinks,
+    forceOwnFacility: settings.forceOwnFacility,
+  });
+}
+
 interface Recipe {
   recipe_id: string;
   name: string;
@@ -587,15 +630,23 @@ export function formatCraftingPlan(plan: CraftingPlan): string {
 }
 
 /**
- * Check if a recipe is craftable (not ship passive or facility only).
+ * Check if a recipe is craftable.
  *
- * `allowedFacilityRecipeIds` is the set of recipe IDs explicitly linked to an
- * owned/available facility via the crafter's `recipeFacilityLinks` config. A
- * "facility only" recipe (e.g. breed_plutonium) would otherwise be rejected
- * here, but when it has been linked to a real facility it IS craftable — just
- * not by hand — so we let it through. This is what unlocks these recipes in the
- * crafter while still blocking unlinked facility-only recipes (which have no
- * venue and would only ever error at craft time).
+ * The only recipes that are truly uncraftable are "ship passive" ones — they
+ * run automatically on ships and have no craft venue at all.
+ *
+ * Previously this also rejected "facility only" recipes unless they were
+ * whitelisted via `recipeFacilityLinks`. That guard is obsolete: the crafting
+ * rework made EVERY recipe "facility only", and the crafter already resolves a
+ * venue for them (own facility with rental/external fallback in
+ * resolveVenueForRecipe / resolveFinalVenue). Rejecting them here just blocked
+ * legitimately craftable recipes (e.g. cultivate_bioluminescent_algae) with no
+ * way to recover except hand-editing settings for each one. The crafter's venue
+ * resolution handles facility routing and missing-facility/rental-disabled
+ * cases gracefully downstream, so there is no need to pre-screen them here.
+ *
+ * `allowedFacilityRecipeIds` is retained for call-site compatibility but is no
+ * longer used to gate facility-only recipes.
  */
 export function isRecipeCraftable(
   recipe: Recipe,
@@ -607,12 +658,12 @@ export function isRecipeCraftable(
     return { ok: false, reason: "Recipe runs automatically on ships" };
   }
 
-  if (category.includes("facility only")) {
-    if (allowedFacilityRecipeIds && allowedFacilityRecipeIds.has(recipe.recipe_id)) {
-      return { ok: true, reason: "Facility-only recipe linked to a facility" };
-    }
-    return { ok: false, reason: "Recipe can only be crafted at facilities" };
-  }
+  // Facility-only recipes are craftable: the crafting rework made every recipe
+  // "facility only", and the crafter resolves a venue for them (own facility
+  // with rental/external fallback) in resolveVenueForRecipe / resolveFinalVenue.
+  // `allowedFacilityRecipeIds` is retained for call-site compatibility and no
+  // longer gates these recipes.
+  void allowedFacilityRecipeIds;
 
   return { ok: true, reason: "" };
 }

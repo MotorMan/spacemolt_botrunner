@@ -30,6 +30,75 @@ body {
   overflow-y: auto;
 }
 
+/* ── Disk Space Alert Banner ─────────────────────── */
+.disk-space-alert-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px;
+  background: repeating-linear-gradient(
+    45deg,
+    #3d0c0c,
+    #3d0c0c 10px,
+    #5a1010 10px,
+    #5a1010 20px
+  );
+  border-bottom: 2px solid var(--red);
+  animation: disk-space-flash 1.5s ease-in-out infinite alternate;
+}
+.disk-space-alert-icon {
+  font-size: 20px;
+  flex-shrink: 0;
+}
+.disk-space-alert-text {
+  flex: 1;
+  min-width: 0;
+}
+.disk-space-alert-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--red);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.disk-space-alert-desc {
+  font-size: 12px;
+  color: var(--text);
+  margin-top: 2px;
+}
+.disk-space-alert-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.disk-space-quick-btn {
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.disk-space-quick-btn:hover {
+  background: var(--bg-row-hover);
+  border-color: var(--text-dim);
+}
+.disk-space-quick-btn.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+.disk-space-quick-btn.danger:hover {
+  background: #3d0c0c;
+}
+
+@keyframes disk-space-flash {
+  0% { border-bottom-color: var(--red); }
+  50% { border-bottom-color: var(--yellow); }
+  100% { border-bottom-color: var(--red); }
+}
+
 /* ── Header ─────────────────────────────────────── */
 header {
   display: flex;
@@ -123,10 +192,6 @@ main {
 }
 #page-commandall.active {
   display: flex;
-}
-#page-achievements {
-  padding: 0;
-  gap: 0;
 }
 #page-marketbrowser {
   padding: 0;
@@ -666,8 +731,17 @@ button.warning:hover { background: #b98cff; }
 button.warning-cargo { background: var(--cyan); border-color: var(--cyan); color: #fff; }
 button.warning-cargo:hover { background: #4de0d0; }
 button.sm { padding: 3px 10px; font-size: 11px; }
+button.primary.held {
+  background: #a371f7;
+  border-color: #bc8cff;
+  animation: pulse-held 1s ease-in-out infinite alternate;
+}
+@keyframes pulse-held {
+  0% { box-shadow: 0 0 0 0 rgba(188, 140, 255, 0.5); }
+  100% { box-shadow: 0 0 0 8px rgba(188, 140, 255, 0); }
+}
 
-/* ── Log panels ─────────────────────────────────── */
+  /* ── Log panels ─────────────────────────────────── */
 .log-area {
   height: 500px;
   flex-shrink: 0;
@@ -728,6 +802,16 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .log-line.cat-rescue { color: var(--cyan); font-weight: 600; }
 .log-line.cat-broadcast { color: var(--orange); }
 .log-line.cat-chat { color: var(--magenta); }
+
+/* Inline ANSI colors for mid-line highlighting */
+.ansi-red { color: #ff6b6b; }
+.ansi-green { color: #3fb950; }
+.ansi-yellow { color: #d29922; }
+.ansi-cyan { color: #22b8cf; }
+.ansi-white { color: #f0f6fc; }
+.ansi-bright { font-weight: 600; }
+.ansi-bright-red { color: #ff8787; font-weight: 600; }
+.ansi-bright-green { color: #56d364; font-weight: 600; }
 
 /* ── Chat input ─────────────────────────────────── */
 .chat-bar {
@@ -1012,6 +1096,18 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   padding: 4px 10px;
   font-size: 11px;
 }
+/* Active state for toggle buttons (e.g. Mine Forever) */
+.cmd-group button.active {
+  background: var(--red, #f85149);
+  border-color: var(--red, #f85149);
+  color: #fff;
+  font-weight: 700;
+  animation: mineForeverPulse 1.4s ease-in-out infinite;
+}
+@keyframes mineForeverPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(248, 81, 73, 0.5); }
+  50% { box-shadow: 0 0 0 5px rgba(248, 81, 73, 0); }
+}
 
 /* ── Collapsible manual sections ────────────────── */
 .manual-section {
@@ -1020,6 +1116,11 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   margin-top: 10px;
   width: 100%;
   flex-shrink: 0;
+}
+.manual-section.collapsed {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
 }
 .manual-section-header {
   display: flex;
@@ -1057,6 +1158,33 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.manual-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.manual-toolbar-btn {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.manual-toolbar-btn:hover {
+  background: rgba(255,255,255,0.06);
+  color: var(--text-bright);
+}
+.manual-toolbar-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }
 
 .craft-details-group {
@@ -2218,6 +2346,13 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   max-height: 300px;
   overflow-y: auto;
 }
+.blacklist-list-expand {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: none;
+  overflow-y: visible;
+}
 .blacklist-item {
   display: flex;
   align-items: center;
@@ -2331,6 +2466,11 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .skills-name.piracy { color: var(--red); font-weight: 600; }
 .skills-name.engineering { color: #a371f7; }
 .skills-name.navigation { color: var(--cyan); }
+.skills-level.piloting { color: var(--green); font-weight: 600; }
+.skills-level.combat { color: var(--yellow); }
+.skills-level.piracy { color: var(--red); font-weight: 600; }
+.skills-level.engineering { color: #a371f7; }
+.skills-level.navigation { color: var(--cyan); }
 .skills-empty {
   color: var(--text-dim);
   font-style: italic;
@@ -2625,7 +2765,7 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   color: #fff;
   border: 1px solid var(--border);
   border-radius: 4px;
-  cursor: pointer;
+  width: 140px;
 }
 .ship-gift-custom-input {
   font-size: 11px;

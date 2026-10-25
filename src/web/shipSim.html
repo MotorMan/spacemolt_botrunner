@@ -190,10 +190,13 @@ function selectShip() {
       const basePowerUsed = currentLoadout.weapons.concat(currentLoadout.defense, currentLoadout.utility)
         .reduce((sum, mod) => sum + (mod.power_usage || mod.power_cost || mod.power || 0), 0);
 
-      // Apply engineering skill efficiency bonus (1% reduction per level)
+      // Apply engineering skill efficiency bonus (1% reduction per level).
+      // The server reduces the summed module total then floors it (it does NOT
+      // ceil, and does NOT reduce per-module first — verified against a live
+      // 12/12 Shard build: 5+4+2+2=13 base, ENG 7 -> floor(13*0.93)=12).
       const efficiencyBonus = engineeringSkillLevel * 0.01; // Convert to decimal
-      const cpuUsed = Math.ceil(baseCpuUsed * (1 - efficiencyBonus));
-      const powerUsed = Math.ceil(basePowerUsed * (1 - efficiencyBonus));
+      const cpuUsed = Math.floor(baseCpuUsed * (1 - efficiencyBonus));
+      const powerUsed = Math.floor(basePowerUsed * (1 - efficiencyBonus));
 
       const baseMaxCpu = selectedShip.cpu_capacity || selectedShip.max_cpu || 80;
       const baseMaxPower = selectedShip.power_capacity || selectedShip.max_power || 100;
@@ -319,6 +322,7 @@ function selectShip() {
         <option value="cpu">Sort by CPU (high to low)</option>
         <option value="power">Sort by PWR (high to low)</option>
         <option value="cpu_power">Lowest CPU, Highest PWR</option>
+        ${category === 'weapons' ? '<option value="dpt">Sort by Dmg/tick (high to low)</option>' : ''}
       `;
       sortSelect.value = moduleSortMode[category] || 'none';
       sortSelect.onchange = () => {
@@ -358,6 +362,12 @@ function selectShip() {
           const bPwr = b.power_usage || b.power_cost || b.power || 0;
           return bPwr - aPwr;
         });
+      } else if (sortValue === 'dpt') {
+        sortedModules.sort((a, b) => {
+          const aDpt = (a.damage || 0) / (a.cooldown || 1);
+          const bDpt = (b.damage || 0) / (b.cooldown || 1);
+          return bDpt - aDpt;
+        });
       }
 
       sortedModules.forEach(module => {
@@ -367,6 +377,11 @@ function selectShip() {
         if (module.cpu_usage || module.cpu_cost || module.cpu) details.push(`CPU: ${module.cpu_usage || module.cpu_cost || module.cpu || 0}`);
         if (module.power_usage || module.power_cost || module.power) details.push(`Pwr: ${module.power_usage || module.power_cost || module.power || 0}`);
         if (module.damage) details.push(`Dmg: ${module.damage}`);
+        if (module.cooldown) details.push(`CD: ${module.cooldown}`);
+        if (category === 'weapons' && module.damage && module.cooldown) {
+          const dpt = (module.damage / module.cooldown).toFixed(2);
+          details.push(`Dmg/tick: ${dpt}`);
+        }
         if (module.mining_power) details.push(`Mining: ${module.mining_power}`);
         if (module.shield_bonus) details.push(`Shield: +${module.shield_bonus}`);
         if (module.armor_bonus) details.push(`Armor: +${module.armor_bonus}`);
@@ -515,8 +530,17 @@ function selectShip() {
         if (currentLoadout[category].length > 0) {
           html += `<div class="shipsim-loadout-title">${category.charAt(0).toUpperCase() + category.slice(1)}</div>`;
           currentLoadout[category].forEach((module, index) => {
+            const details = [];
+            if (module.cpu_usage || module.cpu_cost || module.cpu) details.push(`CPU: ${module.cpu_usage || module.cpu_cost || module.cpu || 0}`);
+            if (module.power_usage || module.power_cost || module.power) details.push(`Pwr: ${module.power_usage || module.power_cost || module.power || 0}`);
+            if (module.damage) details.push(`Dmg: ${module.damage}`);
+            if (module.reach) details.push(`Reach: ${module.reach}`);
+            if (module.cooldown) details.push(`Cooldown: ${module.cooldown}`);
             html += `<div class="shipsim-loadout-item">
-              <span>${module.name || module.item_name || module.id}</span>
+              <div>
+                <span>${module.name || module.item_name || module.id}</span>
+                ${details.length > 0 ? `<span style="font-size:11px;color:var(--text-dim);margin-left:6px;">(${details.join(', ')})</span>` : ''}
+              </div>
               <span class="shipsim-loadout-remove" onclick="removeModuleFromLoadout('${category}', ${index})">✕</span>
             </div>`;
           });

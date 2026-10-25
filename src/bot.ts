@@ -9,7 +9,7 @@ import { perf } from "./perf.js";
 import { mapStore } from "./mapstore.js";
 import type { NotificationMarketUpdate } from "@spacemolt/lib";
 import { marketStreamStore } from "./marketstreamstore.js";
-import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
+import { addMaydayRequest, parseMaydayMessage, isIgnoredMaydaySender, shouldLogIgnoredMayday } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
 import { wildlifeStore, type SurveyWildlifeEntry, type FaintSignature, type ObservedCreature } from "./wildlivestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
@@ -22,12 +22,14 @@ import { chatBuffer } from "./chatbuffer.js";
 import { loadSettings, saveStoppedState, saveLastUsedRoutine, isCustomsDisabled } from "./web/server.js";
 import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
-import { isConnectionError } from "./connection.js";
+import { isConnectionError, isStalePositionError } from "./connection.js";
+import { isRateLimitError, parseServerDelayMs, reportCleanSend, reportRateLimitHit, shouldLogGateClosed, waitForGate } from "./ratelimitgate.js";
 
 /** A login() promise older than this (ms) is treated as wedged and reset, so a
  *  dead socket can never permanently park the routine on an unresolved promise. */
 const LOGIN_WEDGE_TIMEOUT_MS = 60_000;
-import { catalogStore } from "./catalogstore.js";
+   import { catalogStore } from "./catalogstore.js";
+import type { PrizeRecoveryInfo, CrewDisposition, PrizeWaitReason, PrizeTransitKind } from "./types/game.js";
 import { extractShipModules, moduleTypeId } from "./shipmodules.js";
 import { isPirateTarget, isCreatureTarget, isCreatureName } from "./routines/battle.js";
 
@@ -97,8 +99,9 @@ export interface BotStatus {
    * dashboard with a jail-bars indicator next to the bot name when non-empty.
    * Empty object = no bounties / unknown.
    */
-  bounties: Record<string, number>;
-  inBattle?: boolean;
+     bounties: Record<string, number>;
+     prizeRecoveries: PrizeRecoveryInfo[];
+   inBattle?: boolean;
   battleId?: string | null;
   /**
    * Transient flag set only for bot cards that have been rehydrated from the
@@ -187,6 +190,17 @@ export class Bot {
   private _lastAction = "";
   private _error: string | null = null;
   private _abortController: AbortController | null = null;
+  /** In-flight routine runner-loop promise (null when no routine is running). */
+  private _runLoop: Promise<void> | null = null;
+  /** Incremented on every routine start; the runner loop captures its value and
+   *  exits if it goes stale, so a loop left over from an earlier run can never
+   *  resume stepping its generator just because a newer run set the state back
+   *  to "running". */
+  private _runGeneration = 0;
+  /** Serializes routine starts so two callers racing (e.g. the emergency
+   *  return-home timer vs. a manual Start) can't both fall through the
+   *  "already running" check before either has set the state. */
+  private _startGate: Promise<void> = Promise.resolve();
   private pendingCommands = new Map<string, AbortController>();
   private lastSystem = "unknown";
   private lastPoi = "";
@@ -319,11 +333,6 @@ docked = false;
    */
   private _recovery: Promise<boolean> | null = null;
 
-  /** Progressive backoff (ms) applied after a rate-limit/IP-block error, so we
-   *  stop hammering the server and let the temporary block window elapse. Grows
-   *  by 30s per hit (capped at 5min) and resets after a clean command. */
-  private _rateLimitBackoff = 30_000;
-
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
@@ -339,13 +348,36 @@ docked = false;
   /** The ID of the wreck being towed (if any). */
   towingWreckId: string | null = null;
 
-shipSpeed = 1;
-   hasPathfinderDrive = false;
-   hasEmergencyWarpStabilizer: boolean | null = null;
-   installedMods: string[] = [];
-   hasLeadLinedCargoHold: boolean | null = null;
+  shipSpeed = 1;
+    hasPathfinderDrive = false;
+    hasEmergencyWarpStabilizer: boolean | null = null;
+    installedMods: string[] = [];
+    hasLeadLinedCargoHold: boolean | null = null;
+    /** Fit marines aboard the ship (from get_ship personnel). */
+    fitMarines = 0;
+    /** Fit crew aboard the ship (from get_ship personnel). */
+    fitCrew = 0;
+    /** Injured marines aboard the ship (from get_ship personnel). */
+    injuredMarines = 0;
+    /** Injured crew aboard the ship (from get_ship personnel). */
+    injuredCrew = 0;
+    /** Effective marine capacity after hull/module effects (from get_ship). */
+    effectiveMarineCapacity = 0;
+    /** Maximum crew capacity from ship hull class (from get_ship). */
+    crewCapacity = 0;
+    /** Maximum marine capacity from ship hull class (from get_ship). */
+    marineCapacity = 0;
+    /** Whether this ship has boarding capability (from get_ship ship class data). */
+    hasBoardingCapability = false;
+    /** Latch strength of the installed boarding clamp module (0 if none installed). */
+    boardingClampLatchStrength = 0;
+  private _prevHullPct: number = 100;
+  private _prevHasEws: boolean | null = null;
+  private _ewsFallbackTriggered = false;
   /** Outstanding bounties (credits) keyed by faction. Parsed in applyStatusResult. */
   bounties: Record<string, number> = {};
+  /** Prize recovery records. Parsed from get_status prize_recoveries. */
+  prizeRecoveries: PrizeRecoveryInfo[] = [];
   lastKnownTick?: number;
 
   /** Accumulated stats for this bot. */
@@ -377,6 +409,11 @@ shipSpeed = 1;
     battleId: string | null;
     lastUpdate: number; // Timestamp of last battle update
     participants: Array<Record<string, unknown>>;
+    /** From battle_update WebSocket notifications — not always present in get_battle_status API response */
+    yourStance?: string;
+    yourZone?: string;
+    yourSideId?: number;
+    lastTick?: number;
   } = { inBattle: false, battleId: null, lastUpdate: 0, participants: [] };
 
   /** Track the last known observation subscription ID and its cached presence data.
@@ -388,11 +425,34 @@ shipSpeed = 1;
   observationActiveScan = false;
   observationTick = 0;
 
+  /** Track captured prize ships by ship_id → prize_id mapping.
+   *  Populated by ship_captured WebSocket notifications so we can find
+   *  the correct prize_id in get_nearby even if we didn't see it immediately. */
+  capturedPrizeTracker: Map<string, { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number; claim_verified: boolean }> = new Map();
+
   /** Set of queued crafting job IDs to prevent duplicate submissions. */
   private queuedCraftingJobs: Set<string> = new Set();
 
   /** Tracks active crafting queue jobs with server-assigned job IDs. */
   craftQueueTracker: import("./routines/craftQueueTracker.js").CraftQueueTracker | null = null;
+
+  // Per-bot cache of the last `craft` queue fetch. CRITICAL: the crafter routine
+  // used to cache the queue at MODULE level, which is shared by every bot running
+  // in this process — so one drone would receive ANOTHER drone's queue (and its
+  // phantom "pending", e.g. 148k fuel_reserve) whenever the refresh cooldown was
+  // still active. Storing it per-bot guarantees each bot only ever sees its OWN
+  // crafting queue from its own `craft` command.
+  craftQueueCache: {
+    lastQueueCheck: number;
+    jobs: import("./routines/craftQueueTracker.js").ServerJobInfo[];
+  } = { lastQueueCheck: 0, jobs: [] };
+
+  // Per-bot facility round-robin cursor. Module-level sharing would make every
+  // drone route the same recipe to the same facility index.
+  facilityRoundRobin: Map<string, number> = new Map();
+
+  // Per-bot dedupe of "no owned facility" warnings.
+  notifiedMissingFacilities: Set<string> = new Set();
 
   /**
    * Generate a unique job ID for a crafting job.
@@ -566,7 +626,23 @@ shipSpeed = 1;
     action: string,
     payload: Record<string, unknown> | undefined,
   ): Promise<unknown> {
+    // In-place retries for rate-limit rejections. The server rejects a blocked
+    // command WITHOUT executing it, so resending once the block window the
+    // server specified has elapsed is safe (the library's own rate-limit
+    // retry assumes the same). The bound keeps a command that keeps getting
+    // rejected from parking forever inside send; after that we surface the
+    // error so the routine can end cleanly.
+    let rateLimitHits = 0;
     for (;;) {
+      // Global IP-block gate (see ratelimitgate.ts): the server blocks the
+      // whole IP, so when any bot trips a block EVERY outbound command from
+      // EVERY bot parks here until the window the server specified elapses.
+      // This is what actually stops the hammering — the old per-call sleep in
+      // libExec let concurrent commands and the routine loop's next iteration
+      // keep firing straight into the block (each "backing off 300s" while
+      // logging identical failures every second).
+      await waitForGate();
+
       // If the socket is ALREADY observably closed (not just "not yet
       // authenticated"), there is zero point firing the send: it can ONLY throw
       // "cannot send on a closed socket" and spam the log with the very error
@@ -593,9 +669,37 @@ shipSpeed = 1;
       const rawSend = this.liveRawSend();
       if (!rawSend) throw new Error("no account");
       try {
-        return await measureSend(() => rawSend(tool, action, payload));
+        const result = await measureSend(() => rawSend(tool, action, payload));
+        // Clean command: the block (if any) is over — ease the gate's
+        // escalation back to its base so normal operation resumes promptly.
+        reportCleanSend();
+        return result;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        if (isRateLimitError(err)) {
+          // Open the gate for exactly as long as the server asked
+          // ("Try again in N seconds") — or our escalating floor when it states
+          // no delay — then wait on it and retry. Logging only the first
+          // reporter per window keeps a concurrent burst from spamming the same
+          // warning six times a second (the old log).
+          const penalty = reportRateLimitHit(message);
+          if (shouldLogGateClosed()) {
+            const serverDelayMs = parseServerDelayMs(message);
+            const serverNote = serverDelayMs !== null
+              ? ` (server said retry in ${Math.round(serverDelayMs / 1000)}s)`
+              : "";
+            this.log(
+              "warn",
+              `⏳ Rate limit hit — pausing ALL commands for ${Math.round(penalty / 1000)}s${serverNote} to let the IP block lapse`,
+            );
+          }
+          if (++rateLimitHits > 2) throw err;
+          await waitForGate();
+          // Stagger the resume so the fleet's parked commands don't hit the
+          // server as one synchronized burst the instant the gate opens.
+          await new Promise((r) => setTimeout(r, Math.random() * 500));
+          continue;
+        }
         if (!isConnectionError(message)) throw err;
         if (this.state === "stopping" || this._abortController?.signal.aborted) {
           throw err;
@@ -670,6 +774,8 @@ shipSpeed = 1;
     this._state = "idle";
     this._routine = null;
     this._error = null;
+    // Reset the abort controller so ad-hoc commands work after an error/stopping.
+    this._abortController = null;
   }
 
   /** Get the bot's empire affiliation from the library account state. */
@@ -872,6 +978,67 @@ shipSpeed = 1;
     return roundedTimeout * 1000; // Convert to milliseconds
   }
 
+  triggerEmergencyWarpStabilizer(): void {
+    if (this._ewsFallbackTriggered) return;
+    this._ewsFallbackTriggered = true;
+
+    const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+    const emergencyLine = `${timestamp} [emergency] ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`;
+    this.actionLog.push(emergencyLine);
+    const stopLine = `${timestamp} [system] ⛔ Routine stopped — please install a new stabilizer before resuming.`;
+    this.actionLog.push(stopLine);
+
+    if (this.onLog) {
+      this.onLog(this.username, "emergency", "⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.");
+      this.onLog(this.username, "system", "⛔ Routine stopped — please install a new stabilizer before resuming.");
+    } else {
+      console.log(
+        `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
+          `\x1b[91m[emergency]${RESET} ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`
+      );
+      console.log(
+        `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
+          `\x1b[93m[system]${RESET} ⛔ Routine stopped — please install a new stabilizer before resuming.`
+      );
+    }
+
+    saveStoppedState(this.username, "emergency");
+    saveLastUsedRoutine(this.username, "return_home");
+
+    if (this._state === "running") {
+      this._state = "stopping";
+      this._abortController?.abort();
+    }
+
+    this.scheduleEmergencyReturnHome();
+  }
+
+  /**
+   * Launch the return_home routine a few seconds after the emergency warp
+   * stabilizer fired. The delay gives the interrupted routine a moment to
+   * wind down; `bot.start()` itself additionally waits for the previous
+   * runner loop to fully settle (see awaitRunLoopSettled), so the old routine
+   * can never resume farming/fighting just because the state flips back to
+   * "running" — which is what used to keep a hunter hunting after the
+   * stabilizer fired instead of sending it home.
+   */
+  private scheduleEmergencyReturnHome(delayMs = 4000): void {
+    const botName = this.username;
+    setTimeout(() => {
+      void (async () => {
+        try {
+          const { handleStart, getBot } = await import("./botmanager.js");
+          const bot = getBot(botName);
+          if (!bot) return;
+          if (bot.state === "running") return; // a routine (re)started meanwhile
+          await handleStart({ type: "start", bot: botName, routine: "return_home" });
+        } catch {
+          // never let the emergency return path throw into the timer
+        }
+      })();
+    }, delayMs);
+  }
+
   log(category: string, message: string): void {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
     const line = `${timestamp} [${category}] ${message}`;
@@ -881,62 +1048,9 @@ shipSpeed = 1;
     }
 
     // Emergency Warp Stabilizer detection — monitor ALL log lines
-    // Check BEFORE logging to avoid recursion issues
     if (message.includes("Emergency Warp Stabilizer activated")) {
-      // Log the emergency message directly without triggering another detection
-      const emergencyLine = `${timestamp} [emergency] ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`;
-      this.actionLog.push(emergencyLine);
-      const stopLine = `${timestamp} [system] ⛔ Routine stopped — please install a new stabilizer before resuming.`;
-      this.actionLog.push(stopLine);
-
-      if (this.onLog) {
-        this.onLog(this.username, "emergency", "⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.");
-        this.onLog(this.username, "system", "⛔ Routine stopped — please install a new stabilizer before resuming.");
-      } else {
-        console.log(
-          `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
-            `\x1b[91m[emergency]${RESET} ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`
-        );
-        console.log(
-          `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
-            `\x1b[93m[system]${RESET} ⛔ Routine stopped — please install a new stabilizer before resuming.`
-        );
-      }
-
-      // Mark bot as stopped-by-emergency so it won't auto-restart on mass disconnect
-      saveStoppedState(this.username, "emergency");
-
-      // Reassign the bot's last-used routine to "return_home" so that nothing
-      // can ever automatically re-queue it into the routine it was just pulled
-      // out of (miner/trader/etc.). Emergency-Warp always drops the ship back at
-      // its home base, so return_home will find it already home, confirm dock,
-      // and then idle — keeping it home instead of re-entering the old routine.
-      saveLastUsedRoutine(this.username, "return_home");
-
-      // Stop the routine immediately
-      if (this._state === "running") {
-        this._state = "stopping";
-        this._abortController?.abort();
-      }
-
-      // Once the aborted routine has unwound, explicitly start the return_home
-      // routine so the bot is in a "stay home" state (it is already home). This
-      // runs best-effort: if the bot is already busy with another routine it is
-      // skipped, and the re-assigned last-used routine guarantees that the next
-      // auto-resume / mass-reconnect still lands it on return_home, never the
-      // old routine.
-      const botName = this.username;
-      setTimeout(() => {
-        void (async () => {
-          const { handleStart, getBot } = await import("./botmanager.js");
-          const bot = getBot(botName);
-          if (!bot) return;
-          if (bot.state === "running") return;
-          await handleStart({ type: "start", bot: botName, routine: "return_home" });
-        })().catch(() => {});
-      }, 4000);
-
-      return; // Don't log the original message again, we've already handled it
+      this.triggerEmergencyWarpStabilizer();
+      return;
     }
 
     if (this.onLog) {
@@ -972,11 +1086,6 @@ shipSpeed = 1;
     if (COMMAND_TOOL_MAP[command] === "spacemolt_auth") {
       return { result: { ok: true }, error: undefined, notifications: [] };
     }
-    // Notifications arrive via event subscriptions (P2) for library bots.
-    if (command === "get_notifications") {
-      return { result: { notifications: [] }, error: undefined, notifications: [] };
-    }
-
     const blockedCommands = new Set(["jump", "travel", "dock", "undock", "mine", "salvage", "buy", "sell"]);
     if (this.isCustomsHold() && blockedCommands.has(command)) {
       this.log("customs", `⏳ Customs hold ACTIVE - blocking ${command} until clearance...`);
@@ -1001,9 +1110,12 @@ shipSpeed = 1;
     try {
       const res = await acct.send(tool, action, body);
       const result = extractLibResult(res);
-      // A clean command means we're no longer rate-limited; ease the backoff
-      // back to its base so normal operation resumes promptly.
-      this._rateLimitBackoff = 30_000;
+      // Rate-limit handling (waiting for the server's "try again in N
+      // seconds", gating every further command) lives in `sendResilient` at the
+      // single account.send chokepoint — see ratelimitgate.ts. Errors only
+      // surface here once the gate's bounded in-place retries are exhausted,
+      // and the gate stays closed for the rest of the block window, so the
+      // routine's next command parks on it instead of hammering.
       return { result, error: undefined, notifications: [] };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1037,17 +1149,11 @@ shipSpeed = 1;
         return { error: { code: "in_battle", message }, result: undefined, notifications: [] };
       }
       this.log("error", `libExec ${command} failed: ${message}`);
-      // Rate-limit / IP-block protection: the server temporarily bans an IP for
-      // excessive command rate. If we blindly return the error, routines retry
-      // immediately and the storm keeps the IP blocked (or escalates the ban).
-      // Instead, pause here so the block window elapses before we issue more
-      // commands. We sleep in increasing steps so repeated hits back off harder.
-      if (/excessive rate limit|temporarily blocked|rate limit|too many requests/i.test(message)) {
-        const penalty = this._rateLimitBackoff;
-        this._rateLimitBackoff = Math.min(this._rateLimitBackoff + 30_000, 300_000);
-        this.log("warn", `⏳ Rate limit hit — backing off ${Math.round(penalty / 1000)}s before next command to avoid an IP ban`);
-        await sleep(penalty);
-      }
+      // Rate-limit / IP-block protection is enforced at the send chokepoint
+      // (`sendResilient` → ratelimitgate.ts): the gate is already closed for
+      // the server's stated window, so every subsequent command — from every
+      // bot — parks before sending instead of re-tripping the block. Surfacing
+      // the error here is all that's left to do.
       return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
     }
   }
@@ -1304,7 +1410,7 @@ shipSpeed = 1;
    * game-server bandwidth.
    */
   private isTradeRoutine(): boolean {
-    return this._routine === "explorer" || this._routine === "trader" || this._routine === "market";
+    return this._routine === "explorer" || this._routine === "trader" || this._routine === "live_trader" || this._routine === "market";
   }
 
   /**
@@ -1370,7 +1476,52 @@ shipSpeed = 1;
       // loops, which the library handles internally) was removed; the business
       // logic below runs on the normalized ApiResponse libExec returns.
       let resp: ApiResponse;
-      resp = await this.libExec(command, payload);
+      if (command === "jump") {
+        const target = (payload as Record<string, unknown> | undefined)?.target_system;
+        // Pathfinder jumps (target_system = bearing number) return pathfinder_redirect
+        // immediately and NEVER produce action_result. libExec/account.send waits for
+        // action_result which never arrives — causing a 10-minute hang. Worse: when
+        // stop() aborts the routine, the pending libExec promise is still in flight
+        // and eventually resolves, firing the jump long after the routine stopped.
+        // Fire-and-forget: send the command and return immediately.
+        if (typeof target === "number") {
+          const { tool, action, body } = buildLibDispatch(command, payload);
+          debugLogForBot(this.username, "bot:exec", `${this.username} > pathfinder jump bearing=${target} payload=${JSON.stringify(body)}`);
+          const rawSend = this.liveRawSend();
+          if (!rawSend) {
+            return {
+              error: { code: "no_account", message: "Library account not connected" },
+              result: undefined,
+              notifications: [],
+            };
+          }
+          // Pathfinder jumps return pathfinder_redirect immediately and NEVER
+          // produce action_result. libExec/account.send waits for action_result
+          // which never arrives — causing a 10-minute hang. We await the raw
+          // send here (it returns immediately) so send failures are surfaced
+          // instead of being silently swallowed by void + .catch(() => {}).
+          try {
+            await rawSend(tool, action, body);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            this.log("error", `Pathfinder jump at bearing ${target} failed to send: ${message}`);
+            return {
+              error: { code: "send_failed", message },
+              result: undefined,
+              notifications: [],
+            };
+          }
+          resp = {
+            error: undefined,
+            result: { action: "pathfinder_redirect", pathfinder: true },
+            notifications: [],
+          };
+        } else {
+          resp = await this.libExec(command, payload);
+        }
+      } else {
+        resp = await this.libExec(command, payload);
+      }
 
       if (isCombatDebugEnabled() && (
         command === "battle" || command === "scan" || command === "attack" ||
@@ -1562,7 +1713,37 @@ if (command === "get_status") {
       }
       this.bounties = parsed;
     }
-             if (player?.is_cloaked !== undefined || ship?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined || ship?.cloaked !== undefined) {
+    // Parse prize_recoveries from get_status (claimant-private capture state)
+    const prizeRecoveriesRaw = (r.prize_recoveries as Array<Record<string, unknown>> | undefined);
+    if (prizeRecoveriesRaw && Array.isArray(prizeRecoveriesRaw)) {
+      this.prizeRecoveries = prizeRecoveriesRaw.map(pr => ({
+        prize_id: pr.prize_id as string,
+        actor_id: pr.actor_id as string,
+        ship_id: pr.ship_id as string,
+        ship_class: pr.ship_class as string,
+        ship_name: pr.ship_name as string | undefined,
+        status: pr.status as PrizeRecoveryInfo["status"],
+        destination_base_id: pr.destination_base_id as string,
+        prize_crew_fit: pr.prize_crew_fit as number,
+        crew_disposition: pr.crew_disposition as CrewDisposition,
+        hull: pr.hull as number,
+        max_hull: pr.max_hull as number,
+        fuel: pr.fuel as number,
+        max_fuel: pr.max_fuel as number,
+        system_id: pr.system_id as string | undefined,
+        poi_id: pr.poi_id as string | undefined,
+        wait_reason: pr.wait_reason as PrizeWaitReason | undefined,
+        transit_kind: pr.transit_kind as PrizeTransitKind | undefined,
+        transit_from_system_id: pr.transit_from_system_id as string | undefined,
+        transit_from_poi_id: pr.transit_from_poi_id as string | undefined,
+        transit_to_system_id: pr.transit_to_system_id as string | undefined,
+        transit_to_poi_id: pr.transit_to_poi_id as string | undefined,
+        transit_arrival_tick: pr.transit_arrival_tick as number | undefined,
+      }));
+    } else {
+      this.prizeRecoveries = [];
+    }
+            if (player?.is_cloaked !== undefined || ship?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined || ship?.cloaked !== undefined) {
                this.isCloaked = !!(player?.is_cloaked || ship?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked || ship?.cloaked);
              }
 
@@ -1597,7 +1778,7 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
             }
           } else if (command === "jump" || command === "travel") {
             const sysId = (r.system_id as string) || (r.system as string) || (location.system_id as string);
-            const poiId = (r.poi as string) || (r.poi_id as string) || (location.poi_id as string);
+            const poiId = (r.poi_id as string) || (r.poi as string) || (location.poi_id as string);
             if (sysId) this.system = sysId;
             if (poiId) this.poi = poiId;
             if (r.auto_docked || location.docked_at) this.docked = true;
@@ -1638,7 +1819,13 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
             if (qty) this.cargo += qty;
           } else if (command === "refuel") {
             const fuelAdded = (r.fuel_added as number) || (r.quantity as number) || 0;
-            if (fuelAdded) this.fuel = Math.min(this.maxFuel, this.fuel + fuelAdded);
+            if (fuelAdded) {
+              if (payload?.target) {
+                this.fuel = Math.max(0, this.fuel - fuelAdded);
+              } else {
+                this.fuel = Math.min(this.maxFuel, this.fuel + fuelAdded);
+              }
+            }
             if (typeof ship.fuel === "number") this.fuel = ship.fuel;
           } else if (command === "repair") {
             const hullRepaired = (r.hull_repaired as number) || (r.hull as number) || 0;
@@ -1669,6 +1856,15 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           this.logPosition();
           this.lastSystem = this.system;
           this.lastPoi = this.poi;
+        }
+
+        // Stale-position recovery: a jump/travel command can fail because the bot
+        // actually moved during a reconnect (the server says it is no longer at
+        // the system it thought it was). Refresh authoritative position now so
+        // routines see where the bot really is instead of looping on the old spot.
+        if ((command === "jump" || command === "travel") && resp?.error && isStalePositionError(resp.error.message)) {
+          this.log("warn", `Stale position after ${command}: ${resp.error.message} — refreshing location from server`);
+          try { await this.refreshStatus(true); } catch { /* ignore */ }
         }
 
         return resp;
@@ -1814,21 +2010,26 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
   private _lastStatusFetchAt = 0;
   private static readonly STATUS_FETCH_THROTTLE_MS = 5000;
 
-  async refreshStatus(): Promise<ApiResponse> {
+  async refreshStatus(force: boolean = false): Promise<ApiResponse> {
     if (this.account) {
       const now = Date.now();
-      if (now - this._lastStatusFetchAt >= Bot.STATUS_FETCH_THROTTLE_MS) {
+      if (force) this._lastStatusFetchAt = 0;
+      if (now - this._lastStatusFetchAt >= Bot.STATUS_FETCH_THROTTLE_MS || force) {
         const resp = await this.libExec("get_status");
         this._lastStatusFetchAt = now;
         if (!resp.error && resp.result && typeof resp.result === "object") {
           this._lastStatusResult = resp.result as Record<string, unknown>;
           this.applyStatusResult(this._lastStatusResult);
+          this.notifyStateChanged();
           return { result: this._lastStatusResult, error: undefined, notifications: [] };
         }
         // The fetch failed but we have a previous good result — keep using it
         // instead of falling back to the possibly-stale account.state.
         if (this._lastStatusResult == null) {
           this._lastStatusResult = this.account.state as unknown as Record<string, unknown>;
+          this.applyStatusResult(this._lastStatusResult);
+          this.notifyStateChanged();
+          return { result: this._lastStatusResult, error: undefined, notifications: [] };
         }
         this.applyStatusResult(this._lastStatusResult);
         return { result: this._lastStatusResult, error: undefined, notifications: [] };
@@ -1888,6 +2089,8 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     const ship = r.ship as Record<string, unknown> | undefined;
     debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
     if (ship) {
+      const prevHullPct = this.maxHull > 0 ? (this.hull / this.maxHull) * 100 : 100;
+      const prevHasEws = this.hasEmergencyWarpStabilizer;
       const rawName = (ship.name as string) || "";
       const shipType = (ship.ship_type as string) || (ship.type as string) || "";
       this.shipName = (rawName && rawName.toLowerCase() !== "unnamed" ? rawName : shipType) || this.shipName;
@@ -1897,7 +2100,7 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
       this.cargo = (ship.cargo_used as number) ?? this.cargo;
       this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
-this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+      this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
       this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
       this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
@@ -1920,25 +2123,39 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         this.ammo = ship.ammo as number;
       }
       this.applyModuleFlags(modulesArray, modulesResolved);
-     }
+
+      if (!this._ewsFallbackTriggered && this._state === "running" && prevHasEws === true) {
+        const hullPct = this.maxHull > 0 ? (this.hull / this.maxHull) * 100 : 100;
+        const positionChanged = this.system !== this.lastSystem || this.poi !== this.lastPoi;
+        const ewsGone = this.hasEmergencyWarpStabilizer !== true;
+        // EWS is a one-shot module fired at critical hull; detect by module
+        // disappearance (ewsGone) OR unexpected position change at low hull.
+        // The old prevHullPct > 20 gate missed fires when hull was already <= 20%.
+         if (ewsGone || (positionChanged && hullPct <= 20)) {
+              this._ewsFallbackTriggered = true;
+              this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
+              saveStoppedState(this.username, "emergency");
+              saveLastUsedRoutine(this.username, "return_home");
+
+              this.stop();
+              this.scheduleEmergencyReturnHome();
+            }
+          }
+        }
 
     // Towing state handling - moved outside ship block since it's on player/location
     if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
       this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
     }
 
-    const towingWreckId = (p.towing_wreck_id as string) ?? (ship?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
-    // Only update towing state if the field is present in the response
-    if (towingWreckId !== undefined && towingWreckId !== null) {
-      if (towingWreckId !== "") {
-        this.towingWreck = true;
-        this.towingWreckId = towingWreckId;
-      } else {
-        this.towingWreck = false;
-        this.towingWreckId = null;
-      }
-    }
-    // If field is not present, preserve existing towing state
+     const towingWreckId = (p.towing_wreck_id as string) ?? (ship?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
+     if (towingWreckId !== undefined && towingWreckId !== null && towingWreckId !== "") {
+       this.towingWreck = true;
+       this.towingWreckId = towingWreckId;
+     } else {
+       this.towingWreck = false;
+       this.towingWreckId = null;
+     }
 
     playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
 
@@ -1996,9 +2213,11 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
       }
       const towingWreckId = (p.towing_wreck_id as string) ?? (player?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
-      // Only update towing state if the field is present in the response (get_location may not include it)
-      if (towingWreckId !== undefined && towingWreckId !== null) {
-        if (towingWreckId !== "") {
+      // Towing state is owned by refreshStatus() (a real get_status). For
+      // library-backed bots refreshLocation() only sees stale account.state,
+      // so skip towing updates here to avoid resurrecting phantom tows.
+      if (!this.account) {
+        if (towingWreckId !== undefined && towingWreckId !== null && towingWreckId !== "") {
           this.towingWreck = true;
           this.towingWreckId = towingWreckId;
         } else {
@@ -2006,7 +2225,6 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
           this.towingWreckId = null;
         }
       }
-      // If field is not present, preserve existing towing state
       const creditsValue = r.credits ?? player?.credits;
       if (!this.account && typeof creditsValue === "number") this.credits = creditsValue;
     }
@@ -2022,7 +2240,15 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       const r = resp.result as Record<string, unknown>;
       const ship = (r.ship as Record<string, unknown>) || r;
       const player = r.player as Record<string, unknown> | undefined;
+      // Refresh live position from the get_ship response so EWS position-change
+      // detection works even when refreshStatus (get_status) hasn't run recently.
+      const loc = r.location as Record<string, unknown> | undefined;
+      const pos = loc || player || r;
+      this.system = (loc?.system_id as string) || (pos.current_system as string) || this.system;
+      this.poi = (loc?.poi_id as string) || (pos.current_poi as string) || (pos.poi_id as string) || this.poi;
       if (ship) {
+        const prevHullPct = this.maxHull > 0 ? (this.hull / this.maxHull) * 100 : 100;
+        const prevHasEws = this.hasEmergencyWarpStabilizer;
         this.fuel = (ship.fuel as number) ?? this.fuel;
         this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
         this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
@@ -2041,14 +2267,74 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         if (totalAmmo > 0) this.ammo = totalAmmo;
         else if (ship.ammo != null) this.ammo = ship.ammo as number;
         this.applyModuleFlags(modulesArray, modulesResolved);
-        if (modulesArray.length > 0 || modulesResolved) {
-          this.installedMods = modulesArray
-            .map(m => moduleTypeId(m) || (m.name as string) || "")
-            .filter(Boolean);
-        }
-      }
+
+        if (!this._ewsFallbackTriggered && this._state === "running" && prevHasEws === true) {
+          const hullPct = this.maxHull > 0 ? (this.hull / this.maxHull) * 100 : 100;
+          const positionChanged = this.system !== this.lastSystem || this.poi !== this.lastPoi;
+          const ewsGone = this.hasEmergencyWarpStabilizer !== true;
+          // EWS is a one-shot module fired at critical hull; detect by module
+          // disappearance (ewsGone) OR unexpected position change at low hull.
+          // The old prevHullPct > 20 gate missed fires when hull was already <= 20%.
+           if (ewsGone || (positionChanged && hullPct <= 20)) {
+              this._ewsFallbackTriggered = true;
+              this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
+              saveStoppedState(this.username, "emergency");
+              saveLastUsedRoutine(this.username, "return_home");
+
+              this.stop();
+              this.scheduleEmergencyReturnHome();
+            }
+         }
+
+         if (modulesArray.length > 0 || modulesResolved) {
+           this.installedMods = modulesArray
+             .map(m => moduleTypeId(m) || (m.name as string) || "")
+             .filter(Boolean);
+         }
+
+          // Parse personnel data
+          const personnel = (ship.personnel as Record<string, unknown> | undefined) || {};
+          this.fitMarines = (personnel.fit_marines as number) ?? 0;
+          this.injuredMarines = (personnel.injured_marines as number) ?? 0;
+          this.injuredCrew = (personnel.injured_crew as number) ?? 0;
+          this.fitCrew = (personnel.fit_crew as number) ?? 0;
+
+          // Parse capacity data from hull class
+          const hullData = (ship.hull_class as Record<string, unknown> | undefined) || {};
+          this.crewCapacity = (hullData.crew_capacity as number) ?? this.crewCapacity;
+          this.marineCapacity = (hullData.marine_capacity as number) ?? this.marineCapacity;
+
+          // Parse boarding capability and effective marine capacity
+          this.effectiveMarineCapacity = (ship.effective_marine_capacity as number) ?? this.effectiveMarineCapacity;
+           // boarding_capability is in the hull/class data block
+           this.hasBoardingCapability = !!(hullData.boarding_capability as boolean | undefined) || this.installedMods.some(m => m.toLowerCase().includes("boarding"));
+          // Parse boarding clamp latch strength from installed modules
+          let maxLatchStrength = 0;
+          for (const mod of modulesArray) {
+            if (mod && typeof mod === "object") {
+              const modTypeId = moduleTypeId(mod);
+              if (modTypeId && modTypeId.includes("boarding")) {
+                const ls = mod.latch_strength as number | undefined;
+                if (ls && ls > maxLatchStrength) maxLatchStrength = ls;
+              }
+            }
+          }
+          // Fallback: check by known module type ids if module details weren't resolved
+          if (maxLatchStrength === 0) {
+            if (this.installedMods.includes("assault_boarding_lock")) maxLatchStrength = 18;
+            else if (this.installedMods.includes("boarding_clamp")) maxLatchStrength = 8;
+          }
+          this.boardingClampLatchStrength = maxLatchStrength;
+       }
       const creditsValue = r.credits ?? player?.credits;
       if (typeof creditsValue === "number") this.credits = creditsValue;
+      // Track position changes so EWS detection in refreshShip works across calls.
+      if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
+        this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
+        this.logPosition();
+        this.lastSystem = this.system;
+        this.lastPoi = this.poi;
+      }
     }
     return resp;
   }
@@ -2581,7 +2867,13 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   private handleMarketUpdate(payload: NotificationMarketUpdate): void {
     const baseId = payload.base_id;
     if (!baseId || !Array.isArray(payload.items)) return;
-    marketStreamStore.update(baseId, payload.tick, payload.items);
+    marketStreamStore.update(baseId, payload.tick, payload.items, {
+      baseId,
+      systemId: this.system,
+      poiId: this.poi,
+      poiName: mapStore.getSystem(this.system)?.pois.find((p) => p.id === this.poi)?.name || payload.base_name || this.location,
+      updatedAt: Date.now(),
+    });
 
     // Optional mirror into the dashboard's HTTP market cache, normalizing
     // the WS order-book shape (price_each) into what mapStore expects (price).
@@ -2594,6 +2886,42 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       }));
       perf.timeSync("mapStore.updateMarket", () => mapStore.updateMarket(this.system, this.poi, { items: normalized }));
     } catch { /* ignore dashboard mirror errors */ }
+  }
+
+  /**
+   * Wait for a previous routine's runner loop to fully settle before a new
+   * routine may start.
+   *
+   * A stop request only takes effect BETWEEN generator steps, so a routine
+   * that is mid-step (finishing a battle, a jump chain, a transit) keeps
+   * running for a while after stop(). Starting a new routine during that
+   * window used to reset `_state` back to "running" and hand the old loop a
+   * fresh AbortController — the old routine's own `bot.state === "running"`
+   * guards then passed again and it kept farming/fighting, interleaved with
+   * the new routine on the same ship. That is exactly how a hunter whose
+   * emergency warp stabilizer fired kept hunting for ~13 minutes afterwards
+   * instead of going home.
+   *
+   * Bounded by a timeout so a wedged step can never block starts forever;
+   * the run-generation guard in the runner loop then discards the stale loop.
+   */
+  private async awaitRunLoopSettled(): Promise<void> {
+    const RUN_SETTLE_TIMEOUT_MS = 90_000;
+    const loop = this._runLoop;
+    if (!loop) return;
+    this.log("system", "Waiting for the previous routine to finish stopping before starting...");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, RUN_SETTLE_TIMEOUT_MS);
+    });
+    try {
+      await Promise.race([loop.catch(() => {}), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (this._runLoop === loop) {
+      this.log("warn", "Previous routine did not settle in time — starting anyway (its loop will be discarded)");
+    }
   }
 
   /** Start running a routine. */
@@ -2613,10 +2941,39 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       return;
     }
 
+    // Serialize starters: chain onto the start gate so only one caller can be
+    // inside the critical section (settle-wait + state flip) at a time.
+    let releaseStartGate!: () => void;
+    const startGate = new Promise<void>((r) => { releaseStartGate = r; });
+    const previousGate = this._startGate;
+    this._startGate = startGate;
+    await previousGate;
+
+    try {
+      // A routine may still be winding down after a stop request ("stopping").
+      // NEVER let this start override that: the old runner loop only checks for
+      // "stopping" BETWEEN generator steps, so flipping the state back to
+      // "running" here would let the old generator keep farming/fighting (two
+      // routines interleaved on one ship). Wait for the old loop to settle.
+      await this.awaitRunLoopSettled();
+      // The state may have flipped while we waited (another start could have
+      // grabbed the bot), so re-check rather than trusting the earlier guard.
+      if ((this._state as BotState) === "running") {
+        this.log("error", "Bot is already running");
+        return;
+      }
+    } finally {
+      releaseStartGate();
+    }
+
     this._state = "running";
     this._routine = routineName;
     this._error = null;
     this._abortController = new AbortController();
+    // Each routine run gets a generation token. The runner loop below exits if
+    // the token goes stale, so a lingering loop from an earlier run can never
+    // mistake a newer run's "running" state for permission to keep stepping.
+    const generation = ++this._runGeneration;
 
     // (Re)subscribe to the realtime market push stream if this routine deals
     // with trade (explorer/trader); otherwise ensure it's dropped to save
@@ -2663,46 +3020,81 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     await ensureInsured(ctx);
 
     const generator = routine(ctx);
-    try {
-      while (true) {
-        let stateName!: string | void;
-        let done!: boolean | undefined;
-        if (perf.isEnabled()) {
-          const cpuStart = process.cpuUsage();
-          const wallStart = performance.now();
-          ({ value: stateName, done } = await generator.next());
-          const wallMs = performance.now() - wallStart;
-          const cpuDelta = process.cpuUsage(cpuStart);
-          perf.markRoutineTick(this.username, routineName, (cpuDelta.user + cpuDelta.system) / 1000, wallMs);
+    // The runner loop runs as a tracked promise so a subsequent start() can
+    // wait for it to settle (see awaitRunLoopSettled) instead of racing it.
+    const runLoop = (async () => {
+      try {
+        while (true) {
+          // A stop request (or a force-reset by an emergency path) may have
+          // landed while the previous action was in flight, or this loop may
+          // have been superseded by a newer routine run. Never step the
+          // generator again in that case.
+          if (generation !== this._runGeneration || (this._state as BotState) !== "running") {
+            this.log("system", "Routine stopping — bot is no longer running (stopped or superseded)");
+            break;
+          }
+          let stateName!: string | void;
+          let done!: boolean | undefined;
+          if (perf.isEnabled()) {
+            const cpuStart = process.cpuUsage();
+            const wallStart = performance.now();
+            ({ value: stateName, done } = await generator.next());
+            const wallMs = performance.now() - wallStart;
+            const cpuDelta = process.cpuUsage(cpuStart);
+            perf.markRoutineTick(this.username, routineName, (cpuDelta.user + cpuDelta.system) / 1000, wallMs);
+          } else {
+            ({ value: stateName, done } = await generator.next());
+          }
+          if (done) break;
+          if ((this._state as BotState) === "stopping") {
+            this.log("system", `Stopped during state: ${stateName}`);
+            break;
+          }
+          // Small gap between actions - use interruptible sleep
+          await ctx.sleep(2000);
+        }
+      } catch (err) {
+        if (generation !== this._runGeneration) {
+          // Superseded by a newer run (settle timeout elapsed) — this loop's
+          // outcome must not touch the state of the run that replaced it.
+          this.log("system", "Superseded routine loop ended — discarding without touching bot state");
+          return;
+        }
+        if (err instanceof Error && err.name === "AbortError") {
+          this.log("system", "Routine stopped by abort signal");
         } else {
-          ({ value: stateName, done } = await generator.next());
+          const msg = err instanceof Error ? err.message : String(err);
+          this._error = msg;
+          this.log("error", `Routine error: ${msg}`);
+          this._state = "error";
+          throw err;
         }
-        if (done) break;
-        if ((this._state as BotState) === "stopping") {
-          this.log("system", `Stopped during state: ${stateName}`);
-          break;
-        }
-        // Small gap between actions - use interruptible sleep
-        await ctx.sleep(2000);
+      } finally {
+        await generator.return(undefined);
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this._error = msg;
-      this.log("error", `Routine error: ${msg}`);
-      this._state = "error";
-      // Re-throw so the caller's .catch() handler fires, ensuring the bot
-      // assignment is cleared and "crashed" is logged rather than "finished".
-      throw err;
-    } finally {
-      await generator.return(undefined);
-    }
 
-    this._state = "idle";
-    this._routine = null;
-    // Routine ended — drop the market push stream (it was only for trade
-    // routines) so an idle bot generates no market bandwidth.
-    this.syncMarketSubscription();
-    this.log("system", "Routine finished");
+      // Same guard as above: a loop that was superseded while it was wedged
+      // must leave the newer run's state (and abort controller) untouched.
+      if (generation !== this._runGeneration) return;
+
+      this._state = "idle";
+      this._routine = null;
+      // Routine ended — the abort controller was for this routine's lifetime only.
+      // Clear it so ad-hoc commands (get_status, get_nearby, etc.) issued while the
+      // bot is idle don't trip the "Bot stopped" guard in libExec().
+      this._abortController = null;
+      // Routine ended — drop the market push stream (it was only for trade
+      // routines) so an idle bot generates no market bandwidth.
+      this.syncMarketSubscription();
+      this.log("system", "Routine finished");
+    })();
+
+    this._runLoop = runLoop;
+    try {
+      await runLoop;
+    } finally {
+      if (this._runLoop === runLoop) this._runLoop = null;
+    }
   }
 
   /** Fetch ship modules and cache installed mod type ids. */
@@ -2719,6 +3111,22 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
           .filter(Boolean);
       }
       this.applyModuleFlags(modules, resolved);
+      // Refresh boarding clamp latch strength from resolved modules
+      let maxLatchStrength = 0;
+      for (const mod of modules) {
+        if (mod && typeof mod === "object") {
+          const modTypeId = moduleTypeId(mod);
+          if (modTypeId && modTypeId.includes("boarding")) {
+            const ls = mod.latch_strength as number | undefined;
+            if (ls && ls > maxLatchStrength) maxLatchStrength = ls;
+          }
+        }
+      }
+      if (maxLatchStrength === 0) {
+        if (this.installedMods.includes("assault_boarding_lock")) maxLatchStrength = 18;
+        else if (this.installedMods.includes("boarding_clamp")) maxLatchStrength = 8;
+      }
+      this.boardingClampLatchStrength = maxLatchStrength;
     }
     return this.installedMods;
   }
@@ -2812,33 +3220,29 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   }
 
   async pollCurrentTick(): Promise<number | null> {
-    const resp = await this.exec("get_notifications");
-    if (resp.error || !resp.result) {
-      if (this.lastKnownTick !== null) {
-        this.log("warn", "get_notifications failed, using lastKnownTick for tick estimation");
-      }
-      return null;
+    // get_notifications is not available over WebSocket — notifications are pushed
+    // automatically. Rely on observationTick (from observation_update push events)
+    // or lastKnownTick instead.
+    if (this.observationTick && this.observationTick > 0) {
+      this.lastKnownTick = this.observationTick;
+      return this.observationTick;
     }
-    const r = resp.result as Record<string, unknown>;
-    let tick = r.current_tick as number | undefined;
-    if (typeof tick !== "number") {
-      tick = r.tick as number | undefined;
-    }
-    if (typeof tick === "number") {
-      this.lastKnownTick = tick;
-      return tick;
-    }
-    if (this.lastKnownTick !== null) {
-      this.log("debug", `current_tick not in response, using lastKnownTick=${this.lastKnownTick}`);
-    }
-    return null;
+    return this.lastKnownTick ?? null;
   }
 
   async awaitNextTick(pollIntervalMs = 5000): Promise<number> {
     const startTick = await this.pollCurrentTick();
     if (startTick === null) throw new Error("Could not determine current tick");
     while (this.state === "running") {
-      await new Promise(r => setTimeout(r, pollIntervalMs));
+      // Interruptible sleep so a stop request breaks out immediately
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, pollIntervalMs);
+        this._abortController?.signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          resolve();
+        }, { once: true });
+      });
+      if (this.state !== "running") throw new Error("Bot stopped while waiting for next tick");
       const nextTick = await this.pollCurrentTick();
       if (nextTick !== null && nextTick > startTick) return nextTick;
     }
@@ -3316,6 +3720,10 @@ getSkillLevel(skillId: string): number {
     this.currentBattle.battleId = null;
     this.currentBattle.participants = [];
     this.currentBattle.lastUpdate = Date.now();
+    this.currentBattle.yourStance = undefined;
+    this.currentBattle.yourZone = undefined;
+    this.currentBattle.yourSideId = undefined;
+    this.currentBattle.lastTick = undefined;
   }
 
   /**
@@ -3377,11 +3785,9 @@ getSkillLevel(skillId: string): number {
    * Anchors a watch at the current POI/system and returns the initial snapshot.
    * Subsequent updates arrive via observation_update push events.
    */
-async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> {
-     console.error(`[${this.username}] >>> subscribeToObservation called activeScan=${activeScan}`);
-     const libObs = this.libObservationState();
+  async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> {
+    const libObs = this.libObservationState();
     if (libObs.subscribed && !activeScan) {
-      console.error(`[${this.username}] >>> subscribeToObservation(library already active=true, porting cache)`);
       this.observationSession = { id: "active", poi_id: libObs.poiId, system_id: libObs.systemId };
       this.observationTick = libObs.tick;
       this.observationUnknownSignature = libObs.unknownSignature;
@@ -3389,10 +3795,10 @@ async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> 
       this.observationNearby = libObs.nearby;
       this.observationSystemAgents = libObs.systemAgents;
       this.log("observation", `Library observation already active (poi=${libObs.poiId} nearby=${libObs.nearby.length}) — ported cache`);
+      this.feedObservationIntoStore();
       return { result: { poi_id: libObs.poiId, system_id: libObs.systemId, nearby: libObs.nearby, system_agents: libObs.systemAgents, active_scan: libObs.activeScan, unknown_signature: libObs.unknownSignature }, error: undefined, notifications: [] };
     }
     if (libObs.subscribed && activeScan) {
-      console.error(`[${this.username}] >>> subscribeToObservation(library active=true, switching to activeScan)`);
       await this.libExec("subscribe_observation", { active_scan: true });
       const updated = this.libObservationState();
       this.observationSession = { id: "active", poi_id: updated.poiId, system_id: updated.systemId };
@@ -3402,23 +3808,21 @@ async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> 
       this.observationNearby = updated.nearby;
       this.observationSystemAgents = updated.systemAgents;
       this.log("observation", `Observation active scan enabled (poi=${updated.poiId} nearby=${updated.nearby.length})`);
+      this.feedObservationIntoStore();
       return { result: { poi_id: updated.poiId, system_id: updated.systemId, nearby: updated.nearby, system_agents: updated.systemAgents, active_scan: true, unknown_signature: updated.unknownSignature }, error: undefined, notifications: [] };
     }
-this.log("observation", `[${this.username}] >>> subscribeToObservation(activeScan=${activeScan}) calling libExec`);
     const resp = await this.libExec("subscribe_observation", { active_scan: activeScan });
-    this.log("observation", `[${this.username}] >>> subscribe_observation response: error=${resp.error ? resp.error.message : "none"}, result_type=${resp.result ? typeof resp.result : "undefined"}`);
     if (resp.error) {
       this.log("error", `subscribe_observation failed: ${resp.error.message}`);
       return resp;
     }
 
-const sc = resp.result as Record<string, unknown>;
-    this.log("observation", `[${this.username}] >>> subscribe_observation full response: ${JSON.stringify(sc)}`);
+    const sc = resp.result as Record<string, unknown>;
     const fresh = this.libObservationState();
 
-    // Determine nearby and systemAgents from response; if missing, use empty arrays
-    let nearby: Array<Record<string, unknown>> = Array.isArray(sc.nearby) ? sc.nearby as Array<Record<string, unknown>> : [];
-    let systemAgents: Array<Record<string, unknown>> = Array.isArray(sc.system_agents) ? sc.system_agents as Array<Record<string, unknown>> : [];
+    // Determine nearby and systemAgents from response; if missing, use the library cache
+    let nearby: Array<Record<string, unknown>> = Array.isArray(sc.nearby) ? sc.nearby as Array<Record<string, unknown>> : (fresh.nearby.length ? fresh.nearby : []);
+    let systemAgents: Array<Record<string, unknown>> = Array.isArray(sc.system_agents) ? sc.system_agents as Array<Record<string, unknown>> : (fresh.systemAgents.length ? fresh.systemAgents : []);
 
     // Update observation state
     this.observationSession = {
@@ -3435,7 +3839,10 @@ const sc = resp.result as Record<string, unknown>;
     this.log("debug", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length} agents=${this.observationSystemAgents.length})`);
     this.log("observation", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length})`);
 
-    // Return the original response
+    // Feed the baseline snapshot into the player tracker so arrival/departure
+    // lookups in fullPlayerInfo.json work from the very first update.
+    this.feedObservationIntoStore();
+
     return resp;
   }
 
@@ -3462,10 +3869,19 @@ const sc = resp.result as Record<string, unknown>;
   }
 
   /**
-   * Return a synthetic get_nearby-shaped result built from the live
-   * observation cache, so existing parseNearby() logic keeps working.
+   * Feed the current observation cache into the persistent player/name
+   * stores so that arrival/departure lookups work reliably. Called after
+   * subscribeToObservation baseline and after each observation_update.
    */
-getObservationResult(): Record<string, unknown> {
+  private feedObservationIntoStore(): void {
+    try { this.trackNearbyPlayers(this.getObservationResult()); } catch { /* ignore tracking errors */ }
+  }
+
+  /**
+    * Return a synthetic get_nearby-shaped result built from the live
+    * observation cache, so existing parseNearby() logic keeps working.
+    */
+  getObservationResult(): Record<string, unknown> {
 const allNearby = [...this.observationNearby, ...this.observationSystemAgents];
     const pirates: Record<string, unknown>[] = [];
     const creatures: Record<string, unknown>[] = [];
@@ -3522,11 +3938,13 @@ return {
 
   /**
    * Process an observation_update push event from the server and update
-   * the cached nearby / system_agent lists.
+   * the cached nearby / system_agent lists. Logs player arrivals and
+   * departures with resolved display names (falling back to player_id →
+   * fullPlayerInfo.json lookup).
    */
   private handleObservationUpdate(data: Record<string, unknown>): void {
     debugLogForBot(this.username, "bot:observation", `${this.username} >>> handleObservationUpdate received`);
-    
+
     const poiId = (data.poi_id as string) || this.observationSession?.poi_id || "";
     const systemId = (data.system_id as string) || this.observationSession?.system_id || "";
     const tick = (data.tick as number) || 0;
@@ -3543,60 +3961,99 @@ return {
     this.observationTick = tick;
     this.observationUnknownSignature = unknownSig;
 
-const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
-     const systemNpcMap = new Map<string, Record<string, unknown>>();
-     for (const e of this.observationNearby) {
-       const key = (e.username as string) || (e.player_id as string) || "";
-       if (key) nearbyPlayerMap.set(key, e);
-     }
-     for (const e of this.observationSystemAgents) {
-       const key = (e.username as string) || (e.player_id as string) || "";
-       if (key) systemNpcMap.set(key, e);
-     }
+    // Build a map keyed by player_id (primary) with username as fallback so
+    // that departure entries (which arrive as bare player_id strings) match
+    // the same entity that was previously inserted via nearby_changed.
+    const nearbyMap = new Map<string, Record<string, unknown>>();
+    for (const e of this.observationNearby) {
+      const key = (e.player_id as string) || (e.username as string) || "";
+      if (key) nearbyMap.set(key, e);
+    }
 
-     const departures: string[] = [];
-     if (Array.isArray(data.nearby_departed)) {
-       for (const pid of data.nearby_departed as string[]) {
-         nearbyPlayerMap.delete(pid);
-         departures.push(pid);
-       }
-     }
-     if (Array.isArray(data.system_departed)) {
-       for (const pid of data.system_departed as string[]) {
-         systemNpcMap.delete(pid);
-         departures.push(pid);
-       }
-     }
-     if (departures.length > 0) {
-       debugLogForBot(this.username, "bot:observation", `${this.username} observation departed: ${departures.join(", ")}`);
-       this.log("observation", `Departed: ${departures.join(", ")}`);
-     }
+    const arrivals = new Map<string, Record<string, unknown>>();
+    const departures: string[] = [];
 
-     if (Array.isArray(data.nearby_changed)) {
-       for (const e of data.nearby_changed as Array<Record<string, unknown>>) {
-         const key = (e.username as string) || (e.player_id as string) || "";
-         if (key) nearbyPlayerMap.set(key, e);
-       }
-     }
-     if (Array.isArray(data.system_changed)) {
-       for (const e of data.system_changed as Array<Record<string, unknown>>) {
-         const key = (e.username as string) || (e.player_id as string) || "";
-         if (key) systemNpcMap.set(key, e);
-       }
-     }
+    // Process departures (bare id strings)
+    const departureFields = ["nearby_departed", "pirates_departed", "empire_npcs_departed", "creatures_departed", "system_departed"] as const;
+    for (const field of departureFields) {
+      if (Array.isArray(data[field as string])) {
+        for (const id of data[field as string] as string[]) {
+          if (nearbyMap.delete(id)) {
+            departures.push(id);
+          } else {
+            // Key may be stored under a username; try removing by that too
+            nearbyMap.forEach((v, k) => {
+              if ((v.username as string) === id || (v.name as string) === id) {
+                nearbyMap.delete(k);
+                departures.push(id);
+              }
+            });
+          }
+        }
+      }
+    }
+    if (departures.length > 0) {
+      const names = departures.map((pid) => this.resolveEntityName(pid));
+      this.log("observation", `${span("Departed:", "ansi-yellow")} ${names.join(", ")}`);
+    }
 
-     this.observationNearby = Array.from(nearbyPlayerMap.values());
-     this.observationSystemAgents = Array.from(systemNpcMap.values());
+    // Process arrivals / state changes (full objects)
+    const changeFields = ["nearby_changed", "pirates_changed", "empire_npcs_changed", "creatures_changed", "system_changed"] as const;
+    for (const field of changeFields) {
+      if (Array.isArray(data[field as string])) {
+        for (const e of data[field as string] as Array<Record<string, unknown>>) {
+          const key = (e.player_id as string) || (e.username as string) || (e.id as string) || "";
+          if (!key) continue;
+          if (!nearbyMap.has(key)) {
+            arrivals.set(key, e);
+          }
+          nearbyMap.set(key, e);
+        }
+      }
+    }
+    if (arrivals.size > 0) {
+      const parts = Array.from(arrivals.values()).map((e) => {
+        const name = this.resolveEntityName((e.player_id as string) || (e.username as string) || (e.id as string) || "");
+        const ship = (e.ship_name as string) || (e.ship as string) || (e.ship_class as string) || "";
+        const faction = (e.faction_tag as string) || "";
+        const inCombat = (e.in_combat as boolean) ?? false;
+        let detail = span(name, "ansi-bright ansi-green");
+        if (ship) detail += ` [${ship}]`;
+        if (faction) detail += ` {${faction}}`;
+        if (inCombat) detail += ` ${span("⚔", "ansi-red")}`;
+        return detail;
+      });
+      this.log("observation", `${span("Arrived:", "ansi-green")} ${parts.join(", ")}`);
+    }
+
+    this.observationNearby = Array.from(nearbyMap.values());
 
     const cloakedResolved = Array.isArray(data.cloaked_resolved) ? (data.cloaked_resolved as Array<Record<string, unknown>>).length : 0;
     const cloakedLost = Array.isArray(data.cloaked_lost) ? (data.cloaked_lost as string[]).length : 0;
     if (cloakedResolved > 0 || cloakedLost > 0) {
       debugLogForBot(this.username, "bot:observation", `${this.username} observation cloaked: +${cloakedResolved} resolved, -${cloakedLost} lost`);
-      this.log("observation", `Cloaked: +${cloakedResolved} resolved, -${cloakedLost} lost`);
+      this.log("observation", `${span("Cloaked:", "ansi-cyan")} +${cloakedResolved} resolved, -${cloakedLost} lost`);
     }
 
+    // Feed the updated presence into the persistent player/name store so
+    // that future departure lookups (nearby_departed player_ids) can be
+    // resolved to display names via fullPlayerInfo.json.
+    this.feedObservationIntoStore();
+
     debugLogForBot(this.username, "bot:observation", `${this.username} observation snapshot: nearby=${this.observationNearby.length} system_agents=${this.observationSystemAgents.length} unknown=${this.observationUnknownSignature}`);
-    this.log("observation", `[tick ${tick}] nearby=${this.observationNearby.length} system_agents=${this.observationSystemAgents.length} unknown=${this.observationUnknownSignature}`);
+    this.log("observation", `${span("[tick " + tick + "]", "ansi-white")} nearby=${this.observationNearby.length} system_agents=${this.observationSystemAgents.length} unknown=${this.observationUnknownSignature}`);
+  }
+
+  /**
+   * Resolve a player_id (or fallback username/name) to a human-readable
+   * display name. Looks up the entity in the persistent player store
+   * (data/fullPlayerInfo.json) by id first, then by normalized name.
+   * Returns the raw key when no match is found.
+   */
+  private resolveEntityName(idOrName: string): string {
+    if (!idOrName) return "unknown";
+    const detail = playerNameStore.getEntityDetailById(idOrName) || playerNameStore.getEntityDetail(idOrName);
+    return detail?.name || idOrName;
   }
 
   /**
@@ -3645,6 +4102,21 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
       const notif = n as Record<string, unknown>;
       const type = notif.type as string | undefined;
       const msgType = notif.msg_type as string | undefined;
+      let data = notif.data as Record<string, unknown> | string | undefined;
+
+      // Emergency Warp Stabilizer detection via server push frames
+      if (type === "ok" && data && typeof data === "object" && (data as Record<string, unknown>).type === "emergency_warp_stabilizer_activated") {
+        this.triggerEmergencyWarpStabilizer();
+        continue;
+      }
+      if (type === "action_result" && data && typeof data === "object" && (data as Record<string, unknown>).command === "emergency_warp_stabilizer") {
+        this.triggerEmergencyWarpStabilizer();
+        continue;
+      }
+      if (msgType === "battle_left" && data && typeof data === "object" && (data as Record<string, unknown>).reason === "emergency_warp") {
+        this.triggerEmergencyWarpStabilizer();
+        continue;
+      }
 
       if (isCombatDebugEnabled()) {
         const battleTypes = new Set([
@@ -3659,7 +4131,6 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
 
       // Chat messages - route to AI chat handler and display
       if (msgType === "chat_message") {
-        const data = notif.data as Record<string, unknown> | undefined;
         if (data && typeof data === "object") {
           const channel = (data.channel as string) || "local";
           const sender = (data.sender as string) || "Unknown";
@@ -3727,9 +4198,21 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
           if (channel === "emergency" || content.includes("MAYDAY")) {
             const mayday = parseMaydayMessage(content, sender, Date.now(), this.username, this.system, this.poi);
             if (mayday) {
-              const added = addMaydayRequest(mayday);
-              if (added) {
-                this.log("mayday", `🚨 MAYDAY received from ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+              if (isIgnoredMaydaySender(mayday.sender)) {
+                // Settings → FuelRescue → "Ignore MAYDAYs from Wexler pilots".
+                // addMaydayRequest() also rejects these, so the call is skipped
+                // entirely here and only reported (throttled to one line per
+                // sender per minute) — the flood is precisely why it is filtered.
+                const { log: shouldLog, suppressed } = shouldLogIgnoredMayday(mayday.sender);
+                if (shouldLog) {
+                  const extra = suppressed > 0 ? ` (+${suppressed} more suppressed)` : "";
+                  this.log("mayday", `🚫 Ignoring MAYDAY from ${mayday.sender} — sender ignored by the FuelRescue Wexler filter${extra}`);
+                }
+              } else {
+                const added = addMaydayRequest(mayday);
+                if (added) {
+                  this.log("mayday", `🚨 MAYDAY received from ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+                }
               }
             } else {
               this.log("warn", `MAYDAY parse failed - message format may have changed. Content: "${content}"`);
@@ -3871,7 +4354,7 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
         continue;
       }
 
-      let data = notif.data as Record<string, unknown> | string | undefined;
+      data = notif.data as Record<string, unknown> | string | undefined;
       if (typeof data === "string") {
         try { data = JSON.parse(data) as Record<string, unknown>; } catch { /* leave as string */ }
       }
@@ -3891,20 +4374,26 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
             : this.currentBattle.participants;
           debugLogForBot(this.username, "bot:battle", `${this.username} battle_started: ${battleId}`);
         }
-       } else if (msgType === "battle_update" && data && typeof data === "object") {
-        const battleId = (data.battle_id as string) || "";
-        const tick = (data.tick as number) || 0;
-        const participants = Array.isArray(data.participants) ? data.participants : [];
-        
-        if (battleId) {
-          // We're in battle - update global state
-          this.currentBattle.inBattle = true;
-          this.currentBattle.battleId = battleId;
-          this.currentBattle.lastUpdate = Date.now();
-          this.currentBattle.participants = participants as Array<Record<string, unknown>>;
+        } else if (msgType === "battle_update" && data && typeof data === "object") {
+         const battleId = (data.battle_id as string) || "";
+         const tick = (data.tick as number) || 0;
+         const participants = Array.isArray(data.participants) ? data.participants : [];
+         
+         if (battleId) {
+           // We're in battle - update global state
+           this.currentBattle.inBattle = true;
+           this.currentBattle.battleId = battleId;
+           this.currentBattle.lastUpdate = Date.now();
+           this.currentBattle.participants = participants as Array<Record<string, unknown>>;
+           // Stash our own stance/zone/side_id/tick from the push notification —
+           // the get_battle_status API response doesn't include these fields.
+           this.currentBattle.yourStance = (data.your_stance as string) || undefined;
+           this.currentBattle.yourZone = (data.your_zone as string) || undefined;
+           this.currentBattle.yourSideId = (data.your_side_id as number) || undefined;
+           this.currentBattle.lastTick = tick > 0 ? tick : undefined;
 
-          debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
-        }
+           debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length} stance:${this.currentBattle.yourStance} zone:${this.currentBattle.yourZone} side:${this.currentBattle.yourSideId}`);
+         }
        } else if (msgType === "battle_ended" && data && typeof data === "object") {
         // Authoritative lib signal: the battle is over for everyone. Clear our
         // battle flag immediately so isInBattle() stops reporting a stale
@@ -3924,19 +4413,19 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
         if (isUs) {
           this.clearBattleState(`battle_left (${leftName || leftId || "us"})`);
         }
-       } else if (msgType === "battle_damage" && data && typeof data === "object") {
-         // Battle damage also indicates we're in battle
-         const attackerName = (data.attacker_name as string) || "";
-         const targetName = (data.target_name as string) || "";
-         const totalDamage = (data.total_damage as number) || 0;
+        } else if (msgType === "battle_damage" && data && typeof data === "object") {
+          // Battle damage also indicates we're in battle
+          const attackerName = (data.attacker_name as string) || "";
+          const targetName = (data.target_name as string) || "";
+          const totalDamage = (data.total_damage as number) || 0;
 
-         // CRITICAL: Set battle state on damage too (battle_update might not arrive first)
-         const battleId = (data.battle_id as string) || this.currentBattle.battleId || "";
-         if (battleId || attackerName) {
-           this.currentBattle.inBattle = true;
-           if (battleId) {
-             this.currentBattle.battleId = battleId;
-           }
+          // CRITICAL: Set battle state on damage too (battle_update might not arrive first)
+          const battleId = (data.battle_id as string) || this.currentBattle.battleId || "";
+          if (battleId || attackerName) {
+            this.currentBattle.inBattle = true;
+            if (battleId) {
+              this.currentBattle.battleId = battleId;
+            }
 this.currentBattle.lastUpdate = Date.now();
           }
 
@@ -3950,6 +4439,19 @@ this.currentBattle.lastUpdate = Date.now();
               this.lastBattleResponseMs = now;
               await this.sendBattleResponseToAI(attackerName, totalDamage);
 }
+          }
+        } else if (msgType === "ship_captured" && data && typeof data === "object") {
+          const captureData = data as Record<string, unknown>;
+          const capturedShipId = (captureData.ship_id as string) || "";
+          const capturedShipClass = (captureData.ship_class as string) || "";
+          const battleId = (captureData.battle_id as string) || this.currentBattle.battleId || "";
+          const captorId = (captureData.captor_id as string) || "";
+          const captorName = (captureData.captor_username as string) || "";
+          const formerOwnerName = (captureData.former_owner_username as string) || "";
+
+          if (capturedShipId && captorName === this.username) {
+            this.log("combat", `🎉 SHIP_CAPTURED: ${formerOwnerName || capturedShipClass} (ship_id=${capturedShipId}) — prize_id pending from get_nearby`);
+            this.registerCapturedPrize(capturedShipId, capturedShipClass, battleId);
           }
         } else if (msgType === "battle_alert" && data && typeof data === "object") {
          const alertData = data as Record<string, unknown>;
@@ -3992,12 +4494,19 @@ if (this.craftQueueTracker && jobId && recipeId) {
                if (completed) {
                  this.craftQueueTracker.markCompleted(jobId);
                  this.craftQueueTracker.save();
-               } else if (deposited.length > 0) {
-                 const depositedQty = deposited.reduce((sum, item) => sum + ((item.quantity as number) || 0), 0);
-                 const runsRemaining = (job.runs_remaining as number) || 0;
-                 this.craftQueueTracker.updateDeposited(jobId, depositedQty, runsRemaining);
-                 this.craftQueueTracker.save();
-               }
+                } else if (deposited.length > 0) {
+                  const runsRemaining = (job.runs_remaining as number) || 0;
+                  const tracked = this.craftQueueTracker.getJob(jobId);
+                  // job.quantity is stored in RUNS, but the deposited payload
+                  // carries OUTPUT ITEM quantities (e.g. 200 fuel_reserve per
+                  // run). Adding those to `completed` corrupts the run-based
+                  // progress and produces phantom "pending". Derive the completed
+                  // RUN count from the server's authoritative runs_remaining.
+                  const completedRuns = tracked ? Math.max(0, tracked.quantity - runsRemaining) : 0;
+                  const delta = tracked ? Math.max(0, completedRuns - tracked.completed) : 0;
+                  this.craftQueueTracker.updateDeposited(jobId, delta, runsRemaining);
+                  this.craftQueueTracker.save();
+                }
              }
 
             if (recipeId && deposited.length > 0) {
@@ -4476,39 +4985,98 @@ if (this.craftQueueTracker && jobId && recipeId) {
    * the creatureIds we no longer see (killed / despawned), which is what keeps
    * data/creatures from growing forever.
    */
-  trackWildlife(nearbyResult: unknown): void {
-    if (!nearbyResult || typeof nearbyResult !== "object") {
+   trackWildlife(nearbyResult: unknown): void {
+     if (!nearbyResult || typeof nearbyResult !== "object") {
+       return;
+     }
+
+     const data = nearbyResult as Record<string, unknown>;
+     // Only a response that actually carries a creature list may reconcile —
+     // a partial/unrelated payload must never be read as "no creatures here".
+     if (!Array.isArray(data.creatures)) return;
+     const creaturesArray = data.creatures as Array<Record<string, unknown>>;
+
+     const observed: ObservedCreature[] = [];
+     for (const entity of creaturesArray) {
+       const name = (entity.name as string) || "";
+       if (!name || !name.trim()) continue;
+       const hull = (entity.hull as number) || 0;
+       observed.push({
+         name: name.trim(),
+         creatureId: (entity.creature_id as string) || "",
+         species: (entity.species as string) || "",
+         role: (entity.role as string) || "",
+         maxHull: (entity.max_hull as number) || hull,
+       });
+     }
+
+      const nearbyData = nearbyResult as Record<string, unknown>;
+      const poi = (nearbyData.poi_id as string) || this.poi;
+
+      const result = wildlifeStore.reconcile(this.system, poi, observed);
+
+      if (result.newTypes > 0) {
+        this.log("wildlife", `Discovered ${result.newTypes} new wildlife creature(s) from nearby scan`);
+      }
+      if (result.prunedIds > 0 || result.prunedTypes > 0) {
+        debugLogForBot(this.username, "wildlife:prune", `${this.username}`,
+          `Pruned ${result.prunedIds} gone creature(s) / ${result.prunedTypes} type(s) at ${this.system}/${poi}`);
+      }
+    }
+
+  /** Register a captured prize ship from a ship_captured WebSocket notification.
+   *  Stores the mapping so we can find the prize_id in get_nearby by matching ship_id.
+   */
+  registerCapturedPrize(shipId: string, shipClass: string, battleId: string, prizeId?: string): void {
+    if (!shipId) return;
+    const existing = this.capturedPrizeTracker.get(shipId);
+    if (existing && existing.prize_id) {
       return;
     }
+    this.capturedPrizeTracker.set(shipId, {
+      prize_id: prizeId || "",
+      ship_id: shipId,
+      ship_class: shipClass,
+      battle_id: battleId,
+      timestamp: Date.now(),
+      claim_verified: existing?.claim_verified ?? false,
+    });
+    this.log("combat", `📦 Registered captured prize: ship_id=${shipId} class=${shipClass} battle=${battleId}${prizeId ? ` prize_id=${prizeId}` : " (prize_id pending)"}`);
+  }
 
-    const data = nearbyResult as Record<string, unknown>;
-    // Only a response that actually carries a creature list may reconcile —
-    // a partial/unrelated payload must never be read as "no creatures here".
-    if (!Array.isArray(data.creatures)) return;
-    const creaturesArray = data.creatures as Array<Record<string, unknown>>;
-
-    const observed: ObservedCreature[] = [];
-    for (const entity of creaturesArray) {
-      const name = (entity.name as string) || "";
-      if (!name || !name.trim()) continue;
-      const hull = (entity.hull as number) || 0;
-      observed.push({
-        name: name.trim(),
-        creatureId: (entity.creature_id as string) || "",
-        species: (entity.species as string) || "",
-        role: (entity.role as string) || "",
-        maxHull: (entity.max_hull as number) || hull,
-      });
+  markPrizeClaimVerified(shipId: string): void {
+    const entry = this.capturedPrizeTracker.get(shipId);
+    if (entry) {
+      entry.claim_verified = true;
     }
+  }
 
-    const result = wildlifeStore.reconcile(this.system, this.poi, observed);
+  /** Look up a captured prize by ship_id. Returns the tracker entry or undefined. */
+  getCapturedPrizeByShipId(shipId: string): { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number; claim_verified: boolean } | undefined {
+    return this.capturedPrizeTracker.get(shipId);
+  }
 
-    if (result.newTypes > 0) {
-      this.log("wildlife", `Discovered ${result.newTypes} new wildlife creature(s) from nearby scan`);
+  /** Find a captured prize entry matching a nearby prize by ship_id. */
+  findCapturedPrizeMatch(prize: { ship_id?: string; prize_id?: string; status?: string }): { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number; claim_verified: boolean } | undefined {
+    if (!prize.ship_id) return undefined;
+    const entry = this.capturedPrizeTracker.get(prize.ship_id);
+    if (entry) return entry;
+    // Also try matching by prize_id if we already know it
+    if (prize.prize_id) {
+      for (const val of this.capturedPrizeTracker.values()) {
+        if (val.prize_id === prize.prize_id) return val;
+      }
     }
-    if (result.prunedIds > 0 || result.prunedTypes > 0) {
-      debugLogForBot(this.username, "wildlife:prune", `${this.username}`,
-        `Pruned ${result.prunedIds} gone creature(s) / ${result.prunedTypes} type(s) at ${this.system}/${this.poi}`);
+    return undefined;
+  }
+
+  /** Clear old captured prize entries (older than 5 minutes) to prevent memory bloat. */
+  pruneStaleCapturedPrizes(): void {
+    const cutoff = Date.now() - 5 * 60_000;
+    for (const [shipId, entry] of this.capturedPrizeTracker) {
+      if (entry.timestamp < cutoff) {
+        this.capturedPrizeTracker.delete(shipId);
+      }
     }
   }
 
@@ -4815,6 +5383,7 @@ if (this.craftQueueTracker && jobId && recipeId) {
       isCloaked: this.isCloaked,
       hasEmergencyWarpStabilizer: this.hasEmergencyWarpStabilizer,
       bounties: this.bounties,
+      prizeRecoveries: this.prizeRecoveries,
       inBattle: this.currentBattle.inBattle,
       battleId: this.currentBattle.battleId,
     };
@@ -4849,10 +5418,15 @@ const CATEGORY_COLORS: Record<string, string> = {
   scavenge: "\x1b[33m",
   rescue: "\x1b[96m",
   alert: "\x1b[91m",
+  observation: "\x1b[36m",
 };
 
 function getCategoryColor(category: string): string {
   return CATEGORY_COLORS[category] || CATEGORY_COLORS.info;
+}
+
+function span(value: string, cls: string): string {
+  return `<span class="${cls}">${value}</span>`;
 }
 
 function sleep(ms: number): Promise<void> {

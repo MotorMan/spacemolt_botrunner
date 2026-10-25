@@ -20,14 +20,112 @@ import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 // ── Settings ─────────────────────────────────────────────────
 
 const QUEUE_REFRESH_COOLDOWN = 60000;
-let lastQueueCheck = 0;
-let cachedQueueJobs: ServerJobInfo[] = [];
+// NOTE: the queue cache used to live here at MODULE level (lastQueueCheck /
+// cachedQueueJobs). Because all drones share one module scope when run in a
+// single process, that leaked one drone's queue into every other drone (the
+// "148k phantom fuel pending" bug). The cache now lives PER-BOT on
+// `bot.craftQueueCache` — see checkCraftingQueue().
 
-// Round-robin cursor per recipe so multiple same-type facilities share the load.
-const facilityRoundRobin = new Map<string, number>();
-// Recipes we've already warned about not having an owned facility for (dedupe per run).
-const notifiedMissingFacilities = new Set<string>();
+// HTML markup for log lines rendered in the web UI.
+// The dashboard's ANSI parser is unreliable for inline spans, so we inject
+// explicit <span class="ansi-..."> tags directly. The CSS classes are defined
+// in index.css.
+const HTML_RESET = '</span>';
+const HTML_BOLD_RED = '<span class="ansi-red ansi-bright">';
+const HTML_RED = '<span class="ansi-red">';
+const HTML_GREEN = '<span class="ansi-green">';
+const HTML_YELLOW = '<span class="ansi-yellow">';
+const HTML_CYAN = '<span class="ansi-cyan">';
+
+/** Wrap `value` in a colored HTML span. */
+function span(value: string, cls: string): string {
+  return `<span class="${cls}">${value}</span>`;
+}
+
+/** Markup for `NOT Crafting: Name (id): item: LOW:N of M` lines. */
+function markupNotCrafting(recipeName: string, recipeId: string, lowMaterials: string[]): string {
+  const colored = lowMaterials
+    .map(s => {
+      const [mat, rest] = s.split(": ");
+      const m = rest.match(/^(LOW:\d+)\s+(of)\s+(\d+)$/);
+      if (!m) return `${mat}: ${span(rest, "ansi-red")}`;
+      const [, lowPart, ofPart, triggerStr] = m;
+      return `${mat}: ${span(lowPart, "ansi-red ansi-bright")} ${ofPart} ${span(triggerStr, "ansi-green")}`;
+    })
+    .join(", ");
+  return `${span("NOT Crafting:", "ansi-yellow")} ${recipeName} (${recipeId}): ${colored}`;
+}
+
+/** Markup for held/cap log lines (`... at N >= cap M`). */
+function markupHeld(prefix: string, outItem: string, have: number, cap: number): string {
+  return `${prefix} output ${outItem} at ${span(`${have} >= cap ${cap}`, "ansi-green")}`;
+}
+
+/** Markup for a fired trigger summary (`item>N->stop M`). */
+function markupSummary(items: { item: string; triggerAt: number; stopAt: number }[]): string {
+  return items.map(t => `${t.item}>${span(String(t.triggerAt), "ansi-cyan")}→stop ${span(String(t.stopAt), "ansi-green")}`).join(", ");
+}
+
+// Sentinel for the "crafting home base storage" setting. When a crafter's
+// craftingHomeBase equals this, it reads the faction storage of the station it
+// is CURRENTLY docked at instead of a fixed global station. This lets multiple
+// crafters stationed at different bases each pull materials from their own
+// station rather than all sharing one configured home base (which made roaming
+// crafters "lose" their stock and wrongly re-smelt everything).
+const CRAFTER_USE_DOCKED_STATION = "@current";
+
+// Resolve the args for refreshFactionStorage so a "@current" home base reads the
+// docked station, while a real station id (or empty -> bot default) reads that.
+function factionStorageRefreshArgs(homeBase: string): {
+  stationId?: string;
+  readCurrentStation: boolean;
+} {
+  if (homeBase === CRAFTER_USE_DOCKED_STATION) {
+    return { stationId: undefined, readCurrentStation: true };
+  }
+  return { stationId: homeBase || undefined, readCurrentStation: false };
+}
+
+// Read the docked/base station fuel into bot.homeBaseFuel so fuel_reserve goals
+// compare against accurate data. A "@current" home base reads the station the
+// bot is docked at (get_base with no base_id); a real id reads that station; an
+// empty string leaves the fuel untouched (preserving previous behavior).
+async function refreshCrafterBaseFuel(
+  bot: any,
+  homeBase: string,
+  log?: (level: string, msg: string) => void,
+): Promise<void> {
+  if (!homeBase) return;
+  const useCurrent = homeBase === CRAFTER_USE_DOCKED_STATION;
+  const baseResp = await (useCurrent
+    ? bot.exec("get_base", {})
+    : bot.exec("get_base", { base_id: homeBase })
+  ).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
+  if (baseResp.error || !baseResp.result) {
+    if (log && baseResp.error) {
+      log("warn", `[get_base] failed for ${useCurrent ? "docked station" : homeBase}: ${baseResp.error.message}`);
+    }
+    return;
+  }
+  const baseObj = baseResp.result as Record<string, unknown>;
+  const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
+  const newFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
+  const newMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
+  if (log && (newFuel !== bot.homeBaseFuel || newMaxFuel !== bot.homeBaseMaxFuel)) {
+    log("craft", `[get_base] ${useCurrent ? "docked station" : homeBase}: fuel=${newFuel}/${newMaxFuel}`);
+  }
+  bot.homeBaseFuel = newFuel;
+  bot.homeBaseMaxFuel = newMaxFuel;
+}
+
+// Round-robin cursor and missing-facility dedupe used to live at MODULE level
+// here, but that shared them across every drone in a process. They are now
+// per-bot on `bot.facilityRoundRobin` / `bot.notifiedMissingFacilities`
+// (see pickRoundRobinFacility / queueCraftJob / the main routine).
+
 // Cumulative rental spend since the bot started (gated by rentalSpendingLimit).
+// NOTE: this is intentionally shared/session-wide is NOT per-bot; if multiple
+// drones each rent, the cap should be the operator's global budget anyway.
 let rentalSpentThisSession = 0;
 
 interface CraftLimit {
@@ -35,9 +133,90 @@ interface CraftLimit {
   limit: number;
 }
 
+// A single material threshold that arms a recipe's auto-craft "trigger" mode.
+// When the live count of `item` rises ABOVE `triggerAt`, the recipe is eligible
+// to start; once started it queues enough runs to bring `item` back DOWN to
+// `stopAt`. Multiple entries (one per required component) are ANDed: every
+// material must be above its own trigger before the recipe fires, and the run
+// count is sized so the *limiting* material lands exactly on its stop point.
+export interface MaterialTrigger {
+  item: string;
+  triggerAt: number;
+  stopAt: number;
+}
+
+// Per-recipe material-trigger configuration.
+export interface RecipeTriggerConfig {
+  // One entry per required INPUT material. The recipe fires only when ALL are
+  // above their `triggerAt`, and queues enough runs to bring each down to its
+  // `stopAt` (the limiting material wins).
+  materials: MaterialTrigger[];
+  // Optional cap on the recipe's OUTPUT item. When the output stock is at or
+  // above this, the trigger will NOT fire — hysteresis so we stop producing once
+  // we already have enough of the result (e.g. hold at 20k of a grown good and
+  // only re-trigger once stock drops back below that).
+  maxOutput?: number;
+  // Optional firing priority within a cycle. Lower number fires first. Used to
+  // arbitrate when several recipes share the same INPUT materials: the
+  // highest-priority one consumes the surplus first, and lower-priority ones see
+  // the reduced stock (via the in-cycle budget) and hold off when there isn't
+  // enough left to reach their own stop point.
+  priority?: number;
+  // When true, the material trigger will queue additional runs even if a job
+  // for the same recipe is already in-flight. Useful for slow recipes where
+  // you want continuous production instead of waiting for the current batch
+  // to finish.
+  allowDuplicateJobs?: boolean;
+}
+
 interface CrafterProfile {
   name: string;
   craftLimits: CraftLimit[];
+  // Per-recipe material triggers (see RecipeTriggerConfig). Keyed by recipe id.
+  recipeTriggers?: Record<string, RecipeTriggerConfig>;
+}
+
+// Normalize the (possibly legacy / loosely-shaped) recipeTriggers map into the
+// typed RecipeTriggerConfig form. Accepts either the new object form
+// { materials: [...], maxOutput, priority } or the legacy bare-array form
+// ([{ item, triggerAt, stopAt }]).
+function normalizeRecipeTriggers(
+  raw: Record<string, unknown> | undefined,
+): Record<string, RecipeTriggerConfig> {
+  const out: Record<string, RecipeTriggerConfig> = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [recipeId, val] of Object.entries(raw)) {
+    if (!recipeId || !val) continue;
+    const validMaterial = (t: any): t is { item: unknown; triggerAt: unknown; stopAt: unknown } =>
+      !!t && typeof t.item === "string" && t.item &&
+      typeof t.triggerAt === "number" && typeof t.stopAt === "number" &&
+      t.triggerAt >= t.stopAt;
+    let materials: MaterialTrigger[] = [];
+    let maxOutput: number | undefined;
+    let priority: number | undefined;
+    if (Array.isArray(val)) {
+      materials = (val as unknown[])
+        .filter(validMaterial)
+        .map(t => ({ item: (t.item as string).toLowerCase(), triggerAt: t.triggerAt as number, stopAt: t.stopAt as number }));
+    } else if (typeof val === "object") {
+      const obj = val as Record<string, unknown>;
+      const rawMats = (obj.materials as unknown[]) || [];
+      materials = (Array.isArray(rawMats) ? rawMats : [])
+        .filter(validMaterial)
+        .map(t => ({ item: (t.item as string).toLowerCase(), triggerAt: t.triggerAt as number, stopAt: t.stopAt as number }));
+      if (typeof obj.maxOutput === "number" && obj.maxOutput >= 0) maxOutput = obj.maxOutput;
+      if (typeof obj.priority === "number") priority = obj.priority;
+    }
+    const allowDuplicateJobs = (val as any)?.allowDuplicateJobs === true;
+    if (materials.length > 0) {
+      const cfg: RecipeTriggerConfig = { materials };
+      if (maxOutput !== undefined) cfg.maxOutput = maxOutput;
+      if (priority !== undefined) cfg.priority = priority;
+      if (allowDuplicateJobs) cfg.allowDuplicateJobs = true;
+      out[recipeId] = cfg;
+    }
+  }
+  return out;
 }
 
 async function getCrafterSettings(): Promise<{
@@ -107,7 +286,7 @@ async function getCrafterSettings(): Promise<{
 
   let crafters: CrafterProfile[] = [];
   if (Array.isArray(c.crafters)) {
-    crafters = (c.crafters as Array<{name: string, craftLimits: any}>).map(profile => {
+    crafters = (c.crafters as Array<{name: string, craftLimits: any, recipeTriggers?: any}>).map(profile => {
       const rawLimits = profile.craftLimits || [];
       const craftLimits: CraftLimit[] = [];
       if (Array.isArray(rawLimits)) {
@@ -123,7 +302,9 @@ async function getCrafterSettings(): Promise<{
           }
         }
       }
-      return { name: profile.name || 'Unnamed Crafter', craftLimits };
+      // Material triggers: { [recipeId]: { materials, maxOutput, priority } }.
+      const recipeTriggers = normalizeRecipeTriggers(profile.recipeTriggers as any);
+      return { name: profile.name || 'Unnamed Crafter', craftLimits, recipeTriggers };
     });
   } else if (c.craftLimits) {
     const rawLimits = c.craftLimits;
@@ -142,7 +323,11 @@ async function getCrafterSettings(): Promise<{
       }
     }
     if (craftLimits.length > 0) {
-      crafters.push({ name: "Default Crafter", craftLimits });
+      // Legacy global recipeTriggers key (flat object), for configs that still
+      // use the old flat craftLimits format. New configs nest it under each
+      // crafter profile instead.
+      const recipeTriggers = normalizeRecipeTriggers(c.recipeTriggers as any);
+      crafters.push({ name: "Default Crafter", craftLimits, recipeTriggers });
     }
   }
 
@@ -308,6 +493,7 @@ export async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
   const { bot } = ctx;
   const all: Recipe[] = [];
   let page = 1;
+  let totalPages = 1;
   while (true) {
     const resp = await bot.exec("catalog", { type: "recipes", page, page_size: 50 });
     if (resp.error) {
@@ -317,9 +503,15 @@ export async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
     const parsed = parseRecipes(resp.result);
     all.push(...parsed);
     const r = resp.result as Record<string, unknown> | undefined;
-    const totalPages = (r?.total_pages as number) || 1;
+    totalPages = (r?.total_pages as number) || 1;
+    if (page === 1 && totalPages === 1 && all.length < 50) {
+      ctx.log("warn", `Catalog API returned only ${all.length} recipes on page 1 with total_pages=1 — pagination may be broken (expected ${r?.total || "?"} total)`);
+    }
     if (page >= totalPages || parsed.length === 0) break;
     page++;
+  }
+  if (all.length > 0) {
+    ctx.log("debug", `fetchAllRecipes: ${all.length} total across ${page} page(s), total_pages=${totalPages}`);
   }
   return all;
 }
@@ -496,10 +688,13 @@ async function refreshFacilityMaps(
 }
 
 // Distribute jobs across multiple owned facilities of the same type by
-// round-robining through them in a stable order.
-function pickRoundRobinFacility(recipeId: string, facilities: FactionFacility[]): FactionFacility {
-  const idx = (facilityRoundRobin.get(recipeId) || 0) % facilities.length;
-  facilityRoundRobin.set(recipeId, idx + 1);
+// round-robining through them in a stable order. The cursor is per-bot
+// (bot.facilityRoundRobin) so drones in a shared process don't collide on the
+// same facility index for the same recipe.
+function pickRoundRobinFacility(recipeId: string, facilities: FactionFacility[], bot: any): FactionFacility {
+  const cursor = bot.facilityRoundRobin;
+  const idx = (cursor.get(recipeId) || 0) % facilities.length;
+  cursor.set(recipeId, idx + 1);
   return facilities[idx];
 }
 
@@ -555,11 +750,12 @@ export function resolveVenueForRecipe(
   recipeName: string,
   ownFacilityMap: OwnFacilityMap,
   settings: CrafterSettings,
+  bot?: any,
 ): ResolvedVenue {
   if (settings.forceOwnFacility) {
     const facs = ownFacilityMap.get(recipeId) || [];
     if (facs.length > 0) {
-      const fac = pickRoundRobinFacility(recipeId, facs);
+      const fac = pickRoundRobinFacility(recipeId, facs, bot);
       return {
         facilityId: fac.facility_id,
         preset: settings.craftingPreset,
@@ -597,17 +793,32 @@ export function resolveVenueForRecipe(
 
 // ── Queue-focused crafting logic ──────────────────────────────
 
-async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = false): Promise<ServerJobInfo[]> {
+interface CraftQueueRead {
+  // False when the `craft queue` read itself failed (transport error / server
+  // error). Callers must NOT treat that as "the queue is empty": doing so made
+  // the tracker count missing syncs against real in-flight jobs and eventually
+  // forget them, after which the planner re-queued work that was already running.
+  ok: boolean;
+  jobs: ServerJobInfo[];
+}
+
+async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = false): Promise<CraftQueueRead> {
   const now = Date.now();
-  if (!forceRefresh && now - lastQueueCheck < QUEUE_REFRESH_COOLDOWN) {
-    return cachedQueueJobs;
+  const cache = bot.craftQueueCache;
+  if (!forceRefresh && now - cache.lastQueueCheck < QUEUE_REFRESH_COOLDOWN) {
+    return { ok: cache.lastQueueCheck > 0, jobs: cache.jobs };
   }
-  
-  const resp = await bot.exec("craft", { action: "queue" });
+
+  const resp = await bot.exec("craft", { action: "queue" }).catch((e: any) => ({
+    error: { message: (e as Error)?.message || String(e) },
+    result: undefined,
+  }));
   if (resp.error) {
-    return [];
+    // Hand back the last known jobs but flag the read as failed so nobody
+    // mistakes a failed fetch for an empty queue.
+    return { ok: false, jobs: cache.jobs };
   }
-  lastQueueCheck = now;
+  cache.lastQueueCheck = now;
   
   const result = resp.result as Record<string, unknown> | undefined;
   const details = (result as Record<string, unknown>)?.details as Record<string, unknown> | undefined;
@@ -626,13 +837,23 @@ async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = fa
     }
     recipeIdToId.set(r.recipe_id, r.recipe_id);
   }
-  cachedQueueJobs = jobs.map((job: Record<string, unknown>) => {
+  cache.jobs = jobs.map((job: Record<string, unknown>) => {
     const recipeName = ((job.recipe as string) || "").toLowerCase();
     const recipeFromId = (job.recipe as string) || "";
-    const recipeId = recipeNameToId.get(recipeName) 
-      || recipeOutputNameToId.get(recipeName) 
+    // The `craft` queue response carries an authoritative server `recipe_id`
+    // (the same id the crafting_update websocket events use). Prefer it over the
+    // display `recipe` name: matching on the display name is fragile — when it
+    // fails (e.g. "Fuel Reserve" vs "Manufacture Fuel (H2O2)") the job gets
+    // keyed under a junk string, so `tracker.getProgress(recipeId)` reports 0
+    // pending even though the job is live. That was the root cause of the
+    // crafter endlessly re-queuing the same recipe and blowing past its limit.
+    const serverRecipeId = (job.recipe_id as string) || "";
+    const recipeId = (serverRecipeId && (recipeIdToId.get(serverRecipeId.toLowerCase()) || recipeIdToId.get(serverRecipeId)))
+      || recipeNameToId.get(recipeName)
+      || recipeOutputNameToId.get(recipeName)
       || recipeOutputItemToId.get(recipeName)
       || recipeIdToId.get(recipeFromId)
+      || serverRecipeId
       || recipeFromId;
     return {
       jobId: (job.job_id as string) || "",
@@ -641,8 +862,34 @@ async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = fa
       runsDone: (job.runs_done as number) || 0,
       runsRemaining: (job.runs_remaining as number) || 0,
     };
-  }).filter(j => j.jobId && j.recipeId);
-  return cachedQueueJobs;
+  }).filter((j: ServerJobInfo) => j.jobId && j.recipeId);
+  return { ok: true, jobs: cache.jobs };
+}
+
+// Aggregate, per recipe_id, how many RUNS are still pending in the live `craft`
+// queue (server-authoritative). This is the single source of truth for "how much
+// is already in flight" and must NOT depend on the in-memory tracker's
+// recipeIndex (which can be wiped by a transiently-incomplete fetch — see
+// syncWithServer). Everything that needs pending (goal deficits, dedup, the
+// hard limit clamp) should read from here so the crafter always "respects the
+// live queue info from craft".
+async function computeLivePendingRuns(
+  bot: any,
+  recipes: Recipe[],
+  forceRefresh = true,
+): Promise<Map<string, number>> {
+  const { ok, jobs: serverJobs } = await checkCraftingQueue(bot, recipes, forceRefresh);
+  const pending = new Map<string, number>();
+  // A failed read means "unknown", not "nothing pending". Returning an empty map
+  // makes every call site fall back to the in-memory tracker (`?? tracker...`),
+  // which is the closest thing we have to the truth until the next good read.
+  if (!ok) return pending;
+  for (const j of serverJobs) {
+    if (!j.recipeId) continue;
+    const remain = Math.max(0, Math.min(j.quantity - j.runsDone, j.runsRemaining));
+    pending.set(j.recipeId, (pending.get(j.recipeId) || 0) + remain);
+  }
+  return pending;
 }
 
 async function getEstimatedCraftingTime(recipeId: string, recipes: Recipe[]): Promise<number> {
@@ -677,13 +924,99 @@ function reportQueueStatus(ctx: RoutineContext, tracker: CraftQueueTracker, reci
 
 async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker, recipes: Recipe[], forceRefresh = false): Promise<void> {
   const { bot } = ctx;
-  const serverJobs = await checkCraftingQueue(bot, recipes, forceRefresh);
+  const { ok, jobs: serverJobs } = await checkCraftingQueue(bot, recipes, forceRefresh);
+  if (!ok) {
+    // Do NOT reconcile against a failed read: syncWithServer would count this as
+    // a "missing sync" for every live job and eventually forget them.
+    ctx.log("warn", "craft queue read failed - keeping previously tracked jobs (not treating the queue as empty)");
+    return;
+  }
   tracker.syncWithServer(serverJobs);
   // Drop any job we track locally whose recipe no longer resolves to a known
   // catalog recipe — these are phantom jobs (stale session state, or jobs the
   // queue poller couldn't match) that would otherwise inflate "pending" output.
   tracker.prunePhantomJobs(new Set(recipes.map(r => r.recipe_id)));
-  tracker.save();
+
+  // PRESERVE the stall timestamp for fuel jobs that are undrainable (tank full).
+  // syncWithServer() above "refreshes" lastProgressAt every read even when a job
+  // hasn't actually advanced; a full-tank fuel job would otherwise never look
+  // stalled and we'd never cancel it. If the tank is full and the job still has
+  // runs left, keep counting the stall from when it first got wedged.
+  const maxFuel = bot.homeBaseMaxFuel || 0;
+  const fuel = bot.homeBaseFuel || 0;
+  const tankFull = maxFuel > 0 && fuel >= maxFuel * 0.98;
+  if (tankFull) {
+    const recipeById = new Map(recipes.map(r => [r.recipe_id, r]));
+    for (const job of tracker.getActiveJobs()) {
+      if (job.completed >= job.quantity) continue;
+      const recipe = recipeById.get(job.recipeId);
+      if (recipe && outputsFuelReserve(recipe)) {
+        tracker.pinStallSince(job.jobId, job.lastProgressAt);
+      }
+    }
+  }
+
+  // Auto-cancel jobs the server keeps listing but that have made NO progress for
+  // a long time AND are genuinely blocked from completing (their output has
+  // nowhere to go). A fuel_reserve job whose station tank is already full is the
+  // classic case: the remaining runs can never deposit, so the server holds them
+  // "queued" forever. That both blocks fresh top-up work and pollutes the
+  // "pending" count — which is exactly what wedged this crafter for hours.
+  //
+  // We only cancel when ALL of: the job lists runs left, it has been stalled well
+  // past any legitimate craft time, and it is for a fuel_reserve recipe whose
+  // station tank is essentially full. We deliberately do NOT cancel every long-
+  // stalled job: many recipes simply sit waiting for an input and are fine to
+  // leave queued, and cancelling would waste whatever was reserved for them.
+  await autoCancelUndrainableJobs(ctx, tracker, recipes, bot);
+}
+
+// Cancel fuel_reserve jobs whose output literally cannot be deposited: when the
+// station's fuel tank is essentially full the server parks those remaining runs
+// "queued" forever. Left alone that job (a) blocks the crafter from queueing the
+// next top-up (the deficit logic treats it as in-flight forever) and (b) keeps a
+// fake "pending" count alive — which is precisely why the crafter could sit for
+// hours never issuing a new fuel run even though the tank wasn't being topped
+// up. We only cancel after a long stall so a run that is merely being produced
+// quickly, or waiting on an input, is never disturbed.
+async function autoCancelUndrainableJobs(
+  ctx: RoutineContext,
+  tracker: CraftQueueTracker,
+  recipes: Recipe[],
+  bot: any,
+): Promise<void> {
+  const { log } = ctx;
+  const maxFuel = bot.homeBaseMaxFuel || 0;
+  const fuel = bot.homeBaseFuel || 0;
+  // Tank must be essentially full or this run is not undrainable — leave it.
+  if (maxFuel <= 0 || fuel < maxFuel * 0.98) return;
+
+  const recipeById = new Map(recipes.map(r => [r.recipe_id, r]));
+  const STALL_CANCEL_MS = 30 * 60 * 1000;
+  for (const job of tracker.findStalledJobs(STALL_CANCEL_MS)) {
+    if (job.completed >= job.quantity) continue;
+    const recipe = recipeById.get(job.recipeId);
+    if (!recipe || !outputsFuelReserve(recipe)) continue;
+    // One warning per job before we act, so it isn't a silent cancellation.
+    const firstSeen = tracker.markStallWarned(job.jobId);
+    if (firstSeen) {
+      const mins = Math.round((Date.now() - job.lastProgressAt) / 60000);
+      log(
+        "warn",
+        `Crafting job ${job.jobId} (${recipe.name}) has not advanced in ${mins}m and the fuel tank is full ` +
+        `(${fuel}/${maxFuel}) - its remaining ${job.runsRemaining} run(s) cannot deposit, so it will be cancelled in a moment ` +
+        `to let the crafter top up again.`,
+      );
+    }
+    // Give the operator one sync cycle to notice, then cancel.
+    const resp = await bot.exec("craft", { job_id: job.jobId }).catch(() => ({ error: { message: "cancel failed" } }));
+    if (resp.error) {
+      log("warn", `Failed to cancel undrainable job ${job.jobId}: ${resp.error.message}`);
+      continue;
+    }
+    tracker.forgetJob(job.jobId);
+    log("craft", `Cancelled undrainable fuel job ${job.jobId} (${job.runsRemaining} run(s) could not deposit into a full tank)`);
+  }
 }
 
 function calculateMaxCraftable(
@@ -703,6 +1036,317 @@ function calculateMaxCraftable(
 
   if (maxRuns === Infinity) return 0;
   return maxRuns;
+}
+
+// ── Material-triggered crafting ───────────────────────────────
+//
+// A material trigger lets a recipe auto-fire when its INPUT materials pile up
+// past a "trigger" threshold and craft back down to a "stop" threshold. This is
+// the inverse of the normal craftLimit (which maintains a stock of OUTPUT): it
+// is for "I keep mining iron_ore and want to convert the surplus into steel,
+// but stop before I run the stock dry — e.g. wait until iron_ore > 490k, then
+// refine until iron_ore drops to 200k."
+//
+// `evaluateRecipeTrigger` is pure (no I/O) so it can be unit-tested directly.
+
+export function evaluateRecipeTrigger(
+  recipe: Recipe,
+  triggers: MaterialTrigger[] | undefined,
+  countItemFn: (itemId: string) => number,
+): number | null {
+  if (!triggers || triggers.length === 0) return null;
+  let runs = Infinity;
+  let matchedAnyComponent = false;
+  for (const t of triggers) {
+    const current = countItemFn(t.item.toLowerCase());
+    // The trigger item must actually be a component of this recipe, otherwise we
+    // have no way to convert it. Skip (don't count) entries that don't match
+    // BEFORE checking the threshold: a non-component material in the trigger
+    // config (e.g. a stale or typo'd entry) must NOT cause the whole recipe to
+    // fail to fire when the real components are above their triggers.
+    const comp = recipe.components.find(
+      c => c.item_id.toLowerCase() === t.item.toLowerCase(),
+    );
+    if (!comp) continue;
+    matchedAnyComponent = true;
+    // Every material must be ABOVE its trigger point before we start. Because
+    // queued jobs immediately remove their materials from storage, `countItemFn`
+    // already reflects only the FREE stock — so re-firing while a previous batch
+    // is in flight is safe: we simply size from whatever is still free.
+    if (!(current > t.triggerAt)) return null;
+    const perRun = comp.quantity || 1;
+    const surplus = current - t.stopAt;
+    const batchSize = t.triggerAt - t.stopAt;
+    const toCraft = Math.floor(Math.min(surplus, batchSize) / perRun);
+    if (toCraft <= 0) return null; // already at/below the stop point
+    runs = Math.min(runs, toCraft);
+  }
+  if (!matchedAnyComponent) return null;
+  return runs === Infinity ? null : runs;
+}
+
+/**
+ * Evaluate and queue every material-triggered recipe for the active crafter
+ * profile. Returns how many recipes fired and how many successfully queued.
+ *
+ * A recipe fires when all of its material triggers are above their `triggerAt`
+ * on the RAW live stock, and we size the run count from the AVAILABLE material
+ * (raw stock minus what is already committed by in-flight and same-cycle jobs)
+ * so it brings the LIMITING material down to its `stopAt` without ever draining
+ * below it. Because sizing is based on uncommitted material, a recipe can
+ * re-fire while a previous batch is still in flight — it simply won't queue more
+ * than the surplus that hasn't already been claimed. The whole batch is queued
+ * in one shot (exactly like the user's "just put that all in one queue"
+ * expectation).
+ */
+export async function processRecipeTriggers(
+  ctx: RoutineContext,
+  bot: any,
+  recipes: Recipe[],
+  recipeTriggers: Record<string, RecipeTriggerConfig> | undefined,
+  ownFacilityMap: OwnFacilityMap,
+  settings: CrafterSettings,
+  countItemFn: (itemId: string) => number,
+  tracker: CraftQueueTracker,
+  livePendingRuns?: Map<string, number>,
+  outputLimits?: Map<string, number>,
+): Promise<{ fired: number; queued: number }> {
+  const { log } = ctx;
+  const result = { fired: 0, queued: 0 };
+  if (!recipeTriggers || Object.keys(recipeTriggers).length === 0) return result;
+
+  const recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
+  const allowedFacilityRecipeIds = new Set(
+    Object.keys(settings.recipeFacilityLinks || {}),
+  );
+  const livePending =
+    livePendingRuns ?? (await computeLivePendingRuns(bot, recipes, false));
+
+  // Resolve every configured trigger to its recipe up front, dropping anything
+  // unresolvable or not craftable. Keep the priority so we can order them.
+  interface TriggerEntry {
+    recipeId: string;
+    recipe: Recipe;
+    config: RecipeTriggerConfig;
+    priority: number;
+  }
+  const entries: TriggerEntry[] = [];
+  for (const [recipeId, config] of Object.entries(recipeTriggers)) {
+    if (!config || !config.materials || config.materials.length === 0) continue;
+    const recipe =
+      recipeIndex.get(recipeId) ||
+      recipes.find(r =>
+        r.recipe_id === recipeId ||
+        r.name.toLowerCase() === recipeId.toLowerCase() ||
+        r.output_item_id.toLowerCase() === recipeId.toLowerCase(),
+      );
+    if (!recipe) {
+      log("warn", `Material trigger: recipe "${recipeId}" not found - skipping`);
+      continue;
+    }
+    const craftableCheck = isRecipeCraftableNew(recipe, allowedFacilityRecipeIds);
+    if (!craftableCheck.ok) {
+      log("warn", `Material trigger: recipe "${recipeId}" (${recipe.name}) not craftable: ${craftableCheck.reason}`);
+      continue;
+    }
+    entries.push({ recipeId, recipe, config, priority: config.priority ?? 100 });
+  }
+
+  if (entries.length === 0) return result;
+
+  // In-cycle material budget: a working copy of every involved INPUT's stock so
+  // that when several recipes share a material, the higher-priority recipe
+  // consumes the surplus first and lower-priority ones see the reduced stock
+  // (and hold off if there isn't enough left to reach their own stop point).
+  // Without this, two recipes both armed on the same ore would each size a full
+  // drain in the same cycle and over-commit the shared stock.
+  //
+  // Key insight (per the crafting-queue model): once a recipe is queued, its
+  // materials are IMMEDIATELY removed from faction storage and locked to that
+  // job. So `countItem()` already reports only the FREE stock — in-flight jobs
+  // do NOT hold materials in storage. We therefore seed the budget straight from
+  // `countItem()` and only debit runs queued *this cycle*; we must NOT also
+  // subtract in-flight runs, or we'd double-count and under-queue.
+  const budget = new Map<string, number>();
+  for (const e of entries) {
+    for (const c of e.recipe.components) {
+      const key = c.item_id.toLowerCase();
+      if (!budget.has(key)) budget.set(key, countItemFn(key));
+    }
+  }
+  const budgetCount = (item: string) => budget.get(item.toLowerCase()) ?? 0;
+
+  // Process highest-priority first (lower number = earlier).
+  entries.sort((a, b) => a.priority - b.priority);
+
+  // Aggregate output limits by item so recipes that share the same output
+  // collectively respect the limit (e.g. multiple superconductor recipes).
+  const itemLimits = new Map<string, number>();
+  if (outputLimits && outputLimits.size > 0) {
+    for (const e of entries) {
+      const limiter = lowestOutputItem(e.recipe);
+      const outItem = limiter.item_id.toLowerCase();
+      const recipeLimit = outputLimits.get(e.recipeId);
+      if (recipeLimit === undefined) continue;
+      const prev = itemLimits.get(outItem);
+      if (prev === undefined || recipeLimit < prev) {
+        itemLimits.set(outItem, recipeLimit);
+      }
+    }
+  }
+
+  // Build a combined pending map (server + tracker) keyed by recipeId, then
+  // aggregate by output item so limit checks see total committed output.
+  const combinedPendingByRecipe = new Map<string, number>();
+  for (const [recipeId, runs] of livePending.entries()) {
+    combinedPendingByRecipe.set(recipeId, (combinedPendingByRecipe.get(recipeId) || 0) + runs);
+  }
+  for (const job of tracker.getActiveJobs()) {
+    const pending = Math.max(0, Math.min(job.quantity - job.completed, job.runsRemaining));
+    combinedPendingByRecipe.set(job.recipeId, (combinedPendingByRecipe.get(job.recipeId) || 0) + pending);
+  }
+
+  const pendingOutputByItem = new Map<string, number>();
+  for (const [recipeId, pendingRuns] of combinedPendingByRecipe.entries()) {
+    const r = recipeIndex.get(recipeId);
+    if (!r) continue;
+    const outs = (r.outputs && r.outputs.length > 0) ? r.outputs : [{ item_id: r.output_item_id, quantity: r.output_quantity || 1 }];
+    for (const o of outs) {
+      const outId = o.item_id.toLowerCase();
+      pendingOutputByItem.set(outId, (pendingOutputByItem.get(outId) || 0) + (o.quantity || 1) * pendingRuns);
+    }
+  }
+
+  for (const e of entries) {
+    if (bot.state !== "running") break;
+    const { recipe, config } = e;
+
+    // Output cap: don't (re)start if we already have enough of the result. This
+    // is the hysteresis the user asked for — hold at e.g. 20k of a grown good and
+    // only re-trigger once stock drops back below it. Checked against the LIVE
+    // stock (output isn't consumed by crafting, so the budget doesn't track it).
+    if (config.maxOutput !== undefined && config.maxOutput > 0) {
+      const outItem = (recipe.output_item_id || "").toLowerCase();
+      const haveOutput = outItem ? countItemFn(outItem) : 0;
+      if (haveOutput >= config.maxOutput) {
+        log("craft", markupHeld(`Material trigger held for ${recipe.name}:`, outItem, haveOutput, config.maxOutput));
+        continue;
+      }
+    }
+
+    // No "pending > 0" guard: a recipe may re-fire while a previous batch is
+    // still in flight. Run sizing is based on uncommitted material (see the
+    // budget above), so this can never drain below the stop point — it just
+    // won't queue more than the surplus that hasn't already been claimed.
+
+    let runs = evaluateRecipeTrigger(recipe, config.materials, budgetCount);
+     if (runs === null) {
+       const lowMaterials = config.materials
+         .map(t => {
+           const current = countItemFn(t.item.toLowerCase());
+           const comp = recipe.components.find(
+             c => c.item_id.toLowerCase() === t.item.toLowerCase(),
+           );
+           if (!comp || current > t.triggerAt) return null;
+           return `${t.item}: LOW:${current} of ${t.triggerAt}`;
+         })
+         .filter((s): s is string => s !== null);
+        if (lowMaterials.length > 0) {
+          log("craft", markupNotCrafting(recipe.name, recipe.recipe_id, lowMaterials));
+        }
+       continue;
+     }
+
+     // Respect the recipe's output cap (the craftLimit / "make N outputs" target):
+     // a material trigger should fill the surplus but never produce past the
+     // user's stated maximum. If the cap is already met (or will be by in-flight
+     // work), hold off instead of over-producing. Limits are aggregated by output
+     // item so multiple recipes producing the same item share the cap.
+     if (itemLimits.size > 0) {
+       const limiter = lowestOutputItem(recipe);
+       const outPerRun = limiter.quantity || 1;
+       const outItem = limiter.item_id.toLowerCase();
+       const itemLimit = itemLimits.get(outItem);
+       if (itemLimit !== undefined) {
+         const haveOut = countItemFn(outItem);
+         const pendingOut = pendingOutputByItem.get(outItem) || 0;
+         const room = itemLimit - (haveOut + pendingOut);
+         if (room <= 0) {
+           log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${HTML_GREEN}${haveOut}+${pendingOut} pending >= cap ${itemLimit}${HTML_RESET}`);
+           continue;
+         }
+         const maxRuns = Math.floor(room / outPerRun);
+         if (maxRuns <= 0) continue;
+         if (runs > maxRuns) {
+           log("craft", `Material trigger for ${recipe.name}: capping ${runs} runs to ${HTML_CYAN}${maxRuns}${HTML_RESET} (output cap ${HTML_GREEN}${itemLimit}${HTML_RESET})`);
+           runs = maxRuns;
+         }
+       }
+     }
+
+     // maxOutput cap configured on the trigger itself: a fired trigger must never
+     // produce more than this many of the output item. The hold gate above only
+     // skips firing when LIVE stock already exceeds the cap, but it does NOT clamp
+     // the run count — so a recipe with a large input surplus would fire and blow
+     // well past the user's stated maximum (e.g. queue 3784 runs with maxOutput
+     // 1000). Cap the run count here too, accounting for in-flight work.
+     if (config.maxOutput !== undefined && config.maxOutput > 0) {
+       const limiter = lowestOutputItem(recipe);
+       const outPerRun = limiter.quantity || 1;
+       const outItem = limiter.item_id.toLowerCase();
+       const haveOut = countItemFn(outItem);
+       const pendingRuns = livePending.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
+       const pendingOut = pendingRuns * outPerRun;
+       const room = config.maxOutput - (haveOut + pendingOut);
+       if (room <= 0) {
+         log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${HTML_GREEN}${haveOut}+${pendingOut} pending >= cap ${config.maxOutput}${HTML_RESET}`);
+         continue;
+       }
+      const maxRuns = Math.floor(room / outPerRun);
+      if (maxRuns <= 0) continue;
+      if (runs > maxRuns) {
+        log("craft", `Material trigger for ${recipe.name}: capping ${runs} runs to ${maxRuns} (maxOutput ${config.maxOutput})`);
+        runs = maxRuns;
+      }
+    }
+
+    result.fired++;
+    const limiter = lowestOutputItem(recipe);
+    const outputPerRun = limiter.quantity || 1;
+    const venue = resolveVenueForRecipe(recipe.recipe_id, recipe.name, ownFacilityMap, settings, bot);
+    const summary = config.materials.map(t => `${t.item}>${span(String(t.triggerAt), "ansi-cyan")}→stop ${span(String(t.stopAt), "ansi-green")}`).join(", ");
+    log("craft", `${span("⚡", "ansi-yellow")} Material trigger ${span("FIRED", "ansi-green")} (pri ${span(String(e.priority), "ansi-cyan")}) for ${recipe.name}: ${summary} -> queueing ${span(String(runs), "ansi-cyan")} run(s) (limiting output ${span(`${outputPerRun}x ${limiter.name}`, "ansi-cyan")})`);
+
+    const queueResult = await queueCraftJob(
+      ctx,
+      recipe.recipe_id,
+      runs * outputPerRun,
+      bot,
+      tracker,
+      countItemFn,
+      recipes,
+      venue,
+      settings,
+      ownFacilityMap,
+      outputPerRun,
+      countItemFn,
+      config.allowDuplicateJobs,
+    );
+    if (queueResult.success) {
+      result.queued++;
+      log("craft", `${span("✓", "ansi-green")} Queued ${span(String(queueResult.queuedRuns), "ansi-cyan")} run(s) of ${recipe.name} via material trigger`);
+      // Debit the budget for every component this batch will consume, so later
+      // (lower-priority) triggers sharing any input see the reduced availability.
+      for (const c of recipe.components) {
+        const key = c.item_id.toLowerCase();
+        budget.set(key, Math.max(0, (budget.get(key) ?? 0) - runs * (c.quantity || 1)));
+      }
+    } else if (queueResult.error && queueResult.error !== "Job already queued") {
+      log("error", `Failed to queue material-trigger run for ${recipe.name}: ${queueResult.error}`);
+    }
+  }
+
+  return result;
 }
 
 // ── External facility guard (dry-run cost check) ──────────────
@@ -950,6 +1594,7 @@ export async function queueCraftJob(
   // first output and the smaller secondary outputs never get produced.
   outputPerRun: number = 0,
   rawCountItemFn?: (itemId: string) => number,
+  allowDuplicateJobs = false,
 ): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number }> {
   const { log } = ctx;
 
@@ -959,17 +1604,17 @@ export async function queueCraftJob(
    const outputQty = outputPerRun > 0
      ? outputPerRun
      : (recipe?.output_quantity || 1);
-   const originalRuns = Math.ceil(quantity / outputQty);
+    const originalRuns = Math.ceil(quantity / outputQty);
 
-   if (tracker.hasPendingJob(recipeId, originalRuns)) {
-     return { success: true, error: "Job already queued", queuedRuns: originalRuns };
-   }
+    if (!allowDuplicateJobs && tracker.hasPendingJob(recipeId, originalRuns)) {
+      return { success: true, error: "Job already queued", queuedRuns: originalRuns };
+    }
 
-   const serverJobs = await checkCraftingQueue(bot, recipes || [], true);
-   tracker.syncWithServer(serverJobs);
-   if (tracker.hasPendingJob(recipeId, originalRuns)) {
-     return { success: true, error: "Job already queued", queuedRuns: originalRuns };
-   }
+    const { ok: queueOk, jobs: serverJobs } = await checkCraftingQueue(bot, recipes || [], true);
+    if (queueOk) tracker.syncWithServer(serverJobs);
+    if (!allowDuplicateJobs && tracker.hasPendingJob(recipeId, originalRuns)) {
+      return { success: true, error: "Job already queued", queuedRuns: originalRuns };
+    }
 
     const maxCraftable = calculateMaxCraftable(recipe, rawCountItemFn || countItemFn);
    const runs = Math.min(originalRuns, maxCraftable);
@@ -990,10 +1635,12 @@ export async function queueCraftJob(
    const craftCommandQuantity = runs * primaryOutputQty;
 
   // Notify (once per recipe per run) when we wanted our own facility but lack one.
+  // Per-bot (bot.notifiedMissingFacilities) so one drone's dedup doesn't silence
+  // the warning for every other drone.
   if (venue.missingFacility) {
     const key = recipe?.name || recipeId;
-    if (!notifiedMissingFacilities.has(key)) {
-      notifiedMissingFacilities.add(key);
+    if (!bot.notifiedMissingFacilities.has(key)) {
+      bot.notifiedMissingFacilities.add(key);
       log("warn", `⚠ No OWNED facility produces "${key}" - falling back per noFacilityFallback=${settings.noFacilityFallback}`);
     }
   }
@@ -1102,28 +1749,26 @@ async function waitForCompletion(
   const startTime = Date.now();
   let lastStatusReport = Date.now();
 
-  const serverJobIds = await checkCraftingQueue(bot, recipes);
-  tracker.syncWithServer(serverJobIds);
-  tracker.save();
+  const { ok: firstReadOk, jobs: serverJobIds } = await checkCraftingQueue(bot, recipes);
+  if (firstReadOk) tracker.syncWithServer(serverJobIds);
 
-  const progress = tracker.getProgress(recipeId);
-  const completedItems = progress.completed * outputQty;
-  if (completedItems >= quantityItems) {
-    return true;
-  }
+  // Measure completion RELATIVE to where the job started. `progress.completed`
+  // is cumulative for the life of the tracked job, so comparing it directly
+  // against the freshly-requested quantity reported "done" the instant an older
+  // job for the same recipe had already produced that much.
+  const baselineRuns = tracker.getProgress(recipeId).completed;
 
   while (bot.state === "running") {
     await ctx.sleep(5000);
 
     const now = Date.now();
-    if (now - lastQueueCheck >= QUEUE_REFRESH_COOLDOWN) {
-      const currentJobIds = await checkCraftingQueue(bot, recipes);
-      tracker.syncWithServer(currentJobIds);
-      tracker.save();
+    if (now - bot.craftQueueCache.lastQueueCheck >= QUEUE_REFRESH_COOLDOWN) {
+      const { ok, jobs: currentJobIds } = await checkCraftingQueue(bot, recipes);
+      if (ok) tracker.syncWithServer(currentJobIds);
     }
 
     const progress = tracker.getProgress(recipeId);
-    const currentCompletedItems = progress.completed * outputQty;
+    const currentCompletedItems = Math.max(0, progress.completed - baselineRuns) * outputQty;
     if (currentCompletedItems >= quantityItems) {
       log("craft", `Crafting complete for ${recipeId}`);
       return true;
@@ -1143,72 +1788,6 @@ async function waitForCompletion(
   return false;
 }
 
-async function waitForAllCompletions(
-   ctx: RoutineContext,
-   initialQueuedItems: Array<{ recipeId: string; quantity: number; outputQty: number }>,
-   tracker: CraftQueueTracker,
-   bot: any,
-   recipes: Recipe[],
-   settings?: CrafterSettings | null,
-): Promise<string[]> {
-   const { log } = ctx;
-   const crafted: string[] = [];
-
-   const recipeNames = new Map<string, string>();
-   for (const r of recipes) {
-     recipeNames.set(r.recipe_id, r.name);
-   }
-
-     let lastSync = 0;
-     let lastStatusReport = Date.now();
-     let lastBaseCheck = 0;
-     const BASE_CHECK_COOLDOWN = 60000;
-     let remainingItems = [...initialQueuedItems];
-
-     while (bot.state === "running" && remainingItems.length > 0) {
-       await ctx.sleep(5000);
-
-       const now = Date.now();
-       if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
-         const serverJobs = await checkCraftingQueue(bot, recipes);
-         tracker.syncWithServer(serverJobs);
-         tracker.save();
-         lastSync = now;
-       }
-
-       if (settings?.craftingHomeBase && now - lastBaseCheck >= BASE_CHECK_COOLDOWN) {
-         const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
-         if (!baseResp.error && baseResp.result) {
-           const baseObj = baseResp.result as Record<string, unknown>;
-           const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
-           bot.homeBaseFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
-           bot.homeBaseMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
-         }
-         lastBaseCheck = now;
-       }
-
-      const stillQueued: typeof remainingItems = [];
-      for (const item of remainingItems) {
-        const progress = tracker.getProgress(item.recipeId);
-        const completedItems = progress.completed * item.outputQty;
-        if (completedItems >= item.quantity) {
-          crafted.push(`${item.quantity}x ${recipeNames.get(item.recipeId) || item.recipeId}`);
-          bot.stats.totalCrafted += item.quantity;
-        } else {
-          stillQueued.push(item);
-        }
-      }
-      remainingItems = stillQueued;
-
-      if (remainingItems.length > 0 && Date.now() - lastStatusReport >= 60000) {
-        reportQueueStatus(ctx, tracker, recipes);
-        lastStatusReport = Date.now();
-      }
-    }
-
-   return crafted;
- }
-
 async function queueAllRecipesOnce(
     ctx: RoutineContext,
     allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }>,
@@ -1218,12 +1797,30 @@ async function queueAllRecipesOnce(
     ownFacilityMap: OwnFacilityMap,
     settings: CrafterSettings,
     rawCountItemFn: (itemId: string) => number,
+    // Live in-flight pending, per recipe_id (RUNS), read authoritatively from the
+    // `craft` queue. When omitted we re-derive it here. This is what stops the
+    // crafter from ignoring already-queued work and re-queueing past the limit.
+    livePendingRuns?: Map<string, number>,
+    // Hard ceiling per recipe_id (in limiting-output ITEMS) from the craftLimit.
+    // When set, the total queued runs for a recipe are clamped so completed +
+    // pending + queued can never exceed it.
+    limitByRecipe?: Map<string, number>,
 ): Promise<{ queued: Array<{ recipeId: string; quantity: number; outputQty: number }>; queuedItems: number }> {
     const { bot } = ctx;
     const queued: Array<{ recipeId: string; quantity: number; outputQty: number }> = [];
     let queuedItemsTotal = 0;
 
     await syncCraftingQueue(ctx, tracker, recipes, true);
+    // Authoritative in-flight pending, straight from the live `craft` queue —
+    // never trust the in-memory tracker's recipeIndex alone (it can be wiped by a
+    // transiently-incomplete fetch, which is what let the crafter stack 28M fuel
+    // against a 275k limit).
+    const livePending = livePendingRuns ?? await computeLivePendingRuns(bot, recipes, true);
+    // Runs we queue during THIS pass, per recipe. `livePending` is read once at
+    // the top of the pass, so without this a recipe that appears twice in the
+    // plan (two goals sharing a sub-material) would be sized against pre-queue
+    // pending and could be queued twice.
+    const queuedRunsThisPass = new Map<string, number>();
 
     for (const item of allPlanItems) {
       if (bot.state !== "running") break;
@@ -1233,22 +1830,64 @@ async function queueAllRecipesOnce(
       // oxygen), instead of letting the largest output mask the deficit.
       const limiter = lowestOutputItem(item.recipe);
       const outputPerRun = limiter.quantity || 1;
-      const progress = tracker.getProgress(item.recipe.recipe_id);
-      const pendingRuns = progress.remaining;
-      const completedRuns = progress.completed;
+      // Prefer the authoritative live pending; only fall back to the in-memory
+      // tracker if the live read lacks this recipe.
+      const pendingRuns = livePending.get(item.recipe.recipe_id) ?? tracker.getProgress(item.recipe.recipe_id).remaining;
+      const alreadyQueuedThisPass = queuedRunsThisPass.get(item.recipe.recipe_id) || 0;
 
-      // item.quantityToCraft is expressed in the recipe's first-output items;
-      // convert to the limiting-output frame so the run count is correct.
-      const targetLimiterItems = item.quantityToCraft * ((item.recipe.output_quantity || 1) / outputPerRun);
-      const remainingRuns = Math.max(0, Math.ceil((targetLimiterItems - completedRuns * outputPerRun - pendingRuns * outputPerRun) / outputPerRun));
-      const runsToQueue = Math.max(0, remainingRuns);
+      // item.quantityToCraft is expressed in LIMITING-output items: the goal loop
+      // sizes deficits against lowestOutputItem(), and buildCraftingTree converts
+      // it to runs with `ceil(items / limiterQty)`. It must therefore NOT be
+      // rescaled by (output_quantity / outputPerRun) — for a multi-output recipe
+      // (e.g. 4x hydrogen + 2x oxygen) that inflated the request by the ratio
+      // between the outputs and queued twice the runs actually needed.
+      const targetLimiterItems = item.quantityToCraft;
+      // `quantityToCraft` is ALREADY a net deficit: the planner sized it as
+      // limit - (live stock + in-flight output) for goals, and as
+      // needed - available (which also credits in-flight output) for
+      // sub-materials. Subtracting the tracker's `completed`/`pending` AGAIN here
+      // double-counted work that is already reflected in the deficit and is what
+      // wedged the crafter: a job that had finished 100 of 101 runs made
+      // `completed * outputPerRun` (20 000 items) larger than any remaining
+      // deficit, so `runsToQueue` was 0 on EVERY pass and nothing was ever
+      // queued again until the process was restarted (which reset the tracker).
+      let runsToQueue = Math.max(0, Math.ceil(targetLimiterItems / outputPerRun) - alreadyQueuedThisPass);
+
+      // HARD LIMIT CLAMP: never queue so much that stock + pending + queued
+      // exceeds the configured craftLimit (in limiting-output items). This is the
+      // guaranteed safety net — even if the deficit is somehow miscounted, a
+      // recipe can never blow past its cap (e.g. 275k fuel_reserve). It is sized
+      // against LIVE STOCK (not the tracker's cumulative `completed`, which
+      // keeps counting output that is already sitting in storage and therefore
+      // clamped the crafter to zero forever).
+      const limitItems = limitByRecipe?.get(item.recipe.recipe_id);
+      if (limitItems !== undefined) {
+        const limitRuns = Math.ceil(limitItems / outputPerRun);
+        const stockRuns = Math.floor(Math.max(0, rawCountItemFn(limiter.item_id.toLowerCase())) / outputPerRun);
+        const maxQueueable = Math.max(0, limitRuns - stockRuns - pendingRuns - alreadyQueuedThisPass);
+        if (runsToQueue > maxQueueable) {
+          if (maxQueueable <= 0) {
+            ctx.log("craft", `✓ ${item.recipe.name}: at/over limit (stock ${stockRuns} + pending ${pendingRuns} runs >= ${limitRuns} run limit) - not queueing more`);
+            // nothing to do; record what's already in flight so waiters still see it
+            const actualQueued = tracker.getProgress(item.recipe.recipe_id).queued;
+            queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
+            continue;
+          }
+          ctx.log("craft", `Capping ${item.recipe.name}: ${runsToQueue} runs requested but only ${maxQueueable} fit under the ${limitItems}-item limit (stock ${stockRuns} + pending ${pendingRuns} runs, limit ${limitRuns} runs)`);
+          runsToQueue = maxQueueable;
+        }
+      }
       if (runsToQueue <= 0) {
-        const actualQueued = progress.queued;
+        // Log it: this used to be a silent `continue`, which is exactly why the
+        // wedged crafter looked like it was "planning" every pass while never
+        // queueing a single run.
+        ctx.log("craft", `${item.recipe.name}: nothing to queue this pass (deficit ${Math.ceil(targetLimiterItems)} items, ${pendingRuns} runs already in flight)`);
+        const actualQueued = tracker.getProgress(item.recipe.recipe_id).queued;
         queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
         continue;
       }
 
-       const venue = resolveVenueForRecipe(item.recipe.recipe_id, item.recipe.name, ownFacilityMap, settings);
+       const venue = resolveVenueForRecipe(item.recipe.recipe_id, item.recipe.name, ownFacilityMap, settings, bot);
         const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, runsToQueue * outputPerRun, bot, tracker, availableFn, recipes, venue, settings, ownFacilityMap, outputPerRun, rawCountItemFn);
        if (!queueResult.success) {
          if (queueResult.error === "insufficient_inputs") {
@@ -1263,6 +1902,7 @@ async function queueAllRecipesOnce(
        }
 
       const actualQueued = queueResult.queuedRuns || 0;
+      queuedRunsThisPass.set(item.recipe.recipe_id, alreadyQueuedThisPass + actualQueued);
       queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
       queuedItemsTotal += actualQueued * outputPerRun;
       if (actualQueued * outputPerRun < runsToQueue * outputPerRun) {
@@ -1292,12 +1932,12 @@ async function executeCraftingPlan(
    // Facility-only recipes that have been explicitly linked to a facility via
    // recipeFacilityLinks are permitted in the planner (otherwise breed_plutonium
    // and friends are rejected by isRecipeCraftable as "facility only").
-   const allowedFacilityRecipeIds = new Set(
-     Object.keys(settings?.recipeFacilityLinks || {})
-   );
+    let allowedFacilityRecipeIds = new Set(
+      Object.keys(settings?.recipeFacilityLinks || {})
+    );
 
-   const recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
-   const outputQtyOf = (recipeId: string) => recipeIndex.get(recipeId)?.output_quantity || 1;
+    let recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
+    const outputQtyOf = (recipeId: string) => recipeIndex.get(recipeId)?.output_quantity || 1;
 
    const recipeIdForGoal = (g: { itemId: string; recipe?: Recipe }): string => {
      if (g.recipe) return g.recipe.recipe_id;
@@ -1342,144 +1982,92 @@ async function executeCraftingPlan(
       return { hasPending, produced };
     };
 
-    let lastStatusReport = Date.now();
-    let stagnationIterations = 0;
-    let stagnationMs = 0;
-    const STAGNATION_BUDGET_MS = 60000;
-    const ACTIVE_LOOP_CAP = 600;
-    let loopCount = 0;
-    const cycleWaitMs = ((settings && settings.cycleTimeSec) || 30) * 1000;
-
-   // Active loop: keep re-planning and queueing as sub-materials become available.
-    while (bot.state === "running" && loopCount < ACTIVE_LOOP_CAP) {
-      loopCount++;
-      await syncCraftingQueue(ctx, tracker, recipes, true);
-      // Re-resolve the facility list each pass. A facility can be upgraded
-      // (level/type change) while the crafter is mid-plan, and routing must
-      // target the current facility rather than the snapshot taken at round
-      // start — otherwise it keeps using the old-level facility.
-      if (settings) {
-        const refreshed = await refreshFacilityMaps(bot, settings);
-        facilityAvailableRecipes = refreshed.facilityAvailableRecipes;
-        ownFacilityMap = refreshed.ownFacilityMap;
+    // Per-recipe hard ceiling (in limiting-output ITEMS) taken from the
+    // configured craftLimit. Used by queueAllRecipesOnce to clamp how much we
+    // ever queue, so a recipe can NEVER exceed its limit even if pending tracking
+    // glitches (this is the safety net that prevents the 28M-fuel disaster).
+    const limitByRecipe = new Map<string, number>();
+    for (const g of goalsToAchieve) {
+      const recipeId = recipeIdForGoal(g);
+      if (recipeId && g.limit > 0) {
+        // Keep the smallest limit if a recipe is targeted by multiple goals.
+        const prev = limitByRecipe.get(recipeId);
+        limitByRecipe.set(recipeId, prev === undefined ? g.limit : Math.min(prev, g.limit));
       }
-      // Re-read faction storage LIVE each pass. As queued jobs consume/produce
-      // materials on the server, the holdings change continuously; a stale count
-      // here is what makes the planner think it needs to re-refine materials it
-      // already has enough of (e.g. steel_plate). Target the crafting home base
-      // station so a roaming crafter reads the right storage.
-       await bot.refreshFactionStorage(true, settings?.craftingHomeBase || undefined);
+    }
 
-        // Refresh home station fuel via get_base every pass so fuel_reserve
-        // goals always see the actual station fuel level after jobs complete
-        // between loop iterations. Do this unconditionally when a home base is
-        // configured — it is the only source of truth for base.fuel and the
-        // crafter cannot recover from a stale value.
-        if (settings?.craftingHomeBase) {
-          const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
-          if (!baseResp.error && baseResp.result) {
-            const baseObj = baseResp.result as Record<string, unknown>;
-            const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
-            const newFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
-            const newMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
-            if (newFuel !== bot.homeBaseFuel || newMaxFuel !== bot.homeBaseMaxFuel) {
-              ctx.log("craft", `[get_base] ${settings.craftingHomeBase}: fuel=${newFuel}/${newMaxFuel}`);
-            }
-            bot.homeBaseFuel = newFuel;
-            bot.homeBaseMaxFuel = newMaxFuel;
-          } else if (baseResp.error) {
-            ctx.log("warn", `[get_base] failed for ${settings.craftingHomeBase}: ${baseResp.error.message}`);
-          }
-        }
+    // Single-pass plan: sync the server queue, compute remaining goal deficits,
+    // build the full multi-goal crafting tree, and queue every recipe in one
+    // shot. Sub-materials that can't be queued yet (their inputs haven't been
+    // produced) are skipped — the next outer cycle (after cycleTimeSec seconds)
+    // re-reads fresh stock/storage and queues them then. This keeps the crafter
+    // simple and predictable: queue once, wait cycleTimeSec, full restart.
+    await syncCraftingQueue(ctx, tracker, recipes, true);
 
+    // Recompute which goals still need production using live stock + in-flight
+    // output. Read pending straight from the authoritative `craft` queue so a
+    // transiently-stale tracker (which would report 0 pending) can never make
+    // us think we're short and re-queue past the limit.
+    const livePendingRuns = await computeLivePendingRuns(bot, recipes, true);
+    const remainingGoals: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
+    for (const g of goalsToAchieve) {
+      const recipeId = recipeIdForGoal(g);
+      if (!recipeId) continue;
+      const liveStock = countItemFn!(g.itemId.toLowerCase());
+      const pendingRuns = livePendingRuns.get(recipeId) ?? tracker.getProgress(recipeId).remaining;
+      const queuedOutput = pendingRuns * outputQtyOf(recipeId);
+      if (liveStock + queuedOutput < g.limit) {
+        remainingGoals.push({ itemId: g.itemId, quantity: g.limit - (liveStock + queuedOutput), recipe: g.recipe });
+      }
+    }
 
-      // Recompute which goals still need production using live stock + in-flight output.
-     const remainingGoals: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
-     for (const g of goalsToAchieve) {
-       const recipeId = recipeIdForGoal(g);
-       if (!recipeId) continue;
-       const liveStock = countItemFn!(g.itemId.toLowerCase());
-        const prog = tracker.getProgress(recipeId);
-        const queuedOutput = prog.remaining * outputQtyOf(recipeId);
-        if (liveStock + queuedOutput < g.limit) {
-         remainingGoals.push({ itemId: g.itemId, quantity: g.limit - (liveStock + queuedOutput), recipe: g.recipe });
-       }
-     }
-
-     if (remainingGoals.length === 0) {
-       log("craft", "All goals covered by stock + in-flight queue - waiting for production to finish");
-       break;
-     }
-
-      // Whether anything is still in production (including sub-materials we're waiting on).
+    if (remainingGoals.length > 0) {
+      // Credit outputs that in-flight jobs will produce so we can keep building
+      // higher-tier items as soon as their sub-materials appear. We must NOT also
+      // subtract the materials those jobs consume: the server deducts a job's
+      // inputs up-front when it is queued, so the live faction-storage count we
+      // read each pass ALREADY excludes them. Subtracting them again here would
+      // double-count and could zero out a material we genuinely have.
       const { hasPending, produced } = accountPending();
-      const anyPending = hasPending;
       const availableFn = (itemId: string): number => {
         const id = itemId.toLowerCase();
         return Math.max(0, countItemFn!(id) + (produced.get(id) || 0));
       };
 
       const plans = calculateMultiGoalPlan(remainingGoals, recipes, availableFn, facilityAvailableRecipes, countItemFn!, allowedFacilityRecipeIds);
-     const allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }> = [];
-     for (const plan of plans) {
-       log("craft", formatCraftingPlan(plan));
-       for (const item of plan.flatOrder) {
-         allPlanItems.push({
-           recipe: item.recipe,
-           quantityToCraft: Math.max(1, Math.floor(item.quantityToCraft)),
-           reason: item.reason,
-           depth: item.depth,
-         });
-       }
-     }
+      const allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }> = [];
+      for (const plan of plans) {
+        log("craft", formatCraftingPlan(plan));
+        for (const item of plan.flatOrder) {
+          allPlanItems.push({
+            recipe: item.recipe,
+            quantityToCraft: Math.max(1, Math.floor(item.quantityToCraft)),
+            reason: item.reason,
+            depth: item.depth,
+          });
+        }
+      }
 
       const effectiveSettings = settings || await getCrafterSettings();
-      const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, availableFn, ownFacilityMap, effectiveSettings, countItemFn!);
+      const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, availableFn, ownFacilityMap, effectiveSettings, countItemFn!, livePendingRuns, limitByRecipe);
 
-      // Progress is being made if we queued something this pass, or if the queue
-      // still has jobs producing sub-materials we're waiting on.
-      if (queuedItems > 0 || anyPending) {
-        stagnationIterations = 0;
-        stagnationMs = 0;
-      } else {
-        stagnationIterations++;
-        stagnationMs += cycleWaitMs;
+      if (queuedItems > 0) {
+        log("craft", `Queued ${queuedItems} item(s) this pass - waiting ${settings?.cycleTimeSec || 30}s for the next cycle to re-evaluate`);
       }
-
-      if (Date.now() - lastStatusReport >= 60000) {
-        reportQueueStatus(ctx, tracker, recipes);
-        lastStatusReport = Date.now();
+      if (hasPending && queuedItems === 0) {
+        log("craft", "Sub-materials in production - will be ready next cycle");
       }
-
-      if (stagnationIterations >= ACTIVE_LOOP_CAP || stagnationMs >= STAGNATION_BUDGET_MS) {
-        log("craft", "No new materials to progress crafting - pausing active crafting until next cycle");
-        break;
-      }
-
-      log("craft", `Active plan pass ${loopCount} done - waiting ${cycleWaitMs / 1000}s before next pass`);
-      await ctx.sleep(cycleWaitMs);
+    } else {
+      log("craft", "All goals covered by stock + in-flight queue - nothing to queue this cycle");
     }
 
-   // Wait for the final goal items to actually be produced before returning.
-   const finalItems = goalsToAchieve.map(g => {
-     const recipeId = recipeIdForGoal(g);
-     if (!recipeId) return null;
-     const outputQty = outputQtyOf(recipeId);
-      const prog = tracker.getProgress(recipeId);
-      const target = prog.remaining * outputQty;
-      return { recipeId, quantity: target, outputQty };
-   }).filter((x): x is { recipeId: string; quantity: number; outputQty: number } => !!x && x.quantity > 0);
+    for (const g of goalsToAchieve) {
+      const recipeId = recipeIdForGoal(g);
+      if (recipeId) prereqs.push(`${g.limit}x ${recipeIndex.get(recipeId)?.name || recipeId}`);
+    }
 
-    const completed = await waitForAllCompletions(ctx, finalItems, tracker, bot, recipes, settings);
-   crafted.push(...completed);
-
-   for (const g of goalsToAchieve) {
-     const recipeId = recipeIdForGoal(g);
-     if (recipeId) prereqs.push(`${g.limit}x ${recipeIndex.get(recipeId)?.name || recipeId}`);
-   }
-
-   return { crafted, prereqs };
-}
+    return { crafted, prereqs };
+  }
 
 // ── Craft from enabled categories ─────────────────────────────
 
@@ -1540,9 +2128,8 @@ async function craftFromCategories(
   let lastStatusReport = Date.now();
 
   while (totalCrafted < MAX_CRAFTS && bot.state === "running") {
-    const serverJobIds = await checkCraftingQueue(bot, recipes);
-    tracker.syncWithServer(serverJobIds);
-    tracker.save();
+    const { ok: queueOk, jobs: serverJobIds } = await checkCraftingQueue(bot, recipes);
+    if (queueOk) tracker.syncWithServer(serverJobIds);
 
     if (Date.now() - lastStatusReport >= 60000) {
       reportQueueStatus(ctx, tracker, recipes);
@@ -1576,7 +2163,7 @@ async function craftFromCategories(
     const outputQty = target.output_quantity || 1;
     const runs = Math.ceil(1 / outputQty);
     ctx.log("craft", `Queueing ${runs} run(s) of ${target.name} (outputs: ${formatOutputs(target)}; category: ${target.category})`);
-    const venue = resolveVenueForRecipe(target.recipe_id, target.name, ownFacilityMap, settings);
+    const venue = resolveVenueForRecipe(target.recipe_id, target.name, ownFacilityMap, settings, bot);
      const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, venue, settings, ownFacilityMap, 0, countItemForCraft);
     if (!queueResult.success) {
       if (queueResult.error && queueResult.error.includes("aborted")) {
@@ -1698,6 +2285,12 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.initCraftQueueTracker();
 
   while (bot.state === "running") {
+    // Re-evaluate missing-facility warnings each cycle. The dedupe set is
+    // process-lifetime, so clearing it lets a facility that became available
+    // (e.g. after an upgrade) stop being silently treated as permanently missing.
+    // Per-bot now (bot.notifiedMissingFacilities), so clearing one drone's dedupe
+    // doesn't affect the others.
+    bot.notifiedMissingFacilities.clear();
     await detectAndRecoverFromDeath(ctx);
     if (bot.state !== "running") break;
 
@@ -1715,18 +2308,15 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     await ensureDocked(ctx);
 
     // Refresh home station fuel via get_base so fuel_reserve goals compare against accurate data.
+    // A "@current" home base reads the docked station; a fixed id reads that station; empty leaves
+    // the fuel untouched (preserving prior behavior).
     if (settings.craftingHomeBase) {
-      const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
-      if (!baseResp.error && baseResp.result) {
-        const baseObj = baseResp.result as Record<string, unknown>;
-        const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
-        bot.homeBaseFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
-        bot.homeBaseMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
-      }
+      await refreshCrafterBaseFuel(bot, settings.craftingHomeBase, ctx.log);
     }
 
     yield "fetch_recipes";
     const recipes = await fetchAllRecipes(ctx);
+    ctx.log("craft", `Fetched ${recipes.length} recipes from catalog API`);
     if (recipes.length === 0) {
       ctx.log("error", "No recipes available - waiting 60s");
       await ctx.sleep(60000);
@@ -1744,8 +2334,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // Target the crafting home base station explicitly: a roaming crafter may be
     // docked elsewhere, and reading the current station's (near-empty) storage
     // would make the planner "lose" its stock and wrongly re-smelt everything.
-    const craftingHomeBase = settings.craftingHomeBase || undefined;
-    await bot.refreshFactionStorage(true, craftingHomeBase);
+    // A "@current" home base reads the station the crafter is docked at.
+    const fsArgs = factionStorageRefreshArgs(settings.craftingHomeBase || "");
+    await bot.refreshFactionStorage(true, fsArgs.stationId, fsArgs.readCurrentStation);
 
     const recipeIndex = new Map<string, Recipe>();
     for (const r of recipes) {
@@ -1815,6 +2406,12 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("craft", "Processing crafting goals...");
     const goalItems: Array<{ itemId: string; quantity: number; limit: number; recipe?: Recipe }> = [];
 
+    // Authoritative in-flight pending, read straight from the live `craft`
+    // queue. The in-memory tracker can momentarily lose jobs (an incomplete
+    // fetch), which would make `tracker.getProgress()` report 0 pending and lead
+    // to re-queueing past the limit — so always size deficits against this.
+    const livePendingRuns = await computeLivePendingRuns(bot, recipes, true);
+
     for (const [recipeId, limit] of Array.from(effectiveQuotas.entries())) {
       if (bot.state !== "running") break;
 
@@ -1853,8 +2450,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       const limiter = lowestOutputItem(recipe);
       const limitRuns = Math.ceil(limit / (limiter.quantity || 1));
       const currentStock = countItem(limiter.item_id);
-      const progress = tracker.getProgress(recipe.recipe_id);
-      const pendingRuns = progress.remaining;
+      // Prefer the authoritative live pending; fall back to the in-memory tracker
+      // only if the live read lacks this recipe.
+      const pendingRuns = livePendingRuns.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
       const pendingItems = pendingRuns * (limiter.quantity || 1);
       const stockIncludingQueue = currentStock + pendingItems;
       const needed = limitRuns * (limiter.quantity || 1) - stockIncludingQueue;
@@ -1867,6 +2465,33 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       // Track the goal by the limiting output item so every produced item
       // (including the secondary ones) is actually requested and counted.
       goalItems.push({ itemId: limiter.item_id, quantity: needed, limit, recipe: isItemGoal ? undefined : recipe });
+    }
+
+    // ── Material-triggered crafting ──
+    // Auto-craft recipes whose INPUT materials have piled up past their trigger
+    // threshold, draining them back down to the stop threshold. This runs every
+    // cycle regardless of the goal/limit configuration (and independently of it):
+    // triggers are about converting a raw-material surplus, goals are about
+    // maintaining a finished-goods stock. Both can coexist.
+    const recipeTriggers = (assignedCrafter.recipeTriggers as
+      | Record<string, RecipeTriggerConfig>
+      | undefined) || {};
+    if (Object.keys(recipeTriggers).length > 0) {
+      const trigResult = await processRecipeTriggers(
+        ctx,
+        bot,
+        recipes,
+        recipeTriggers,
+        ownFacilityMap,
+        settings,
+        countItem,
+        tracker!,
+        livePendingRuns,
+        effectiveQuotas,
+      );
+      if (trigResult.fired > 0) {
+        ctx.log("craft", `Material triggers fired: ${trigResult.fired} recipe(s), ${trigResult.queued} queued this cycle`);
+      }
     }
 
     if (goalItems.length === 0 && !isSpecializedBot) {

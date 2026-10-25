@@ -4,6 +4,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const ACTIVITY_FILE = join(DATA_DIR, "rescueActivity.json");
@@ -82,16 +83,17 @@ export function loadRescueActivity(): RescueActivityData {
 async function saveWithRetry(data: string, ctx?: { sleep: (ms: number) => Promise<void> }): Promise<boolean> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
+      const dataSize = Buffer.byteLength(data, "utf-8");
       if (existsSync(ACTIVITY_FILE)) {
         try {
           const content = readFileSync(ACTIVITY_FILE, "utf-8");
-          writeFileSync(ACTIVITY_FILE_BACKUP, content, "utf-8");
+          safeWriteFileSync(ACTIVITY_FILE_BACKUP, content, Buffer.byteLength(content, "utf-8"));
         } catch (backupErr) {
           console.warn("Could not create backup file:", backupErr);
         }
       }
       
-      writeFileSync(ACTIVITY_FILE_TEMP, data, "utf-8");
+      safeWriteFileSync(ACTIVITY_FILE_TEMP, data, dataSize);
       
       renameSync(ACTIVITY_FILE_TEMP, ACTIVITY_FILE);
       

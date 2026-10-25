@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import type { Bot } from "./bot";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 // ── Interface Definitions ─────────────────────────────────────
 
@@ -88,7 +89,8 @@ function loadPilotData(): void {
 function savePilotData(): void {
   try {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(PILOT_FILE, JSON.stringify(pilotDataMap, null, 2), "utf8");
+    const payload = JSON.stringify(pilotDataMap, null, 2);
+    safeWriteFileSync(PILOT_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Failed to save pilotSkill data:", err);
   }
@@ -112,7 +114,8 @@ function loadSkillLog(): void {
 function saveSkillLog(): void {
   try {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(SKILLS_FILE, JSON.stringify(skillLogMap, null, 2), "utf8");
+    const payload = JSON.stringify(skillLogMap, null, 2);
+    safeWriteFileSync(SKILLS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Failed to save skills log:", err);
   }

@@ -114,12 +114,30 @@ describe('libExecute param translations', () => {
     assert.deepEqual(calls.at(-1), { tool: 'spacemolt_faction', action: 'prepay_tax', payload: { quantity: 5 } });
   });
 
-  it('send_gift maps to storage/withdraw with credits item_id, quantity, target', async () => {
+  it('send_gift maps to storage/deposit with credits item_id, quantity, target', async () => {
     await dispatch(account, calls, 'send_gift', { credits: 10, recipient: 'bob' });
     assert.deepEqual(calls.at(-1), {
       tool: 'spacemolt_storage',
-      action: 'withdraw',
+      action: 'deposit',
       payload: { item_id: 'credits', quantity: 10, target: 'bob' },
+    });
+  });
+
+  it('send_gift keeps an explicit item_id instead of forcing credits', async () => {
+    await dispatch(account, calls, 'send_gift', { item_id: 'fuel_cell', quantity: 3, recipient: 'bob' });
+    assert.deepEqual(calls.at(-1), {
+      tool: 'spacemolt_storage',
+      action: 'deposit',
+      payload: { item_id: 'fuel_cell', quantity: 3, target: 'bob' },
+    });
+  });
+
+  it('send_gift maps ship_id -> item_id for ship gifts', async () => {
+    await dispatch(account, calls, 'send_gift', { ship_id: 'ship-uuid', recipient: 'faction' });
+    assert.deepEqual(calls.at(-1), {
+      tool: 'spacemolt_storage',
+      action: 'deposit',
+      payload: { item_id: 'ship-uuid', target: 'faction' },
     });
   });
 

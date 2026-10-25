@@ -71,6 +71,25 @@ export interface CoordinationPayload {
   data: unknown;
 }
 
+export interface CreatureClaimPayload {
+  claimer: string;
+  targetId: string;
+  targetName: string;
+  system: string;
+  poi: string;
+  expiresAt: number;
+}
+
+/**
+ * A single-system wildlife update pushed by a light client (or the master's own
+ * `drainPushes` hook) to the master. Carries exactly one `SystemWildlife` so the
+ * master merges only what changed — not the full galaxy — keeping bandwidth low.
+ */
+export interface WildlifeDeltaPayload {
+  system: string;
+  data: unknown;
+}
+
 export interface PlayerNamePayload {
   name: string;
   faction?: string;
@@ -179,11 +198,27 @@ export interface MarketQueryRequest {
   /** Type of trade: "buy" to find cheapest sell orders, "sell" to find
    *  highest buy orders. Defaults to "buy". */
   tradeType?: "buy" | "sell";
+  /** If set, return only results for this exact station POI id (bypasses the
+   *  global top-10 limit so the caller can inspect the full book for one
+   *  station regardless of how it ranks globally). */
+  stationPoiId?: string;
+  /** If set, return only results for this exact system id. Required together
+   *  with stationPoiId when verifying a price at a specific station, because
+   *  the same POI id (e.g. a mobile station alias like frontier_station) can
+   *  exist in multiple systems and stale data from another location must not
+   *  hijack route planning. */
+  systemId?: string;
+  /** Stable base id of the station, if known. Used as a cross-system fallback:
+   *  when the direct system+poi query returns nothing (e.g. a mobile station
+   *  that just jumped), the query rescans all systems for entries whose
+   *  stationPoiId matches this base id. */
+  baseStationId?: string;
 }
 
 /** A single market deal result returned by the data-holding client. */
 export interface MarketQueryResponse {
   ok: boolean;
+  itemId: string;
   stationName: string;
   systemId: string;
   stationPoiId: string;
@@ -213,4 +248,24 @@ export interface MarketQueryResult {
    *  no reachable remote market client), `remote` = another connected client
    *  via the sync master. Purely diagnostic — the payload is identical. */
   source?: "local" | "remote";
+}
+
+/**
+ * Incremental wildlife delta a light client polls from the master after its
+ * one-time full sync. Only the systems that changed since `since` are included,
+ * so normal operation stays low-bandwidth (a few KB instead of the full
+ * multi-MB galaxy dump).
+ */
+export interface WildlifeDeltasResponse {
+  ok: boolean;
+  /** The master's current wildlife version. The client stores this and sends it
+   *  back as `since` on the next poll so the master knows where to continue from. */
+  version: number;
+  /** Systems that changed since `since`, keyed by system id. Empty when there
+   *  are no new discoveries — the common case, keeping each poll response tiny. */
+  systems: Record<string, unknown>;
+  /** `true` when the client has fallen too far behind (master restarted or
+   *  changelog was trimmed): the client should re-pull the full wildlife data
+   *  via GET /api/client-sync/wildlife instead of merging these deltas. */
+  needsFull: boolean;
 }

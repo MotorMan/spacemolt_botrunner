@@ -14,6 +14,7 @@
     .creatures-stats { color:var(--text-dim); font-size:12px; }
     .creatures-stats b { color:var(--text-bright); font-weight:600; }
     .creatures-stats .apex-count { color:#ff5cc8; }
+    .creatures-stats .juvenile-count { color:#5cc8ff; }
 
     .toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
     .search-input { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:12px; flex:1; min-width:200px; max-width:420px; }
@@ -44,6 +45,7 @@
     .c-seen { color:var(--text-dim); font-size:11px; }
     .badge { display:inline-block; padding:1px 6px; border-radius:3px; font-size:10px; font-weight:700; letter-spacing:.3px; }
     .badge-apex { background:#ff3db2; color:#fff; box-shadow:0 0 6px rgba(255,61,178,.7); }
+    .badge-juvenile { background:#0ea5e9; color:#fff; box-shadow:0 0 6px rgba(14,165,233,.7); }
 
     /* Apex / leviathan rows: bright and impossible to miss in the sea of regular creatures */
     tr.apex td { background: rgba(255, 61, 178, 0.14); border-bottom-color: rgba(255,61,178,.35); }
@@ -51,6 +53,13 @@
     tr.apex td.c-role { color:#ffb0ec; }
     tr.apex:hover td { background: rgba(255, 61, 178, 0.22); }
     tr.apex td:first-child { box-shadow: inset 3px 0 0 #ff3db2; }
+
+    /* Juvenile rows: the baby variants of the apex families (calf / hatchling / young / juvenile names) */
+    tr.juvenile td { background: rgba(90, 200, 255, 0.10); border-bottom-color: rgba(90,200,255,.32); }
+    tr.juvenile td.c-name { color:#8fd8ff; text-shadow:0 0 6px rgba(90,200,255,.6); }
+    tr.juvenile td.c-role { color:#aee2ff; }
+    tr.juvenile:hover td { background: rgba(90, 200, 255, 0.18); }
+    tr.juvenile td:first-child { box-shadow: inset 3px 0 0 #38bdf8; }
 
     .empty-state { text-align:center; padding:40px; color:var(--text-dim); }
     .pill { display:inline-block; padding:1px 7px; border-radius:10px; background:var(--border); color:var(--text); font-size:11px; }
@@ -68,6 +77,7 @@
       <select class="filter-select" id="roleFilter" onchange="onFilterChange()"><option value="">All Roles</option></select>
       <select class="filter-select" id="systemFilter" onchange="onFilterChange()"><option value="">All Systems</option></select>
       <label class="chk"><input type="checkbox" id="apexOnly" onchange="onFilterChange()"> Apex only</label>
+      <label class="chk"><input type="checkbox" id="juvenileOnly" onchange="onFilterChange()"> Juveniles only</label>
       <select class="filter-select" id="sortBy" onchange="onFilterChange()">
         <option value="name">Sort: Name</option>
         <option value="hull">Sort: Max Hull</option>
@@ -84,6 +94,14 @@
   </div>
 
   <script>
+    // Adult apex creatures, matched by name (and species). Held out from the
+    // role/hull heuristics below because apex mothers and their babies share a
+    // species and the babies often fall under the hull threshold — see
+    // isBabyName. Baby variants (Cloudwhale Calf, Young Cloudwhale, Juvenile
+    // Molt Leviathan, Rainbow Leviathan Hatchling, ...) get their own filter.
+    const APEX_NAMES = ["cloudwhale", "rainbow leviathan", "molt leviathan", "hoarfrost leviathan"];
+    const BABY_NAME_WORDS = ["calf", "hatchling", "young", "juvenile"];
+
     // Roles / hull that mark a creature as an apex / leviathan-class threat.
     // Tune APEX_ROLES / APEX_HULL_THRESHOLD to match what the game actually sends.
     const APEX_ROLES = ["boss", "apex", "leviathan", "titan", "kraken", "dread", "wyrm", "colossus", "behemoth", "elder"];
@@ -102,7 +120,21 @@
     let sortDir = 1; // 1 asc, -1 desc (toggle on header click)
     let sortKey = "name";
 
-    function isApex(role, maxHull) {
+    function normName(s) { return (s || "").toLowerCase().replace(/_/g, " "); }
+
+    // True for the baby variants of any species: names carrying "calf",
+    // "hatchling", "young" or "juvenile" (e.g. "Cloudwhale Calf",
+    // "Young Cloudwhale", "Juvenile Molt Leviathan"). Same rule the hunter
+    // uses to protect young creatures.
+    function isBabyName(name) {
+      const n = (name || "").toLowerCase();
+      return BABY_NAME_WORDS.some(w => n.includes(w));
+    }
+
+    function isApex(role, maxHull, name, species) {
+      const n = normName(name);
+      const sp = normName(species);
+      if (APEX_NAMES.some(a => n.includes(a) || sp.includes(a))) return true;
       const r = (role || "").toLowerCase();
       if (APEX_ROLES.some(k => r.includes(k))) return true;
       return (maxHull || 0) >= APEX_HULL_THRESHOLD;
@@ -162,7 +194,8 @@
               system: sysName,
               poi: poiName,
               seen: e.seen || "",
-              apex: isApex(e.r, e.h),
+              baby: isBabyName(e.n),
+              apex: !isBabyName(e.n) && isApex(e.r, e.h, e.n, e.s),
             });
           }
         }
@@ -193,10 +226,12 @@
       const role = document.getElementById("roleFilter").value;
       const system = document.getElementById("systemFilter").value;
       const apexOnly = document.getElementById("apexOnly").checked;
+      const juvenileOnly = document.getElementById("juvenileOnly").checked;
       const sortBy = document.getElementById("sortBy").value;
 
       let rows = allRows.filter(r => {
         if (apexOnly && !r.apex) return false;
+        if (juvenileOnly && !r.baby) return false;
         if (role && r.role !== role) return false;
         if (system && r.system !== system) return false;
         if (q) {
@@ -230,13 +265,15 @@
       const totalIndividuals = allRows.reduce((s, r) => s + r.count, 0);
       const systemsCovered = new Set(allRows.map(r => r.system)).size;
       const apexCount = allRows.filter(r => r.apex).length;
+      const juvenileCount = allRows.filter(r => r.baby).length;
 
       document.getElementById("creaturesStats").innerHTML =
         `<b>${rows.length}</b> shown · ` +
         `<b>${totalTypes}</b> types · ` +
         `<b>${totalIndividuals}</b> individuals · ` +
         `<b>${systemsCovered}</b> systems · ` +
-        `<span class="apex-count">${apexCount} apex</span>`;
+        `<span class="apex-count">${apexCount} apex</span> · ` +
+        `<span class="juvenile-count">${juvenileCount} juveniles</span>`;
 
       if (!rows.length) {
         wrap.innerHTML = '<div class="empty-state">No creatures match the current filters.</div>';
@@ -244,11 +281,13 @@
       }
 
       const body = rows.map(r => {
-        const apexCls = r.apex ? " apex" : "";
-        const roleBadge = r.apex ? `<span class="badge badge-apex">APEX</span> ${esc(r.role)}` : esc(r.role);
-        return `<tr class="${apexCls.trim()}">
+        const rowCls = r.apex ? "apex" : (r.baby ? "juvenile" : "");
+        let roleCell = esc(r.role);
+        if (r.apex) roleCell = `<span class="badge badge-apex">APEX</span> ${esc(r.role)}`;
+        else if (r.baby) roleCell = `<span class="badge badge-juvenile">JUVENILE</span> ${esc(r.role)}`;
+        return `<tr class="${rowCls}">
           <td class="c-name">${esc(r.name)}</td>
-          <td class="c-role">${roleBadge}</td>
+          <td class="c-role">${roleCell}</td>
           <td class="c-hull">${r.maxHull.toLocaleString()}</td>
           <td class="c-count">${r.count}</td>
           <td class="c-species">${esc(r.species)}</td>

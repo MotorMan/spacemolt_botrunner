@@ -58,7 +58,7 @@
       <input type="number" id="globalMinPrice" placeholder="Min sell price" min="0" step="1" />
       <input type="number" id="globalPreload" placeholder="Preload to station" min="0" step="1" title="Fixed quantity to keep in station storage (0 = off)" />
       <button class="btn" id="globalAddBtn">Add</button>
-      <button class="btn sm" id="loadStorageBtn">Load Faction Storage Items</button>
+      <button class="btn sm" id="loadStorageBtn">Load Catalog Items</button>
       <span class="hint" id="globalStatus"></span>
     </div>
     <div id="globalItems"></div>
@@ -233,28 +233,19 @@
     });
   }
 
-  async function loadFactionStorage() {
+  async function loadCatalogItems() {
     try {
-      const list = await api("/api/faction-storage/list");
-      const caches = list.caches || [];
-      if (!caches.length) {
-        factionItems = [];
-        alert("No faction storage caches found.");
-        return;
-      }
-      const settings = await api("/api/settings");
-      const general = settings.general || {};
-      const station = general.factionStorageStation || "";
-      const faction = general.factionName || "";
-      let cache = caches.find(c => c.station === station && c.factionName === faction);
-      if (!cache) cache = caches[0];
-      const data = await api(`/api/faction-storage?station=${encodeURIComponent(cache.station)}&faction=${encodeURIComponent(cache.factionName)}`);
-      factionItems = (data.items || []).map(i => ({ itemId: i.itemId || i.item_id || "", itemName: i.name || i.item_name || i.itemId || i.item_id || "" })).sort((a, b) => a.itemName.localeCompare(b.itemName));
+      const data = await api("/api/catalog");
+      const catalogItems = data.items || {};
+      factionItems = Object.values(catalogItems)
+        .filter(i => i.tradeable !== false)
+        .map(i => ({ itemId: i.id || "", itemName: i.name || i.id || "" }))
+        .sort((a, b) => a.itemName.localeCompare(b.itemName));
       populateItemSelects();
-      document.getElementById("globalStatus").textContent = `Loaded ${factionItems.length} items from ${cache.factionName} @ ${cache.station}`;
+      document.getElementById("globalStatus").textContent = "Loaded " + factionItems.length + " items from catalog";
     } catch (e) {
       console.error(e);
-      alert("Failed to load faction storage: " + e.message);
+      alert("Failed to load catalog: " + (e instanceof Error ? e.message : String(e)));
     }
   }
 
@@ -301,7 +292,7 @@
     await saveSettings();
   });
 
-  document.getElementById("loadStorageBtn").addEventListener("click", loadFactionStorage);
+  document.getElementById("loadStorageBtn").addEventListener("click", loadCatalogItems);
 
   document.getElementById("saveBtn").addEventListener("click", async () => {
     await saveSettings();
@@ -335,13 +326,7 @@
       }
     }
     renderAllBotsGrid();
-    const settings = await api("/api/settings");
-    const general = settings.general || {};
-    const station = general.factionStorageStation || "";
-    const faction = general.factionName || "";
-    if (station) {
-      await loadFactionStorage();
-    }
+    await loadCatalogItems();
   }
 
   init();

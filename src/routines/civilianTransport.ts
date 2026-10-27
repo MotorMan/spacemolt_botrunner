@@ -894,8 +894,8 @@ export async function unloadPassengersToLounge(
   };
 
   const settings = getCivilianTransportSettings(bot.username);
-  const homeStation = settings.homeStation;
-  const homeSystem = settings.homeSystem;
+   const homeStation = settings.homeStation;
+   const homeSystem = systemForStation(homeStation) || settings.homeSystem;
 
   // The lounge lives at the faction's home base. Navigate there if configured.
   if (homeSystem && bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
@@ -915,13 +915,30 @@ export async function unloadPassengersToLounge(
     }
   }
 
-  if (homeStation && bot.poi && bot.poi.toLowerCase() !== homeStation.toLowerCase()) {
-    ctx.log("transport", `unload-to-lounge: traveling to home station ${homeStation}...`);
-    const tr = await bot.exec("travel", { target_poi: homeStation });
-    if (tr.error) {
-      return { ok: false, error: `Travel to home station failed: ${tr.error.message}` };
-    }
-  }
+   if (homeStation && bot.poi && bot.poi.toLowerCase() !== homeStation.toLowerCase()) {
+     ctx.log("transport", `unload-to-lounge: traveling to home station ${homeStation}...`);
+     const tr = await bot.exec("travel", { target_poi: homeStation });
+     if (tr.error) {
+       const errMsg = tr.error.message || "";
+       const m = errMsg.match(/in the [^()]* system \(([^)]+)\)/i);
+       const targetSys = m ? m[1].trim() : null;
+        const curM = errMsg.match(/you are in ([^.]+)\./i);
+        if (curM) invalidateCachedPosition(bot, curM[1].trim());
+        if (targetSys && (!bot.system || bot.system.toLowerCase() !== targetSys.toLowerCase())) {
+          const ok = await navigateToSystem(ctx, targetSys, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+          if (ok) {
+            invalidateCachedPosition(bot, targetSys);
+            await bot.refreshStatus(true);
+            const tr2 = await bot.exec("travel", { target_poi: homeStation });
+            if (tr2.error) return { ok: false, error: `Travel to home station failed: ${tr2.error.message}` };
+          } else {
+            return { ok: false, error: `Failed to navigate to ${targetSys}` };
+          }
+        } else {
+         return { ok: false, error: `Travel to home station failed: ${errMsg}` };
+       }
+     }
+   }
 
   await bot.refreshStatus();
 
@@ -1025,7 +1042,44 @@ function countFuelCells(ctx: RoutineContext): number {
   return getCargoFuelCells(ctx.bot).cells;
 }
 
-/** True only when the bot is currently docked at its configured home base. */
+/** Resolve the system a station POI belongs to using the local map data. */
+function systemForStation(poiId: string): string | null {
+  if (!poiId) return null;
+  const needle = poiId.toLowerCase();
+  const systems = mapStore.getAllSystems();
+  for (const [sysId, sys] of Object.entries(systems)) {
+    const pois = (sys as any).pois || [];
+    if (pois.some((p: any) => (p.id || "").toLowerCase() === needle)) {
+      return sysId;
+    }
+  }
+  try {
+    const ref = loadStationRef();
+    for (const st of ref.stations || []) {
+      if ((st.station_id || "").toLowerCase() === needle) {
+        return st.system_id || null;
+      }
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+/** Invalidate the bot's cached get_status/location result so a stale position
+ *  (common after a socket drop) cannot clobber a position we just corrected
+ *  from a server error message. */
+function invalidateCachedPosition(bot: any, systemId: string): void {
+  try { bot.system = systemId; } catch { /* ignore */ }
+  try { (bot as any)._lastStatusResult = null; } catch { /* ignore */ }
+  try {
+    const acc = (bot as any).account;
+    if (acc && acc.state && typeof acc.state === "object") {
+      acc.state.current_system = systemId;
+      if (acc.state.location && typeof acc.state.location === "object") {
+        acc.state.location.system_id = systemId;
+      }
+    }
+  } catch { /* ignore */ }
+}
 function isAtHomeBase(ctx: RoutineContext, settings: CivilianTransportSettings): boolean {
   if (!settings.homeSystem || !settings.homeStation) return false;
   const sys = (ctx.bot.system || "").toLowerCase();
@@ -1040,12 +1094,13 @@ function isAtHomeBase(ctx: RoutineContext, settings: CivilianTransportSettings):
  * resumes the tour after restocking.
  */
 async function returnHomeForFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
-  if (!settings.homeSystem) return;
+  const homeSystem = systemForStation(settings.homeStation) || settings.homeSystem;
+  if (!homeSystem) return;
   const { bot } = ctx;
 
-  if (settings.homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
+  if (homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
     await ensureUndocked(ctx);
-    const ok = await navigateToSystem(ctx, settings.homeSystem, {
+    const ok = await navigateToSystem(ctx, homeSystem, {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
       skipBlacklist: true,
@@ -1056,19 +1111,35 @@ async function returnHomeForFuelCells(ctx: RoutineContext, settings: CivilianTra
     }
     // Verify we actually arrived at the home system
     await bot.refreshLocation();
-    if (settings.homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
-      ctx.log("error", `Navigation reported success but bot is still in ${bot.system}, not ${settings.homeSystem}`);
+    if (homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
+      ctx.log("error", `Navigation reported success but bot is still in ${bot.system}, not ${homeSystem}`);
       return;
     }
   }
 
-  if (settings.homeStation && (bot.poi || "").toLowerCase() !== settings.homeStation.toLowerCase()) {
-    const tr = await bot.exec("travel", { target_poi: settings.homeStation });
-    if (tr.error) {
-      ctx.log("error", `Travel to home station failed: ${tr.error.message}`);
-      return;
-    }
-  }
+   if (settings.homeStation && (bot.poi || "").toLowerCase() !== settings.homeStation.toLowerCase()) {
+     const tr = await bot.exec("travel", { target_poi: settings.homeStation });
+     if (tr.error) {
+       const errMsg = tr.error.message || "";
+       const m = errMsg.match(/in the [^()]* system \(([^)]+)\)/i);
+       const targetSys = m ? m[1].trim() : null;
+       const curM = errMsg.match(/you are in ([^.]+)\./i);
+        if (curM) invalidateCachedPosition(bot, curM[1].trim());
+        if (targetSys && (!bot.system || bot.system.toLowerCase() !== targetSys.toLowerCase())) {
+          const ok = await navigateToSystem(ctx, targetSys, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+          if (ok) {
+            invalidateCachedPosition(bot, targetSys);
+            await bot.refreshStatus(true);
+            const tr2 = await bot.exec("travel", { target_poi: settings.homeStation });
+            if (tr2.error) ctx.log("error", `Travel to home station failed: ${tr2.error.message}`);
+          } else {
+            ctx.log("error", `Travel to home station failed: ${errMsg}`);
+          }
+        } else {
+         ctx.log("error", `Travel to home station failed: ${errMsg}`);
+       }
+     }
+   }
 
   await ensureDocked(ctx);
   await collectFuelCells(ctx, settings);
@@ -2599,24 +2670,41 @@ if (state && state.status !== "idle") {
           await ctx.sleep(30000);
           continue;
         }
-        if (state.pickupSystem !== bot.system) {
-          const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
-          if (!ok) {
-            state.status = "idle";
-            saveTransportState(state);
-            await ctx.sleep(30000);
-            continue;
-          }
-        }
-        if (bot.poi !== state.pickupStation) {
-          const tr = await bot.exec("travel", { target_poi: state.pickupStation });
-          if (tr.error) {
-            state.status = "idle";
-            saveTransportState(state);
-            await ctx.sleep(30000);
-            continue;
-          }
-        }
+         if (state.pickupSystem !== bot.system) {
+           try { await bot.refreshStatus(true); } catch { /* ignore */ }
+           await bot.refreshLocation();
+           if (state.pickupSystem !== bot.system) {
+             const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+             if (!ok) {
+               state.status = "idle";
+               saveTransportState(state);
+               await ctx.sleep(30000);
+               continue;
+             }
+           }
+         }
+         if (bot.poi !== state.pickupStation) {
+           const tr = await bot.exec("travel", { target_poi: state.pickupStation });
+           if (tr.error) {
+             const errMsg = tr.error.message || "";
+             const m = errMsg.match(/in the [^()]* system \(([^)]+)\)/i);
+             const targetSys = m ? m[1].trim() : null;
+              const curM = errMsg.match(/you are in ([^.]+)\./i);
+              if (curM) invalidateCachedPosition(bot, curM[1].trim());
+              if (targetSys && (!bot.system || bot.system.toLowerCase() !== targetSys.toLowerCase())) {
+                const ok = await navigateToSystem(ctx, targetSys, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+                if (ok) {
+                  invalidateCachedPosition(bot, targetSys);
+                  await bot.refreshStatus(true);
+                  // retry handled next loop
+                }
+              }
+             state.status = "idle";
+             saveTransportState(state);
+             await ctx.sleep(30000);
+             continue;
+           }
+         }
         const dOk = await ensureDocked(ctx);
         if (!dOk) {
           state.status = "idle";
@@ -3356,7 +3444,7 @@ if (state && state.status !== "idle") {
 
       // Handle lounge_transport mode: instead of delivering to destinations, return to home base
       if (settings.mode === "lounge_transport") {
-        if (!settings.homeSystem || !settings.homeStation) {
+         if ((!settings.homeSystem && !systemForStation(settings.homeStation)) || !settings.homeStation) {
           ctx.log("error", "Lounge transport mode requires homeSystem and homeStation to be configured");
           state.status = "idle";
           state.onboardPassengers = [];
@@ -3386,7 +3474,7 @@ if (state && state.status !== "idle") {
     }
 
     if (state.status === "returning_to_lounge") {
-      if (!settings.homeSystem || !settings.homeStation) {
+       if ((!settings.homeSystem && !systemForStation(settings.homeStation)) || !settings.homeStation) {
         ctx.log("error", "Lounge transport mode requires homeSystem and homeStation");
         state.status = "idle";
         state.onboardPassengers = [];
@@ -3396,38 +3484,62 @@ if (state && state.status !== "idle") {
         continue;
       }
 
-      const homeSystem = settings.homeSystem;
-      const homeStation = settings.homeStation;
+         const homeStation = settings.homeStation;
+         const homeSystem = systemForStation(homeStation) || settings.homeSystem;
 
-      // Navigate to home system if not there
-      if (bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
-        ctx.log("transport", `Lounge transport: navigating to home system ${homeSystem}`);
-        const ok = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
-        if (!ok) {
-          ctx.log("transport", `Failed to navigate to home system ${homeSystem}`);
-          await ctx.sleep(30000);
+       // Force an authoritative status refresh so bot.system/poi reflect the
+       // server's view of our position (library-backed bots otherwise rely on
+       // a stale cached account.state and can believe we are already home).
+       try { await bot.refreshStatus(true); } catch { /* ignore */ }
+       await bot.refreshLocation();
+
+       // Navigate to home system if not there
+       if (bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
+         ctx.log("transport", `Lounge transport: navigating to home system ${homeSystem}`);
+         const ok = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+         if (!ok) {
+           ctx.log("transport", `Failed to navigate to home system ${homeSystem}`);
+           await ctx.sleep(30000);
+           continue;
+         }
+          await bot.refreshStatus(true);
+          await checkAndRecloak(ctx, settings);
+          await depositExcessCredits(ctx, settings);
           continue;
         }
-        await bot.refreshStatus();
-        await checkAndRecloak(ctx, settings);
-        await depositExcessCredits(ctx, settings);
-        continue;
-      }
 
-      // Travel to home station if not there
-      if (bot.poi && bot.poi.toLowerCase() !== homeStation.toLowerCase()) {
-        ctx.log("transport", `Lounge transport: traveling to home station ${homeStation}`);
-        const tr = await bot.exec("travel", { target_poi: homeStation });
-        if (tr.error) {
-          ctx.log("error", `Travel to home station failed: ${tr.error.message}`);
-          await ctx.sleep(30000);
-          continue;
-        }
-        await bot.refreshStatus();
-        await checkAndRecloak(ctx, settings);
-        await depositExcessCredits(ctx, settings);
-        continue;
-      }
+        // Travel to home station if not there
+       if (bot.poi && bot.poi.toLowerCase() !== homeStation.toLowerCase()) {
+         ctx.log("transport", `Lounge transport: traveling to home station ${homeStation}`);
+         const tr = await bot.exec("travel", { target_poi: homeStation });
+         if (tr.error) {
+           const errMsg = tr.error.message || "";
+           ctx.log("error", `Travel to home station failed: ${errMsg}`);
+           // If the server says the station is in another system, jump there
+           // first instead of retrying the same doomed travel command.
+           const m = errMsg.match(/in the [^()]* system \(([^)]+)\)/i);
+           const targetSys = m ? m[1].trim() : null;
+            const curM = errMsg.match(/you are in ([^.]+)\./i);
+            if (curM) {
+              invalidateCachedPosition(bot, curM[1].trim());
+            }
+            if (targetSys && (!bot.system || bot.system.toLowerCase() !== targetSys.toLowerCase())) {
+              ctx.log("transport", `Lounge transport: station is in ${targetSys}, navigating there first`);
+              const ok = await navigateToSystem(ctx, targetSys, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+              if (ok) {
+                invalidateCachedPosition(bot, targetSys);
+                await bot.refreshStatus(true);
+                continue;
+              }
+            }
+            await ctx.sleep(30000);
+            continue;
+          }
+          await bot.refreshStatus(true);
+         await checkAndRecloak(ctx, settings);
+         await depositExcessCredits(ctx, settings);
+         continue;
+       }
 
       // Dock at home station
       if (!bot.docked) {
@@ -3585,28 +3697,42 @@ if (state && state.status !== "idle") {
       const waypoint = state.route[state.currentRouteIndex];
       ctx.log("transport", `Lounge delivery: waypoint ${state.currentRouteIndex + 1}/${state.route.length}: ${waypoint.system} / ${waypoint.poiName}`);
 
-      if (waypoint.system !== bot.system) {
-        ctx.log("transport", `Lounge delivery: navigating to system ${waypoint.system}`);
-        const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
-        if (!ok) {
-          ctx.log("transport", `Lounge delivery: FAILED to navigate to system ${waypoint.system}`);
-          await ctx.sleep(30000);
-          continue;
+        if (waypoint.system !== bot.system) {
+          try { await bot.refreshStatus(true); } catch { /* ignore */ }
+          await bot.refreshLocation();
+          if (waypoint.system !== bot.system) {
+            ctx.log("transport", `Lounge delivery: navigating to system ${waypoint.system}`);
+            const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+            if (!ok) {
+              ctx.log("transport", `Lounge delivery: FAILED to navigate to system ${waypoint.system}`);
+              await ctx.sleep(30000);
+              continue;
+            }
+            await bot.refreshStatus();
+            await checkAndRecloak(ctx, settings);
+            await depositExcessCredits(ctx, settings);
+            continue;
+          }
         }
-        await bot.refreshStatus();
-        await checkAndRecloak(ctx, settings);
-        await depositExcessCredits(ctx, settings);
-        continue;
-      }
 
       if (bot.poi !== waypoint.poi) {
         ctx.log("transport", `Lounge delivery: traveling to poi ${waypoint.poi}`);
-        const tr = await bot.exec("travel", { target_poi: waypoint.poi });
-        if (tr.error) {
-          ctx.log("transport", `Lounge delivery: Travel to ${waypoint.poi} failed: ${tr.error.message}`);
-          await ctx.sleep(30000);
-          continue;
-        }
+         const tr = await bot.exec("travel", { target_poi: waypoint.poi });
+         if (tr.error) {
+           const errMsg = tr.error.message || "";
+           const m = errMsg.match(/in the [^()]* system \(([^)]+)\)/i);
+           const targetSys = m ? m[1].trim() : null;
+            const curM = errMsg.match(/you are in ([^.]+)\./i);
+            if (curM) invalidateCachedPosition(bot, curM[1].trim());
+            if (targetSys && (!bot.system || bot.system.toLowerCase() !== targetSys.toLowerCase())) {
+              ctx.log("transport", `Lounge delivery: target in ${targetSys}, navigating there first`);
+              const ok = await navigateToSystem(ctx, targetSys, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+              if (ok) { invalidateCachedPosition(bot, targetSys); await bot.refreshStatus(true); continue; }
+            }
+           ctx.log("transport", `Lounge delivery: Travel to ${waypoint.poi} failed: ${errMsg}`);
+           await ctx.sleep(30000);
+           continue;
+         }
         await bot.refreshStatus();
         await checkAndRecloak(ctx, settings);
         await depositExcessCredits(ctx, settings);
@@ -3730,19 +3856,23 @@ if (state && state.status !== "idle") {
       const waypoint = state.route[state.currentRouteIndex];
       ctx.log("transport", `Waypoint ${span(`${state.currentRouteIndex + 1}/${state.route.length}`, "ansi-cyan")}: ${span(waypoint.system, "ansi-yellow")} / ${waypoint.poiName}`);
 
-      if (waypoint.system !== bot.system) {
-        ctx.log("transport", `Navigating to system ${waypoint.system}`);
-        const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
-        if (!ok) {
-          ctx.log("transport", `FAILED to navigate to system ${waypoint.system}`);
-          await ctx.sleep(30000);
-          continue;
-        }
-        await bot.refreshStatus();
-        await checkAndRecloak(ctx, settings);
-        await depositExcessCredits(ctx, settings);
-        ctx.log("transport", `Arrived at system ${waypoint.system}`);
-      }
+       if (waypoint.system !== bot.system) {
+         try { await bot.refreshStatus(true); } catch { /* ignore */ }
+         await bot.refreshLocation();
+         if (waypoint.system !== bot.system) {
+           ctx.log("transport", `Navigating to system ${waypoint.system}`);
+           const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+           if (!ok) {
+             ctx.log("transport", `FAILED to navigate to system ${waypoint.system}`);
+             await ctx.sleep(30000);
+             continue;
+           }
+           await bot.refreshStatus();
+           await checkAndRecloak(ctx, settings);
+           await depositExcessCredits(ctx, settings);
+           ctx.log("transport", `Arrived at system ${waypoint.system}`);
+         }
+       }
       if (bot.poi !== waypoint.poi) {
         // Refuel tank from cargo fuel cells before traveling. Cargo cells are
         // not usable by `travel` until burned into the tank via `refuel`.
@@ -3771,9 +3901,23 @@ if (state && state.status !== "idle") {
         }
         ctx.log("transport", `Traveling to poi ${waypoint.poi} (fuel: ${fuelPct}%)`);
         const tr = await bot.exec("travel", { target_poi: waypoint.poi });
-        if (tr.error) {
-          const errMsg = tr.error.message || "";
-          if (isMobileStation(waypoint.poi) && state.routeRebuildAttempts < 3) {
+         if (tr.error) {
+           const errMsg = tr.error.message || "";
+           // If the target POI is actually in another system, jump there first.
+           const sysM = errMsg.match(/in the [^()]* system \(([^)]+)\)/i);
+           const targetSys = sysM ? sysM[1].trim() : null;
+            const curM = errMsg.match(/you are in ([^.]+)\./i);
+            if (curM) invalidateCachedPosition(bot, curM[1].trim());
+            if (targetSys && (!bot.system || bot.system.toLowerCase() !== targetSys.toLowerCase())) {
+              ctx.log("transport", `Travel target ${waypoint.poi} is in ${targetSys}; navigating there first`);
+              const ok = await navigateToSystem(ctx, targetSys, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+              if (ok) {
+                invalidateCachedPosition(bot, targetSys);
+                await bot.refreshStatus(true);
+                continue;
+              }
+            }
+           if (isMobileStation(waypoint.poi) && state.routeRebuildAttempts < 3) {
             const suggestedMatch = errMsg.match(/jump to (.+?) to find it/i);
             if (suggestedMatch) {
               const suggestedSystemName = suggestedMatch[1].trim();

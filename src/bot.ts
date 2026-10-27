@@ -2181,7 +2181,7 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
 
   async refreshLocation(): Promise<ApiResponse> {
     const resp: ApiResponse = this.account
-      ? { result: this.account.state as unknown as Record<string, unknown>, error: undefined, notifications: [] }
+      ? { result: (this._lastStatusResult ?? this.account.state) as unknown as Record<string, unknown>, error: undefined, notifications: [] }
       : await this.libExec("get_location");
     if (!resp.error && resp.result) {
       const r = resp.result as Record<string, unknown>;

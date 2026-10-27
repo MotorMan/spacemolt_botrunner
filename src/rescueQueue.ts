@@ -441,14 +441,35 @@ export function getQueueStats(): {
 }
 
 /**
- * Remove stale entries from the queue (older than 1 hour without attempts).
+ * Remove stale entries from the queue.
+ *
+ * Entries are removed when any of these conditions hold:
+ *  - The entry has never been attempted and is older than `maxAgeMs` (default 1h).
+ *  - The entry was claimed by a bot but the claim is older than `claimTimeoutMs`
+ *    (default 30 min) — the claiming bot presumably crashed or got stuck and never
+ *    released the claim or marked the rescue completed.
+ *
+ * This prevents the queue from accumulating "zombie" entries that are claimed by a
+ * dead bot and can never be re-claimed (claimRescue returns false for entries
+ * claimed by another bot, and getUnclaimedRescuesInSystem skips claimed entries).
  */
-export function cleanupStaleQueue(maxAgeMs: number = 60 * 60 * 1000): void {
+export function cleanupStaleQueue(
+  maxAgeMs: number = 60 * 60 * 1000,
+  claimTimeoutMs: number = 30 * 60 * 1000,
+): void {
   const data = loadRescueQueue();
   const now = Date.now();
 
   data.pending = data.pending.filter(r => {
-    // Keep recent entries or ones that have been attempted
+    // Remove entries with stale claims — the claiming bot never completed or
+    // released the claim within the claim timeout window. These are orphaned:
+    // no other bot can re-claim them (claimRescue refuses them) and they are
+    // never marked completed, so they accumulate in the file indefinitely.
+    if (r.claimedBy && r.claimedAt && (now - r.claimedAt) > claimTimeoutMs) {
+      console.log(`[rescueQueue] Cleaning stale entry: ${r.targetUsername} claimed by ${r.claimedBy} (claim expired after ${claimTimeoutMs}ms)`);
+      return false;
+    }
+    // Keep recent entries or ones that have been attempted (with non-stale claims)
     if (r.attempts > 0) {
       return true;
     }

@@ -2315,6 +2315,43 @@ function stopCreditTopOffBackground(): void {
   console.log("[rescue] 💰 Credit top-off background loop stopped");
 }
 
+// ── Queue cleanup helper ────────────────────────────────────────────────────
+
+/**
+ * Clean up the rescue queue entry for a target username.
+ *
+ * When `markCompleted` is true the entry is moved from `pending` to the
+ * completed-history list — used when the target no longer needs rescue
+ * (self-refueled, recovered, already rescued by another bot, etc.).
+ *
+ * When `markCompleted` is false only the bot's claim is released — used when
+ * the rescue failed for a transient reason (pirates, couldn't reach, etc.)
+ * and the target may still need help on a future retry.
+ */
+function cleanupQueuedRescue(
+  ctx: RoutineContext,
+  targetUsername: string,
+  botUsername: string,
+  markCompleted: boolean,
+  reason: string,
+): void {
+  const queue = getRescueQueue();
+  const queuedRescue = queue.pending.find(
+    r => r.targetUsername === targetUsername && !r.completed,
+  );
+  if (!queuedRescue) {
+    return;
+  }
+
+  if (markCompleted) {
+    markRescueCompleted(queuedRescue.id);
+    ctx.log("rescue", `📋 Marked ${targetUsername} as completed in rescue queue (${reason})`);
+  } else {
+    releaseRescueClaim(queuedRescue.id, botUsername);
+    ctx.log("rescue", `📋 Released claim on ${targetUsername} in rescue queue (${reason})`);
+  }
+}
+
 // ── FuelTransfer routine (using refuel command) ─────────────────
 
 /**
@@ -2630,8 +2667,12 @@ skipToReturnHome = true;
 
         const targets = shouldHandleFleetRescue(bot.username, strandedBots.length) ? strandedBots : [];
 
-        // Clean up stale queue entries
+        // Clean up stale queue entries (including entries with stale claims)
         cleanupStaleQueue();
+        // Also release claims that have been held too long by a bot that
+        // presumably crashed or got stuck mid-rescue — without this, orphaned
+        // claims block re-claiming and the entries pile up in the queue.
+        cleanupStaleClaims();
 
         // ── Check for MAYDAY requests if no fleet targets ──
         // A non-primary bot only handles MAYDAYs when there are 2+ pending (a
@@ -3387,17 +3428,19 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
           maydayMaxJumps: settings.maydayMaxJumps
         });
-        if (trapCheck.isTrap) {
-          ctx.log("rescue", `🚨 ABORTING RESCUE - ${trapCheck.reason}`);
-          ctx.log("rescue", `🚨 This appears to be a PIRATE TRAP using false flag operation`);
-          
-          // Fail the rescue session if one exists
-          const activeSession = getActiveRescueSession(bot.username);
-          if (activeSession) {
-            await failRescueSession(bot.username, `Aborted - pirate trap detected: ${trapCheck.reason}`);
-          }
-          
-          // Mark MAYDAY as handled to prevent re-triggering
+       if (trapCheck.isTrap) {
+         ctx.log("rescue", `🚨 ABORTING RESCUE - ${trapCheck.reason}`);
+         ctx.log("rescue", `🚨 This appears to be a PIRATE TRAP using false flag operation`);
+         
+         // Fail the rescue session if one exists
+         const activeSession = getActiveRescueSession(bot.username);
+         if (activeSession) {
+           await failRescueSession(bot.username, `Aborted - pirate trap detected: ${trapCheck.reason}`);
+         }
+         // Target is a trap — don't retry, mark queue entry as completed
+         cleanupQueuedRescue(ctx, target.username, bot.username, true, `pirate trap: ${trapCheck.reason}`);
+         
+         // Mark MAYDAY as handled to prevent re-triggering
           if (isMaydayTarget) {
             const mayday = getNextMayday();
             if (mayday) markMaydayHandled(mayday);
@@ -3539,16 +3582,18 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         }
         
         // If no safe route found after all attempts, abort
-        if (!routeToTarget) {
-          ctx.log("rescue", `🚫 BLOCKED: All routes to ${target.system} pass through blacklisted systems`);
-          ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available after ${MAX_ROUTE_ATTEMPTS} attempts`);
-          
-          const activeSession = getActiveRescueSession(bot.username);
-          if (activeSession) {
-            await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
-          }
-          
-          if (isMaydayTarget) {
+       if (!routeToTarget) {
+         ctx.log("rescue", `🚫 BLOCKED: All routes to ${target.system} pass through blacklisted systems`);
+         ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available after ${MAX_ROUTE_ATTEMPTS} attempts`);
+         
+         const activeSession = getActiveRescueSession(bot.username);
+         if (activeSession) {
+           await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
+         }
+         // Target is unreachable via safe routes — mark queue entry as completed
+         cleanupQueuedRescue(ctx, target.username, bot.username, true, "no safe route available");
+         
+         if (isMaydayTarget) {
             const mayday = getNextMayday();
             if (mayday) markMaydayHandled(mayday);
           }
@@ -5930,16 +5975,21 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
           // Target still needs help - resume the session
           recoveredSession = activeSession;
           ctx.log("rescue", `Resuming rescue mission for ${activeSession.targetUsername} (state: ${activeSession.state})`);
-        } else {
-          // Target has been refueled - clear the session
-          ctx.log("rescue", `${activeSession.targetUsername} has been refueled (${fuelPct}%) - clearing session`);
-          await failRescueSession(bot.username, "Target no longer needs rescue");
-        }
-      } else {
-        // Target not in fleet - they may have logged off or session is stale
-        ctx.log("rescue", `Target ${activeSession.targetUsername} not in fleet - clearing session`);
-        await failRescueSession(bot.username, "Target not found in fleet");
-      }
+         } else {
+           // Target has been refueled - clear the session
+           ctx.log("rescue", `${activeSession.targetUsername} has been refueled (${fuelPct}%) - clearing session`);
+           await failRescueSession(bot.username, "Target no longer needs rescue");
+           // The target resolved their fuel situation, so clean up the queue entry
+           // (otherwise it lingers in pending forever, blocking future re-queues).
+           cleanupQueuedRescue(ctx, activeSession.targetUsername, bot.username, true, "target refueled during session recovery");
+         }
+       } else {
+         // Target not in fleet - they may have logged off or session is stale
+         ctx.log("rescue", `Target ${activeSession.targetUsername} not in fleet - clearing session`);
+         await failRescueSession(bot.username, "Target not found in fleet");
+         // Target is gone — clean up the queue entry so it doesn't accumulate.
+         cleanupQueuedRescue(ctx, activeSession.targetUsername, bot.username, true, "target not in fleet during session recovery");
+       }
     }
 
     const settings = getRescueSettings();
@@ -6098,8 +6148,12 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
          return true;
        });
 
-       // Clean up stale queue entries
-       cleanupStaleQueue();
+        // Clean up stale queue entries (including entries with stale claims)
+        cleanupStaleQueue();
+        // Also release claims that have been held too long by a bot that
+        // presumably crashed or got stuck mid-rescue — without this, orphaned
+        // claims block re-claiming and the entries pile up in the queue.
+        cleanupStaleClaims();
 
         // ── Check for MAYDAY requests if no fleet targets ──
         // A non-primary bot only handles MAYDAYs when there are 2+ pending (a
@@ -6956,6 +7010,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (recoveredSession || getActiveRescueSession(bot.username)) {
           await failRescueSession(bot.username, "Could not acquire fuel cells or credits");
         }
+        // Release the queue claim so another bot can try or the entry can be retried
+        cleanupQueuedRescue(ctx, target.username, bot.username, false, "no fuel cells or credits available");
         await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
@@ -7030,14 +7086,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         // A per-jump check that finds the target refueled (or moved) is a
         // successful outcome, not a navigation failure, so don't log it as an
         // error or count it toward the consecutive-failure abort.
-        if (enRouteAbort.reason) {
-          ctx.log("rescue", `✅ Fleet rescue for ${target.username} called off en-route — ${enRouteAbort.reason}`);
-          if (getActiveRescueSession(bot.username)) {
-            await failRescueSession(bot.username, `Called off en-route: ${enRouteAbort.reason}`);
-          }
-          await ctx.sleep(settings.scanIntervalSec * 1000);
-          continue;
-        }
+         if (enRouteAbort.reason) {
+           ctx.log("rescue", `✅ Fleet rescue for ${target.username} called off en-route — ${enRouteAbort.reason}`);
+           if (getActiveRescueSession(bot.username)) {
+             await failRescueSession(bot.username, `Called off en-route: ${enRouteAbort.reason}`);
+           }
+           // Target resolved their fuel situation (refueled/moved) — remove the
+           // queue entry so it doesn't linger as a stale pending rescue.
+           cleanupQueuedRescue(ctx, target.username, bot.username, true, enRouteAbort.reason);
+           await ctx.sleep(settings.scanIntervalSec * 1000);
+           continue;
+         }
 
         ctx.log("error", `Could not reach fleet target system ${target.system} for ${target.username} (or target moved during travel)`);
         
@@ -7045,6 +7104,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (activeSession) {
           await failRescueSession(bot.username, `Could not reach target system ${target.system}`);
         }
+        // Release the queue claim so another bot can attempt this rescue
+        cleanupQueuedRescue(ctx, target.username, bot.username, false, "could not reach target system");
         
         if (isMaydayTarget) {
           const mayday = getNextMayday();
@@ -7077,6 +7138,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (activeSession) {
           await failRescueSession(bot.username, `Aborted - pirate trap detected: ${trapCheck.reason}`);
         }
+        // Target is a trap — mark queue entry as completed so it doesn't linger
+        cleanupQueuedRescue(ctx, target.username, bot.username, true, `pirate trap: ${trapCheck.reason}`);
         
         // Mark MAYDAY as handled to prevent re-triggering
         if (isMaydayTarget) {
@@ -7104,6 +7167,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (activeSession) {
           await failRescueSession(bot.username, "Aborted - target system is blacklisted");
         }
+        // Target is in a blacklisted system — mark queue entry as completed
+        cleanupQueuedRescue(ctx, target.username, bot.username, true, "target system blacklisted");
         
         if (isMaydayTarget) {
           const mayday = getNextMayday();
@@ -7219,6 +7284,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (activeSession) {
           await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
         }
+        // Target is unreachable via safe routes — mark queue entry as completed
+        cleanupQueuedRescue(ctx, target.username, bot.username, true, "no safe route available");
         
         if (isMaydayTarget) {
           const mayday = getNextMayday();
@@ -7251,6 +7318,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         ctx.log("warn", `Could not calculate route to ${target.system}: ${e}`);
       }
 
+      // Set when an en-route check cancels the MAYDAY mission (target refueled/moved),
+      // so the `!arrived` handler below can distinguish a deliberate stand-down from
+      // an actual navigation failure.
+      const maydayEnRouteAbort: { reason: string | null } = { reason: null };
+
       const safetyOpts = {
         fuelThresholdPct: settings.refuelThreshold,
         hullThresholdPct: 30,
@@ -7268,7 +7340,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           );
 
           if (!statusCheck.needsRescue) {
-            ctx.log("rescue", `🛑 ABORTING rescue - ${statusCheck.reason}`);
+            maydayEnRouteAbort.reason = statusCheck.reason || "target moved or refueled";
+            ctx.log("rescue", `🛑 ABORTING rescue - ${maydayEnRouteAbort.reason}`);
             return false; // Abort navigation
           }
 
@@ -7282,6 +7355,23 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       };
       const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
       if (!arrived) {
+        // Distinguish "we stood down on purpose" (target refueled/moved) from
+        // "we couldn't get there" (real navigation failure).
+        if (maydayEnRouteAbort.reason) {
+          ctx.log("rescue", `✅ MAYDAY rescue for ${target.username} called off en-route — ${maydayEnRouteAbort.reason}`);
+          if (getActiveRescueSession(bot.username)) {
+            await failRescueSession(bot.username, `Called off en-route: ${maydayEnRouteAbort.reason}`);
+          }
+          // Target resolved their fuel situation — clean up the queue entry
+          cleanupQueuedRescue(ctx, target.username, bot.username, true, maydayEnRouteAbort.reason);
+          if (isMaydayTarget) {
+            const mayday = getNextMayday();
+            if (mayday) markMaydayHandled(mayday);
+          }
+          await ctx.sleep(settings.scanIntervalSec * 1000);
+          continue;
+        }
+
         // Track consecutive failures to prevent infinite retry loops
         const activeSession = getActiveRescueSession(bot.username);
         const failureReason = `Could not reach ${target.system}`;
@@ -7300,6 +7390,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               const mayday = getNextMayday();
               if (mayday) markMaydayHandled(mayday);
             }
+            // Release the queue claim so another bot can attempt this rescue
+            cleanupQueuedRescue(ctx, target.username, bot.username, false, "navigation failed after 3 attempts");
             await ctx.sleep(settings.scanIntervalSec * 1000);
             continue;
           }
@@ -7315,6 +7407,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             }
           }
         }
+        // Release the queue claim so another bot can attempt this rescue
+        cleanupQueuedRescue(ctx, target.username, bot.username, false, "could not reach target system");
         await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
@@ -7369,13 +7463,15 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           fuelThresholdPct: settings.refuelThreshold,
           hullThresholdPct: 30,
         });
-        if (!arrived2) {
-          ctx.log("error", `Could not follow target to new system ${target.system}`);
-          const activeSession = getActiveRescueSession(bot.username);
-          if (activeSession) {
-            await failRescueSession(bot.username, `Could not follow target to ${target.system}`);
-          }
-          if (isMaydayTarget) {
+         if (!arrived2) {
+           ctx.log("error", `Could not follow target to new system ${target.system}`);
+           const activeSession = getActiveRescueSession(bot.username);
+           if (activeSession) {
+             await failRescueSession(bot.username, `Could not follow target to ${target.system}`);
+           }
+           // Release the queue claim so another bot can attempt this rescue
+           cleanupQueuedRescue(ctx, target.username, bot.username, false, "could not follow target to new system");
+           if (isMaydayTarget) {
             const mayday = getNextMayday();
             if (mayday) markMaydayHandled(mayday);
           }
@@ -7665,6 +7761,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (recoveredSession || getActiveRescueSession(bot.username)) {
             await failRescueSession(bot.username, "Could not reach target - all attempts failed");
           }
+          // Release the queue claim so another bot can attempt this rescue
+          cleanupQueuedRescue(ctx, target.username, bot.username, false, "all POI travel attempts failed");
           markMaydayHandled({ sender: target.username, system: target.system, poi: target.poi || "", fuelPct: target.fuelPct, timestamp: Date.now(), currentFuel: 0, maxFuel: 0, rawMessage: "" });
 
           // Return home after failed rescue
@@ -8108,6 +8206,15 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         await failRescueSession(bot.username, alreadyRescuedByOther
           ? "Target already rescued by another - no fuel needed"
           : "Fuel transfer failed - target not reachable at reported location");
+      }
+
+      // Clean up the queue entry for this target. If another rescuer already
+      // helped (alreadyRescuedByOther), the target no longer needs rescue so mark
+      // it completed. Otherwise release the claim so another bot can retry.
+      if (alreadyRescuedByOther) {
+        cleanupQueuedRescue(ctx, target.username, bot.username, true, "already rescued by another bot");
+      } else {
+        cleanupQueuedRescue(ctx, target.username, bot.username, false, "fuel transfer failed - target not reachable");
       }
 
       // Only record a ghost for genuine no-shows, NOT when another rescuer simply

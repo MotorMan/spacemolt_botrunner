@@ -740,39 +740,27 @@ export async function ensureDocked(
         if (bot.state !== "running") return false;
         ctx.log("travel", `Jumping to ${route[i]} (${i}/${route.length - 1})...`);
         const jumpResp = await bot.exec("jump", { target_system: route[i] });
-        if (jumpResp.error) {
-          ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-          if (isStalePositionError(jumpResp.error.message)) {
-            ctx.log("travel", "Stale position detected — refreshing location");
+          if (jumpResp.error) {
+            ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+            // Check if we actually made the jump despite the error
             await bot.refreshLocation();
-            try { await bot.refreshStatus(true); } catch { /* ignore */ }
-            return false;
+            if (bot.system.toLowerCase() !== route[i].toLowerCase()) {
+              return false; // Jump truly failed
+            }
+            ctx.log("travel", `Jump succeeded despite error (server confirmed position)`);
           }
-          // Check if we actually made the jump despite the error
-          await bot.refreshLocation();
-          if (bot.system.toLowerCase() !== route[i].toLowerCase()) {
-            return false; // Jump truly failed
-          }
-          ctx.log("travel", `Jump succeeded despite error (server confirmed position)`);
-        }
       }
     } else {
         const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
         if (jumpResp.error) {
           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-          if (isStalePositionError(jumpResp.error.message)) {
-            ctx.log("travel", "Stale position detected — refreshing location");
-            await bot.refreshLocation();
-            try { await bot.refreshStatus(true); } catch { /* ignore */ }
-            return false;
-          }
           // Check if we actually made the jump despite the error
           await bot.refreshLocation();
           if (bot.system.toLowerCase() !== nearest.systemId.toLowerCase()) {
             return false; // Jump truly failed
           }
           ctx.log("travel", `Jump succeeded despite error (server confirmed position)`);
-      }
+        }
     }
     // Refresh location after navigation
     await bot.refreshLocation();
@@ -2870,16 +2858,10 @@ if (looted > 0) {
           }
           ctx.log("travel", `Jumping to ${route[i]} (${i}/${route.length - 1})...`);
            const jumpResp = await bot.exec("jump", { target_system: route[i] });
-           if (jumpResp.error) {
-             ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-             if (isStalePositionError(jumpResp.error.message)) {
-               ctx.log("travel", "Stale position detected — refreshing location");
-               await bot.refreshLocation();
-               try { await bot.refreshStatus(true); } catch { /* ignore */ }
-               return false;
-             }
-             return await emergencyFuelRecovery(ctx);
-           }
+            if (jumpResp.error) {
+              ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+              return await emergencyFuelRecovery(ctx);
+            }
         }
       } else {
         ctx.log("travel", `Direct jump to ${nearest.systemId}...`);
@@ -3255,8 +3237,7 @@ export async function navigateToSystem(
       const reconnected = await waitForReconnect(ctx);
       if (!reconnected) return false;
     }
-    await bot.refreshLocation();
-    // Case-insensitive comparison for system names (handle underscore vs space)
+    // Check position directly (position-changed notices are the source of truth).
     if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
       ctx.log("travel", `Already at ${targetSystemId} (normalized: "${normalizeSystemName(bot.system)}" === "${normalizeSystemName(targetSystemId)}")`);
       return true;
@@ -3322,7 +3303,6 @@ export async function navigateToSystem(
         // Server returned no route - check if we might already be at the target
         // This can happen due to case mismatch or if we're already there
         ctx.log("warn", `Server returned no route to ${targetSystemId} — checking if already arrived...`);
-        await bot.refreshLocation();
         if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
           ctx.log("travel", `Confirmed at ${targetSystemId} after failed route lookup (normalized comparison)`);
           return true;
@@ -3376,8 +3356,7 @@ export async function navigateToSystem(
       return false;
     }
 
-    // CRITICAL: Re-check position after ensureFueled — it may have moved us to a different system!
-    await bot.refreshLocation();
+    // Re-check position after ensureFueled — it may have moved us to a different system!
     if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) return true;
 
     // Recalculate route from CURRENT position (ensureFueled may have moved us, use blacklist)
@@ -3573,21 +3552,7 @@ export async function navigateToSystem(
 
       const errorMsg = jumpResp.error.message.toLowerCase();
 
-      // Stale position: the bot actually moved during a reconnect, so the jump
-      // target is no longer valid from its current system. Refresh authoritative
-      // position and recalculate the route from where it really is.
-      if (isStalePositionError(jumpResp.error.message)) {
-        ctx.log("travel", `Stale position detected (moved during reconnect) — refreshing location and recalculating route...`);
-        await bot.refreshLocation();
-        try { await bot.refreshStatus(true); } catch { /* ignore */ }
-        if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
-          ctx.log("travel", `Already at target ${targetSystemId} after position refresh`);
-          return true;
-        }
-        continue;
-      }
-
-      // Check for in_battle error - for escorts, this means they got pulled into a battle
+       // Check for in_battle error - for escorts, this means they got pulled into a battle
       // Return false to signal navigation was interrupted by battle so escort routine can handle it
       if (errorMsg.includes("in_battle") || errorMsg.includes("in combat")) {
         ctx.log("combat", `Jump failed due to battle: ${jumpResp.error.message}`);
@@ -3635,8 +3600,6 @@ export async function navigateToSystem(
           return false;
         }
         // Refresh location after transit completes
-        await bot.refreshLocation();
-        // Check if we're now at the target system
         if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
           ctx.log("travel", `Arrived at ${targetSystemId} after transit completed`);
           return true;
@@ -3646,54 +3609,28 @@ export async function navigateToSystem(
         continue; // Continue the jump loop with updated position
       }
 
-      // Special case: "already in" means we're already at the target system
+      // Special case: "already in" means we're already at that system.
       if (errorMsg.includes("you are already in")) {
-        ctx.log("travel", `Server says already in system — refreshing location to verify position...`);
-        await bot.refreshLocation();
-        // Check if we're actually at the target system
-        if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+        const m = jumpResp.error.message.match(/already in (.+)/i);
+        const alreadySystem = m ? m[1].replace(/\.$/, "").trim() : null;
+        if (alreadySystem && normalizeSystemName(alreadySystem) === normalizeSystemName(targetSystemId)) {
           ctx.log("travel", `Confirmed: already at target ${targetSystemId}`);
+          bot.system = targetSystemId;
           return true;
         }
-        // Not at target - the "already in" error was for a different system
-        // Fall through to retry logic
+        if (alreadySystem) {
+          ctx.log("travel", `Already in ${alreadySystem} (not target) - updating position`);
+          bot.system = alreadySystem;
+        }
+        return false;
       }
 
       ctx.log("error", `Jump failed (transient): ${jumpResp.error.message}`);
-      
+
       if (retries < MAX_RETRIES_PER_JUMP) {
-        // Wait before retrying - exponential backoff
-        const waitTime = 5000 * retries; // 5s, 10s, 15s
-        ctx.log("travel", `Waiting ${waitTime/1000}s before retry...`);
-        await sleep(waitTime);
-
-        // CRITICAL: Refresh location and recalculate route after wait
-        await bot.refreshLocation();
-        if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
-
-        // Recalculate route from CURRENT position (may have changed during wait, use blacklist)
-        // For "systems not connected" errors, always do a full server re-query to avoid stale bad hops
-        let retryRoute = mapStore.findRoute(bot.system, targetSystemId, blacklist);
-        if (!retryRoute || retryRoute.length <= 1) {
-          ctx.log("travel", `No mapped route after wait — querying server for fresh route to ${targetSystemId}`);
-          const retryResp = await bot.exec("find_route", { target_system: targetSystemId });
-          const retryData = retryResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number } | null;
-          if (!retryResp.error && retryData?.found && retryData.route && retryData.route.length > 1) {
-            const ids = retryData.route.map(r => r.system_id);
-            const startsHere = ids[0] && normalizeSystemName(ids[0]) === normalizeSystemName(bot.system);
-            if (startsHere) {
-              retryRoute = ids;
-              const full = ids.join(" → ");
-              ctx.log("debug", `Fresh server route after wait for ${targetSystemId}: ${full}`);
-            } else {
-              ctx.log("warn", `Fresh server route after wait rejected — does not start at ${bot.system}`);
-            }
-          }
-        }
-        if (retryRoute && retryRoute.length > 1) {
-          nextSystem = retryRoute[1];
-          ctx.log("travel", `Route recalculated after wait: ${retryRoute.length - 1} jump${retryRoute.length - 1 !== 1 ? "s" : ""} remaining`);
-        }
+        // Short wait before retry (no long backoff / route recalc)
+        await sleep(2000);
+        continue;
       }
     }
     
@@ -3701,8 +3638,6 @@ export async function navigateToSystem(
       ctx.log("error", `Jump to ${nextSystem} failed after ${MAX_RETRIES_PER_JUMP} retries`);
       return false;
     }
-
-    await bot.refreshLocation();
 
     // Check for customs inspection after entering new system
     await checkCustomsInspection(ctx, nextSystem);
@@ -3757,7 +3692,6 @@ export async function navigateToSystem(
     ctx.log("travel", `Arrived in ${bot.system}`);
     if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) {
       await sleep(1000);
-      await bot.refreshLocation();
       return true;
     }
     if (bot.state !== "running") return false;

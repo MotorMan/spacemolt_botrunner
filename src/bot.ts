@@ -1858,15 +1858,6 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           this.lastPoi = this.poi;
         }
 
-        // Stale-position recovery: a jump/travel command can fail because the bot
-        // actually moved during a reconnect (the server says it is no longer at
-        // the system it thought it was). Refresh authoritative position now so
-        // routines see where the bot really is instead of looping on the old spot.
-        if ((command === "jump" || command === "travel") && resp?.error && isStalePositionError(resp.error.message)) {
-          this.log("warn", `Stale position after ${command}: ${resp.error.message} — refreshing location from server`);
-          try { await this.refreshStatus(true); } catch { /* ignore */ }
-        }
-
         return resp;
         } catch (err) {
         // Handle abort
@@ -2188,20 +2179,26 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       const location = r.location as Record<string, unknown> | undefined;
       const player = r.player as Record<string, unknown> | undefined;
       const p = location || player || r;
-      this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
-      this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
-      this.docked = location?.docked_at != null
-        ? !!(location.docked_at)
-        : (p.docked_at_base != null
-          ? !!(p.docked_at_base)
-          : (p.docked as boolean) ?? (p.status === "docked"));
-      this.location =
-        (location?.system_name as string) ||
-        (location?.system_id as string) ||
-        (p.current_system as string) ||
-        (p.location as string) ||
-        this.location;
-      this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+      // For library-backed bots, refreshLocation only sees the stale account.state
+      // cache, so applying system/poi/docked/location/faction from it clobbers the
+      // authoritative values updated by command responses and position-changed
+      // notices. Trust those instead; use refreshStatus() for authoritative data.
+      if (!this.account) {
+        this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
+        this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+        this.docked = location?.docked_at != null
+          ? !!(location.docked_at)
+          : (p.docked_at_base != null
+            ? !!(p.docked_at_base)
+            : (p.docked as boolean) ?? (p.status === "docked"));
+        this.location =
+          (location?.system_name as string) ||
+          (location?.system_id as string) ||
+          (p.current_system as string) ||
+          (p.location as string) ||
+          this.location;
+        this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+      }
       // For library-backed bots `r` is `account.state`, which the library only
       // updates from push events and does NOT keep current for is_cloaked /
       // credits (see refreshStatus's throttle note). Re-deriving these here from

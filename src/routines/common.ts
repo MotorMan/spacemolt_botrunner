@@ -4785,11 +4785,39 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
     return;
   }
 
+  // Instant check: do we already have an active policy? (no mutation / no tick wait)
+  const policiesResp = await bot.exec("view_insurance");
+  if (!policiesResp.error && policiesResp.result) {
+    const r = policiesResp.result as Record<string, unknown>;
+    const policies =
+      (r?.policies as unknown[]) ??
+      ((r?.result as Record<string, unknown>)?.policies as unknown[]) ??
+      ((r?.structuredContent as Record<string, unknown>)?.policies as unknown[]) ??
+      [];
+    if (Array.isArray(policies) && policies.length > 0) {
+      ctx.log("insurance", "Already insured - skipping purchase");
+      return;
+    }
+  } else if (policiesResp.error) {
+    const errMsg = policiesResp.error?.message || "no result";
+    const errCode = policiesResp.error?.code || "";
+    if (/already has active insurance/i.test(errMsg) || /already_insured/i.test(errCode)) {
+      ctx.log("insurance", "Already insured - skipping purchase");
+      return;
+    }
+    ctx.log("insurance", `Policies check failed: ${errMsg}`);
+  }
+
    const quoteResp = await bot.exec("get_insurance_quote");
    if (quoteResp.error || !quoteResp.result) {
      const errMsg = quoteResp.error?.message || "no result";
-     if (/already has active insurance/i.test(errMsg)) {
+     const errCode = quoteResp.error?.code || "";
+     if (/already has active insurance/i.test(errMsg) || /already_insured/i.test(errCode)) {
        ctx.log("insurance", "Already insured - skipping purchase");
+       return;
+     }
+     if (/starter ships cannot be insured/i.test(errMsg) || /not_insurable/i.test(errCode) || /not_insurable/i.test(errMsg)) {
+       ctx.log("insurance", "Skipping insurance check - starter ship not insurable");
        return;
      }
      ctx.log("insurance", `Skipping insurance check - quote failed: ${errMsg}`);
@@ -4806,9 +4834,20 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
     return;
   }
 
+  const refused = (quoteObj.refused as boolean) ?? false;
+  if (refused) {
+    ctx.log("insurance", "Skipping insurance check - quote refused");
+    return;
+  }
+
   const cost = (quoteObj.cost as number) || (quoteObj.premium as number) || (quoteObj.price as number) || 0;
   if (cost <= 0) {
     ctx.log("insurance", "Skipping insurance check - no valid quote cost");
+    return;
+  }
+
+  if (typeof bot.credits === "number" && bot.credits < cost) {
+    ctx.log("insurance", `Skipping insurance check - insufficient credits (have ${bot.credits}, need ${cost})`);
     return;
   }
 

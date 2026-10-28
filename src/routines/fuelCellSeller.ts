@@ -2035,22 +2035,49 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
     if (settings.preStageMode === "preStage") {
       preStagePlan = await buildPreStagePlan(ctx, bot, fcData, settings, cycleFilters, currentFocusItemId);
-      if (preStagePlan.length === 0) {
-        ctx.log("fc", "All stations already stocked — returning home");
-        if (bot.state !== "running") break;
-        yield "return_home";
-        if (bot.system !== settings.homeSystem) {
-          if (bot.state !== "running") break;
-          await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
-        }
-        if (bot.poi !== settings.homeStation) {
-          if (bot.state !== "running") break;
-          await ensureUndocked(ctx);
-          await bot.exec("travel", { target_poi: settings.homeStation });
-          bot.poi = settings.homeStation;
-        }
-        continue;
-      }
+       if (preStagePlan.length === 0) {
+         ctx.log("fc", "All stations already stocked — cooling down");
+         if (bot.state !== "running") break;
+
+         // Only travel home if we are not already there; never undock/dock in a
+         // loop when there is nowhere to go.
+         if (bot.system !== settings.homeSystem || bot.poi !== settings.homeStation) {
+           yield "return_home";
+           if (bot.system !== settings.homeSystem) {
+             if (bot.state !== "running") break;
+             await ensureUndocked(ctx);
+             const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+             if (!fueled) {
+               ctx.log("error", "Cannot refuel for return journey");
+               await ctx.sleep(settings.blockedWaitMs);
+               continue;
+             }
+             await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+           }
+           if (bot.poi !== settings.homeStation) {
+             if (bot.state !== "running") break;
+             await ensureUndocked(ctx);
+             const travelResp = await bot.exec("travel", { target_poi: settings.homeStation });
+             if (travelResp.error) {
+               ctx.log("error", `Return travel failed: ${travelResp.error.message}`);
+               await ctx.sleep(settings.blockedWaitMs);
+               continue;
+             }
+             bot.poi = settings.homeStation;
+           }
+         }
+
+         // Settle at home (docked) and wait for stations to need restocking,
+         // instead of repeatedly undocking/docking. Do not scan faction storage
+         // here — the periodic remote update (remoteUpdateIntervalMs) handles that.
+         if (bot.system === settings.homeSystem && bot.poi === settings.homeStation) {
+           await ensureDocked(ctx);
+           await tryRefuel(ctx);
+         }
+
+         await ctx.sleep(settings.blockedWaitMs);
+         continue;
+       }
 
       let selectedPlanIdx = -1;
       const focusItemConfig = settings.sellItems.find(i => i.itemId === currentFocusItemId) || settings.sellItems[0];

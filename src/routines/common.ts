@@ -4785,11 +4785,16 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
     return;
   }
 
-  const quoteResp = await bot.exec("get_insurance_quote");
-  if (quoteResp.error || !quoteResp.result) {
-    ctx.log("insurance", `Skipping insurance check - quote failed: ${quoteResp.error?.message || "no result"}`);
-    return;
-  }
+   const quoteResp = await bot.exec("get_insurance_quote");
+   if (quoteResp.error || !quoteResp.result) {
+     const errMsg = quoteResp.error?.message || "no result";
+     if (/already has active insurance/i.test(errMsg)) {
+       ctx.log("insurance", "Already insured - skipping purchase");
+       return;
+     }
+     ctx.log("insurance", `Skipping insurance check - quote failed: ${errMsg}`);
+     return;
+   }
 
   const q = quoteResp.result as Record<string, unknown>;
   const quoteObj = (q.quote as Record<string, unknown>) ?? q;

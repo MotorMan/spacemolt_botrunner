@@ -6441,9 +6441,10 @@
            settings: updated,
          });
          settings[bot.username] = updated;
-       }
+        }
 
-        const bot = getProfileBot();
+         function saveProfileCrafterProfile() {
+         const bot = getProfileBot();
         if (!bot) return;
         const sel = document.getElementById("profile-crafterProfile");
         if (!sel) return;

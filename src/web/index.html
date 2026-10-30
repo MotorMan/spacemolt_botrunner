@@ -5841,17 +5841,23 @@
           (bot.state !== "running" &&
             bot.state !== "stopping" &&
             getProfileSelectedRoutine() === "civilian_transport");
-        if (isCivilianTransport) {
-          const botSettings = settings[bot.username] || {};
-          const globalMode = (settings.civilian_transport || {}).mode || "normal";
-          const botMode = botSettings.mode || globalMode;
-          actions += `
-        <span class="profile-ore-label" style="margin-left:8px">Mode:</span>
-        <select id="profile-civilianTransportMode" onchange="saveProfileCivilianTransportMode()">
-          <option value="normal"${botMode === "normal" ? " selected" : ""}>Normal (deliver to destinations)</option>
-          <option value="lounge_transport"${botMode === "lounge_transport" ? " selected" : ""}>Lounge Transport (drop at Transit Lounge)</option>
-          <option value="achievement"${botMode === "achievement" ? " selected" : ""}>Achievement (transport every civilian once)</option>
-        </select>`;
+         if (isCivilianTransport) {
+           const botSettings = settings[bot.username] || {};
+           const globalMode = (settings.civilian_transport || {}).mode || "normal";
+           const botMode = botSettings.mode || globalMode;
+           const globalAllowRepeat = (settings.civilian_transport || {}).allowRepeatPassengers ?? false;
+           const botAllowRepeat = botSettings.allowRepeatPassengers ?? globalAllowRepeat;
+           actions += `
+         <span class="profile-ore-label" style="margin-left:8px">Mode:</span>
+         <select id="profile-civilianTransportMode" onchange="saveProfileCivilianTransportMode()">
+           <option value="normal"${botMode === "normal" ? " selected" : ""}>Normal (deliver to destinations)</option>
+           <option value="lounge_transport"${botMode === "lounge_transport" ? " selected" : ""}>Lounge Transport (drop at Transit Lounge)</option>
+           <option value="achievement"${botMode === "achievement" ? " selected" : ""}>Achievement (transport every civilian once)</option>
+         </select>
+         <label style="display:inline-flex;align-items:center;gap:4px;margin-left:8px;font-size:11px;cursor:pointer">
+           <input type="checkbox" id="profile-civilianTransportAllowRepeat" onchange="saveProfileCivilianTransportAllowRepeat()"${botAllowRepeat ? " checked" : ""}>
+           Allow repeat passengers
+         </label>`;
         }
 
         actions += `
@@ -6421,7 +6427,22 @@
         settings[bot.username] = updated;
       }
 
-      function saveProfileCrafterProfile() {
+       function saveProfileCivilianTransportAllowRepeat() {
+         const bot = getProfileBot();
+         if (!bot) return;
+         const cb = document.getElementById("profile-civilianTransportAllowRepeat");
+         if (!cb) return;
+         const allowRepeatPassengers = !!cb.checked;
+         const existing = settings[bot.username] || {};
+         const updated = Object.assign({}, existing, { allowRepeatPassengers });
+         send({
+           type: "saveSettings",
+           routine: bot.username,
+           settings: updated,
+         });
+         settings[bot.username] = updated;
+       }
+
         const bot = getProfileBot();
         if (!bot) return;
         const sel = document.getElementById("profile-crafterProfile");
@@ -37077,7 +37098,12 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
-        <div class="setting-label">Max passengers per run</div>
+        <div class="setting-label">Allow repeat passengers</div>
+        <div class="setting-hint">When enabled, achievement mode will transport civilians even if this bot has already transported them before (useful for leaderboard competition).</div>
+      </div>
+      <label><input type="checkbox" id="set-civilian_transport-allowRepeatPassengers" ${ct.allowRepeatPassengers ? "checked" : ""}></label>
+    </div>
+</div>
         <div class="setting-hint">Global passenger cap. Set to 0 for unlimited (only limited by berths).</div>
       </div>
       <input type="number" id="set-civilian_transport-maxPassengers" min="0" max="100" value="${esc(String(ct.maxPassengers ?? 0))}">
@@ -37287,8 +37313,12 @@ ignoreBlacklist: document.getElementById(
           document.getElementById("set-civilian_transport-minFuelCellsToDepart")
             ?.value || 6,
         );
-        const mode =
-          document.getElementById("set-civilian_transport-mode")?.value || "normal";
+         const mode =
+           document.getElementById("set-civilian_transport-mode")?.value || "normal";
+         const allowRepeatPassengers =
+           document.getElementById("set-civilian_transport-allowRepeatPassengers")
+             ?.checked ?? false;
+
 
         const s = {};
         if (homeStation && homeStation.includes("|")) {
@@ -37320,7 +37350,9 @@ ignoreBlacklist: document.getElementById(
         s.factionDepositThreshold = factionDepositThreshold;
         s.buyFuelCells = buyFuelCells;
         s.minFuelCellsToDepart = minFuelCellsToDepart;
-        s.mode = mode;
+         s.mode = mode;
+         s.allowRepeatPassengers = allowRepeatPassengers;
+
 
         send({
           type: "saveSettings",

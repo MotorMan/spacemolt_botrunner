@@ -687,6 +687,7 @@ interface CivilianTransportSettings {
   allowBusinessClass: boolean;
   allowEconomyClass: boolean;
   allowParkInLounge: boolean;
+  allowRepeatPassengers: boolean;
   announceDestination: boolean;
   useLivePassengers: boolean;
   disableFactionMessage: boolean;
@@ -724,6 +725,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     allowBusinessClass: (t.allowBusinessClass as boolean) !== false,
     allowEconomyClass: (t.allowEconomyClass as boolean) !== false,
     allowParkInLounge: (t.allowParkInLounge as boolean) ?? false,
+    allowRepeatPassengers: (botOverrides.allowRepeatPassengers as boolean | undefined) ?? (t.allowRepeatPassengers as boolean | undefined) ?? false,
     announceDestination: (t.announceDestination as boolean) !== false,
     useLivePassengers: (t.useLivePassengers as boolean) !== false,
     disableFactionMessage: (t.disableFactionMessage as boolean) ?? false,
@@ -1959,7 +1961,7 @@ async function tryDeliverExpiredLoungePassenger(
         allCandidates.push(p);
       }
     }
-    candidates = allCandidates.filter((p) => !civilianStore.hasBeenTransportedByBot(p.citizenId, botUsername));
+    candidates = allCandidates.filter((p) => settings.allowRepeatPassengers || !civilianStore.hasBeenTransportedByBot(p.citizenId, botUsername));
     ctx.log("transport", `Lounge check: expired=${expiredLoungePassengers.length} waiting=${waitingLoungePassengers.length} ready=${readyLoungePassengers.length} candidates=${candidates.length}`);
   }
 
@@ -2130,6 +2132,7 @@ async function tryDeliverExpiredLoungePassenger(
 function hasUndeliveredLoungeCandidates(botUsername: string): boolean {
   if (!botUsername) return false;
   try {
+    const settings = getCivilianTransportSettings(botUsername);
     const expired = passengersLounge.checkExpiredPassengers();
     const waiting = passengersLounge.getWaitingPassengers();
     const ready = passengersLounge.getReadyForDeliveryPassengers();
@@ -2139,6 +2142,9 @@ function hasUndeliveredLoungeCandidates(botUsername: string): boolean {
     }
     for (const p of ready) {
       if (!all.some((e) => e.citizenId === p.citizenId)) all.push(p);
+    }
+    if (settings.allowRepeatPassengers) {
+      return all.length > 0;
     }
     return all.some((p) => !civilianStore.hasBeenTransportedByBot(p.citizenId, botUsername));
   } catch {
@@ -2823,7 +2829,7 @@ if (state && state.status !== "idle") {
         // Achievement mode: only pick up civilians no bot has successfully
         // delivered yet, so we make progress toward transporting every single
         // civilian. Anyone already transported by this bot is skipped here.
-        if (settings.mode === "achievement" && civilianStore.hasBeenTransportedByBot(p.citizen_id, bot.username)) {
+         if (settings.mode === "achievement" && !settings.allowRepeatPassengers && civilianStore.hasBeenTransportedByBot(p.citizen_id, bot.username)) {
           skipped.push({ name: p.name, reason: "already transported by this bot (achievement mode)" });
           continue;
         }

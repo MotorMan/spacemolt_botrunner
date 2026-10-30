@@ -1940,8 +1940,13 @@ async function tryDeliverExpiredLoungePassenger(
 
   let candidates: LoungePassenger[];
   if (botUsername === null) {
-    // lounge_transport mode: only expired passengers are delivered one at a time
-    candidates = expiredLoungePassengers;
+    // lounge_transport mode: deliver expired AND ready-for-delivery passengers
+    const readyLoungePassengers = passengersLounge.getReadyForDeliveryPassengers();
+    const allExpired = [...expiredLoungePassengers];
+    for (const p of readyLoungePassengers) {
+      if (!allExpired.some((e) => e.citizenId === p.citizenId)) allExpired.push(p);
+    }
+    candidates = allExpired;
   } else {
     // achievement mode: pick up ALL lounge passengers not yet transported by
     // this bot. The Transit Lounge at home base is the primary source of
@@ -2512,53 +2517,8 @@ if (state && state.status !== "idle") {
         idleStartTime = 0;
       }
 
-      // ── Lounge delivery check ──
-      // When docked at home in lounge_transport mode, deliver expired lounge
-      // passengers before picking up new ones. Runs every idle cycle so it
-      // doesn't only happen on routine restart.
-      if (settings.mode === "lounge_transport" && bot.docked && isAtHomeBase(ctx, settings)) {
-        const expiredLoungePassengers = passengersLounge.checkExpiredPassengers();
-        if (expiredLoungePassengers.length > 0) {
-          const p = expiredLoungePassengers[0];
-          if (isBlockedStation(p.destination, p.destinationName)) {
-            ctx.log("transport", `Lounge delivery: skipping ${p.name} — destination ${p.destinationName} is blacklisted`);
-            passengersLounge.markDelivered(p.citizenId);
-            await ctx.sleep(5000);
-            continue;
-          }
-          const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
-          if (resolved) {
-            state.status = "delivering_lounge_passenger";
-            state.onboardPassengers = [{
-              citizenId: p.citizenId,
-              name: p.name,
-              accommodationClass: p.accommodationClass,
-              citizenship: p.citizenship,
-              destination: p.destination,
-              destinationName: p.destinationName,
-              destinationSystem: p.destinationSystem,
-              fare: p.fare,
-              bio: p.bio,
-              routeData: null,
-              loadedAt: p.checkedInAt,
-              status: "boarded",
-            }];
-            state.route = [{ system: resolved.system, poi: resolved.poi, poiName: resolved.poiName, origDest: p.destination }];
-            state.currentRouteIndex = 0;
-            state.currentDestination = resolved.poiName;
-            state.pickupStation = settings.homeStation || null;
-            state.pickupSystem = settings.homeSystem || null;
-            saveTransportState(state);
-            ctx.log("transport", `Lounge delivery: picking up ${p.name} from lounge, delivering to ${resolved.poiName}`);
-            continue;
-          } else {
-            ctx.log("transport", `Lounge delivery: could not resolve destination for ${p.name}, skipping`);
-            passengersLounge.markDelivered(p.citizenId);
-            await ctx.sleep(5000);
-            continue;
-          }
-        }
-      }
+       // Achievement-mode: return home when lounge has undelivered passengers (handled below)
+
 
        const isAwayFromHomeIdle = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
        const forceHomeForLounge = settings.mode === "achievement" && !!isAwayFromHomeIdle && hasUndeliveredLoungeCandidates(bot.username);
@@ -3809,9 +3769,15 @@ if (state && state.status !== "idle") {
       if (p) {
         ctx.log("transport", `Lounge delivery: unloading ${p.name} at ${waypoint.poiName}`);
         const unloadResp = await bot.exec("unload_passenger", { id: p.citizenId || p.name });
-        if (unloadResp.error) {
-          ctx.log("error", `Lounge delivery: Unload failed: ${unloadResp.error.message}`);
-        } else {
+         if (unloadResp.error) {
+           const msg = unloadResp.error.message || "";
+           if (msg.toLowerCase().includes("passenger_not_found") || msg.toLowerCase().includes("no passenger")) {
+             ctx.log("transport", `Lounge delivery: passenger ${p.name} not aboard (${msg}) — marking delivered and continuing`);
+             passengersLounge.markDelivered(p.citizenId);
+           } else {
+             ctx.log("error", `Lounge delivery: Unload failed: ${msg}`);
+           }
+         } else {
           passengersLounge.markDelivered(p.citizenId);
           civilianStore.addOrUpdate({
             citizenId: p.citizenId,

@@ -1930,6 +1930,20 @@ async function tryDeliverExpiredLoungePassenger(
   settings: CivilianTransportSettings,
   botUsername: string | null,
 ): Promise<boolean> {
+  // If we're at the home station POI but the docked flag is stale, refresh and
+  // re-dock so lounge pickup isn't skipped after a home return.
+  if (settings.homeStation && bot.poi && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()) {
+    try { await bot.refreshStatus(true); } catch { /* ignore */ }
+    if (!bot.docked) {
+      try {
+        const dr = await bot.exec("dock");
+        if (!dr.error || (dr.error?.message || "").toLowerCase().includes("already")) {
+          bot.docked = true;
+        }
+      } catch { /* ignore */ }
+    }
+  }
+
   // When docked at home in achievement mode, sync lounge store from the station
   // API so we can see transit_lounge passengers before checking candidates.
   if (botUsername !== null && bot.docked && bot.poi && bot.system && settings.homeStation && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()) {

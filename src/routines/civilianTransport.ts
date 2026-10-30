@@ -2123,6 +2123,29 @@ async function tryDeliverExpiredLoungePassenger(
   return true;
 }
 
+// ── Achievement-mode lounge candidate check ────────────────────────────────
+// True when the Transit Lounge still holds passengers this bot has not yet
+// transported. Used to decide whether an achievement-mode bot should head home
+// instead of wandering to remote stations.
+function hasUndeliveredLoungeCandidates(botUsername: string): boolean {
+  if (!botUsername) return false;
+  try {
+    const expired = passengersLounge.checkExpiredPassengers();
+    const waiting = passengersLounge.getWaitingPassengers();
+    const ready = passengersLounge.getReadyForDeliveryPassengers();
+    const all: LoungePassenger[] = [...expired];
+    for (const p of waiting) {
+      if (!all.some((e) => e.citizenId === p.citizenId)) all.push(p);
+    }
+    for (const p of ready) {
+      if (!all.some((e) => e.citizenId === p.citizenId)) all.push(p);
+    }
+    return all.some((p) => !civilianStore.hasBeenTransportedByBot(p.citizenId, botUsername));
+  } catch {
+    return false;
+  }
+}
+
 // ── Main routine ─────────────────────────────────────────────
 
 export const civilianTransportRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -2531,12 +2554,26 @@ if (state && state.status !== "idle") {
         }
       }
 
-      // Need to find passengers and load up
+       const isAwayFromHomeIdle = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
+       const forceHomeForLounge = settings.mode === "achievement" && !!isAwayFromHomeIdle && hasUndeliveredLoungeCandidates(bot.username);
+       if (forceHomeForLounge) {
+         ctx.log("transport", "Achievement mode: undelivered lounge passengers waiting — heading home instead of scanning");
+       }
+
+       // Need to find passengers and load up
       // If already docked at a station, check for passengers to loaf
-      if (bot.docked && bot.poi && bot.system) {
-        if (state.needsTravel) {
-          // We already have a new pickup station set, proceed to travel
-        } else {
+       if (bot.docked && bot.poi && bot.system) {
+         if (state.needsTravel || forceHomeForLounge) {
+           if (forceHomeForLounge && !state.needsTravel) {
+             state.pickupStation = settings.homeStation || null;
+             state.pickupSystem = settings.homeSystem || null;
+             state.needsTravel = true;
+             state.roundsWithoutPassengers = 0;
+             state.awayPickupAttempts = 0;
+             saveTransportState(state);
+           }
+           // We already have a new pickup station set, proceed to travel
+         } else {
           // Collect fuel cells at any station when idle
           await collectFuelCells(ctx, settings);
           const lookup = await fetchStationPassengers(ctx, bot.system, bot.poi);
@@ -2557,7 +2594,7 @@ if (state && state.status !== "idle") {
             ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
               if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
                 ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-                if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+                 if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username)))) {
                   ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
                   state.pickupStation = settings.homeStation || null;
                   state.pickupSystem = settings.homeSystem || null;
@@ -2601,9 +2638,17 @@ if (state && state.status !== "idle") {
               }
             }
           }
-      } else {
-        const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
-        if (!pickup) {
+       } else {
+         if (forceHomeForLounge) {
+           state.pickupStation = settings.homeStation || null;
+           state.pickupSystem = settings.homeSystem || null;
+           state.needsTravel = true;
+           state.roundsWithoutPassengers = 0;
+           state.awayPickupAttempts = 0;
+           saveTransportState(state);
+         } else {
+           const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
+           if (!pickup) {
           // No passengers found anywhere - check if we should return home
           if (settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase()) {
             ctx.log("transport", `No passengers found, returning home from ${bot.system}`);
@@ -2630,10 +2675,11 @@ if (state && state.status !== "idle") {
           state.pickupStation = pickup.poi;
           state.pickupSystem = pickup.system;
           state.needsTravel = true;
-        }
-      }
+          }
+          }
+          }
 
-      // Check if already at pickup station before any travel
+       // Check if already at pickup station before any travel
       const poiMatch = String(bot.poi || "").toLowerCase() === String(state.pickupStation || "").toLowerCase();
       const sysMatch = String(bot.system || "").toLowerCase() === String(state.pickupSystem || "").toLowerCase();
       const alreadyAtPickup = bot.docked && poiMatch && sysMatch;
@@ -2855,7 +2901,7 @@ if (state && state.status !== "idle") {
         if (isAwayFromHome) {
           state.awayPickupAttempts = (state.awayPickupAttempts || 0) + 1;
         }
-        if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+        if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username)))) {
           ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached — returning home to check lounge`);
           state.pickupStation = settings.homeStation || null;
           state.pickupSystem = settings.homeSystem || null;
@@ -3152,7 +3198,7 @@ if (state && state.status !== "idle") {
         ctx.log("transport", `No passengers loaded, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
         if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
           ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-          if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+          if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username)))) {
             ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
             state.pickupStation = settings.homeStation || null;
             state.pickupSystem = settings.homeSystem || null;
@@ -3254,7 +3300,7 @@ if (state && state.status !== "idle") {
         ctx.log("transport", `No route planned for passengers, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
         if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
           ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-          if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+          if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username)))) {
             ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
             state.pickupStation = settings.homeStation || null;
             state.pickupSystem = settings.homeSystem || null;

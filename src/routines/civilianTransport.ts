@@ -1244,13 +1244,23 @@ async function fetchStationPassengers(
   const parsed = parseStationPassengers(resp.result);
   if (!parsed) return null;
 
-  // Populate the lounge store with transit_lounge passengers from the API
-  // response so achievement-mode bots can pick them up from home base.
-  if (parsed.transitLounge && parsed.transitLounge.length > 0) {
+   // Populate the lounge store with transit_lounge passengers from the API
+  // response so achievement-mode bots can pick them up from home base. Only
+  // reconcile against actual lounge contents when at the home station, so an
+  // empty remote lounge cannot wipe the home roster.
+  const ctSettings = getCivilianTransportSettings(ctx.bot.username);
+  const isHomeStation = !!ctSettings.homeStation && stationId.toLowerCase() === ctSettings.homeStation.toLowerCase();
+  if (isHomeStation) {
+    if (parsed.transitLounge && parsed.transitLounge.length > 0) {
+      passengersLounge.syncWithActual(parsed.transitLounge);
+      ctx.log("transport", `Lounge store synced: ${parsed.transitLounge.length} passengers from transit lounge at ${parsed.station}`);
+    } else if (parsed.transitLounge) {
+      passengersLounge.syncWithActual([]);
+    }
+  } else if (parsed.transitLounge && parsed.transitLounge.length > 0) {
     for (const p of parsed.transitLounge) {
       passengersLounge.addOrUpdatePassenger(p);
     }
-    ctx.log("transport", `Lounge store synced: ${parsed.transitLounge.length} passengers from transit lounge at ${parsed.station}`);
   }
 
   return { station: parsed.station || stationId, waiting: parsed.waiting, count: parsed.count };
@@ -1950,6 +1960,20 @@ async function tryDeliverExpiredLoungePassenger(
     await fetchStationPassengers(ctx, bot.system, bot.poi);
   }
 
+  // Refresh berth availability from the ship so stale full berths don't block
+  // lounge pickup after a prior delivery run.
+  if (bot.docked) {
+    const lr = await bot.exec("list_passengers");
+    if (!lr.error && lr.result) {
+      const parsed = parseListPassengers(lr.result);
+      if (parsed) {
+        const hasBerths = (parsed.berths.economy + parsed.berths.business + parsed.berths.first) > 0;
+        if (hasBerths) state.berths = parsed.berths;
+        state.berths_used = parsed.berths_used;
+      }
+    }
+  }
+
   const expiredLoungePassengers = passengersLounge.checkExpiredPassengers();
 
   let candidates: LoungePassenger[];
@@ -2535,7 +2559,8 @@ if (state && state.status !== "idle") {
 
 
        const isAwayFromHomeIdle = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
-       const forceHomeForLounge = settings.mode === "achievement" && !!isAwayFromHomeIdle && hasUndeliveredLoungeCandidates(bot.username);
+       const isAtHomeStation = !!settings.homeStation && !!bot.poi && bot.poi.toLowerCase() === settings.homeStation.toLowerCase();
+       const forceHomeForLounge = settings.mode === "achievement" && !!hasUndeliveredLoungeCandidates(bot.username) && !isAtHomeStation;
        if (forceHomeForLounge) {
          ctx.log("transport", "Achievement mode: undelivered lounge passengers waiting — heading home instead of scanning");
        }
@@ -2574,7 +2599,7 @@ if (state && state.status !== "idle") {
             ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
               if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
                 ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-                 if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username)))) {
+                 if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username))) || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username) && !(bot.poi && settings.homeStation && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()))) {
                   ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
                   state.pickupStation = settings.homeStation || null;
                   state.pickupSystem = settings.homeSystem || null;
@@ -2744,9 +2769,13 @@ if (state && state.status !== "idle") {
         ctx.log("transport", `Ready at ${state.pickupStation}`);
         await collectFuelCells(ctx, settings);
       }
-      state.status = "loading";
-      saveTransportState(state);
-      if (bot.state !== "running") {
+       state.status = "loading";
+       saveTransportState(state);
+       if (settings.mode === "achievement" && bot.docked && bot.poi && settings.homeStation && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()) {
+         const loungeActed = await tryDeliverExpiredLoungePassenger(ctx, bot, state, settings, bot.username);
+         if (loungeActed) continue;
+       }
+       if (bot.state !== "running") {
         await ctx.sleep(10000);
         continue;
       }
@@ -2881,7 +2910,7 @@ if (state && state.status !== "idle") {
         if (isAwayFromHome) {
           state.awayPickupAttempts = (state.awayPickupAttempts || 0) + 1;
         }
-        if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username)))) {
+        if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username))) || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username) && !(bot.poi && settings.homeStation && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()))) {
           ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached — returning home to check lounge`);
           state.pickupStation = settings.homeStation || null;
           state.pickupSystem = settings.homeSystem || null;
@@ -3178,7 +3207,7 @@ if (state && state.status !== "idle") {
         ctx.log("transport", `No passengers loaded, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
         if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
           ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-          if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username)))) {
+          if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username))) || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username) && !(bot.poi && settings.homeStation && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()))) {
             ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
             state.pickupStation = settings.homeStation || null;
             state.pickupSystem = settings.homeSystem || null;
@@ -3280,7 +3309,7 @@ if (state && state.status !== "idle") {
         ctx.log("transport", `No route planned for passengers, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
         if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
           ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-          if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username)))) {
+          if (isAwayFromHome && (state.awayPickupAttempts >= settings.maxAwayPickupAttempts || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username))) || (settings.mode === "achievement" && hasUndeliveredLoungeCandidates(bot.username) && !(bot.poi && settings.homeStation && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()))) {
             ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
             state.pickupStation = settings.homeStation || null;
             state.pickupSystem = settings.homeSystem || null;
@@ -3598,12 +3627,13 @@ if (state && state.status !== "idle") {
       const verified = verifyResp.error || !verifyResp.result ? null : parseListPassengers(verifyResp.result);
       if (!verified || verified.passengers.length === 0) {
         ctx.log("transport", "Lounge transport: no passengers actually aboard, clearing state and returning to idle");
-        state.status = "idle";
-        state.onboardPassengers = [];
-        state.route = [];
-        state.currentRouteIndex = 0;
-        state.currentDestination = null;
-        saveTransportState(state);
+         state.status = "idle";
+         state.onboardPassengers = [];
+         state.route = [];
+         state.currentRouteIndex = 0;
+         state.currentDestination = null;
+         state.berths_used = { economy: 0, business: 0, first: 0 };
+         saveTransportState(state);
         await ctx.sleep(5000);
         continue;
       }
@@ -3710,12 +3740,13 @@ if (state && state.status !== "idle") {
           recordTransportedPassenger(bot.username, p.name);
           ctx.log("transport", `Lounge delivery: delivered ${p.name} to ${state.currentDestination}`);
         }
-        state.status = "idle";
-        state.onboardPassengers = [];
-        state.route = [];
-        state.currentRouteIndex = 0;
-        state.currentDestination = null;
-        saveTransportState(state);
+         state.status = "idle";
+         state.onboardPassengers = [];
+         state.route = [];
+         state.currentRouteIndex = 0;
+         state.currentDestination = null;
+         state.berths_used = { economy: 0, business: 0, first: 0 };
+         saveTransportState(state);
         await ctx.sleep(5000);
         continue;
       }
@@ -4095,13 +4126,14 @@ if (state && state.status !== "idle") {
           await collectFuelCells(ctx, settings);
         }
         
-        state.status = "idle";
-        state.onboardPassengers = [];
-        state.route = [];
-        state.revenue = 0;
-        state.currentRouteIndex = 0;
-        state.currentDestination = null;
-        saveTransportState(state);
+         state.status = "idle";
+         state.onboardPassengers = [];
+         state.route = [];
+         state.revenue = 0;
+         state.currentRouteIndex = 0;
+         state.currentDestination = null;
+         state.berths_used = { economy: 0, business: 0, first: 0 };
+         saveTransportState(state);
         
         if (!settings.disableFactionMessage) {
           const announceService = (globalThis as any).aiChatService;

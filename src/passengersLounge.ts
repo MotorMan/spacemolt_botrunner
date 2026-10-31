@@ -145,6 +145,26 @@ export class PassengersLoungeStore {
     this.save();
   }
 
+  /**
+   * Reconcile the store with the passengers actually present in a station's
+   * Transit Lounge. Passengers that are no longer present (and not already
+   * delivered) are removed, so stale entries cannot keep the achievement-mode
+   * bot force-routing home forever. Delivered records are preserved.
+   */
+  syncWithActual(actual: LoungePassenger[]): void {
+    const actualIds = new Set(actual.map((p) => p.citizenId));
+    for (const p of Array.from(this.passengers.values())) {
+      if (p.status === "delivered") continue;
+      if (!actualIds.has(p.citizenId)) {
+        this.passengers.delete(p.citizenId);
+      }
+    }
+    for (const p of actual) {
+      this.passengers.set(p.citizenId, p);
+    }
+    this.save();
+  }
+
   static createLoungePassenger(from: {
     citizenId: string;
     name: string;

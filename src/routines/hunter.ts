@@ -5770,13 +5770,33 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
     if (death === "stop") return;
     if (death === "wait") continue;
 
+    // â”€â”€ Fuel check â”€â”€
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
+      continue;
+    }
+
+    // â”€â”€ Hull check â”€â”€
+    await bot.refreshShip();
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (hullPct <= settings.repairThreshold) {
+      ctx.log("system", `Hull at ${hullPct}% â€” returning home to repair`);
+      await returnToHomeAndResupply(ctx, settings);
+      continue;
+    }
+
     // â”€â”€ Low fuel cells check â”€â”€
     await bot.refreshCargo();
     const fuelCellCount = countFuelCellsInInventory(bot.inventory);
     if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
-      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
-      await returnToHomeAndResupply(ctx, settings);
-      continue;
+      const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+      if (canMakeItHome) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+        await returnToHomeAndResupply(ctx, settings);
+        continue;
+      }
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home â€” proceeding anyway`);
     }
 
     const patrolList = settings.patrolSystems || [];
@@ -5822,6 +5842,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
     // (reuse existing code path by temporarily overriding via settings isn't clean,
     // so we just call the navigation + let the main loop handle; instead do direct patrol here)
     // Simpler: run the stationary-style patrol in this system
+    let outOfFuel = false;
     yield* (async function* singleSystemPatrol() {
       // inline minimal patrol of current system (copy of key parts)
       await fetchSecurityLevel(ctx, bot.system);
@@ -5833,7 +5854,26 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
       }
       for (const poi of patrolPois) {
         if (bot.state !== "running") break;
-        await bot.exec("travel", { target_poi: poi.id });
+        // Fuel check before each POI travel
+        await bot.refreshShip();
+        const fuelPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 100;
+        if (fuelPct < settings.refuelThreshold) {
+          const f = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+          if (f !== "fueled") {
+            outOfFuel = true;
+            return;
+          }
+        }
+        const travelResp = await bot.exec("travel", { target_poi: poi.id });
+        if (travelResp.error) {
+          const msg = (travelResp.error.message || "").toLowerCase();
+          ctx.log("error", `travel failed: ${travelResp.error.message}`);
+          if (msg.includes("fuel") || msg.includes("insufficient")) {
+            outOfFuel = true;
+            return;
+          }
+          continue;
+        }
         bot.poi = poi.id;
         await ctx.sleep(500);
         await ensureObservationSubscribed();
@@ -5867,6 +5907,15 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         }
       }
     })();
+
+    if (outOfFuel) {
+      ctx.log("error", "Out of fuel during patrol sweep â€” handling fuel...");
+      const f = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+      if (f !== "fueled") {
+        await handleFuelCheckFailure(ctx, settings, f);
+      }
+      continue;
+    }
 
     // Single loop support for patrol_systems mode
     // After completing one full cycle, return to base for resupply, then repeat
@@ -6282,13 +6331,24 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
     if (death === "stop") return;
     if (death === "wait") continue;
 
+    // â”€â”€ Fuel check â”€â”€
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
+      continue;
+    }
+
     // â”€â”€ Low fuel cells check â”€â”€
     await bot.refreshCargo();
     const fuelCellCount = countFuelCellsInInventory(bot.inventory);
     if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
-      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
-      await returnToHomeAndResupply(ctx, settings);
-      continue;
+      const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+      if (canMakeItHome) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+        await returnToHomeAndResupply(ctx, settings);
+        continue;
+      }
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home â€” proceeding anyway`);
     }
 
     const cycleMode = settings.patrolCycleMode || "sequential";
@@ -6354,7 +6414,19 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
       for (const poi of patrolPois) {
         if (bot.state !== "running") break;
-        await bot.exec("travel", { target_poi: poi.id });
+        await bot.refreshShip();
+        const fuelPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 100;
+        if (fuelPct < settings.refuelThreshold) {
+          const f = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+          if (f !== "fueled") { await handleFuelCheckFailure(ctx, settings, f); break; }
+        }
+        const travelResp = await bot.exec("travel", { target_poi: poi.id });
+        if (travelResp.error) {
+          const msg = (travelResp.error.message || "").toLowerCase();
+          ctx.log("error", `travel failed: ${travelResp.error.message}`);
+          if (msg.includes("fuel") || msg.includes("insufficient")) { await handleFuelCheckFailure(ctx, settings, "failed"); break; }
+          continue;
+        }
         bot.poi = poi.id;
         await ctx.sleep(500);
         await ensureObservationSubscribed();
@@ -6474,13 +6546,33 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
     if (death === "stop") return;
     if (death === "wait") continue;
 
+    // â”€â”€ Fuel check â”€â”€
+    const fueled = await ensureFueledEx(ctx, currentSettings.refuelThreshold, { homeSystem: currentSettings.homeSystem, homeStation: currentSettings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, currentSettings, fueled);
+      continue;
+    }
+
+    // â”€â”€ Hull check â”€â”€
+    await bot.refreshShip();
+    const hullPctR = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (hullPctR <= currentSettings.repairThreshold) {
+      ctx.log("system", `Hull at ${hullPctR}% â€” returning home to repair`);
+      await returnToHomeAndResupply(ctx, currentSettings);
+      continue;
+    }
+
     // â”€â”€ Low fuel cells check â”€â”€
     await bot.refreshCargo();
     const fuelCellCount = countFuelCellsInInventory(bot.inventory);
     if (currentSettings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= currentSettings.returnHomeOnFuelCellsRemaining) {
-      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
-      await returnToHomeAndResupply(ctx, currentSettings);
-      continue;
+      const canMakeItHome = await canReachHomeWithFuel(ctx, currentSettings);
+      if (canMakeItHome) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+        await returnToHomeAndResupply(ctx, currentSettings);
+        continue;
+      }
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home â€” proceeding anyway`);
     }
 
     const currentSafetyOpts = {
@@ -6512,6 +6604,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
     }
 
     ctx.log("info", `Starting patrol sweep in ${targetSystem}`);
+    let outOfFuel = false;
     yield* (async function* singleSystemPatrol() {
       await fetchSecurityLevel(ctx, bot.system);
       const { pois } = await getSystemInfo(ctx);
@@ -6522,7 +6615,19 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
       }
       for (const poi of patrolPois) {
         if (bot.state !== "running") break;
-        await bot.exec("travel", { target_poi: poi.id });
+        await bot.refreshShip();
+        const fuelPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 100;
+        if (fuelPct < currentSettings.refuelThreshold) {
+          const f = await ensureFueledEx(ctx, currentSettings.refuelThreshold, { homeSystem: currentSettings.homeSystem, homeStation: currentSettings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+          if (f !== "fueled") { outOfFuel = true; return; }
+        }
+        const travelResp = await bot.exec("travel", { target_poi: poi.id });
+        if (travelResp.error) {
+          const msg = (travelResp.error.message || "").toLowerCase();
+          ctx.log("error", `travel failed: ${travelResp.error.message}`);
+          if (msg.includes("fuel") || msg.includes("insufficient")) { outOfFuel = true; return; }
+          continue;
+        }
         bot.poi = poi.id;
         await ctx.sleep(500);
         await ensureObservationSubscribed();
@@ -6555,6 +6660,15 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
         }
       }
     })();
+
+    if (outOfFuel) {
+      ctx.log("error", "Out of fuel during patrol sweep â€” handling fuel...");
+      const f = await ensureFueledEx(ctx, currentSettings.refuelThreshold, { homeSystem: currentSettings.homeSystem, homeStation: currentSettings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+      if (f !== "fueled") {
+        await handleFuelCheckFailure(ctx, currentSettings, f);
+      }
+      continue;
+    }
 
     if (currentSettings.singleLoop && systemIndex >= patrolList.length) {
       ctx.log("system", "Single loop mode â€” returning to faction home base for resupply...");

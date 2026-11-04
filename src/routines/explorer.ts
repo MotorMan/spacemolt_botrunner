@@ -4371,7 +4371,9 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
 
     // ── Route complete → navigate home, restock fuel cells, restart ──
     if (fixed.currentIndex >= fixed.route.length) {
-      ctx.log("system", "Fixed route complete — returning home to restock fuel cells...");
+      const lastEntry = fixed.route.length > 0 ? fixed.route[fixed.route.length - 1] : null;
+      const lastLabel = lastEntry ? `${lastEntry.systemId} (#${fixed.route.length}/${fixed.route.length})` : `end of route`;
+      ctx.log("system", `Fixed route complete — reached final system ${lastLabel}; returning home to restock fuel cells and restart the full cycle...`);
       const homeOk = await returnToHomeBaseForFuelCells(ctx);
       if (!homeOk) {
         ctx.log("error", "Fixed route: could not reach home base to restock — waiting 30s");
@@ -4383,7 +4385,7 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
       fixed = explorerFixedPathStore.getFixedPath(bot.username)!;
       fixed.currentIndex = 0;
       consecutiveFailures = 0;
-      ctx.log("system", "Fixed route complete — restarting from start");
+      ctx.log("system", `Fixed route cycle complete — restarted from system 1/${fixed.route.length}`);
       continue;
     }
 

@@ -461,12 +461,19 @@ export function cleanupStaleQueue(
   const now = Date.now();
 
   data.pending = data.pending.filter(r => {
+    // Remove entries that have been attempted too many times without success —
+    // these are almost certainly unresolvable (cloaked/full/moved) and would
+    // otherwise block the queue indefinitely.
+    if (r.attempts >= 5) {
+      console.log(`[rescueQueue] Cleaning stale entry: ${r.targetUsername} (too many attempts: ${r.attempts})`);
+      return false;
+    }
     // Remove entries with stale claims — the claiming bot never completed or
     // released the claim within the claim timeout window. These are orphaned:
     // no other bot can re-claim them (claimRescue refuses them) and they are
     // never marked completed, so they accumulate in the file indefinitely.
     if (r.claimedBy && r.claimedAt && (now - r.claimedAt) > claimTimeoutMs) {
-      console.log(`[rescueQueue] Cleaning stale entry: ${r.targetUsername} claimed by ${r.claimedBy} (claim expired after ${claimTimeoutMs}ms)`);
+      console.log(`[rescueQueue] Releasing stale entry: ${r.targetUsername} claimed by ${r.claimedBy} (claim expired after ${claimTimeoutMs}ms)`);
       return false;
     }
     // Keep recent entries or ones that have been attempted (with non-stale claims)

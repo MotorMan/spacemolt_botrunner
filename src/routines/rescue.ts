@@ -1354,6 +1354,58 @@ async function checkTargetStillNeedsRescue(
 }
 
 /**
+ * Check whether a queued rescue target has already resolved its fuel situation
+ * according to the live cross-client fleet data. Used to prune stale queue
+ * entries instead of chasing a bot that is already full.
+ */
+async function queuedTargetResolvedInFleet(
+  ctx: RoutineContext,
+  targetUsername: string,
+): Promise<{ resolved: boolean; reason: string; fuelPct: number | null; hasFuelCells: boolean }> {
+  const fleet = await getTrackingFleet(ctx);
+  const targetBot = fleet.find(b => b.username === targetUsername);
+  if (!targetBot) {
+    return { resolved: false, reason: "not in fleet", fuelPct: null, hasFuelCells: false };
+  }
+  const fuelPct = targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100;
+  const hasFuelCells = botHasFuelCellReserve(targetBot);
+  const settings = getRescueSettings();
+  const threshold = settings.fuelThreshold;
+  if (hasFuelCells) {
+    return { resolved: true, reason: "has fuel cell reserve", fuelPct, hasFuelCells };
+  }
+  if (fuelPct >= threshold + REFUELED_MARGIN_PCT) {
+    return { resolved: true, reason: `fuel ${fuelPct}% >= threshold+margin`, fuelPct, hasFuelCells };
+  }
+  return { resolved: false, reason: `fuel ${fuelPct}% still low`, fuelPct, hasFuelCells };
+}
+
+/**
+ * Prune queued rescues that the live fleet data shows are no longer stranded.
+ * Removes (marks completed) entries for own bots whose fuel is back above the
+ * rescue threshold (or that carry a fuel cell reserve). External players are
+ * left alone since we have no live fuel data for them.
+ */
+async function pruneResolvedQueuedRescues(ctx: RoutineContext): Promise<void> {
+  const queue = getRescueQueue();
+  const pending = queue.pending.filter(r => !r.completed);
+  if (pending.length === 0) return;
+  const fleet = await getTrackingFleet(ctx);
+  for (const r of pending) {
+    const targetBot = fleet.find(b => b.username === r.targetUsername);
+    if (!targetBot) continue;
+    const fuelPct = targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100;
+    const hasFuelCells = botHasFuelCellReserve(targetBot);
+    const settings = getRescueSettings();
+    const threshold = settings.fuelThreshold;
+    if (hasFuelCells || fuelPct >= threshold + REFUELED_MARGIN_PCT) {
+      markRescueCompleted(r.id);
+      ctx.log("rescue", `📋 Pruned queued rescue for ${r.targetUsername} — no longer stranded (fuel ${fuelPct}%, fuelCells=${hasFuelCells})`);
+    }
+  }
+}
+
+/**
  * Parse a `different_location` refuel error into the target's reported location.
  *
  * The server returns messages like:
@@ -3134,14 +3186,16 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         continue;
       }
 
-      // ── Select rescue target: Check queue first for optimized routing ──
-      // Priority: Manual rescue > MAYDAY > Queued rescues (optimized) > Fresh scan targets
-      let selectedTarget: RescueTarget | null = null;
-      let selectedFromQueue = false;
+       // Prune queue entries that the live fleet shows are already resolved.
+       await pruneResolvedQueuedRescues(ctx);
 
-      // Check rescue queue for pending rescues
-      const queueStats = getQueueStats();
-      if (queueStats.pending > 0) {
+       // Check rescue queue for pending rescues (only when no MAYDAY is pending,
+       // so a MAYDAY is never starved by a stale queue entry).
+       let selectedTarget: RescueTarget | null = null;
+       let selectedFromQueue = false;
+
+       const queueStats = getQueueStats();
+       if (!maydayTarget && queueStats.pending > 0) {
         ctx.log("rescue", `📋 Rescue queue has ${queueStats.pending} pending rescues — selecting optimal target...`);
 
         // Optimize route based on current location
@@ -3158,6 +3212,14 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             // Pick the most critical (lowest fuel) rescue in the closest system
             rescuesInSystem.sort((a, b) => a.fuelPct - b.fuelPct);
             const queuedRescue = rescuesInSystem[0];
+
+            // Double-check live fleet data before committing to this rescue.
+            const liveCheck = await queuedTargetResolvedInFleet(ctx, queuedRescue.targetUsername);
+            if (liveCheck.resolved) {
+              ctx.log("rescue", `📋 Skipping queued rescue for ${queuedRescue.targetUsername} — ${liveCheck.reason}`);
+              markRescueCompleted(queuedRescue.id);
+              continue; // skip claiming; will re-evaluate next iteration
+            }
 
             // Try to claim this rescue
             if (claimRescue(queuedRescue.id, bot.username)) {
@@ -3418,6 +3480,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     // reported as a successful rescue. Declared at routine-loop scope so the
     // post-transfer billing/failure logic can read it.
     let rescueDelivered = false;
+    let fuelTransferTargetNotFound = false;
     if (!skipToReturnHome) {
       ctx.log("rescue", `🔍 Navigation debug: target.system=${target?.system}, bot.system=${bot.system}, isMayday=${isMaydayTarget}, isManual=${isManualRescueTarget}, skipToReturnHome=${skipToReturnHome}`);
       yield "navigate_to_target";
@@ -3874,15 +3937,15 @@ if (travelSucceeded) {
         // Need to get the target's player ID for the refuel command
         const targetPlayerId = await findPlayerId(ctx, target.username);
 
-        if (!targetPlayerId) {
-          ctx.log("error", `Could not find player ID for ${target.username} — aborting transfer`);
-          if (isMaydayTarget) {
-            // Re-add to queue so another bot can try
-            // (For now, just log - the MAYDAY is already marked as handled)
-          }
-          await ctx.sleep(settings.scanIntervalSec * 1000);
-          continue;
-        }
+         if (!targetPlayerId) {
+           ctx.log("error", `Could not find player ID for ${target.username} — aborting transfer`);
+           // Target not locatable (likely cloaked/full/unreachable) — remove from
+           // queue so it doesn't block further rescues, and set a cooldown.
+           cleanupQueuedRescue(ctx, target.username, bot.username, true, "player ID not found");
+           ownBotRescueCooldown.set(target.username, Date.now() + 5 * 60 * 1000);
+           await ctx.sleep(settings.scanIntervalSec * 1000);
+           continue;
+         }
 
           // Calculate maximum fuel to deliver (capped by setting)
           const rescueSettings = getRescueSettings();
@@ -3929,8 +3992,15 @@ if (travelSucceeded) {
             }
 
             // Refuel returned an error.
-            refuelError = refuelResp.error.message;
-            ctx.log("error", `Refuel command failed: ${refuelError}`);
+              refuelError = refuelResp.error.message;
+              ctx.log("error", `Refuel command failed: ${refuelError}`);
+
+              const errLower = refuelError.toLowerCase();
+              if (errLower.includes("player_not_found") || errLower.includes("not found")) {
+                fuelTransferTargetNotFound = true;
+                cleanupQueuedRescue(ctx, target.username, bot.username, true, "target not found (likely already full/cloaked)");
+                ownBotRescueCooldown.set(target.username, Date.now() + 5 * 60 * 1000);
+              }
 
             // ── BONUS: target moved a short distance — retarget and retry ──
             const movedLocation = parseDifferentLocationError(refuelError);
@@ -4236,10 +4306,21 @@ if (travelSucceeded) {
         await failRescueSession(bot.username, "Fuel transfer failed - target not reachable at reported location");
       }
 
-      // Record a ghost so repeated no-shows are down-weighted for future rescues.
-      try {
-        recordGhost(target.username);
-      } catch { /* best-effort */ }
+       // Clean up the queue entry. If the target could not be located (player_not_found,
+       // typical for a cloaked/full bot after a successful refuel) OR the live fleet
+       // shows it is no longer stranded, remove it from the queue so it can't block
+       // further rescues; otherwise just release the claim.
+       const liveCheck = await queuedTargetResolvedInFleet(ctx, target.username);
+       const remove = fuelTransferTargetNotFound || liveCheck.resolved;
+       cleanupQueuedRescue(ctx, target.username, bot.username, remove, remove ? "target not found / no longer stranded" : "fuel transfer failed - target not reachable");
+       if (remove) {
+         ownBotRescueCooldown.set(target.username, Date.now() + 5 * 60 * 1000);
+       }
+
+       // Record a ghost so repeated no-shows are down-weighted for future rescues.
+       if (!remove && !fuelTransferTargetNotFound) {
+         try { recordGhost(target.username); } catch { /* best-effort */ }
+       }
 
       // Return home to refuel/idle, then continue the loop (no billing).
       if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
@@ -6547,9 +6628,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           idleStartTime = 0;
         }
 
-             // ── RESCUE QUEUE: Check if we have queued rescues before idling ──
-             const queueStats = getQueueStats();
-             if (queueStats.pending > 0) {
+              // Prune queue entries that the live fleet shows are already resolved.
+              await pruneResolvedQueuedRescues(ctx);
+
+              // ── RESCUE QUEUE: Check if we have queued rescues before idling ──
+              const queueStats = getQueueStats();
+              if (queueStats.pending > 0) {
                ctx.log("rescue", `📋 Rescue queue has ${queueStats.pending} pending rescues — checking for optimized route...`);
                
                // Optimize route based on current location
@@ -6565,9 +6649,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                  if (rescuesInSystem.length > 0) {
                    // Pick the most critical rescue in the first system
                    rescuesInSystem.sort((a, b) => a.fuelPct - b.fuelPct);
-                   const queuedRescue = rescuesInSystem[0];
+                    const queuedRescue = rescuesInSystem[0];
 
-                   // ── RESCUE COOPERATION: Check with partner bot if enabled for fleet rescues ──
+                    // Double-check live fleet data before committing to this rescue.
+                    const liveCheck = await queuedTargetResolvedInFleet(ctx, queuedRescue.targetUsername);
+                    if (liveCheck.resolved) {
+                      ctx.log("rescue", `📋 Skipping queued rescue for ${queuedRescue.targetUsername} — ${liveCheck.reason}`);
+                      markRescueCompleted(queuedRescue.id);
+                      continue;
+                    }
+
+                    // ── RESCUE COOPERATION: Check with partner bot if enabled for fleet rescues ──
                    let partnerClaim = null;
                    let cooperationDecision = "proceed"; // Default to proceed if no cooperation
                    
@@ -7804,6 +7896,10 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     // already full — i.e. another rescuer beat us to it. We treat this as a
     // "no charge, already handled" case rather than a no-show ghost.
     let alreadyRescuedByOther = false;
+    // Set when the refuel failed because the target could not be located
+    // (cloaked/full/unreachable). Treated like "already handled" for queue
+    // cleanup so a stale entry can't block the queue forever.
+    let targetNotFound = false;
 
     // Check if target is actually at the location (for non-station targets)
     let targetFound = true;
@@ -7890,11 +7986,13 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       // Need to get the target's player ID for the refuel command
       const targetPlayerId = await findPlayerId(ctx, target.username);
 
-      if (!targetPlayerId) {
-        ctx.log("error", `Could not find player ID for ${target.username} — aborting transfer`);
-        await ctx.sleep(settings.scanIntervalSec * 1000);
-        continue;
-      }
+       if (!targetPlayerId) {
+         ctx.log("error", `Could not find player ID for ${target.username} — aborting transfer`);
+         cleanupQueuedRescue(ctx, target.username, bot.username, true, "player ID not found");
+         ownBotRescueCooldown.set(target.username, Date.now() + 5 * 60 * 1000);
+         await ctx.sleep(settings.scanIntervalSec * 1000);
+         continue;
+       }
 
       // Calculate maximum fuel to deliver (capped by setting)
       const rescueSettings = getRescueSettings();
@@ -7942,6 +8040,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (errLower.includes("target_tank_full") || errLower.includes("fuel tank is already full")) {
           alreadyRescuedByOther = true;
           ctx.log(logCategory, `ℹ️ ${target.username}'s tank is already full — another rescuer beat us to it. No charge.`);
+          break;
+        }
+
+        // ── Target could not be located (cloaked/full/unreachable) ──
+        // After a successful refuel the game stops returning "tank full" and
+        // instead returns "player_not_found" to protect cloaked players. Treat
+        // this as "already handled" so the queue entry is removed instead of
+        // being retried forever.
+        if (errLower.includes("player_not_found") || errLower.includes("not found")) {
+          targetNotFound = true;
+          ctx.log(logCategory, `ℹ️ ${target.username} not found (likely cloaked/full) — treating as already handled. No charge.`);
           break;
         }
 
@@ -8209,17 +8318,23 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       }
 
       // Clean up the queue entry for this target. If another rescuer already
-      // helped (alreadyRescuedByOther), the target no longer needs rescue so mark
-      // it completed. Otherwise release the claim so another bot can retry.
-      if (alreadyRescuedByOther) {
-        cleanupQueuedRescue(ctx, target.username, bot.username, true, "already rescued by another bot");
+      // helped, or the target could not be located (player_not_found — typical for
+      // a cloaked/full bot after a successful refuel), the target no longer needs
+      // rescue so mark it completed. Otherwise release the claim so another bot
+      // can retry.
+      if (alreadyRescuedByOther || targetNotFound) {
+        cleanupQueuedRescue(ctx, target.username, bot.username, true, targetNotFound ? "target not found (likely already full/cloaked)" : "already rescued by another bot");
+        if (targetNotFound) {
+          ownBotRescueCooldown.set(target.username, Date.now() + 5 * 60 * 1000);
+        }
       } else {
         cleanupQueuedRescue(ctx, target.username, bot.username, false, "fuel transfer failed - target not reachable");
       }
 
       // Only record a ghost for genuine no-shows, NOT when another rescuer simply
-      // beat us to it (the player was legitimately there and got helped).
-      if (!alreadyRescuedByOther) {
+      // beat us to it, and NOT when the target is a cloaked/full bot that the
+      // game no longer reports (would just spam ghost records).
+      if (!alreadyRescuedByOther && !targetNotFound) {
         try { recordGhost(target.username); } catch { /* best-effort */ }
       }
 

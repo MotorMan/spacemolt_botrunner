@@ -19,6 +19,28 @@ async function waitForBattleUpdate(ctx: RoutineContext, beforeUpdate: number): P
 }
 
 /**
+ * Wait for the next real server tick during a battle, using the tick number
+ * pushed by the battle_update subscription (bot.currentBattle.lastTick) when
+ * available, falling back to a 10-second wall-clock wait when no push event
+ * arrives. This keeps command timing aligned to actual tick edges instead of
+ * an arbitrary fixed delay.
+ */
+async function waitForNextBattleTick(ctx: RoutineContext, lastTick: number | undefined): Promise<number | undefined> {
+  const { bot } = ctx;
+  const start = Date.now();
+  while (bot.state === "running" && Date.now() - start < 10000) {
+    const current = bot.currentBattle.lastTick;
+    if (lastTick === undefined) {
+      if (current !== undefined) return current;
+    } else if (current !== undefined && current > lastTick) {
+      return current;
+    }
+    await ctx.sleep(500);
+  }
+  return bot.currentBattle.lastTick;
+}
+
+/**
  * Returns true if the given display name belongs to a known creature (wildlife).
  * Creatures are NOT players — even with onlyNPCs=true the hunter should fight
  * (or at least not flee from) a creature that attacks it.
@@ -588,7 +610,7 @@ export async function emergencyFleeSpam(ctx: RoutineContext, reason: string): Pr
   // Send flee stance - wait for tick completion
   ctx.log("combat", `Setting flee stance (waiting for server tick)...`);
   const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
-  await ctx.sleep(10000);
+  await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
 
   if (fleeResp.error) {
     const errMsg = fleeResp.error.message.toLowerCase();
@@ -605,7 +627,7 @@ export async function emergencyFleeSpam(ctx: RoutineContext, reason: string): Pr
 
       ctx.log("combat", `Retrying flee stance...`);
       await bot.exec("battle", { action: "stance", stance: "flee" });
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
     } else {
       ctx.log("error", `Flee stance failed: ${fleeResp.error.message}`);
     }
@@ -639,7 +661,7 @@ export async function emergencyFleeSpam(ctx: RoutineContext, reason: string): Pr
     for (let i = 0; i < 3; i++) {
       ctx.log("combat", `Attempting retreat (${i + 1}/3)...`);
       const retreatResp = await bot.exec("battle", { action: "retreat" }); //human side note, you may need to be in the outer zone to enable flee though.
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
 
       if (retreatResp.error) {
         const errMsg = retreatResp.error.message.toLowerCase();
@@ -982,6 +1004,7 @@ export async function fightFreshBattle(
   let tickCount = 0;
   let lastHull = bot.hull;
   let lastBattleTick: number | undefined;
+let lastBattleTickTime = 0;
   const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
 const originalTarget = target;
   const bracedTargets = new Set<string>();
@@ -1055,7 +1078,7 @@ const originalTarget = target;
   } else {
     ctx.log("combat", `⚔️ Battle started with ${target.name} — closing to engaged`);
   }
-  await ctx.sleep(10000);
+  await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
 
   // Ensure we're at engaged zone before entering combat loop
   // (especially important when battle was already active and no advance was done)
@@ -1121,14 +1144,6 @@ const originalTarget = target;
 
   while (true) {
     if (bot.state !== "running") return false;
-    tickCount++;
-
-    if (tickCount > MAX_BATTLE_TICKS) {
-      ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
-      await checkAndPraiseMorgThar(ctx, true);
-      await recloakAfterBattle(ctx, cloakOnStart);
-      return true;
-    }
 
     status = await getBattleStatus(ctx);
     if (!status) {
@@ -1138,7 +1153,15 @@ const originalTarget = target;
       return true;
     }
 
-    if (lastBattleTick !== undefined && status.tick === lastBattleTick) {
+    if (status?.tick !== undefined && lastBattleTick !== undefined && status.tick === lastBattleTick) {
+      // Only treat an unchanged server tick as "frozen" once a full real-world
+      // tick (10 seconds) has elapsed since we last saw it advance. Polls that
+      // land inside the same 10-second tick must NOT be mistaken for a frozen
+      // battle — otherwise we falsely declare victory and rejoin.
+      if (Date.now() - lastBattleTickTime < 10000) {
+        await ctx.sleep(10000 - (Date.now() - lastBattleTickTime));
+        continue;
+      }
       ctx.log("combat", `⚡ Battle tick frozen at ${status.tick} for 2 consecutive polls — treating as victory`);
       bot.currentBattle.inBattle = false;
       bot.currentBattle.battleId = null;
@@ -1147,7 +1170,34 @@ const originalTarget = target;
       await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
-    lastBattleTick = status.tick;
+    // Count real 10-second server ticks instead of arbitrary loop iterations.
+    let tickAdvanced = false;
+    if (status?.tick !== undefined) {
+      if (lastBattleTick === undefined) {
+        tickCount += 1;
+        tickAdvanced = true;
+      } else if (status.tick > lastBattleTick) {
+        tickCount += status.tick - lastBattleTick;
+        tickAdvanced = true;
+      }
+    } else {
+      const now = Date.now();
+      if (!lastBattleTickTime || now - lastBattleTickTime >= 10000) {
+        tickCount += 1;
+        tickAdvanced = true;
+      }
+    }
+    if (tickAdvanced) {
+      lastBattleTick = status?.tick;
+      lastBattleTickTime = Date.now();
+    }
+
+    if (tickCount > MAX_BATTLE_TICKS) {
+      ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
+      await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
+      return true;
+    }
 
     // Brace detection: track our own damage output. If a hit lands at ~25% of
     // our baseline, the target is likely in brace stance -> switch targets.
@@ -1209,7 +1259,7 @@ const originalTarget = target;
     if (targetParticipant && target && !targetParticipant.is_destroyed) {
       const coop = await cooperateWithBoardingClaim(ctx, status, target);
       if (coop.brace) {
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
         continue;
       }
       if (coop.target && (coop.target.id !== target.id || coop.target.name !== target.name)) {
@@ -1262,7 +1312,7 @@ const originalTarget = target;
     if (!targetParticipant && target) {
       const coop = await cooperateWithBoardingClaim(ctx, status, target);
       if (coop.brace) {
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
         continue;
       }
       if (coop.target && (coop.target.id !== target.id || coop.target.name !== target.name)) {
@@ -1333,7 +1383,7 @@ const originalTarget = target;
         if (await topUpShields(ctx, shieldRechargePct / 100)) didAction = true;
       }
       if (didAction) {
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
         continue;
       }
     }
@@ -1504,7 +1554,7 @@ const originalTarget = target;
           }
           ctx.log("error", "Advance to engaged failed: " + advResp.error.message);
         }
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
       } else {
         ctx.log("combat", `⚔️ Already at engaged zone (stay-at-engaged)`);
       }
@@ -1535,7 +1585,7 @@ const originalTarget = target;
 
       await attackTarget(ctx, target);
       await bot.exec("battle", { action: "target", target_id: target.id });
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
       continue;
     }
 
@@ -1557,9 +1607,9 @@ const originalTarget = target;
         }
         ctx.log("error", `Advance failed: ${advResp.error.message}`);
       }
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
     } else {
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
     }
   }
 }
@@ -1882,7 +1932,7 @@ export async function fightJoinedBattle(
   if (currentTarget) {
     await doEngage(currentTarget);
   }
-  await ctx.sleep(10000);
+  await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
 
   // Immediate readiness check after engaging — do not blindly advance if we're
   // already critically wounded or can top-up shields before moving into range.
@@ -1897,12 +1947,12 @@ export async function fightJoinedBattle(
   if (repairThreshold > 0 && startShieldPct <= repairThreshold && shieldRechargePct > 0) {
     ctx.log("combat", `🛡️ Shields ${startShieldPct}% ≤ repairThreshold (${repairThreshold}%) — recharging before advancing`);
     await topUpShields(ctx, shieldRechargePct / 100);
-    await ctx.sleep(10000);
+    await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
   }
   if (repairThreshold > 0 && startHullPct <= repairThreshold) {
     ctx.log("combat", `🛠️ Hull ${startHullPct}% ≤ repairThreshold (${repairThreshold}%) — repairing before advancing`);
     if (await useRepairKits(ctx)) {
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
     }
   }
 
@@ -1958,7 +2008,7 @@ export async function fightJoinedBattle(
         }
         ctx.log("error", `Advance to ${zoneName} failed: ${advResp.error.message}`);
       }
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
       
       // Check hull/shield after each advance step — we may be taking fire while closing distance
       await bot.refreshShip();
@@ -1972,12 +2022,12 @@ export async function fightJoinedBattle(
       if (repairThreshold > 0 && advShieldPct <= repairThreshold && shieldRechargePct > 0) {
         ctx.log("combat", `🛡️ Shields ${advShieldPct}% ≤ repairThreshold (${repairThreshold}%) — recharging during advance`);
         await topUpShields(ctx, shieldRechargePct / 100);
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
       }
       if (repairThreshold > 0 && advHullPct <= repairThreshold) {
         ctx.log("combat", `🛠️ Hull ${advHullPct}% ≤ repairThreshold (${repairThreshold}%) — repairing during advance`);
         if (await useRepairKits(ctx)) {
-          await ctx.sleep(10000);
+          await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
         }
       }
     }
@@ -1986,17 +2036,10 @@ export async function fightJoinedBattle(
   let lastKnownEnemyZone = "outer";
   let tickCount = 0;
   let lastBattleTick: number | undefined;
+let lastBattleTickTime = 0;
 
   while (true) {
     if (bot.state !== "running") return false;
-    tickCount++;
-
-    if (tickCount > MAX_BATTLE_TICKS) {
-      ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
-      await checkAndPraiseMorgThar(ctx, true);
-      await recloakAfterBattle(ctx, cloakOnStart);
-      return true;
-    }
 
     const status = await getBattleStatus(ctx);
     if (!status) {
@@ -2006,7 +2049,15 @@ export async function fightJoinedBattle(
       return true;
     }
 
-    if (lastBattleTick !== undefined && status.tick === lastBattleTick) {
+    if (status?.tick !== undefined && lastBattleTick !== undefined && status.tick === lastBattleTick) {
+      // Only treat an unchanged server tick as "frozen" once a full real-world
+      // tick (10 seconds) has elapsed since we last saw it advance. Polls that
+      // land inside the same 10-second tick must NOT be mistaken for a frozen
+      // battle — otherwise we falsely declare victory and rejoin.
+      if (Date.now() - lastBattleTickTime < 10000) {
+        await ctx.sleep(10000 - (Date.now() - lastBattleTickTime));
+        continue;
+      }
       ctx.log("combat", `⚡ Battle tick frozen at ${status.tick} for 2 consecutive polls — treating as victory`);
       bot.currentBattle.inBattle = false;
       bot.currentBattle.battleId = null;
@@ -2015,7 +2066,34 @@ export async function fightJoinedBattle(
       await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
-    lastBattleTick = status.tick;
+    // Count real 10-second server ticks instead of arbitrary loop iterations.
+    let tickAdvanced2 = false;
+    if (status?.tick !== undefined) {
+      if (lastBattleTick === undefined) {
+        tickCount += 1;
+        tickAdvanced2 = true;
+      } else if (status.tick > lastBattleTick) {
+        tickCount += status.tick - lastBattleTick;
+        tickAdvanced2 = true;
+      }
+    } else {
+      const now = Date.now();
+      if (!lastBattleTickTime || now - lastBattleTickTime >= 10000) {
+        tickCount += 1;
+        tickAdvanced2 = true;
+      }
+    }
+    if (tickAdvanced2) {
+      lastBattleTick = status?.tick;
+      lastBattleTickTime = Date.now();
+    }
+
+    if (tickCount > MAX_BATTLE_TICKS) {
+      ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
+      await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
+      return true;
+    }
 
     // Immediate hull/shield check at the start of every combat tick — do not
     // wait for target-switching logic to decide whether we're in danger.
@@ -2031,13 +2109,13 @@ export async function fightJoinedBattle(
     if (repairThreshold > 0 && tickShieldPct <= repairThreshold && shieldRechargePct > 0) {
       ctx.log("combat", `🛡️ Shields ${tickShieldPct}% ≤ repairThreshold (${repairThreshold}%) — recharging in combat`);
       await topUpShields(ctx, shieldRechargePct / 100);
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
       continue;
     }
     if (repairThreshold > 0 && tickHullPct <= repairThreshold) {
       ctx.log("combat", `🛠️ Hull ${tickHullPct}% ≤ repairThreshold (${repairThreshold}%) — repairing in combat`);
       if (await useRepairKits(ctx)) {
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
         continue;
       }
     }
@@ -2106,7 +2184,7 @@ export async function fightJoinedBattle(
     if (targetParticipant && currentTarget && !targetParticipant.is_destroyed) {
       const coop = await cooperateWithBoardingClaim(ctx, status, currentTarget);
       if (coop.brace) {
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
         continue;
       }
       if (coop.target && currentTarget && (coop.target.id !== currentTarget.id || coop.target.name !== currentTarget.name)) {
@@ -2123,7 +2201,7 @@ export async function fightJoinedBattle(
     if (!targetParticipant) {
       const coop = await cooperateWithBoardingClaim(ctx, status, currentTarget);
       if (coop.brace) {
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
         continue;
       }
       if (coop.target && currentTarget && (coop.target.id !== currentTarget.id || coop.target.name !== currentTarget.name)) {
@@ -2244,7 +2322,7 @@ export async function fightJoinedBattle(
     if (shieldTargetPct > 0 && shieldPct < shieldTargetPct * 100) {
       ctx.log("combat", `🛡️ Shields ${shieldPct}% < ${shieldTargetPct * 100}% — recharging...`);
       if (await topUpShields(ctx, shieldTargetPct)) {
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
         continue;
       }
     }
@@ -2287,7 +2365,7 @@ const originalTarget = target;
           return true;
         }
       }
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
       continue;
     }
 
@@ -2383,7 +2461,7 @@ const originalTarget = target;
           }
           ctx.log("error", "Advance to engaged failed: " + advResp.error.message);
         }
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
       } else {
         ctx.log("combat", `⚔️ Already at engaged zone (stay-at-engaged)`);
       }
@@ -2428,10 +2506,10 @@ const originalTarget = target;
             await bot.exec("battle", { action: "stance", stance: "brace" });
           }
         }
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
       } else {
         if (currentTarget) await doEngage(currentTarget);
-        await ctx.sleep(10000);
+        await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
       }
       continue;
     }
@@ -2455,7 +2533,7 @@ const originalTarget = target;
         }
         ctx.log("error", `Advance failed: ${advResp.error.message}`);
       }
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
     } else if (nullCannonBraceCycle && status.tick !== undefined) {
       if (status.tick !== lastNullCannonTick) {
         lastNullCannonTick = status.tick;
@@ -2472,10 +2550,10 @@ const originalTarget = target;
           await bot.exec("battle", { action: "stance", stance: "brace" });
         }
       }
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
     } else {
       if (currentTarget) await doEngage(currentTarget);
-      await ctx.sleep(10000);
+      await waitForNextBattleTick(ctx, ctx.bot.currentBattle.lastTick);
     }
   }
 }

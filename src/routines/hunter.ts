@@ -4913,7 +4913,7 @@ async function* pvpRoutine(ctx: RoutineContext): AsyncGenerator<string, void, vo
   ctx.log("info", `PVP mode: camping ${originalPoi} (${originalSystem}) â€” will attack the configured target player every tick (no movement).`);
 
   // Tick cadence for re-issuing the attack command.
-  const TICK_MS = 3000;
+  const TICK_MS = 10000;
 
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
@@ -6702,8 +6702,8 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
 // marines, so the subroutine keeps an eye on hull and bails to fire/brace if
 // things go badly.
 
-const BOARD_MAX_TICKS = 90000;
-const BOARD_TICK_MS = 5000;
+const BOARD_MAX_TICKS = 90;
+const BOARD_TICK_MS = 10000;
 
 /**
  * When fit marines drop below this fraction of the ship's marine capacity,
@@ -7020,14 +7020,19 @@ export async function boardingSubroutine(
    //   4. Once boarding starts, monitor the operation to completion
    const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
 
-    let tickCount = 0;
-    let boardingActive = false;
+     let tickCount = 0;
+     let boardingTickTime = 0;
+     let boardingActive = false;
     let lastHull = bot.hull;
     let boardStanceIssued = false;
 
-   while (bot.state === "running") {
-     tickCount++;
-     if (tickCount > BOARD_MAX_TICKS) {
+    while (bot.state === "running") {
+      const _now = Date.now();
+      if (!boardingTickTime || _now - boardingTickTime >= 10000) {
+        tickCount++;
+        boardingTickTime = _now;
+      }
+      if (tickCount > BOARD_MAX_TICKS) {
        ctx.log("combat", "Boarding: timeout reached â€” switching to fire stance to finish");
        await bot.exec("battle", { action: "stance", stance: "fire" });
        return "failed";

@@ -388,6 +388,121 @@ export function getMccWindowInfo(
   return null;
 }
 
+
+export function generateScanPattern(
+  pattern: string,
+  startDegree: number,
+  stepDegrees: number,
+  numAngles: number,
+): number[] {
+  const angles: number[] = [];
+  const start = ((startDegree % 360) + 360) % 360;
+  const step = Math.max(1, Math.min(180, stepDegrees));
+  const n = Math.max(1, Math.floor(numAngles));
+
+  const norm = (a: number): number => ((a % 360) + 360) % 360;
+
+  const base: number[] = [];
+  for (let i = 0; i < n; i++) base.push(norm(start + i * step));
+
+  const seen = new Set<number>();
+  const pushUnique = (value: number): boolean => {
+    const v = norm(value);
+    if (seen.has(v)) return false;
+    seen.add(v);
+    angles.push(v);
+    return true;
+  };
+  const fillRemaining = (): void => {
+    for (const b of base) {
+      if (angles.length >= n) break;
+      pushUnique(b);
+    }
+  };
+
+  switch (pattern) {
+    case "circle": {
+      for (const b of base) pushUnique(b);
+      break;
+    }
+    case "star": {
+      for (let i = 0; i < n; i++) {
+        const k = Math.floor(i / 2) + 1;
+        if (i % 2 === 0) {
+          pushUnique(start + 180 + k * step);
+        } else {
+          pushUnique(start + k * step);
+        }
+      }
+      fillRemaining();
+      break;
+    }
+    case "spiral": {
+      for (let i = 0; i < n; i++) {
+        const offset = Math.floor((i + 1) / 2) * step;
+        const dir = i % 2 === 0 ? 1 : -1;
+        pushUnique(start + dir * offset);
+      }
+      fillRemaining();
+      break;
+    }
+    case "figure8": {
+      const half = Math.ceil(n / 2);
+      for (let i = 0; i < half; i++) pushUnique(start + i * step);
+      for (let i = half - 1; i >= 0; i--) pushUnique(start + i * step);
+      fillRemaining();
+      break;
+    }
+    case "zigzag": {
+      for (let i = 0; i < n; i++) {
+        const offset = Math.floor((i + 1) / 2) * step;
+        const dir = i % 2 === 0 ? -1 : 1;
+        pushUnique(start + dir * offset);
+      }
+      fillRemaining();
+      break;
+    }
+    case "petal": {
+      const stride = 7;
+      for (let i = 0; i < n; i++) {
+        pushUnique(base[(i * stride) % n]);
+      }
+      fillRemaining();
+      break;
+    }
+    case "square": {
+      for (let i = 0; i < 4; i++) pushUnique(start + i * 90);
+      break;
+    }
+    case "cross": {
+      for (let i = 0; i < 8; i++) pushUnique(start + i * 45);
+      break;
+    }
+    case "wedge": {
+      const halfWedge = Math.min(45, Math.floor(n / 2) * step);
+      for (let i = 0; i < n; i++) pushUnique(start - halfWedge + i * step);
+      break;
+    }
+    case "random": {
+      const shuffled = [...base];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = shuffled[i];
+        shuffled[i] = shuffled[j];
+        shuffled[j] = tmp;
+      }
+      for (const a of shuffled) pushUnique(a);
+      break;
+    }
+    default: {
+      for (const b of base) pushUnique(b);
+      break;
+    }
+  }
+
+  return angles;
+}
+
 export function isPathfinderLandingAtVoid(landing: PathfinderResult | null): boolean {
   if (!landing) return true;
   const systemId = landing.systemId.toLowerCase();

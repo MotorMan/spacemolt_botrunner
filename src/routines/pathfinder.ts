@@ -10,7 +10,7 @@ import {
   ensureDocked,
   tryRefuel,
 } from "./common.js";
-import { formatBearing, PATHFINDER_SPEED } from "../pathfinder.js";
+import { formatBearing, PATHFINDER_SPEED, generateScanPattern } from "../pathfinder.js";
 
 const PATHFINDER_SETTINGS_KEY = "pathfinder";
 
@@ -89,89 +89,7 @@ export function setPathfinderScanPattern(username: string, pattern: PathfinderSe
 /** Generate a sequence of scan angles for a given sweep pattern.
  *  All patterns except "circle" return to origin after each angle (out + back),
   *  keeping outward distance low. "circle" chains jumps mid-drift. */
-function generateScanPattern(
-  pattern: PathfinderSettings["scanPattern"],
-  startDegree: number,
-  stepDegrees: number,
-  numAngles: number,
-): number[] {
-  const angles: number[] = [];
-  const start = ((startDegree % 360) + 360) % 360;
-  const step = Math.max(1, Math.min(180, stepDegrees));
-
-  switch (pattern) {
-    case "circle": {
-      for (let i = 0; i < numAngles; i++) {
-        angles.push((start + i * step) % 360);
-      }
-      break;
-    }
-    case "star": {
-      for (let i = 0; i < numAngles; i++) {
-        angles.push((start + i * step) % 360);
-      }
-      break;
-    }
-    case "spiral": {
-      for (let i = 0; i < numAngles; i++) {
-        const dir = i % 2 === 0 ? 1 : -1;
-        const offset = Math.floor(i / 2) * step;
-        angles.push(((start + dir * offset) % 360 + 360) % 360);
-      }
-      break;
-    }
-    case "figure8": {
-      for (let i = 0; i < numAngles; i++) {
-        const dir = i % 2 === 0 ? 1 : -1;
-        const offset = Math.floor(i / 2) * step;
-        angles.push(((start + dir * offset) % 360 + 360) % 360);
-      }
-      break;
-    }
-    case "zigzag": {
-      for (let i = 0; i < numAngles; i++) {
-        const dir = i % 2 === 0 ? 1 : -1;
-        const offset = Math.floor(i / 2) * step;
-        angles.push(((start + dir * offset) % 360 + 360) % 360);
-      }
-      break;
-    }
-    case "petal": {
-      for (let i = 0; i < numAngles; i++) {
-        const offset = Math.round(Math.sin(i * (step * Math.PI / 180)) * 90);
-        angles.push(((start + offset) % 360 + 360) % 360);
-      }
-      break;
-    }
-    case "square": {
-      for (let i = 0; i < 4; i++) {
-        angles.push((start + i * 90) % 360);
-      }
-      break;
-    }
-    case "cross": {
-      for (let i = 0; i < 8; i++) {
-        angles.push((start + i * 45) % 360);
-      }
-      break;
-    }
-    case "wedge": {
-      const halfWedge = Math.min(45, Math.floor(numAngles / 2) * step);
-      for (let i = 0; i < numAngles; i++) {
-        angles.push(((start - halfWedge + i * step) % 360 + 360) % 360);
-      }
-      break;
-    }
-    case "random": {
-      for (let i = 0; i < numAngles; i++) {
-        angles.push(Math.floor(Math.random() * 360));
-      }
-      break;
-    }
-  }
-
-  return angles;
-}
+export { generateScanPattern } from "../pathfinder.js";
 
 /** Perform a raw pathfinder jump at a given bearing.
  *  When `waitForCompletion` is true (default), waits for transit to START then

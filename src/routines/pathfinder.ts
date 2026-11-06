@@ -149,9 +149,9 @@ async function pathfinderJumpAtBearing(
 
   // Phase 1: wait for transit to START
   let startPolls = 0;
-  const maxStartPolls = 24; // up to ~2 minutes to detect transit start
+  const maxStartPolls = 60; // up to ~1 minute at 1s polls
   while (bot.state === "running" && startPolls < maxStartPolls && !inTransit) {
-    await ctx.sleep(5000);
+    await ctx.sleep(1000);
     if (bot.state !== "running") break;
     startPolls++;
     const startPoi = await bot.exec("get_poi");
@@ -181,7 +181,7 @@ async function pathfinderJumpAtBearing(
 
   // Phase 2: wait for transit to COMPLETE
   while (bot.state === "running" && poll < maxPolls && inTransit) {
-    await ctx.sleep(5000);
+    await ctx.sleep(2000);
     if (bot.state !== "running") break;
     poll++;
 
@@ -317,7 +317,7 @@ async function checkAndRefuelMidScan(
 
   // Wait for any in-progress transit to complete before we can dock.
   while (bot.inTransit && bot.state === "running") {
-    await ctx.sleep(5000);
+    await ctx.sleep(2000);
     await bot.refreshStatus();
   }
 
@@ -351,7 +351,7 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
   const scanStartDegree = settings.scanStartDegree ?? 0;
   const scanStepDegrees = Math.max(1, Math.min(180, settings.scanStepDegrees ?? 12));
   const scanWaitMinutes = settings.scanWaitMinutes ?? 5;
-  const scanDelayTicks = settings.scanDelayTicks ?? 2;
+  const scanDelayTicks = settings.scanDelayTicks ?? 0;
   const refuelThreshold = settings.refuelThreshold ?? 50;
 
   const scanPattern = settings.scanPattern ?? "circle";
@@ -420,7 +420,7 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
     if (bot.state !== "running") return;
 
     // Brief settle so the server registers the jump before we read get_poi.
-    await ctx.sleep(1000);
+    await ctx.sleep(500);
 
     if (bot.state !== "running") return;
 

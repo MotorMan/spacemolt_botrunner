@@ -1565,8 +1565,113 @@ async function getTrackingFleet(ctx: RoutineContext): Promise<BotStatus[]> {
 }
 
 /**
+ * Request a cloaked own-bot target to decloak so the rescue bot can refuel it.
+ * Returns true if we believe the target is now decloaked.
+ */
+async function requestDecloakAndWait(ctx: RoutineContext, username: string, force: boolean = false): Promise<boolean> {
+  if (!isOwnBot(username)) return false;
+  if (!force) {
+    const fleet = await getTrackingFleet(ctx);
+    const t = fleet.find(b => b.username === username);
+    if (!t?.isCloaked) return false;
+  }
+
+  ctx.log("rescue", `🔓 Requesting ${username} to decloak for refuel...`);
+  ctx.sendBotChat?.("DECLOAK_FOR_REFUEL", "general", [username], {
+    type: "decloak_for_refuel",
+    target: username,
+    requester: ctx.bot.username,
+  });
+
+  // Wait up to ~20s for the target to report decloaked (fleet status or local bot).
+  for (let i = 0; i < 20; i++) {
+    await ctx.sleep(1000);
+    try {
+      const f = await getTrackingFleet(ctx);
+      const tt = f.find(b => b.username === username);
+      if (tt && !tt.isCloaked) return true;
+    } catch { /* ignore */ }
+    try {
+      const { getBot } = await import("../botmanager.js");
+      const lb = getBot(username);
+      if (lb && !lb.isCloaked) return true;
+    } catch { /* ignore */ }
+  }
+  ctx.log("warn", `Timed out waiting for ${username} to decloak`);
+  return false;
+}
+
+/** Ask a (previously cloaked) own-bot target to re-cloak after refueling. */
+async function requestRecloak(ctx: RoutineContext, username: string): Promise<void> {
+  if (!isOwnBot(username)) return;
+  ctx.log("rescue", `🔒 Requesting ${username} to re-cloak after refuel...`);
+  ctx.sendBotChat?.("RECLOAK", "general", [username], {
+    type: "recloak",
+    target: username,
+    requester: ctx.bot.username,
+  });
+  await ctx.sleep(2000);
+}
+
+/**
+ * Wrapper around the refuel command that handles cloaked own-bot targets:
+ * asks them to decloak first, retries on player_not_found, and re-cloaks
+ * afterwards when we caused the decloak.
+ */
+async function refuelTargetWithDecloak(
+  ctx: RoutineContext,
+  username: string,
+  playerId: string,
+  quantity: number,
+): Promise<any> {
+  const { bot } = ctx;
+  let knownCloaked = false;
+  let decloakedByUs = false;
+
+  if (isOwnBot(username)) {
+    try {
+      const fleet = await getTrackingFleet(ctx);
+      const t = fleet.find(b => b.username === username);
+      if (t?.isCloaked) {
+        knownCloaked = true;
+        const ok = await requestDecloakAndWait(ctx, username, false);
+        decloakedByUs = ok || true; // we requested it
+      }
+    } catch { /* ignore */ }
+  }
+
+  let resp = await bot.exec("refuel", { target: playerId, quantity });
+
+  // If the target could not be located, it may be cloaked with stale fleet status.
+  // Ask it to decloak and retry a few times.
+  if (resp?.error && isOwnBot(username)) {
+    const errLower = String(resp.error.message || "").toLowerCase();
+    if (errLower.includes("player_not_found") || errLower.includes("not found")) {
+      ctx.log("rescue", `🔓 ${username} not found — requesting decloak and retrying refuel...`);
+      await requestDecloakAndWait(ctx, username, true);
+      decloakedByUs = true;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        await ctx.sleep(3000);
+        resp = await bot.exec("refuel", { target: playerId, quantity });
+        if (!resp?.error) break;
+        const rl = String(resp.error.message || "").toLowerCase();
+        if (!(rl.includes("player_not_found") || rl.includes("not found"))) break;
+      }
+    }
+  }
+
+  const success = !resp?.error;
+  if (isOwnBot(username) && decloakedByUs) {
+    if (success || knownCloaked) {
+      await requestRecloak(ctx, username);
+    }
+  }
+  return resp;
+}
+
+
+/**
  * Check if the ship has the refueling_pump module installed.
- * Returns true if the module is found, false otherwise.
  */
 async function hasRefuelingPump(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
@@ -3961,7 +4066,7 @@ if (travelSucceeded) {
           let refuelError: string | null = null;
 
           while (true) {
-            const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
+        const refuelResp = await refuelTargetWithDecloak(ctx, target.username, targetPlayerId, maxDeliverable);
             // Check for battle notifications after refuel
             if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
               ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
@@ -3995,7 +4100,7 @@ if (travelSucceeded) {
               refuelError = refuelResp.error.message;
               ctx.log("error", `Refuel command failed: ${refuelError}`);
 
-              const errLower = refuelError.toLowerCase();
+              const errLower = (refuelError as string).toLowerCase();
               if (errLower.includes("player_not_found") || errLower.includes("not found")) {
                 fuelTransferTargetNotFound = true;
                 cleanupQueuedRescue(ctx, target.username, bot.username, true, "target not found (likely already full/cloaked)");
@@ -4003,7 +4108,7 @@ if (travelSucceeded) {
               }
 
             // ── BONUS: target moved a short distance — retarget and retry ──
-            const movedLocation = parseDifferentLocationError(refuelError);
+            const movedLocation = parseDifferentLocationError(refuelError as string);
             if (movedLocation && retargets < MAX_RETARGETS) {
               const resolved = resolveSystemForLocationName(movedLocation);
               if (!resolved) {
@@ -4244,7 +4349,7 @@ if (travelSucceeded) {
 
         const rescueSettings = getRescueSettings();
         const maxDeliverable = Math.min(Math.floor(bot.fuel / 3), rescueSettings.maxFuelDelivery);
-        const extraRefuelResp = await bot.exec("refuel", { target: extraPlayerId, quantity: maxDeliverable });
+        const extraRefuelResp = await refuelTargetWithDecloak(ctx, extra.username, extraPlayerId, maxDeliverable);
 
         if (extraRefuelResp.error) {
           ctx.log("warn", `Failed to refuel additional bot ${extra.username}: ${extraRefuelResp.error.message}`);
@@ -4866,7 +4971,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         const maxDeliverable = Math.min(Math.floor(bot.fuel / 3), rescueSettings.maxFuelDelivery);
         ctx.log("rescue", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel}, capped at ${rescueSettings.maxFuelDelivery})`);
 
-        const refuelResp = await bot.exec("refuel", { target: player.playerId, quantity: maxDeliverable });
+        const refuelResp = await refuelTargetWithDecloak(ctx, player.username, player.playerId, maxDeliverable);
         // Check for battle notifications after refuel
         if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
           ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
@@ -5568,7 +5673,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
         const maxDeliverable = Math.min(Math.floor(bot.fuel / 3), rescueSettings.maxFuelDelivery);
         ctx.log("mayday", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel}, capped at ${rescueSettings.maxFuelDelivery})`);
 
-        const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
+const refuelResp = await refuelTargetWithDecloak(ctx, mayday.sender, targetPlayerId, maxDeliverable);
         // Check for battle notifications after refuel
         if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
           ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
@@ -7999,7 +8104,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       const maxDeliverable = Math.min(Math.floor(bot.fuel / 3), rescueSettings.maxFuelDelivery);
       ctx.log("rescue", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel}, capped at ${rescueSettings.maxFuelDelivery})`);
 
-      const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
+      const refuelResp = await refuelTargetWithDecloak(ctx, target.username, targetPlayerId, maxDeliverable);
 
       // Attempt the refuel, with up to a couple of retargets if the player has
       // moved a short distance (1-2 systems) since we cached their location.
@@ -8098,7 +8203,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           }
 
           // Retry the refuel at the new location
-          refuelResult = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
+          refuelResult = await refuelTargetWithDecloak(ctx, target.username, targetPlayerId, maxDeliverable);
           continue;
         }
 
@@ -8242,7 +8347,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
              continue;
            }
 
-           const extraRefuelResp = await bot.exec("refuel", { target: extraPlayerId, quantity: maxDeliverable });
+        const extraRefuelResp = await refuelTargetWithDecloak(ctx, extra.username, extraPlayerId, maxDeliverable);
            if (extraRefuelResp.error) {
              const errLower = extraRefuelResp.error.message.toLowerCase();
              if (errLower.includes("target_tank_full") || errLower.includes("fuel tank is already full")) {
@@ -8642,7 +8747,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             break;
           }
 
-          const chainRefuelResp = await bot.exec("refuel", { target: chainPlayerId, quantity: chainMaxDeliverable });
+          const chainRefuelResp = await refuelTargetWithDecloak(ctx, closest.username, chainPlayerId, chainMaxDeliverable);
 
           if (chainRefuelResp.error) {
             const errLower = chainRefuelResp.error.message.toLowerCase();
@@ -8723,7 +8828,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               break;
             }
 
-            const chainRetryResp = await bot.exec("refuel", { target: chainRecheckId, quantity: chainRetryMax });
+            const chainRetryResp = await refuelTargetWithDecloak(ctx, closest.username, chainRecheckId, chainRetryMax);
             if (chainRetryResp.error) {
               const retryErrLower = chainRetryResp.error.message.toLowerCase();
               if (retryErrLower.includes("target_tank_full") || retryErrLower.includes("fuel tank is already full")) {

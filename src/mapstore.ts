@@ -1591,6 +1591,12 @@ class MapStore {
         const targetResource = poi.resources?.find((r) => r.resource_id === oreId);
         const targetRemaining = targetResource?.remaining ?? 0;
         const targetMaxRemaining = targetResource?.max_remaining ?? 0;
+        // If this POI has been scanned (resources array present) and the target ore
+        // is NOT in the scan results, the ore is no longer present here — skip it.
+        // This prevents stale ores_found history from resurrecting depleted/absent ores.
+        if (Array.isArray(poi.resources) && !targetResource) {
+          continue;
+        }
         if (targetRemaining <= 0 && targetMaxRemaining > 0) {
           continue;
         }

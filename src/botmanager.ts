@@ -2857,6 +2857,64 @@ async function main(): Promise<void> {
     const line = `${timestamp} [BOT_CHAT] [${msg.channel}] ${msg.sender}${recipientInfo}: ${msg.content}`;
     server.logSystem(line);
   });
+  // Bot-to-bot decloak/recloak handling for rescue refueling of cloaked ships.
+  // When a rescue bot asks a (possibly remote) bot to decloak so it can be
+  // refueled, this handler performs the cloak toggle on any local bot that is
+  // the target. Cross-client delivery happens via the chat relay/pull above.
+  botChatChannel.onGlobalMessage((msg: BotChatMessage) => {
+    const meta = (msg.metadata || {}) as Record<string, unknown>;
+    const type = meta.type as string | undefined;
+    if (type !== "decloak_for_refuel" && type !== "recloak") return;
+
+    const targetName = (meta.target as string) || (msg.recipients.length === 1 ? msg.recipients[0] : "");
+    if (!targetName) return;
+    const targetBot = bots.get(targetName);
+    if (!targetBot) return;
+    if (!targetBot.isConnected || !targetBot.isConnected()) return;
+
+    (async () => {
+      try {
+        if (type === "decloak_for_refuel") {
+          if (targetBot.isCloaked) {
+            await targetBot.exec("cloak", { enable: false });
+            for (let i = 0; i < 6; i++) {
+              await new Promise((r) => setTimeout(r, 1000));
+              await targetBot.refreshStatus().catch(() => { /* ignore */ });
+              if (!targetBot.isCloaked) break;
+            }
+            targetBot.isCloaked = false;
+          }
+          botChatChannel.send({
+            sender: targetBot.username,
+            recipients: [],
+            channel: (msg.channel as BotChatChannel) || "general",
+            content: "DECLOAKED",
+            metadata: { type: "decloak_done", target: targetBot.username },
+          });
+        } else {
+          if (!targetBot.isCloaked) {
+            await targetBot.exec("cloak", { enable: true });
+            for (let i = 0; i < 6; i++) {
+              await new Promise((r) => setTimeout(r, 1000));
+              await targetBot.refreshStatus().catch(() => { /* ignore */ });
+              if (targetBot.isCloaked) break;
+            }
+            targetBot.isCloaked = true;
+          }
+          botChatChannel.send({
+            sender: targetBot.username,
+            recipients: [],
+            channel: (msg.channel as BotChatChannel) || "general",
+            content: "RECLOAKED",
+            metadata: { type: "recloak_done", target: targetBot.username },
+          });
+        }
+      } catch (e) {
+        console.error(`[BotChat] cloak toggle handler error for ${targetName}:`, e);
+      }
+    })();
+  });
+
   server.logSystem("Bot-to-bot chat channel initialized");
 
   // Seed galaxy map from public API so pathfinding works from first run

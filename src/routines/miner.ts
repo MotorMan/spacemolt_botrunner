@@ -4811,6 +4811,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
     }
     if (systemId) bot.system = systemId;
     let scanResources: Array<any> = [];
+    let hasScanResources = false;
 
     // CRITICAL MAP UPDATE: Record system visit and update POI data
     // Miners are excellent map data sources since they visit systems frequently
@@ -4870,9 +4871,13 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         const poiScanResp = await bot.exec("get_poi", { poi_id: bot.poi });
         if (!poiScanResp.error && poiScanResp.result) {
           const scanData = poiScanResp.result as Record<string, unknown>;
-          scanResources = Array.isArray(scanData.resources) ? (scanData.resources as Array<any>) : [];
-          const shouldCheckAsDepleted = (currentPoi.resources !== undefined) || (scanResources.length > 0 && scanResources.some(r => r.resource_id === effectiveTarget));
-          if (shouldCheckAsDepleted) {
+           hasScanResources = Array.isArray(scanData.resources);
+           scanResources = hasScanResources ? (scanData.resources as Array<any>) : [];
+           // Always refresh map resources from an actual POI scan, even when the
+           // target ore is absent, so stale ores_found history can't keep pointing
+           // at POIs that no longer contain the ore (e.g. radioactive ores that
+           // were depleted/removed from a belt).
+           if (hasScanResources) {
             const resourceData = scanResources.map((raw: any) => ({
               resource_id: String(raw.resource_id ?? raw.resourceId ?? raw.id ?? ""),
               name: String(raw.name ?? raw.resourceName ?? raw.resource_id ?? ""),
@@ -4886,8 +4891,10 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           }
         }
 
-        const knownTarget = currentOres.some((o: any) => o.item_id === effectiveTarget);
-        const hasTargetInScan = scanResources.some((r: any) => r.resource_id === effectiveTarget);
+         const knownTarget = hasScanResources
+           ? scanResources.some((r: any) => r.resource_id === effectiveTarget)
+           : currentOres.some((o: any) => o.item_id === effectiveTarget);
+         const hasTargetInScan = scanResources.some((r: any) => r.resource_id === effectiveTarget);
         if ((knownTarget && canMineHere) || hasTargetInScan) {
           miningPoi = { id: bot.poi, name: currentPoi.name };
         }

@@ -13,6 +13,7 @@ import {
   navigateToSystem,
   detectAndRecoverFromDeath,
   buildDeniedStationSet,
+  markStationDenied,
   readSettings,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
@@ -3797,17 +3798,26 @@ if (state && state.status !== "idle") {
       }
 
       // Dock at destination
-      if (!bot.docked) {
-        ctx.log("transport", `Lounge delivery: docking at ${waypoint.poiName}`);
-        const dockResp = await bot.exec("dock");
-        if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
-          ctx.log("error", `Lounge delivery: Dock failed: ${dockResp.error.message}`);
-          await ctx.sleep(30000);
-          continue;
-        }
-        await bot.refreshStatus();
-        continue;
-      }
+       if (!bot.docked) {
+         ctx.log("transport", `Lounge delivery: docking at ${waypoint.poiName}`);
+         const dockResp = await bot.exec("dock");
+         if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+           const msg = dockResp.error.message || "";
+           if (/access denied/i.test(msg)) {
+             ctx.log("error", `Lounge delivery: Dock denied at ${waypoint.poiName} — marking restricted and skipping waypoint`);
+             markStationDenied(waypoint.poi);
+             state.currentRouteIndex += 1;
+             saveTransportState(state);
+             await ctx.sleep(5000);
+             continue;
+           }
+           ctx.log("error", `Lounge delivery: Dock failed: ${msg}`);
+           await ctx.sleep(30000);
+           continue;
+         }
+         await bot.refreshStatus();
+         continue;
+       }
 
       // Unload the lounge passenger at their destination
       const p = state.onboardPassengers[0];
@@ -3941,12 +3951,17 @@ if (state && state.status !== "idle") {
         // not usable by `travel` until burned into the tank via `refuel`.
         // Without this the bot sits with 3900 fuel in cargo and 0 in tank,
         // failing every travel attempt with "Insufficient fuel for travel".
-        if (!bot.docked) {
-          const dockResp = await bot.exec("dock");
-          if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
-            ctx.log("error", `Dock failed before travel: ${dockResp.error.message} — skipping pre-travel refuel at non-station POI`);
-            // Cannot dock here (e.g. current POI is not a station). Skip refuel and attempt travel directly instead of looping.
-          } else {
+         if (!bot.docked) {
+           const dockResp = await bot.exec("dock");
+           if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+             const msg = dockResp.error.message || "";
+             if (/access denied/i.test(msg) && bot.poi) {
+               ctx.log("error", `Dock denied at ${bot.poi} — marking station restricted`);
+               markStationDenied(bot.poi);
+             }
+             ctx.log("error", `Dock failed before travel: ${msg} — skipping pre-travel refuel at non-station POI`);
+             // Cannot dock here (e.g. current POI is not a station). Skip refuel and attempt travel directly instead of looping.
+           } else {
             bot.docked = true;
             await bot.refreshStatus();
             await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
@@ -4027,28 +4042,33 @@ if (state && state.status !== "idle") {
       
       const creditsBefore = bot.credits || 0;
       
-      if (!alreadyDocked) {
-        const dockResp = await bot.exec("dock");
-        if (dockResp.error && !dockResp.error.message.includes("already")) {
-          const blockedHere = isBlockedStation(waypoint.poi) || isBlockedStation(waypoint.poiName);
-          if (blockedHere) {
-            // We're not docked here, so we cannot unload the passenger (unload
-            // requires being docked). Skip this waypoint and re-plan without it;
-            // the passenger stays aboard and will be dropped at the next station
-            // the bot docks at via dropBlacklistedAboardPassengers().
-            ctx.log("transport", `Dock failed at ${waypoint.poiName} (${waypoint.poi}) which is now on the blacklist. Skipping waypoint and re-planning.`);
-            state.route = [];
-            state.currentRouteIndex = 0;
-            state.status = "in_transit";
-            saveTransportState(state);
-            await ctx.sleep(5000);
-            continue;
-          }
-          ctx.log("error", `Dock failed: ${dockResp.error.message}`);
-          await ctx.sleep(30000);
-          continue;
-        }
-      }
+       if (!alreadyDocked) {
+         const dockResp = await bot.exec("dock");
+         if (dockResp.error && !dockResp.error.message.includes("already")) {
+           const msg = dockResp.error.message || "";
+           if (/access denied/i.test(msg)) {
+             ctx.log("error", `Dock denied at ${waypoint.poiName} (${waypoint.poi}) — marking station restricted and skipping waypoint`);
+             markStationDenied(waypoint.poi);
+           }
+           const blockedHere = isBlockedStation(waypoint.poi) || isBlockedStation(waypoint.poiName);
+           if (blockedHere) {
+             // We're not docked here, so we cannot unload the passenger (unload
+             // requires being docked). Skip this waypoint and re-plan without it;
+             // the passenger stays aboard and will be dropped at the next station
+             // the bot docks at via dropBlacklistedAboardPassengers().
+             ctx.log("transport", `Dock failed at ${waypoint.poiName} (${waypoint.poi}) which is now on the blacklist. Skipping waypoint and re-planning.`);
+             state.route = [];
+             state.currentRouteIndex = 0;
+             state.status = "in_transit";
+             saveTransportState(state);
+             await ctx.sleep(5000);
+             continue;
+           }
+           ctx.log("error", `Dock failed: ${msg}`);
+           await ctx.sleep(30000);
+           continue;
+         }
+       }
 
       if (isMobileStation(waypoint.poi)) {
         state.routeRebuildAttempts = 0;

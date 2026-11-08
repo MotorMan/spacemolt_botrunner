@@ -407,6 +407,11 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
           fuelThresholdPct: refuelThreshold,
           hullThresholdPct: 40,
           skipBlacklist: ignoreBlacklist && isCloaked,
+          // Cloaked = safe anywhere, so prefer the server's find_route which
+          // knows wormhole shortcuts the local BFS can't follow, and accept
+          // wormhole hops (jump({target_system}) handles them per the API spec).
+          preferServerRoute: isCloaked,
+          allowWormholes: isCloaked,
         });
 
         if (arrived) {

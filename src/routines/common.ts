@@ -3206,11 +3206,67 @@ export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
   return route.some(seg => seg.via_wormhole === true);
 }
 
+/** Route resolution outcome from the server `find_route` API. */
+async function resolveNextSystemViaServer(
+  bot: any,
+  ctx: RoutineContext,
+  targetSystemId: string,
+  blacklist: string[],
+  bypassBlacklist: boolean,
+  allowWormholes: boolean,
+  normalizeSystemName: (name: string) => string,
+  contextSuffix = "",
+): Promise<{ nextSystem: string | null; alreadyAtTarget: boolean }> {
+  const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
+  const routeData = routeResp.result as { found?: boolean; route?: RouteSegment[]; total_jumps?: number; message?: string } | null;
+
+  const alreadyAtTarget = !!routeData?.found && (
+    routeData.total_jumps === 0 ||
+    (routeData.message && routeData.message.toLowerCase().includes('already')) ||
+    (routeData.route && routeData.route.length === 1)
+  );
+  if (alreadyAtTarget) {
+    return { nextSystem: null, alreadyAtTarget: true };
+  }
+
+  if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
+    const serverRouteSystemIds = routeData.route.map(r => r.system_id);
+    const systemsToCheck = serverRouteSystemIds.slice(1);
+    const blacklistedOnRoute = systemsToCheck.find(
+      sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
+    );
+    const routeStartsHere = serverRouteSystemIds[0] &&
+      normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
+    const hasWormhole = routeHasWormhole(routeData.route);
+
+    if (blacklistedOnRoute && !bypassBlacklist) {
+      ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route${contextSuffix}`);
+    } else if (blacklistedOnRoute && bypassBlacklist) {
+      ctx.log("travel", `Server route passes through blacklisted system ${blacklistedOnRoute} — cloaked/skipBlacklist, using route${contextSuffix}`);
+      return { nextSystem: routeData.route[1].system_id, alreadyAtTarget: false };
+    } else if (!routeStartsHere) {
+      ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route${contextSuffix}`);
+    } else if (hasWormhole && !allowWormholes) {
+      ctx.log("warn", `Server route uses wormhole — rejecting route (bot has not unlocked wormhole POI)${contextSuffix}`);
+      ctx.log("debug", `Route contained wormhole segment(s) - forcing reroute to avoid POI the bot cannot access${contextSuffix}`);
+    } else {
+      if (hasWormhole) {
+        ctx.log("travel", `Server route uses wormhole shortcut (allowed) — next: ${routeData.route[1].system_id}${contextSuffix}`);
+      }
+      const fullRoute = routeData.route.map(r => r.system_id).join(" → ");
+      ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${routeData.route[1].system_id}${contextSuffix}`);
+      ctx.log("debug", `Server returned full route for ${targetSystemId}: ${fullRoute}`);
+      return { nextSystem: routeData.route[1].system_id, alreadyAtTarget: false };
+    }
+  }
+  return { nextSystem: null, alreadyAtTarget: false };
+}
+
 /** Navigate to a target system via jump chain. Returns true if arrived. */
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; onPreJump?: (nextSystem: string, jumpNumber: number) => void; skipBlacklist?: boolean; skipApprovedCheck?: boolean; isCombatBot?: boolean; joinBattles?: boolean; ignorePiratesWhenCloaked?: boolean; ignoreBlacklistWhenCloaked?: boolean; homeSystem?: string; homeStation?: string },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; onPreJump?: (nextSystem: string, jumpNumber: number) => void; skipBlacklist?: boolean; skipApprovedCheck?: boolean; isCombatBot?: boolean; joinBattles?: boolean; ignorePiratesWhenCloaked?: boolean; ignoreBlacklistWhenCloaked?: boolean; homeSystem?: string; homeStation?: string; preferServerRoute?: boolean; allowWormholes?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
@@ -3224,6 +3280,9 @@ export async function navigateToSystem(
   // A cloaked ship also bypassses the blacklist (cloaking alone is enough)
   // unless the routine explicitly opted out via ignoreBlacklistWhenCloaked.
   const blacklist = (opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked)) ? [] : getSystemBlacklist();
+  const preferServerRoute = opts.preferServerRoute === true;
+  const allowWormholes = opts.allowWormholes === true;
+  const bypassBlacklist = (ignoreBlacklistWhenCloaked && bot.isCloaked) || !!opts.skipBlacklist;
 
   // Normalize system names for comparison (replace underscores with spaces, lowercase)
   const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
@@ -3243,62 +3302,53 @@ export async function navigateToSystem(
       return true;
     }
 
-    // Plan route from current position (use blacklist to avoid pirate systems)
-    const route = mapStore.findRoute(bot.system, targetSystemId, blacklist);
+    // Plan route from current position. When preferServerRoute is set, the
+    // server's find_route (which knows wormhole shortcuts the local BFS
+    // cannot express) is tried FIRST and only falls back to the local map.
+    let route = preferServerRoute ? null : mapStore.findRoute(bot.system, targetSystemId, blacklist);
     let nextSystem: string | null = null;
 
-    if (route && route.length > 1) {
-      nextSystem = route[1];
-      ctx.log("travel", `Route: ${route.length - 1} jump${route.length - 1 !== 1 ? "s" : ""} remaining`);
-    } else {
-      ctx.log("travel", `No mapped route — querying server for route to ${targetSystemId}`);
-      const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
-      const routeData = routeResp.result as { found?: boolean; route?: RouteSegment[]; total_jumps?: number; message?: string } | null;
-
-      // Check if server says we're already at target (message field or 0 jumps)
-      const alreadyAtTarget = routeData?.found && (
-        routeData.total_jumps === 0 ||
-        (routeData.message && routeData.message.toLowerCase().includes('already')) ||
-        (routeData.route && routeData.route.length === 1)
+    if (preferServerRoute) {
+      ctx.log("travel", `Querying server for route to ${targetSystemId} (preferServerRoute)`);
+      const resolved = await resolveNextSystemViaServer(
+        bot,
+        ctx,
+        targetSystemId,
+        blacklist,
+        bypassBlacklist,
+        allowWormholes,
+        normalizeSystemName,
       );
-
-      if (alreadyAtTarget) {
+      if (resolved.alreadyAtTarget) {
         ctx.log("travel", `Server confirms we are already at ${targetSystemId}`);
         return true;
       }
-
-      if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
-        const serverRouteSystemIds = routeData.route.map(r => r.system_id);
-        // Exclude the first system (current position) from blacklist check - we're already there
-        const systemsToCheck = serverRouteSystemIds.slice(1);
-        const blacklistedOnRoute = systemsToCheck.find(
-          sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
-        );
-        const routeStartsHere = serverRouteSystemIds[0] && 
-          normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
-        const hasWormhole = routeHasWormhole(routeData.route);
-
-        const bypassBlacklist = (ignoreBlacklistWhenCloaked && bot.isCloaked) || !!opts.skipBlacklist;
-
-        if (blacklistedOnRoute && !bypassBlacklist) {
-          ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route`);
-        } else if (blacklistedOnRoute && bypassBlacklist) {
-          ctx.log("travel", `Server route passes through blacklisted system ${blacklistedOnRoute} — cloaked/skipBlacklist, using route`);
-          nextSystem = routeData.route[1].system_id;
-        } else if (!routeStartsHere) {
-          ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route`);
-        } else if (hasWormhole) {
-          ctx.log("warn", `Server route uses wormhole — rejecting route (bot has not unlocked wormhole POI)`);
-          ctx.log("debug", `Route contained wormhole segment(s) - forcing reroute to avoid POI the bot cannot access`);
-        } else {
-          nextSystem = routeData.route[1].system_id;
-          const fullRoute = routeData.route.map(r => r.system_id).join(" → ");
-          ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
-          ctx.log("debug", `Server returned full route for ${targetSystemId}: ${fullRoute}`);
-        }
+      nextSystem = resolved.nextSystem;
+      if (!nextSystem) {
+        // Fall back to the local BFS map before giving up.
+        route = mapStore.findRoute(bot.system, targetSystemId, blacklist);
       }
+    }
 
-      // If server route was rejected or unavailable, try fallback options
+    if (!nextSystem && route && route.length > 1) {
+      nextSystem = route[1];
+      ctx.log("travel", `Route: ${route.length - 1} jump${route.length - 1 !== 1 ? "s" : ""} remaining`);
+    } else if (!nextSystem && !preferServerRoute) {
+      ctx.log("travel", `No mapped route — querying server for route to ${targetSystemId}`);
+      const resolved = await resolveNextSystemViaServer(
+        bot,
+        ctx,
+        targetSystemId,
+        blacklist,
+        bypassBlacklist,
+        allowWormholes,
+        normalizeSystemName,
+      );
+      if (resolved.alreadyAtTarget) {
+        ctx.log("travel", `Server confirms we are already at ${targetSystemId}`);
+        return true;
+      }
+      nextSystem = resolved.nextSystem;
       if (!nextSystem) {
         // Server returned no route - check if we might already be at the target
         // This can happen due to case mismatch or if we're already there
@@ -3325,8 +3375,29 @@ export async function navigateToSystem(
           return false;
         }
       }
-
+    } else if (!nextSystem) {
+      ctx.log("warn", `Server returned no route to ${targetSystemId} — checking if already arrived...`);
+      if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+        ctx.log("travel", `Confirmed at ${targetSystemId} after failed route lookup (normalized comparison)`);
+        return true;
       }
+      const currentSystemData = mapStore.getSystem(bot.system);
+      if (currentSystemData) {
+        const isNeighbor = currentSystemData.connections.some(
+          c => normalizeSystemName(c.system_id) === normalizeSystemName(targetSystemId)
+        );
+        if (isNeighbor) {
+          ctx.log("travel", `Target ${targetSystemId} is adjacent - attempting direct jump`);
+          nextSystem = targetSystemId;
+        } else {
+          ctx.log("error", `No route to ${targetSystemId} from ${bot.system} — cannot navigate`);
+          return false;
+        }
+      } else {
+        ctx.log("error", `No route to ${targetSystemId} — cannot navigate`);
+        return false;
+      }
+    }
 
     // Hull check — repair immediately if <= 40%
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
@@ -3360,62 +3431,59 @@ export async function navigateToSystem(
     if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) return true;
 
     // Recalculate route from CURRENT position (ensureFueled may have moved us, use blacklist)
-    const postFuelRoute = mapStore.findRoute(bot.system, targetSystemId, blacklist);
+    const postFuelRoute = preferServerRoute ? null : mapStore.findRoute(bot.system, targetSystemId, blacklist);
     if (postFuelRoute && postFuelRoute.length > 1) {
       nextSystem = postFuelRoute[1];
       ctx.log("travel", `Route recalculated from ${bot.system}: ${postFuelRoute.length - 1} jump${postFuelRoute.length - 1 !== 1 ? "s" : ""} remaining`);
     } else {
-      // No mapped route — query server
       ctx.log("travel", `No mapped route from ${bot.system} — querying server for route to ${targetSystemId}`);
-      const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
-      const routeData = routeResp.result as { found?: boolean; route?: RouteSegment[]; total_jumps?: number; message?: string } | null;
-
-      // Check if server says we're already at target
-      const alreadyAtTarget = routeData?.found && (
-        routeData.total_jumps === 0 ||
-        (routeData.message && routeData.message.toLowerCase().includes('already')) ||
-        (routeData.route && routeData.route.length === 1)
+      const resolvedPostFuel = await resolveNextSystemViaServer(
+        bot,
+        ctx,
+        targetSystemId,
+        blacklist,
+        bypassBlacklist,
+        allowWormholes,
+        normalizeSystemName,
+        " (post-fuel)",
       );
-
-      if (alreadyAtTarget) {
+      if (resolvedPostFuel.alreadyAtTarget) {
         ctx.log("travel", `Server confirms we are already at ${targetSystemId} (post-fuel check)`);
         return true;
       }
-
-      if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
-        const serverRouteSystemIds = routeData.route.map(r => r.system_id);
-        // Exclude the first system (current position) from blacklist check - we're already there
-        const systemsToCheck = serverRouteSystemIds.slice(1);
-        const blacklistedOnRoute = systemsToCheck.find(
-          sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
-        );
-        const routeStartsHere = serverRouteSystemIds[0] && 
-          normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
-        const hasWormhole = routeHasWormhole(routeData.route);
-
-        const bypassBlacklist = (ignoreBlacklistWhenCloaked && bot.isCloaked) || !!opts.skipBlacklist;
-        
-        if (blacklistedOnRoute && !bypassBlacklist) {
-          ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route (post-fuel)`);
-        } else if (blacklistedOnRoute && bypassBlacklist) {
-          ctx.log("travel", `Server route passes through blacklisted system ${blacklistedOnRoute} — cloaked/skipBlacklist, using route (post-fuel)`);
-          nextSystem = routeData.route[1].system_id;
-        } else if (!routeStartsHere) {
-          ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route (post-fuel)`);
-        } else if (hasWormhole) {
-          ctx.log("warn", `Server route uses wormhole — rejecting route (bot has not unlocked wormhole POI) (post-fuel)`);
-          ctx.log("debug", `Route contained wormhole segment(s) - forcing reroute to avoid POI the bot cannot access (post-fuel)`);
-        } else {
-          nextSystem = routeData.route[1].system_id;
-          const fullRoute = routeData.route.map(r => r.system_id).join(" → ");
-          ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
-          ctx.log("debug", `Server returned full route for ${targetSystemId}: ${fullRoute}`);
+      nextSystem = resolvedPostFuel.nextSystem;
+      if (preferServerRoute && !nextSystem) {
+        const localFallback = mapStore.findRoute(bot.system, targetSystemId, blacklist);
+        if (localFallback && localFallback.length > 1) {
+          nextSystem = localFallback[1];
+          ctx.log("travel", `Server route unavailable — using local map route from ${bot.system}: ${localFallback.length - 1} jumps`);
         }
       }
-
       if (!nextSystem) {
-        ctx.log("error", `No route from ${bot.system} to ${targetSystemId} — cannot navigate`);
-        return false;
+        // Server returned no route - check if we might already be at the target
+        // This can happen due to case mismatch or if we're already there
+        ctx.log("warn", `Server returned no route to ${targetSystemId} — checking if already arrived...`);
+        if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+          ctx.log("travel", `Confirmed at ${targetSystemId} after failed route lookup (normalized comparison)`);
+          return true;
+        }
+        // Also check if we're in a neighboring system (1 jump away)
+        const currentSystemData = mapStore.getSystem(bot.system);
+        if (currentSystemData) {
+          const isNeighbor = currentSystemData.connections.some(
+            c => normalizeSystemName(c.system_id) === normalizeSystemName(targetSystemId)
+          );
+          if (isNeighbor) {
+            ctx.log("travel", `Target ${targetSystemId} is adjacent - attempting direct jump`);
+            nextSystem = targetSystemId;
+          } else {
+            ctx.log("error", `No route to ${targetSystemId} from ${bot.system} — cannot navigate`);
+            return false;
+          }
+        } else {
+          ctx.log("error", `No route to ${targetSystemId} — cannot navigate`);
+          return false;
+        }
       }
     }
 

@@ -8533,15 +8533,31 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     logStatus(ctx);
 
     // â”€â”€ Fuel â”€â”€
-    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
-    if (fueled !== "fueled") {
-      await handleFuelCheckFailure(ctx, settings, fueled);
-      continue;
+    // Stay-in-POI is a manually-deployed emergency posture (e.g. a boarding
+    // hunter sent to hold one POI until manually released). Returning home
+    // on low fuel cells would abandon that post, and any captured prize
+    // would be abandoned with it. The low-fuel-cells return-home trigger is
+    // therefore disabled entirely in that mode. While a captured prize is
+    // still unresolved the same rule applies: never abandon a prize to chase
+    // a fuel-cell restock. Tank-level fuel is still checked immediately
+    // before any actual inter-system travel (navigateToSystem calls
+    // ensureFueled), so intra-POI combat/prize work is never blocked.
+    const inStayInPoi = !!settings.stayInPoi;
+    const hasUnresolvedPrize = bot.capturedPrizeTracker.size > 0 || (bot.prizeRecoveries || []).some(r => r.status === "claimed" || r.status === "in_transit");
+
+    // ── Fuel ──
+    if (!inStayInPoi && !(hasUnresolvedPrize && settings.boardingEnabled)) {
+      const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+      if (fueled !== "fueled") {
+        await handleFuelCheckFailure(ctx, settings, fueled);
+        continue;
+      }
     }
 
-    // â”€â”€ Can we make it home with remaining fuel? â”€â”€
+    // ── Can we make it home with remaining fuel? ──
+    // (disabled in stay-in-POI / unresolved-prize case above)
     const fuelCellCount = countFuelCellsInInventory(bot.inventory);
-    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+    if (!inStayInPoi && !hasUnresolvedPrize && settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
       const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
       if (canMakeItHome) {
         ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
@@ -8587,9 +8603,20 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
          await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
        }
 
-       ctx.log("system", `Fit marines critically low â€” returning home to treat and recruit personnel`);
-       await returnToHomeAndResupply(ctx, settings);
-       continue;
+       // Never abandon a captured prize (or a stay-in-POI post) for a marine
+       // resupply: the stay-in-POI sweep claims/services prizes each cycle,
+       // and the top-of-loop fuel gate defers home returns while a prize is
+       // unresolved.
+       const unresolvedPrize = bot.capturedPrizeTracker.size > 0 || (bot.prizeRecoveries || []).some(r => r.status === "claimed" || r.status === "in_transit");
+       if (settings.stayInPoi) {
+         ctx.log("combat", "Marine health critical but stay-in-POI is set - holding post (marine resupply deferred until released)");
+       } else if (unresolvedPrize) {
+         ctx.log("combat", "Marine health critical but a captured prize is still unresolved - deferring home return until the prize is claimed/serviced");
+       } else {
+         ctx.log("system", `Fit marines critically low - returning home to treat and recruit personnel`);
+         await returnToHomeAndResupply(ctx, settings);
+         continue;
+       }
      }
 
      // â”€â”€ Stay-in-POI mode: anchor at one POI and re-scan each cycle â”€â”€
@@ -8722,6 +8749,27 @@ async function* engageBoardingTargetsAtCurrentPoi(
   const { bot } = ctx;
   let totalKills = startKills;
   let totalBoardings = startBoardings;
+
+  // Prize-first: a capture that finished inside the boarding subroutine
+  // registers the prize in capturedPrizeTracker and polls for it there, but if
+  // control reaches this sweep (e.g. battle ended on a later loop iteration)
+  // the prize must still be claimed/serviced before anything else. Running
+  // this on every stay-in-POI cycle guarantees the winnings are never left
+  // behind between battle-end and the next engagement.
+  await serviceAnyStalledPrizes(ctx);
+  {
+    const preSweepResp = await bot.exec("get_nearby");
+    if (!preSweepResp.error && preSweepResp.result) {
+      const preSweepPrizes = getNearbyPrizes(preSweepResp.result).filter(p => p.status === "available" || p.status === "claimed");
+      for (const prePrize of preSweepPrizes) {
+        ctx.log("combat", `\uD83D\uDEB8 Prize-first: claiming ${prePrize.ship_name || prePrize.prize_id} at ${bot.poi} before next engagement`);
+        const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false, prePrize);
+        if (claimed) ctx.log("combat", `\uD83C\uDFC6 Prize-first: ${prePrize.ship_name || prePrize.prize_id} claimed`);
+        await ctx.sleep(1000);
+      }
+      await serviceAnyStalledPrizes(ctx);
+    }
+  }
 
   if (await checkAndHandleExistingBattle(ctx, settings)) return [totalKills, totalBoardings];
   await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
@@ -9030,6 +9078,21 @@ async function* boardingSystemPass(
     }
 
     if (await checkAndHandleExistingBattle(ctx, settings)) continue;
+
+    // Prize-first at this POI (see engageBoardingTargetsAtCurrentPoi).
+    await serviceAnyStalledPrizes(ctx);
+    {
+      const preSweepResp = await bot.exec("get_nearby");
+      if (!preSweepResp.error && preSweepResp.result) {
+        const preSweepPrizes = getNearbyPrizes(preSweepResp.result).filter(p => p.status === "available" || p.status === "claimed");
+        for (const prePrize of preSweepPrizes) {
+          const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false, prePrize);
+          if (claimed) ctx.log("combat", `\uD83C\uDFC6 Prize-first: ${prePrize.ship_name || prePrize.prize_id} claimed at ${poi.name}`);
+          await ctx.sleep(1000);
+        }
+        await serviceAnyStalledPrizes(ctx);
+      }
+    }
 
     yield "travel_to_poi";
     ctx.log("travel", `Boarding patrol: ${poi.name}...`);

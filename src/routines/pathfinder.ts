@@ -21,7 +21,9 @@ interface PathfinderSettings {
   scanWaitMinutes?: number;
   scanDelayTicks?: number;
   refuelThreshold?: number;
-  scanPattern?: "circle" | "star" | "spiral" | "figure8" | "zigzag" | "petal" | "square" | "cross" | "wedge" | "random";
+  scanPattern?: "circle" | "star" | "spiral" | "figure8" | "zigzag" | "petal" | "square" | "cross" | "wedge" | "random" | "p2p";
+  p2pStartSystem?: string;
+  p2pDestinationSystem?: string;
 }
 
 interface GalacticPos {
@@ -55,6 +57,8 @@ export function getPathfinderSettings(username?: string): PathfinderSettings {
     scanDelayTicks: asNumber(botOverrides.scanDelayTicks, asNumber(global.scanDelayTicks, 0)),
     refuelThreshold: asNumber(botOverrides.refuelThreshold, asNumber(global.refuelThreshold, 50)),
     scanPattern: (asString(botOverrides.scanPattern, asString(global.scanPattern, "circle")) as PathfinderSettings["scanPattern"]),
+    p2pStartSystem: asString(botOverrides.p2pStartSystem, asString(global.p2pStartSystem, "")),
+    p2pDestinationSystem: asString(botOverrides.p2pDestinationSystem, asString(global.p2pDestinationSystem, "")),
   };
 }
 
@@ -355,14 +359,70 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
   const refuelThreshold = settings.refuelThreshold ?? 50;
 
   const scanPattern = settings.scanPattern ?? "circle";
+  let scanAngles: number[];
+  let originPos: GalacticPos | null = null;
+  let totalJumps = 0;
+  let jumpsPerAngle = 1;
 
-  const startDegree = ((scanStartDegree % 360) + 360) % 360;
+  // Handle P2P mode: point-to-point jump from start system to destination system
+  if (scanPattern === "p2p") {
+    const startSystem = settings.p2pStartSystem || originSystem;
+    const destSystem = settings.p2pDestinationSystem || "";
+    if (!destSystem) {
+      ctx.log("error", "P2P mode requires a destination system — aborting");
+      return;
+    }
+    ctx.log("system", `P2P mode: navigating from ${startSystem} to ${destSystem}`);
+
+    // Navigate to start system
+    const startArrived = await navigateToSystem(ctx, startSystem, {
+      fuelThresholdPct: refuelThreshold,
+      hullThresholdPct: 30,
+    });
+    if (!startArrived) {
+      ctx.log("error", `Could not reach start system ${startSystem} — aborting P2P mode`);
+      return;
+    }
+    ctx.log("travel", `At start system ${startSystem}`);
+
+    // Get origin position for fuel check
+    await getSystemInfo(ctx);
+    const startSys = mapStore.getSystem(startSystem);
+    originPos = startSys?.position ?? null;
+
+    // Single jump to destination
+    scanAngles = [];
+    totalJumps = 1;
+    ctx.log("system", `P2P mode: jumping to destination ${destSystem}`);
+
+    // Perform the jump
+    const jumped = await pathfinderJumpAtBearing(ctx, 0, originPos, {
+      waitForCompletion: true,
+    });
+    if (!jumped.success) {
+      ctx.log("error", `P2P jump to ${destSystem} failed`);
+      return;
+    }
+
+    ctx.log("system", `P2P complete: arrived at ${bot.system}`);
+    // Report and yield done
+    ctx.log("system", `=== Pathfinder P2P Complete ===`);
+    ctx.log("system", `Origin: ${startSystem}`);
+    ctx.log("system", `Destination: ${destSystem}`);
+    ctx.log("system", `Pattern: p2p`);
+    ctx.log("system", `Systems found: 1`);
+    ctx.log("system", `Back at ${bot.system} — pathfinder routine finished`);
+    yield "done";
+    return;
+  }
+
+  const startDegree = ((settings.scanStartDegree ?? 0 % 360) + 360) % 360;
   const numAngles = Math.floor(360 / scanStepDegrees);
-  const scanAngles = generateScanPattern(scanPattern, startDegree, scanStepDegrees, numAngles);
+  scanAngles = generateScanPattern(scanPattern, startDegree, scanStepDegrees, numAngles);
   // Every angle is a single pathfinder jump. Circle adds a final return jump;
   // non-circle patterns chain scans mid-drift without returning between angles.
-  const jumpsPerAngle = 1;
-  const totalJumps = scanAngles.length * jumpsPerAngle + (scanPattern === "circle" ? 1 : 0);
+  jumpsPerAngle = 1;
+  totalJumps = scanAngles.length * jumpsPerAngle + (scanPattern === "circle" ? 1 : 0);
 
   ctx.log("system", `Pathfinder scan routine started — origin: ${originSystem}, start: ${startDegree}°, step: ${scanStepDegrees}° (${scanAngles.length} angles), pattern: ${scanPattern}, wait: ${scanWaitMinutes} min`);
 
@@ -396,7 +456,7 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
   // Ensure origin position is known for return calculations
   await getSystemInfo(ctx);
   const originSys = mapStore.getSystem(originSystem);
-  const originPos: GalacticPos | null = originSys?.position ?? null;
+  originPos = originSys?.position ?? null;
   if (!originPos) {
     ctx.log("warn", `Origin system ${originSystem} has no position data — return bearing cannot be calculated`);
   }

@@ -429,9 +429,9 @@ export function generateScanPattern(
       for (let i = 0; i < n; i++) {
         const k = Math.floor(i / 2) + 1;
         if (i % 2 === 0) {
-          pushUnique(start - k * step);
+          pushUnique(start + 180 + k * step);
         } else {
-          pushUnique(start + k * step);
+          pushUnique(start - k * step);
         }
       }
       fillRemaining();

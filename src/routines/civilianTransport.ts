@@ -3747,6 +3747,14 @@ if (state && state.status !== "idle") {
          state.currentRouteIndex = 0;
          state.currentDestination = null;
          state.berths_used = { economy: 0, business: 0, first: 0 };
+         // Same stale-pickup fix as the completed handler: point the pickup
+         // back at home and require a travel decision so the next idle cycle
+         // checks the home Transit Lounge rather than scanning remote stations.
+         state.pickupStation = settings.homeStation || null;
+         state.pickupSystem = settings.homeSystem || null;
+         state.needsTravel = true;
+         state.roundsWithoutPassengers = 0;
+         state.awayPickupAttempts = 0;
          saveTransportState(state);
         await ctx.sleep(5000);
         continue;
@@ -3919,9 +3927,14 @@ if (state && state.status !== "idle") {
         }
         state.status = "idle";
         state.routeRebuildAttempts = 0;
-        // Set pickupStation to current location if docked, otherwise null
-        state.pickupStation = bot.docked && bot.poi ? bot.poi : settings.homeStation || null;
-        state.pickupSystem = bot.docked && bot.poi ? bot.system : settings.homeSystem || null;
+        // Point pickup back at home (not the current station) so the next
+        // idle cycle does not treat the delivery station as home and skip
+        // the Transit Lounge check.
+        state.pickupStation = settings.homeStation || null;
+        state.pickupSystem = settings.homeSystem || null;
+        state.needsTravel = true;
+        state.roundsWithoutPassengers = 0;
+        state.awayPickupAttempts = 0;
         saveTransportState(state);
         continue;
       }
@@ -4146,13 +4159,26 @@ if (state && state.status !== "idle") {
           await collectFuelCells(ctx, settings);
         }
         
-         state.status = "idle";
+          state.status = "idle";
          state.onboardPassengers = [];
          state.route = [];
          state.revenue = 0;
          state.currentRouteIndex = 0;
          state.currentDestination = null;
          state.berths_used = { economy: 0, business: 0, first: 0 };
+         // Reset the pickup target so the next idle iteration does not treat
+         // "already at pickup" as home and scan remote stations. In achievement
+         // mode the lounge at home must be checked first; the lounge
+         // candidate check (tryDeliverExpiredLoungePassenger) will also
+         // refresh lounge data, but only when we are not claiming to be at
+         // home. Force a travel decision on the next cycle.
+         state.pickupStation = settings.homeStation || null;
+         state.pickupSystem = settings.homeSystem || null;
+         state.needsTravel = true;
+         state.roundsWithoutPassengers = 0;
+         state.awayPickupAttempts = 0;
+         state.routeRebuildAttempts = 0;
+         state.recentlyVisitedStations = state.recentlyVisitedStations || [];
          saveTransportState(state);
         
         if (!settings.disableFactionMessage) {

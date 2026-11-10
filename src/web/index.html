@@ -40247,6 +40247,8 @@ ignoreBlacklist: document.getElementById(
             </select>
             <label style="font-size:12px;color:var(--text-dim)">Parallel:</label>
             <input type="number" id="bulkRefitParallel" value="1" min="1" max="20" style="width:70px;font-size:12px;padding:4px" title="Number of bots to refit simultaneously">
+            <input type="checkbox" id="bulkRefitModuleOverride" style="margin-top:4px;width:16px;height:16px;transform:scale(1.2);vertical-align:middle">
+            <label style="font-size:12px;color:var(--text-dim);margin-left:4px" title="Skip faction module count check - allows refitting ships even if modules are missing or insufficient">Disable module check</label>
             <button class="sm primary" onclick="startBulkRefit()" id="bulkRefitStartBtn" disabled>Start Refit</button>
             <button class="sm danger" onclick="stopBulkRefit()" id="bulkRefitStopBtn" disabled>Stop</button>
           </div>
@@ -40342,7 +40344,8 @@ ignoreBlacklist: document.getElementById(
         if (!btn) return;
         const preset = document.getElementById("bulkRefitPreset")?.value;
         const recipients = getBulkRefitRecipients();
-        btn.disabled = !preset || recipients.length === 0;
+        const moduleOverride = document.getElementById("bulkRefitModuleOverride")?.checked || false;
+        btn.disabled = !preset && !moduleOverride || recipients.length === 0;
       }
 
       function bulkRefitLog(msg) {
@@ -40364,7 +40367,8 @@ ignoreBlacklist: document.getElementById(
       async function startBulkRefit() {
         const presetName = document.getElementById("bulkRefitPreset")?.value;
         const recipients = getBulkRefitRecipients();
-        if (!presetName || recipients.length === 0) {
+        const moduleOverride = document.getElementById("bulkRefitModuleOverride")?.checked || false;
+        if (!presetName && !moduleOverride || recipients.length === 0) {
           bulkRefitLog("Select a module preset and at least one bot first.");
           return;
         }
@@ -40421,43 +40425,46 @@ ignoreBlacklist: document.getElementById(
           factionMap.set(item.itemId, item.quantity);
         }
 
-        const totalNeeded = new Map();
-        for (const modId of targetModules) {
-          totalNeeded.set(modId, (totalNeeded.get(modId) || 0) + recipients.length);
-        }
+        // Skip module check if override is enabled
+        if (!moduleOverride) {
+          const totalNeeded = new Map();
+          for (const modId of targetModules) {
+            totalNeeded.set(modId, (totalNeeded.get(modId) || 0) + recipients.length);
+          }
 
-        const missing = [];
-        const shortage = [];
-        for (const [modId, needed] of totalNeeded) {
-          const available = factionMap.get(modId) || 0;
-          if (available < needed) {
-            const name = catalog.items?.[modId]?.name || modId;
-            if (available === 0) {
-              missing.push(`${name} (need ${needed}, have 0)`);
-            } else {
-              shortage.push(`${name} (need ${needed}, have ${available}, missing ${needed - available})`);
+          const missing = [];
+          const shortage = [];
+          for (const [modId, needed] of totalNeeded) {
+            const available = factionMap.get(modId) || 0;
+            if (available < needed) {
+              const name = catalog.items?.[modId]?.name || modId;
+              if (available === 0) {
+                missing.push(`${name} (need ${needed}, have 0)`);
+              } else {
+                shortage.push(`${name} (need ${needed}, have ${available}, missing ${needed - available})`);
+              }
             }
           }
-        }
 
-        if (missing.length > 0 || shortage.length > 0) {
-          bulkRefitLog("ABORTED: Not enough modules in faction storage!");
-          if (missing.length > 0) {
-            bulkRefitLog("Missing entirely:");
-            missing.forEach((m) => bulkRefitLog(`  - ${m}`));
+          if (missing.length > 0 || shortage.length > 0) {
+            bulkRefitLog("ABORTED: Not enough modules in faction storage!");
+            if (missing.length > 0) {
+              bulkRefitLog("Missing entirely:");
+              missing.forEach((m) => bulkRefitLog(`  - ${m}`));
+            }
+            if (shortage.length > 0) {
+              bulkRefitLog("Shortage:");
+              shortage.forEach((s) => bulkRefitLog(`  - ${s}`));
+            }
+            return;
           }
-          if (shortage.length > 0) {
-            bulkRefitLog("Shortage:");
-            shortage.forEach((s) => bulkRefitLog(`  - ${s}`));
-          }
-          return;
-        }
 
-        bulkRefitLog(`Pre-flight check passed. ${recipients.length} bots, preset: ${presetName}`);
-        for (const [modId, needed] of totalNeeded) {
-          const available = factionMap.get(modId) || 0;
-          const name = catalog.items?.[modId]?.name || modId;
-          bulkRefitLog(`  ${name}: need ${needed}, have ${available}`);
+          bulkRefitLog(`Pre-flight check passed. ${recipients.length} bots, preset: ${presetName}`);
+          for (const [modId, needed] of totalNeeded) {
+            const available = factionMap.get(modId) || 0;
+            const name = catalog.items?.[modId]?.name || modId;
+            bulkRefitLog(`  ${name}: need ${needed}, have ${available}`);
+          }
         }
 
         bulkRefitState = {

@@ -1484,6 +1484,7 @@
       let marketDetails = { items: [] };
       let activeSettingsTab = "general";
       let missionsSelectedBotFromStorage = null;
+      let showConsolidatedMissionsFromStorage = false;
       let diskSpaceLow = false;
       let diskSpaceFreeBytes = 0;
       let diskSpaceThresholdBytes = 100 * 1024 * 1024;
@@ -2521,6 +2522,11 @@
               // Restore previously selected bot from localStorage
               if (missionsSelectedBotFromStorage && bots.some((b) => b.username === missionsSelectedBotFromStorage)) {
                 missionsSelectedBot = missionsSelectedBotFromStorage;
+              }
+              // Restore consolidated view preference from localStorage
+              showConsolidatedMissionsFromStorage = localStorage.getItem("showConsolidatedMissions") === "true";
+              if (showConsolidatedMissionsFromStorage !== undefined) {
+                showConsolidatedMissions = showConsolidatedMissionsFromStorage;
               }
               setTimeout(refreshHomeStationFuel, 2000);
               updateChatBotSelect();
@@ -22537,6 +22543,8 @@ function renderMissionsPage() {
 
       function toggleConsolidatedMissionsView() {
         showConsolidatedMissions = !showConsolidatedMissions;
+        // Persist consolidated view preference to localStorage
+        try { localStorage.setItem("showConsolidatedMissions", showConsolidatedMissions); } catch (e) {}
         const btn = document.getElementById("consolidatedViewBtn");
         if (btn) {
           btn.textContent = showConsolidatedMissions

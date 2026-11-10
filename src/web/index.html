@@ -2548,7 +2548,11 @@
               setTimeout(refreshHomeStationFuel, 2000);
               updateChatBotSelect();
               // Re-render the missions tab so the restored selection takes effect
-              renderMissionsPage();
+              // Only re-render if missions tab is not active (to avoid wiping view on periodic init)
+              const missionsPage = document.getElementById("page-missions");
+              if (!missionsPage || !missionsPage.classList.contains("active")) {
+                renderMissionsPage();
+              }
               // Only re-render settings if settings tab is not active (to avoid clearing unsaved changes)
               if (
                 !document
@@ -22489,8 +22493,18 @@ When responding:
       let factionLogLines = []; // all faction log entries
       let factionLogFilter = "all"; // 'all' | 'deposit' | 'withdraw' | 'donation' | 'gift'
       let factionWithdrawSortOrder = "alpha"; // 'alpha' | 'quantity'
+      let missionsFetchInProgress = false; // Guard to prevent concurrent fetches
 
 function renderMissionsPage() {
+        // If missions tab is not visible, skip rendering (will catch up when shown)
+        const missionsPage = document.getElementById("page-missions");
+        if (!missionsPage || !missionsPage.classList.contains("active")) {
+          return;
+        }
+        // If a fetch is already in progress for the current view, don't start another
+        if (missionsFetchInProgress) {
+          return;
+        }
         renderMissionsSidebar();
         if (showConsolidatedMissions) {
           fetchAllActiveMissions();
@@ -22541,13 +22555,15 @@ function switchMissionsSubTab(tab) {
         renderMissionsPage();
 }
 
-      /** Fetch active missions for all bots (for consolidated view) */
+/** Fetch active missions for all bots (for consolidated view) */
       function fetchAllActiveMissions() {
+        missionsFetchInProgress = true;
         let fetched = 0;
         const total = bots.length;
 
         if (total === 0) {
           renderConsolidatedMissions();
+          missionsFetchInProgress = false;
           return;
         }
 
@@ -22578,10 +22594,11 @@ function switchMissionsSubTab(tab) {
             fetched++;
             if (fetched >= total) {
               renderConsolidatedMissions();
+              missionsFetchInProgress = false;
             }
           });
         }
-      }
+}
 
       function toggleConsolidatedMissionsView() {
         showConsolidatedMissions = !showConsolidatedMissions;
@@ -22647,13 +22664,20 @@ function switchMissionsSubTab(tab) {
         }
       }
 
-      function fetchActiveMissions(username) {
+function fetchActiveMissions(username) {
+        missionsFetchInProgress = true;
         const content = document.getElementById("missionsContent");
-        if (!content) return;
+        if (!content) {
+          missionsFetchInProgress = false;
+          return;
+        }
         content.innerHTML = '<div class="map-empty">Loading missions...</div>';
 
         sendExec(username, "get_active_missions", undefined, (result) => {
-          if (missionsSelectedBot !== username) return;
+          if (missionsSelectedBot !== username) {
+            missionsFetchInProgress = false;
+            return;
+          }
           let activeMissions = [];
           if (result.ok && result.data) {
             const d = result.data;
@@ -22677,8 +22701,9 @@ function switchMissionsSubTab(tab) {
           }
           activeMissionsCache[username] = activeMissions;
           renderBotMissions(username, activeMissions);
+          missionsFetchInProgress = false;
         });
-      }
+}
 
       function renderBotMissions(username, activeMissions) {
         const content = document.getElementById("missionsContent");
@@ -22816,9 +22841,13 @@ function switchMissionsSubTab(tab) {
         direction: "asc",
       };
 
-      function fetchAllKnownMissions() {
+function fetchAllKnownMissions() {
+        missionsFetchInProgress = true;
         const content = document.getElementById("missionsContent");
-        if (!content) return;
+        if (!content) {
+          missionsFetchInProgress = false;
+          return;
+        }
         content.innerHTML = '<div class="map-empty">Loading all known missions...</div>';
 
         fetch("/data/rawMissions.json")
@@ -22826,11 +22855,13 @@ function switchMissionsSubTab(tab) {
           .then((data) => {
             allKnownMissions = data;
             renderAllKnownMissions();
+            missionsFetchInProgress = false;
           })
           .catch((err) => {
             content.innerHTML = `<div class="map-empty">Failed to load missions: ${err.message}</div>`;
+            missionsFetchInProgress = false;
           });
-      }
+}
 
       function renderAllKnownMissions() {
         const content = document.getElementById("missionsContent");
@@ -22967,14 +22998,15 @@ function renderConsolidatedMissions() {
             botMissions = [];
           }
           for (const m of botMissions) {
-            const templateId = m.mission_id || m.id || "";
-            const title =
-              m.title || m.name || m.mission_template_id || templateId;
+            // Use mission_template_id for grouping (shared across bots), fallback to title, then mission_id
+            const templateId = m.mission_template_id || m.title || m.name || m.mission_id || m.id || "";
+            const title = m.title || m.name || m.mission_template_id || templateId;
             const type = m.type || m.mission_type || "";
             const reward = m.reward_credits
               ? `${Number(m.reward_credits).toLocaleString()} cr`
               : m.reward || "-";
             const status = m.status || "active";
+            const missionUuid = m.mission_id || m.id || ""; // Per-bot UUID for complete_mission command
 
             if (!missionGroups.has(templateId)) {
               missionGroups.set(templateId, {
@@ -22988,7 +23020,7 @@ function renderConsolidatedMissions() {
             }
             missionGroups.get(templateId).bots.push({
               username: bot.username,
-              missionId: templateId, // This is the UUID from get_active_missions
+              missionId: missionUuid, // Per-bot UUID for complete_mission
               status,
             });
           }
@@ -23090,11 +23122,13 @@ function renderConsolidatedMissions() {
         for (const bot of bots) {
           const botMissions = activeMissionsCache[bot.username] || [];
           for (const m of botMissions) {
+            // Match by mission_template_id (shared template), fallback to title, then mission_id
+            const mTemplateId = m.mission_template_id || m.title || m.name || m.mission_id || m.id || "";
             if (
-              (m.mission_id || m.id) === templateId &&
+              mTemplateId === templateId &&
               (m.status || "active") === "active"
             ) {
-              groupBots.push({ username: bot.username, missionId: templateId });
+              groupBots.push({ username: bot.username, missionId: m.mission_id || m.id || "" });
               break;
             }
           }

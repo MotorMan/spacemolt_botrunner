@@ -22467,24 +22467,25 @@ When responding:
       let factionLogFilter = "all"; // 'all' | 'deposit' | 'withdraw' | 'donation' | 'gift'
       let factionWithdrawSortOrder = "alpha"; // 'alpha' | 'quantity'
 
-      function renderMissionsPage() {
+function renderMissionsPage() {
         renderMissionsSidebar();
         if (showConsolidatedMissions) {
           fetchAllActiveMissions();
-        } else if (missionsSubTab === "bot" && missionsSelectedBot) {
-          fetchActiveMissions(missionsSelectedBot);
-        } else if (missionsSubTab === "bot" && missionsSelectedBot === null && bots.length > 0) {
-          missionsSelectedBot = bots[0]?.username;
-          fetchActiveMissions(missionsSelectedBot);
         } else if (missionsSubTab === "bot") {
-          renderMissionsFromMap();
+          if (missionsSelectedBot) {
+            fetchActiveMissions(missionsSelectedBot);
+          } else if (bots.length > 0) {
+            missionsSelectedBot = bots[0].username;
+            fetchActiveMissions(missionsSelectedBot);
+          } else {
+            renderMissionsFromMap();
+          }
         } else if (missionsSubTab === "all") {
           fetchAllKnownMissions();
         } else {
           renderMissionsFromMap();
         }
-      }
-
+}
       function switchMissionsSubTab(tab) {
         missionsSubTab = tab;
         missionsSelectedBot = null;

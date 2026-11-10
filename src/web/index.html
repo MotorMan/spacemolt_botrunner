@@ -2529,25 +2529,26 @@
                 lastUsedRoutines = { ...settings.botAssignments };
               }
               renderBots();
-              // Restore previously selected bot from localStorage
-              if (missionsSelectedBotFromStorage !== null) {
-                if (missionsSelectedBotFromStorage === "__ALL__") {
+              // Restore previously selected bot from localStorage (read fresh on every init)
+              let storedBot = null;
+              try {
+                storedBot = localStorage.getItem("missionsSelectedBot");
+              } catch (e) {}
+              if (storedBot !== null) {
+                if (storedBot === "__ALL__") {
                   missionsSelectedBot = null;
-                } else if (bots.some((b) => b.username === missionsSelectedBotFromStorage)) {
-                  missionsSelectedBot = missionsSelectedBotFromStorage;
+                } else if (bots.some((b) => b.username === storedBot)) {
+                  missionsSelectedBot = storedBot;
                 } else {
                   missionsSelectedBot = null;
                 }
               }
               // Restore consolidated view preference from localStorage
-              showConsolidatedMissionsFromStorage = localStorage.getItem("showConsolidatedMissions") === "true";
-              if (showConsolidatedMissionsFromStorage !== undefined) {
-                showConsolidatedMissions = showConsolidatedMissionsFromStorage;
-              }
+              showConsolidatedMissions = localStorage.getItem("showConsolidatedMissions") === "true";
               // Restore missions sub-tab from localStorage
-              missionsSubTabFromStorage = localStorage.getItem("missionsSubTabFromStorage");
-              if (missionsSubTabFromStorage !== null) {
-                missionsSubTab = missionsSubTabFromStorage;
+              const storedSubTab = localStorage.getItem("missionsSubTabFromStorage");
+              if (storedSubTab !== null) {
+                missionsSubTab = storedSubTab;
               }
               setTimeout(refreshHomeStationFuel, 2000);
               updateChatBotSelect();

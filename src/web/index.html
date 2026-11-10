@@ -1483,6 +1483,7 @@
       let mapData = {};
       let marketDetails = { items: [] };
       let activeSettingsTab = "general";
+      let missionsSelectedBotFromStorage = null;
       let diskSpaceLow = false;
       let diskSpaceFreeBytes = 0;
       let diskSpaceThresholdBytes = 100 * 1024 * 1024;
@@ -2517,8 +2518,14 @@
                 lastUsedRoutines = { ...settings.botAssignments };
               }
               renderBots();
+              // Restore previously selected bot from localStorage
+              if (missionsSelectedBotFromStorage && bots.some((b) => b.username === missionsSelectedBotFromStorage)) {
+                missionsSelectedBot = missionsSelectedBotFromStorage;
+              }
               setTimeout(refreshHomeStationFuel, 2000);
               updateChatBotSelect();
+              // Re-render the missions tab so the restored selection takes effect
+              renderMissionsPage();
               // Only re-render settings if settings tab is not active (to avoid clearing unsaved changes)
               if (
                 !document
@@ -22556,6 +22563,14 @@ When responding:
           return;
         }
         missionsSelectedBot = botName;
+        // Persist selection to localStorage so it survives page refreshes
+        try {
+          if (botName) {
+            localStorage.setItem("missionsSelectedBot", botName);
+          } else {
+            localStorage.removeItem("missionsSelectedBot");
+          }
+        } catch (e) {}
         renderMissionsSidebar();
         if (botName) {
           fetchActiveMissions(botName);

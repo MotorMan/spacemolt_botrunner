@@ -1700,7 +1700,7 @@
         if (name === "map") renderMapPage();
         if (name === "market") renderMarketPage();
         if (name === "missions") {
-          renderMissionsPage();
+          renderMissionsPage(true);
           // Capture snapshot after render so subsequent background refreshes don't wipe user selections
           setTimeout(captureMissionsPanelSnapshot, 0);
 }
@@ -2552,14 +2552,11 @@
               }
               setTimeout(refreshHomeStationFuel, 2000);
               updateChatBotSelect();
-              // Re-render the missions tab so the restored selection takes effect
-              // Only re-render if missions tab is not active (to avoid wiping view on periodic init)
+              // Restore missions selection variables (don't re-render - the view is already correct if tab is active)
+              // Only re-render if missions tab is not active (to restore selection when user returns to it)
               const missionsPage = document.getElementById("page-missions");
               if (!missionsPage || !missionsPage.classList.contains("active")) {
-                renderMissionsPage();
-              } else {
-                // Tab is active - capture snapshot so dirty check preserves user selections
-                captureMissionsPanelSnapshot();
+                renderMissionsPage(true);
               }
               // Only re-render settings if settings tab is not active (to avoid clearing unsaved changes)
               if (
@@ -22532,18 +22529,18 @@ When responding:
         return JSON.stringify(state) !== _missionsPanelSnapshot;
       }
 
-function renderMissionsPage() {
+function renderMissionsPage(force = false) {
         // If missions tab is not visible, skip rendering (will catch up when shown)
         const missionsPage = document.getElementById("page-missions");
         if (!missionsPage || !missionsPage.classList.contains("active")) {
-          return;
+          if (!force) return;
         }
         // If a fetch is already in progress for the current view, don't start another
         if (missionsFetchInProgress) {
           return;
         }
         // If the panel has unsaved user selections (dirty), skip re-render to avoid wiping view
-        if (missionsPanelDirty()) {
+        if (!force && missionsPanelDirty()) {
           return;
         }
         renderMissionsSidebar();
@@ -22593,7 +22590,7 @@ function switchMissionsSubTab(tab) {
           localStorage.setItem("missionsSubTabFromStorage", missionsSubTab);
         } catch (e) {}
         renderMissionsSidebar();
-        renderMissionsPage();
+        renderMissionsPage(true);
         captureMissionsPanelSnapshot();
 }
 
@@ -22660,7 +22657,7 @@ function toggleConsolidatedMissionsView() {
         if (!showConsolidatedMissions) {
           renderMissionsSidebar();
         }
-        renderMissionsPage();
+        renderMissionsPage(true);
         captureMissionsPanelSnapshot();
 }
 

@@ -1,6 +1,6 @@
 import type { RoutineContext } from "../bot.js";
 import type { BotStatus } from "../bot.js";
-import type { BattleStatus } from "../types/game.js";
+import type { BattleStatus, BattleParticipant } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
 import { wildlifeStore } from "../wildlivestore.js";
@@ -201,6 +201,38 @@ async function cooperateWithBoardingClaim(
   ctx.log("combat", `🤝 Boarding cooperation: ${currentTarget.name} claimed by ally — switching to brace stance (no other targets)`);
   await bot.exec("battle", { action: "stance", stance: "brace" });
   return { target: currentTarget, brace: true };
+}
+
+/**
+ * Check if we're being boarded by an enemy.
+ * Returns the boarder participant if we're being boarded (phase: latching or assault),
+ * null otherwise.
+ */
+export function checkForBoardingAttempt(
+  status: BattleStatus | null | undefined,
+  botUsername: string
+): BattleParticipant | null {
+  if (!status?.boarding || status.boarding.length === 0) return null;
+  if (!status.participants || status.participants.length === 0) return null;
+
+  // Find our participant to get our player_id
+  const ourParticipant = status.participants.find(p => p.username === botUsername);
+  if (!ourParticipant) return null;
+  const ourPlayerId = ourParticipant.player_id;
+
+  // Check for boarding operations where we're the target
+  for (const boarding of status.boarding) {
+    if (boarding.target_id === ourPlayerId && (boarding.phase === "latching" || boarding.phase === "assault")) {
+      // Find the boarder (attacker)
+      if (boarding.attacker_id) {
+        const boarder = status.participants.find(p => p.player_id === boarding.attacker_id);
+        if (boarder && !boarder.is_destroyed) {
+          return boarder;
+        }
+      }
+    }
+  }
+  return null;
 }
 
 export const TIER_ORDER: Record<PirateTier, number> = {
@@ -1153,6 +1185,20 @@ const originalTarget = target;
       return true;
     }
 
+    // Check if we're being boarded — if so, immediately switch target to the boarder
+    const boarder = checkForBoardingAttempt(status, bot.username);
+    if (boarder) {
+      ctx.log("combat", `🏴‍☠️ BOARDING ATTEMPT DETECTED! ${boarder.username} (${boarder.player_id}) is boarding us (phase: ${status.boarding?.find(b => b.attacker_id === boarder.player_id)?.phase}) — SWITCHING TARGET!`);
+      target = { id: boarder.player_id, name: boarder.username } as NearbyEntity;
+      await bot.exec("battle", { action: "target", target_id: target.id });
+      // Reset brace detection for new target
+      bracedTargets.delete(target.id);
+      damageBaseline = 0;
+      currentTargetId = target.id;
+      // Continue to next iteration to engage the boarder
+      continue;
+    }
+
     if (status?.tick !== undefined && lastBattleTick !== undefined && status.tick === lastBattleTick) {
       // Only treat an unchanged server tick as "frozen" once a full real-world
       // tick (10 seconds) has elapsed since we last saw it advance. Polls that
@@ -2047,6 +2093,20 @@ let lastBattleTickTime = 0;
       await checkAndPraiseMorgThar(ctx, true);
       await recloakAfterBattle(ctx, cloakOnStart);
       return true;
+    }
+
+    // Check if we're being boarded — if so, immediately switch target to the boarder
+    const boarder = checkForBoardingAttempt(status, bot.username);
+    if (boarder) {
+      ctx.log("combat", `🏴‍☠️ BOARDING ATTEMPT DETECTED! ${boarder.username} (${boarder.player_id}) is boarding us (phase: ${status.boarding?.find(b => b.attacker_id === boarder.player_id)?.phase}) — SWITCHING TARGET!`);
+      currentTarget = { id: boarder.player_id, name: boarder.username } as NearbyEntity;
+      await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+      // Reset brace detection for new target
+      bracedTargetsJoined.delete(currentTarget.id);
+      damageBaselineJoined = 0;
+      currentTargetIdJoined = currentTarget.id;
+      // Continue to next iteration to engage the boarder
+      continue;
     }
 
     if (status?.tick !== undefined && lastBattleTick !== undefined && status.tick === lastBattleTick) {

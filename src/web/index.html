@@ -23140,7 +23140,7 @@ function renderConsolidatedMissions() {
         content.innerHTML = html;
       }
 
-      /** Complete a mission for a specific bot using its mission UUID */
+/** Complete a mission for a specific bot using its mission UUID */
       function completeBotMission(username, missionId) {
         appendLine(
           "system",
@@ -23156,6 +23156,10 @@ function renderConsolidatedMissions() {
                 "system",
                 `Mission completed for ${username}`,
               );
+              if (showConsolidatedMissions) {
+                renderConsolidatedMissions();
+                captureMissionsPanelSnapshot();
+              }
             } else {
               appendLine(
                 "system",
@@ -23164,9 +23168,9 @@ function renderConsolidatedMissions() {
             }
           },
         );
-      }
+}
 
-      /** Complete a mission for all bots that have it active */
+/** Complete a mission for all bots that have it active */
       function completeConsolidatedMission(templateId) {
         const groupBots = [];
         for (const bot of bots) {
@@ -23194,50 +23198,49 @@ function renderConsolidatedMissions() {
           `Completing mission "${templateId}" for ${groupBots.length} bot(s)...`,
         );
 
-        let index = 0;
-        function completeNext() {
-          if (index >= groupBots.length) {
-            appendLine("system", "All completion commands sent!");
-            // Refresh missions after a delay
-            setTimeout(() => {
-              if (showConsolidatedMissions) {
-                renderConsolidatedMissions();
-                captureMissionsPanelSnapshot();
-              }
-            }, 1000);
-            return;
-          }
+        let completed = 0;
+        let succeeded = 0;
+        let failed = 0;
 
-          const botInfo = groupBots[index];
+        function checkAllDone() {
+          if (completed >= groupBots.length) {
+            appendLine(
+              "system",
+              `All done: ${succeeded} succeeded, ${failed} failed`,
+            );
+            // Refresh missions after all responses received
+            if (showConsolidatedMissions) {
+              renderConsolidatedMissions();
+              captureMissionsPanelSnapshot();
+            }
+          }
+        }
+
+        for (const botInfo of groupBots) {
           sendExec(
             botInfo.username,
             "complete_mission",
             { mission_id: botInfo.missionId },
             (result) => {
+              completed++;
               if (result.ok) {
+                succeeded++;
                 appendLine(
                   "system",
                   `✓ ${botInfo.username}: mission completed`,
                 );
               } else {
+                failed++;
                 appendLine(
                   "system",
                   `✗ ${botInfo.username}: ${result.error || "failed"}`,
                 );
               }
+              checkAllDone();
             },
           );
-
-          index++;
-          if (index < groupBots.length) {
-            setTimeout(completeNext, CONSOLIDATED_MISSIONS_DELAY_MS);
-          } else {
-            completeNext();
-          }
         }
-
-        completeNext();
-      }
+}
 
       // ── Faction ─────────────────────────────────────────────────
 

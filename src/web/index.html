@@ -22891,7 +22891,8 @@ function renderMissionsPage() {
         if (!content) return;
 
         // Collect all active missions from all bots
-        const missionGroups = new Map(); // templateId -> { templateId, title, type, reward, bots: [{username, missionId, status}] }
+        // Key: templateId, Value: {templateId, title, type, reward, bots: [{username, missionId, status}]}
+        const missionGroups = new Map();
 
         for (const bot of bots) {
           const botMissions = activeMissionsCache[bot.username] || [];
@@ -22917,7 +22918,7 @@ function renderMissionsPage() {
             }
             missionGroups.get(templateId).bots.push({
               username: bot.username,
-              missionId: templateId,
+              missionId: templateId, // This is the UUID from get_active_missions
               status,
             });
           }
@@ -22933,7 +22934,7 @@ function renderMissionsPage() {
           html +=
             '<div class="missions-section-title">Consolidated Missions</div>';
           html +=
-            '<div style="color:var(--text-dim);font-size:12px;margin-bottom:12px">Grouped by mission template. Complete all instances of a mission with one click.</div>';
+            '<div style="color:var(--text-dim);font-size:12px;margin-bottom:12px">Grouped by mission template. UUID per bot used with `complete_mission id=UUID`. Complete all instances with one click.</div>';
 
           for (const [templateId, group] of missionGroups) {
             const botCount = group.bots.length;
@@ -22953,14 +22954,17 @@ function renderMissionsPage() {
               html += `<div class="mission-desc">${esc(group.description)}</div>`;
             }
 
-            // List bots with this mission
+            // List bots with this mission, showing UUID per bot
             html += `<div class="consolidated-bots-list">`;
             for (const botInfo of group.bots) {
               const statusClass =
-                botInfo.status === "active" ? "active" : "complete";
+                botInfo.status === "active" ? "active" : "inactive";
               html += `<div class="consolidated-bot-item">`;
               html += `<span class="bot-name">${esc(botInfo.username)}</span>`;
+              html += `<span class="mission-uuid">${esc(botInfo.missionId)}</span>`;
               html += `<span class="mission-status-badge ms-${statusClass}">${botInfo.status}</span>`;
+              // Per-bot complete button
+              html += `<button class="mission-action-btn tiny-btn" onclick="completeBotMission('${esc(botInfo.username)}','${esc(botInfo.missionId)}')">Complete</button>`;
               html += `</div>`;
             }
             html += `</div>`;
@@ -22968,7 +22972,7 @@ function renderMissionsPage() {
             html += `<div class="mission-meta">`;
             html += `<span class="mission-reward">${group.reward} each</span>`;
 
-            // Complete All button
+            // Complete All button (completes for all bots that have this mission active)
             const activeBots = group.bots.filter((b) => b.status === "active");
             if (activeBots.length > 0) {
               html += `<button class="mission-action-btn complete-btn" onclick="completeConsolidatedMission('${esc(templateId)}')">Complete All (${activeBots.length})</button>`;
@@ -22982,6 +22986,32 @@ function renderMissionsPage() {
         }
 
         content.innerHTML = html;
+      }
+
+      /** Complete a mission for a specific bot using its mission UUID */
+      function completeBotMission(username, missionId) {
+        appendLine(
+          "system",
+          `Completing mission "${missionId}" for ${username}...`,
+        );
+        sendExec(
+          username,
+          "complete_mission",
+          { mission_id: missionId },
+          (result) => {
+            if (result.ok) {
+              appendLine(
+                "system",
+                `Mission completed for ${username}`,
+              );
+            } else {
+              appendLine(
+                "system",
+                `Failed to complete mission for ${username}: ${result.error || "unknown"}`,
+              );
+            }
+          },
+        );
       }
 
       /** Complete a mission for all bots that have it active */

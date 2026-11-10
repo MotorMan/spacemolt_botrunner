@@ -406,12 +406,12 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
         arrived = await navigateToSystem(ctx, homeSystem, {
           fuelThresholdPct: refuelThreshold,
           hullThresholdPct: 40,
-          skipBlacklist: ignoreBlacklist && isCloaked,
-          // Cloaked = safe anywhere, so prefer the server's find_route which
+          skipBlacklist: ignoreBlacklist,
+          // When ignoreBlacklist is enabled, use the server's find_route which
           // knows wormhole shortcuts the local BFS can't follow, and accept
           // wormhole hops (jump({target_system}) handles them per the API spec).
-          preferServerRoute: isCloaked,
-          allowWormholes: isCloaked,
+          preferServerRoute: ignoreBlacklist,
+          allowWormholes: ignoreBlacklist,
         });
 
         if (arrived) {

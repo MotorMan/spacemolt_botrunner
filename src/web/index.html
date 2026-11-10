@@ -15355,8 +15355,8 @@
 
     <div class="setting-row">
       <div>
-        <div class="setting-label">Ignore blacklist while cloaked</div>
-        <div class="setting-hint">When enabled, return home can pass through blacklisted systems while cloaked. Safe because cloaked ships cannot be attacked.</div>
+        <div class="setting-label">Ignore blacklist (use server routing)</div>
+        <div class="setting-hint">When enabled, bypasses the system blacklist entirely and uses the server's find_route for navigation (including wormholes). Works regardless of cloaking status.</div>
       </div>
       <label class="checkbox-label"><input type="checkbox" id="set-returnhome-ignoreBlacklist"${returnHome.ignoreBlacklist ? " checked" : ""}> Ignore blacklist</label>
     </div>
@@ -15521,8 +15521,8 @@
 
     <div class="setting-row">
       <div>
-        <div class="setting-label">Ignore blacklist while cloaked</div>
-        <div class="setting-hint">When enabled, GoTo can pass through blacklisted systems while cloaked. Safe because cloaked ships cannot be attacked.</div>
+        <div class="setting-label">Ignore blacklist (use server routing)</div>
+        <div class="setting-hint">When enabled, bypasses the system blacklist entirely and uses the server's find_route for navigation (including wormholes). Works regardless of cloaking status.</div>
       </div>
       <label class="checkbox-label"><input type="checkbox" id="set-goto-ignoreBlacklist"${goTo.ignoreBlacklist ? " checked" : ""}> Ignore blacklist</label>
     </div>

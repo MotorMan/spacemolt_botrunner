@@ -411,7 +411,12 @@ export const goToRoutine: Routine = async function* (ctx: RoutineContext) {
         arrived = await navigateToSystem(ctx, destinationSystem, {
           fuelThresholdPct: refuelThreshold,
           hullThresholdPct: 40,
-          skipBlacklist: ignoreBlacklist && isCloaked,
+          skipBlacklist: ignoreBlacklist,
+          // When ignoreBlacklist is enabled, use the server's find_route which
+          // knows wormhole shortcuts the local BFS can't follow, and accept
+          // wormhole hops (jump({target_system}) handles them per the API spec).
+          preferServerRoute: ignoreBlacklist,
+          allowWormholes: ignoreBlacklist,
         });
 
         if (arrived) {

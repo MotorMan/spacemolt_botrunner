@@ -22466,17 +22466,15 @@ When responding:
           fetchAllActiveMissions();
         } else if (missionsSubTab === "bot" && missionsSelectedBot) {
           fetchActiveMissions(missionsSelectedBot);
-        } else if (missionsSubTab === "bot" && missionsSelectedBot === null) {
+        } else if (missionsSubTab === "bot" && missionsSelectedBot === null && bots.length > 0) {
           missionsSelectedBot = bots[0]?.username;
-          if (missionsSelectedBot) {
-            fetchActiveMissions(missionsSelectedBot);
-          } else {
-            renderMissionsFromMap();
-          }
+          fetchActiveMissions(missionsSelectedBot);
         } else if (missionsSubTab === "bot") {
           renderMissionsFromMap();
-        } else {
+        } else if (missionsSubTab === "all") {
           fetchAllKnownMissions();
+        } else {
+          renderMissionsFromMap();
         }
       }
 
@@ -22620,6 +22618,8 @@ When responding:
               : m.reward || "-";
             const status = m.status || "active";
             const mId = m.mission_id || m.id || "";
+            const percentComplete = m.percent_complete !== undefined ? `${m.percent_complete}%` : "";
+            const objectives = m.objectives || [];
 
             html += `<div class="mission-card">`;
             html += `<div class="mission-card-head">`;
@@ -22627,8 +22627,31 @@ When responding:
             if (type)
               html += `<span class="mission-type-badge">${esc(type)}</span>`;
             html += `<span class="active-mission-status ams-${status === "active" ? "active" : "complete"}">${esc(status)}</span>`;
+            if (percentComplete)
+              html += `<span class="percent-complete">${percentComplete}</span>`;
             html += `</div>`;
             if (desc) html += `<div class="mission-desc">${esc(desc)}</div>`;
+
+            // Objectives section
+            if (objectives && objectives.length > 0) {
+              html += `<div class="objectives-section">`;
+              html += `<div class="objectives-header">`;
+              html += `<span>${objectives.length} ${objectives.length === 1 ? "objective" : "objectives"}</span>`;
+              html += `</div>`;
+              html += `<div class="objectives-list">`;
+              for (const obj of objectives) {
+                const objCompleted = obj.completed === true;
+                const objProgress = obj.current && obj.required ? `${obj.current}/${obj.required}` : "";
+                const objClass = objCompleted ? "completed" : "incomplete";
+                html += `<div class="objective-item ${objClass}" title="${esc(obj.description)}">`;
+                html += `<span class="objective-progress">${objProgress}</span>`;
+                html += `<span class="objective-desc">${esc(obj.description)}</span>`;
+                html += `</div>`;
+              }
+              html += `</div>`;
+              html += `</div>`;
+            }
+
             html += `<div class="mission-meta">`;
             html += `<span class="mission-reward">${reward}</span>`;
             html += `<button class="mission-action-btn complete-btn" onclick="missionAction('${esc(username)}','complete_mission','${esc(mId)}')">Complete</button>`;

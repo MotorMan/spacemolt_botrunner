@@ -22576,24 +22576,17 @@ When responding:
           let activeMissions = [];
           if (result.ok && result.data) {
             const d = result.data;
-            // Try various known response formats from the server
-            if (Array.isArray(d)) {
-              // Direct array of missions
-              activeMissions = d;
-            } else if (d.missions && Array.isArray(d.missions)) {
-              // {missions: [...]}
+            // API response structure: { missions: { active: [...] } }
+            if (d.missions && Array.isArray(d.missions.active)) {
+              activeMissions = d.missions.active;
+            } else if (Array.isArray(d.missions)) {
+              // Fallback: missions is already an array
               activeMissions = d.missions;
-            } else if (d.active_missions && Array.isArray(d.active_missions)) {
-              // {active_missions: [...]}
-              activeMissions = d.active_missions;
-            } else if (d.active && Array.isArray(d.active)) {
-              // {active: [...]}
-              activeMissions = d.active;
             } else if (d.mission_id || d.id) {
               // Single mission object
               activeMissions = [d];
             } else if (d && typeof d === 'object') {
-              // Unknown object format - try to use it as a single mission
+              // Unknown format - try to use it
               activeMissions = [d];
             }
           }

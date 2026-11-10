@@ -1486,6 +1486,11 @@
       let missionsSelectedBotFromStorage = null;
       let showConsolidatedMissionsFromStorage = false;
       let missionsSubTabFromStorage = "bot";
+      try {
+        missionsSelectedBotFromStorage = localStorage.getItem("missionsSelectedBot");
+        showConsolidatedMissionsFromStorage = localStorage.getItem("showConsolidatedMissions") === "true";
+        missionsSubTabFromStorage = localStorage.getItem("missionsSubTabFromStorage") || "bot";
+      } catch (e) {}
       let diskSpaceLow = false;
       let diskSpaceFreeBytes = 0;
       let diskSpaceThresholdBytes = 100 * 1024 * 1024;
@@ -2521,8 +2526,14 @@
               }
               renderBots();
               // Restore previously selected bot from localStorage
-              if (missionsSelectedBotFromStorage && bots.some((b) => b.username === missionsSelectedBotFromStorage)) {
-                missionsSelectedBot = missionsSelectedBotFromStorage;
+              if (missionsSelectedBotFromStorage !== null) {
+                if (missionsSelectedBotFromStorage === "__ALL__") {
+                  missionsSelectedBot = null;
+                } else if (bots.some((b) => b.username === missionsSelectedBotFromStorage)) {
+                  missionsSelectedBot = missionsSelectedBotFromStorage;
+                } else {
+                  missionsSelectedBot = null;
+                }
               }
               // Restore consolidated view preference from localStorage
               showConsolidatedMissionsFromStorage = localStorage.getItem("showConsolidatedMissions") === "true";
@@ -22486,11 +22497,28 @@ function renderMissionsPage() {
         } else if (missionsSubTab === "bot") {
           if (missionsSelectedBot) {
             fetchActiveMissions(missionsSelectedBot);
-          } else if (bots.length > 0) {
-            missionsSelectedBot = bots[0].username;
-            fetchActiveMissions(missionsSelectedBot);
           } else {
-            renderMissionsFromMap();
+            let storedSelection = null;
+            try {
+              storedSelection = localStorage.getItem("missionsSelectedBot");
+            } catch (e) {}
+            if (storedSelection !== null) {
+              if (storedSelection === "__ALL__") {
+                missionsSelectedBot = null;
+                renderMissionsFromMap();
+              } else if (storedSelection && bots.some((b) => b.username === storedSelection)) {
+                missionsSelectedBot = storedSelection;
+                fetchActiveMissions(missionsSelectedBot);
+              } else {
+                missionsSelectedBot = null;
+                renderMissionsFromMap();
+              }
+            } else if (bots.length > 0) {
+              missionsSelectedBot = bots[0].username;
+              fetchActiveMissions(missionsSelectedBot);
+            } else {
+              renderMissionsFromMap();
+            }
           }
         } else if (missionsSubTab === "all") {
           fetchAllKnownMissions();
@@ -22498,12 +22526,20 @@ function renderMissionsPage() {
           renderMissionsFromMap();
         }
 }
-      function switchMissionsSubTab(tab) {
+function switchMissionsSubTab(tab) {
         missionsSubTab = tab;
         missionsSelectedBot = null;
+        // Persist "All Available" selection for bot sub-tab
+        try {
+          localStorage.setItem("missionsSelectedBot", "__ALL__");
+        } catch (e) {}
+        // Persist missions sub-tab to localStorage
+        try {
+          localStorage.setItem("missionsSubTabFromStorage", missionsSubTab);
+        } catch (e) {}
         renderMissionsSidebar();
         renderMissionsPage();
-      }
+}
 
       /** Fetch active missions for all bots (for consolidated view) */
       function fetchAllActiveMissions() {
@@ -22595,11 +22631,12 @@ function renderMissionsPage() {
         }
         missionsSelectedBot = botName;
         // Persist selection to localStorage so it survives page refreshes
+        // Use "__ALL__" as explicit marker for "All Available" to distinguish from "never selected"
         try {
           if (botName) {
             localStorage.setItem("missionsSelectedBot", botName);
           } else {
-            localStorage.removeItem("missionsSelectedBot");
+            localStorage.setItem("missionsSelectedBot", "__ALL__");
           }
         } catch (e) {}
         renderMissionsSidebar();

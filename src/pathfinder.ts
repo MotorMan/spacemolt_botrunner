@@ -428,7 +428,9 @@ export function generateScanPattern(
     case "star": {
       for (let i = 0; i < n; i++) {
         const k = Math.floor(i / 2) + 1;
-        if (i % 2 === 0) {
+        if (i === 0) {
+          pushUnique(start);
+        } else if (i % 2 === 0) {
           pushUnique(start + 180 + k * step);
         } else {
           pushUnique(start - k * step);

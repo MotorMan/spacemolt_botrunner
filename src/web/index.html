@@ -22576,9 +22576,30 @@ When responding:
           let activeMissions = [];
           if (result.ok && result.data) {
             const d = result.data;
-            activeMissions = Array.isArray(d)
-              ? d
-              : d.missions || d.active_missions || d.active || [];
+            // Try various known response formats from the server
+            if (Array.isArray(d)) {
+              // Direct array of missions
+              activeMissions = d;
+            } else if (d.missions && Array.isArray(d.missions)) {
+              // {missions: [...]}
+              activeMissions = d.missions;
+            } else if (d.active_missions && Array.isArray(d.active_missions)) {
+              // {active_missions: [...]}
+              activeMissions = d.active_missions;
+            } else if (d.active && Array.isArray(d.active)) {
+              // {active: [...]}
+              activeMissions = d.active;
+            } else if (d.mission_id || d.id) {
+              // Single mission object
+              activeMissions = [d];
+            } else if (d && typeof d === 'object') {
+              // Unknown object format - try to use it as a single mission
+              activeMissions = [d];
+            }
+          }
+          // Ensure activeMissions is always an array
+          if (!Array.isArray(activeMissions)) {
+            activeMissions = [];
           }
           activeMissionsCache[username] = activeMissions;
           renderBotMissions(username, activeMissions);

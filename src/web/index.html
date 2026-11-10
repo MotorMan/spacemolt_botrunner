@@ -22466,6 +22466,9 @@ When responding:
           fetchAllActiveMissions();
         } else if (missionsSubTab === "bot" && missionsSelectedBot) {
           fetchActiveMissions(missionsSelectedBot);
+        } else if (missionsSubTab === "bot" && missionsSelectedBot === null && bots.length > 0) {
+          missionsSelectedBot = bots[0].username;
+          fetchActiveMissions(missionsSelectedBot);
         } else if (missionsSubTab === "bot") {
           renderMissionsFromMap();
         } else {

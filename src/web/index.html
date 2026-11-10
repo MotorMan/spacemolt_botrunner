@@ -15347,6 +15347,14 @@
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Enable cloaking for journey</div>
+        <div class="setting-hint">When enabled, the bot will cloak for the entire trip. Disable to save fuel on safe routes or if you want to be seen.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-returnhome-enableCloak"${returnHome.enableCloak !== false ? " checked" : ""}> Enable cloaking</label>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Ignore blacklist while cloaked</div>
         <div class="setting-hint">When enabled, return home can pass through blacklisted systems while cloaked. Safe because cloaked ships cannot be attacked.</div>
       </div>
@@ -15497,6 +15505,14 @@
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Enable cloaking for journey</div>
+        <div class="setting-hint">When enabled, the bot will cloak for the entire trip. Disable to save fuel on safe routes or if you want to be seen.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-goto-enableCloak"${goTo.enableCloak !== false ? " checked" : ""}> Enable cloaking</label>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Dock if destination is a station</div>
         <div class="setting-hint">When the chosen POI is a station, dock at it. Disable to just travel there (e.g. orbit) without docking.</div>
       </div>
@@ -15585,10 +15601,13 @@
           parseInt(
             document.getElementById("set-goto-refuelThreshold").value,
           ) || 50;
+        const enableCloak = document.getElementById(
+          "set-goto-enableCloak",
+        ).checked;
         const dockIfStation = document.getElementById("set-goto-dockIfStation").checked;
         const ignoreBlacklist = document.getElementById("set-goto-ignoreBlacklist").checked;
         const decloakBeforeDock = document.getElementById("set-goto-decloakBeforeDock").checked;
-        const s = { destinationSystem: sysVal, destinationPoi: poiVal, refuelThreshold, dockIfStation, ignoreBlacklist, decloakBeforeDock };
+        const s = { destinationSystem: sysVal, destinationPoi: poiVal, refuelThreshold, enableCloak, dockIfStation, ignoreBlacklist, decloakBeforeDock };
         send({ type: "saveSettings", routine: "goto", settings: s });
         settings.goto = Object.assign(settings.goto || {}, s);
       }
@@ -15627,13 +15646,16 @@
           parseInt(
             document.getElementById("set-returnhome-refuelThreshold").value,
           ) || 50;
+        const enableCloak = document.getElementById(
+          "set-returnhome-enableCloak",
+        ).checked;
         const ignoreBlacklist = document.getElementById(
           "set-returnhome-ignoreBlacklist",
         ).checked;
         const decloakBeforeDock = document.getElementById(
           "set-returnhome-decloakBeforeDock",
         ).checked;
-        const s = { homeSystem, homeStation, refuelThreshold, ignoreBlacklist, decloakBeforeDock };
+        const s = { homeSystem, homeStation, refuelThreshold, enableCloak, ignoreBlacklist, decloakBeforeDock };
         send({ type: "saveSettings", routine: "return_home", settings: s });
         settings.return_home = Object.assign(settings.return_home || {}, s);
       }

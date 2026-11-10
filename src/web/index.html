@@ -1699,7 +1699,11 @@
         if (name === "settings") renderSettingsPanel();
         if (name === "map") renderMapPage();
         if (name === "market") renderMarketPage();
-        if (name === "missions") renderMissionsPage();
+        if (name === "missions") {
+          renderMissionsPage();
+          // Capture snapshot after render so subsequent background refreshes don't wipe user selections
+          setTimeout(captureMissionsPanelSnapshot, 0);
+}
         if (name === "faction") renderFactionPage();
         if (name !== "faction") {
           stopFactionQueueUsageAutoRefresh();
@@ -2552,6 +2556,9 @@
               const missionsPage = document.getElementById("page-missions");
               if (!missionsPage || !missionsPage.classList.contains("active")) {
                 renderMissionsPage();
+              } else {
+                // Tab is active - capture snapshot so dirty check preserves user selections
+                captureMissionsPanelSnapshot();
               }
               // Only re-render settings if settings tab is not active (to avoid clearing unsaved changes)
               if (
@@ -22494,6 +22501,35 @@ When responding:
       let factionLogFilter = "all"; // 'all' | 'deposit' | 'withdraw' | 'donation' | 'gift'
       let factionWithdrawSortOrder = "alpha"; // 'alpha' | 'quantity'
       let missionsFetchInProgress = false; // Guard to prevent concurrent fetches
+      let _missionsPanelSnapshot = null; // Snapshot for dirty checking
+
+      function captureMissionsPanelSnapshot() {
+        const sidebar = document.getElementById("missionsSidebarBody");
+        const content = document.getElementById("missionsContent");
+        if (!sidebar || !content) return;
+        const state = {
+          showConsolidatedMissions,
+          missionsSubTab,
+          missionsSelectedBot,
+          sidebarHtml: sidebar.innerHTML,
+          contentHtml: content.innerHTML,
+        };
+        _missionsPanelSnapshot = JSON.stringify(state);
+      }
+
+      function missionsPanelDirty() {
+        const sidebar = document.getElementById("missionsSidebarBody");
+        const content = document.getElementById("missionsContent");
+        if (!sidebar || !content || _missionsPanelSnapshot === null) return false;
+        const state = {
+          showConsolidatedMissions,
+          missionsSubTab,
+          missionsSelectedBot,
+          sidebarHtml: sidebar.innerHTML,
+          contentHtml: content.innerHTML,
+        };
+        return JSON.stringify(state) !== _missionsPanelSnapshot;
+      }
 
 function renderMissionsPage() {
         // If missions tab is not visible, skip rendering (will catch up when shown)
@@ -22503,6 +22539,10 @@ function renderMissionsPage() {
         }
         // If a fetch is already in progress for the current view, don't start another
         if (missionsFetchInProgress) {
+          return;
+        }
+        // If the panel has unsaved user selections (dirty), skip re-render to avoid wiping view
+        if (missionsPanelDirty()) {
           return;
         }
         renderMissionsSidebar();
@@ -22553,6 +22593,7 @@ function switchMissionsSubTab(tab) {
         } catch (e) {}
         renderMissionsSidebar();
         renderMissionsPage();
+        captureMissionsPanelSnapshot();
 }
 
 /** Fetch active missions for all bots (for consolidated view) */
@@ -22563,6 +22604,7 @@ function switchMissionsSubTab(tab) {
 
         if (total === 0) {
           renderConsolidatedMissions();
+          captureMissionsPanelSnapshot();
           missionsFetchInProgress = false;
           return;
         }
@@ -22594,13 +22636,14 @@ function switchMissionsSubTab(tab) {
             fetched++;
             if (fetched >= total) {
               renderConsolidatedMissions();
+              captureMissionsPanelSnapshot();
               missionsFetchInProgress = false;
             }
           });
         }
 }
 
-      function toggleConsolidatedMissionsView() {
+function toggleConsolidatedMissionsView() {
         showConsolidatedMissions = !showConsolidatedMissions;
         // Persist consolidated view preference to localStorage
         try { localStorage.setItem("showConsolidatedMissions", showConsolidatedMissions); } catch (e) {}
@@ -22617,7 +22660,8 @@ function switchMissionsSubTab(tab) {
           renderMissionsSidebar();
         }
         renderMissionsPage();
-      }
+        captureMissionsPanelSnapshot();
+}
 
       function renderMissionsSidebar() {
         const body = document.getElementById("missionsSidebarBody");
@@ -22641,7 +22685,7 @@ function switchMissionsSubTab(tab) {
         body.innerHTML = html;
       }
 
-      function selectMissionView(botName) {
+function selectMissionView(botName) {
         if (missionsSubTab === "all") {
           switchMissionsSubTab("all");
           return;
@@ -22662,7 +22706,8 @@ function switchMissionsSubTab(tab) {
         } else {
           renderMissionsFromMap();
         }
-      }
+        captureMissionsPanelSnapshot();
+}
 
 function fetchActiveMissions(username) {
         missionsFetchInProgress = true;
@@ -22701,6 +22746,7 @@ function fetchActiveMissions(username) {
           }
           activeMissionsCache[username] = activeMissions;
           renderBotMissions(username, activeMissions);
+          captureMissionsPanelSnapshot();
           missionsFetchInProgress = false;
         });
 }
@@ -22770,14 +22816,15 @@ function fetchActiveMissions(username) {
         }
         html += `</div>`;
 
-        // Available missions from map data
+// Available missions from map data
         html += `<div class="missions-section">`;
         html += `<div class="missions-section-title">Available to Claim</div>`;
         html += renderAvailableMissions(username);
         html += `</div>`;
 
         content.innerHTML = html;
-      }
+        captureMissionsPanelSnapshot();
+}
 
       function renderAvailableMissions(claimBot) {
         let html = "";
@@ -22826,7 +22873,7 @@ function fetchActiveMissions(username) {
 
       function renderMissionsFromMap() {
         const content = document.getElementById("missionsContent");
-        if (!content) return;
+if (!content) return;
 
         let html = '<div class="missions-section">';
         html +=
@@ -22834,7 +22881,8 @@ function fetchActiveMissions(username) {
         html += renderAvailableMissions(null);
         html += "</div>";
         content.innerHTML = html;
-      }
+        captureMissionsPanelSnapshot();
+}
 
       let allKnownMissionsSortState = {
         sortBy: "title",
@@ -22855,6 +22903,7 @@ function fetchAllKnownMissions() {
           .then((data) => {
             allKnownMissions = data;
             renderAllKnownMissions();
+            captureMissionsPanelSnapshot();
             missionsFetchInProgress = false;
           })
           .catch((err) => {
@@ -22931,7 +22980,7 @@ function fetchAllKnownMissions() {
         content.innerHTML = html;
       }
 
-      function sortAllKnownMissions(sortBy) {
+function sortAllKnownMissions(sortBy) {
         if (allKnownMissionsSortState.sortBy === sortBy) {
           allKnownMissionsSortState.direction = allKnownMissionsSortState.direction === "asc" ? "desc" : "asc";
         } else {
@@ -22939,7 +22988,8 @@ function fetchAllKnownMissions() {
           allKnownMissionsSortState.direction = "asc";
         }
         renderAllKnownMissions();
-      }
+        captureMissionsPanelSnapshot();
+}
 
       function claimMission(botName, missionId) {
         if (!botName || !missionId) return;
@@ -23152,6 +23202,7 @@ function renderConsolidatedMissions() {
             setTimeout(() => {
               if (showConsolidatedMissions) {
                 renderConsolidatedMissions();
+                captureMissionsPanelSnapshot();
               }
             }, 1000);
             return;

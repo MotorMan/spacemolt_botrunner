@@ -22508,9 +22508,23 @@ function renderMissionsPage() {
             let activeMissions = [];
             if (result.ok && result.data) {
               const d = result.data;
-              activeMissions = Array.isArray(d)
-                ? d
-                : d.missions || d.active_missions || d.active || [];
+              // API response structure: { missions: { active: [...] } }
+              if (d.missions && Array.isArray(d.missions.active)) {
+                activeMissions = d.missions.active;
+              } else if (Array.isArray(d.missions)) {
+                // Fallback: missions is already an array
+                activeMissions = d.missions;
+              } else if (d.mission_id || d.id) {
+                // Single mission object
+                activeMissions = [d];
+              } else if (d && typeof d === 'object') {
+                // Unknown format - try to use it
+                activeMissions = [d];
+              }
+            }
+            // Ensure activeMissions is always an array
+            if (!Array.isArray(activeMissions)) {
+              activeMissions = [];
             }
             activeMissionsCache[bot.username] = activeMissions;
             fetched++;
@@ -22886,16 +22900,19 @@ function renderMissionsPage() {
       const CONSOLIDATED_MISSIONS_DELAY_MS = 1000; // 1 second delay between bots
 
       /** Render consolidated missions view - groups missions by template across all bots */
-      function renderConsolidatedMissions() {
+function renderConsolidatedMissions() {
         const content = document.getElementById("missionsContent");
         if (!content) return;
 
         // Collect all active missions from all bots
-        // Key: templateId, Value: {templateId, title, type, reward, bots: [{username, missionId, status}]}
-        const missionGroups = new Map();
+        const missionGroups = new Map(); // templateId -> { templateId, title, type, reward, bots: [{username, missionId, status}] }
 
         for (const bot of bots) {
-          const botMissions = activeMissionsCache[bot.username] || [];
+          const botMissions = activeMissionsCache[bot.username];
+          // Ensure botMissions is an array (may be empty if not fetched yet)
+          if (!botMissions || !Array.isArray(botMissions)) {
+            botMissions = [];
+          }
           for (const m of botMissions) {
             const templateId = m.mission_id || m.id || "";
             const title =

@@ -46,7 +46,7 @@ import {
   isFleetLeader,
   type FleetStatusResponse,
 } from "./fleet.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist } from "../web/server.js";
 import {
   readFlockSettings,
   readFlockState,
@@ -1233,7 +1233,7 @@ const names = nonFuelCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
     const targetSystemId = settings.system || "";
     if (targetSystemId && targetSystemId !== bot.system) {
       // Check if target system is blacklisted (unless ignoreBlacklist is enabled)
-      const effectiveBlacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+      const effectiveBlacklist = settings.ignoreBlacklist ? [] : getEffectiveSystemBlacklist(bot);
       const targetIsBlacklisted = effectiveBlacklist.some(b => b.toLowerCase() === targetSystemId.toLowerCase()) || (!settings.ignoreBlacklist && isTemporarilyBlacklisted(targetSystemId));
       if (targetIsBlacklisted) {
         ctx.log("error", `Target system ${targetSystemId} is blacklisted — salvaging locally instead`);
@@ -1486,7 +1486,7 @@ totalLooted += result.itemsLooted;
     // ── Expand to roam systems if current system had no wrecks ──
     // Don't expand if already towing (need to deliver wreck first)
     if (!skipScanning && totalLooted === 0 && !cargoFull && !bot.towingWreck && bot.state === "running") {
-      const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+      const blacklist = settings.ignoreBlacklist ? [] : getEffectiveSystemBlacklist(bot);
       const roamList = buildRoamList(bot.system, settings.maxRoamJumps, settings.roamBaseSystems, blacklist, settings.ignoreBlacklist);
 
       if (roamList.length > 0) {

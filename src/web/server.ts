@@ -412,6 +412,38 @@ export function getSystemBlacklist(): string[] {
   return [];
 }
 
+/** Get the frontier system blacklist from settings.
+ *  These are one-way wormhole systems with no return path.
+ *  Only explorers (with pathfinder drives) can safely enter these. */
+export function getFrontierSystemBlacklist(): string[] {
+  const settings = loadSettings();
+  const raw = (settings.frontier_system_blacklist as any)
+           || (settings.frontierSystemBlacklist as any)
+           || (settings.frontier_blacklist as any)
+           || [];
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object' && Array.isArray(raw.frontier_system_blacklist)) {
+    return raw.frontier_system_blacklist;
+  }
+  if (raw && typeof raw === 'object' && Array.isArray(raw.frontierSystemBlacklist)) {
+    return raw.frontierSystemBlacklist;
+  }
+  return [];
+}
+
+/** Get the effective system blacklist for a specific bot.
+ *  Combines the global system blacklist with the frontier system blacklist,
+ *  but excludes frontier systems for explorers (who have pathfinder drives). */
+export function getEffectiveSystemBlacklist(bot: { routineName: string | null }): string[] {
+  const systemBlacklist = getSystemBlacklist();
+  const routine = bot?.routineName?.toLowerCase();
+  if (routine === "explorer" || routine === "pathfinder") {
+    return systemBlacklist;
+  }
+  const frontierBlacklist = getFrontierSystemBlacklist();
+  return [...systemBlacklist, ...frontierBlacklist];
+}
+
 /** Get the global station blacklist from settings. These are POI ids (or
  *  "system|poiId" keys) that must never be treated as a usable station —
  *  e.g. outposts the bot cannot dock at because they can never be set public. */

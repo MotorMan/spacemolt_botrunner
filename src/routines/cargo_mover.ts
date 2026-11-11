@@ -17,7 +17,7 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist } from "../web/server.js";
 import {
   ensureUndocked,
   ensureFueled,
@@ -1409,7 +1409,7 @@ function findMoveJobs(
     ctx.log("cargo", `  ${configItem.itemName}: inStorage=${inStorage}, inCargo=${inCargo}, inCargoForDest=${inCargoForDest}, totalAvailable=${totalAvailable}, availableForBot=${availableQty}, inTransit=${inTransitQty}, delivered=${delivered}, effectiveTarget=${effectiveTargetQty}, alreadyClaimed=${alreadyClaimed} (storageType=${storageType})`);
 
     if (effectiveTargetQty > 0 && availableQty > 0) {
-      const blacklist = (settings.ignoreBlacklistWhenCloaked && ctx.bot.isCloaked) ? [] : getSystemBlacklist();
+      const blacklist = (settings.ignoreBlacklistWhenCloaked && ctx.bot.isCloaked) ? [] : getEffectiveSystemBlacklist(ctx.bot);
       const route = mapStore.findRoute(sourceSystem, effectiveDestSystem, blacklist);
       const jumps = route ? route.length - 1 : 999;
 
@@ -1770,7 +1770,7 @@ async function findNextBulkSourceStation(
   const allSystems = mapStore.getAllSystems();
   // Respect the global system blacklist — never query faction storage at
   // blacklisted systems (they're blocked for a reason).
-  const blacklistedSystems = new Set(getSystemBlacklist().map((s) => s.toLowerCase()));
+  const blacklistedSystems = new Set(getEffectiveSystemBlacklist(bot).map((s) => s.toLowerCase()));
   // User-configured excluded stations (by base_id or system|poiId)
   const excludedStations = new Set(settings.bulkExcludeStations.map((s) => s.toLowerCase()));
   const candidates: Array<{ stationRef: string; systemId: string; poiName: string; baseId: string; totalItems: number }> = [];

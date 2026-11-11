@@ -1,6 +1,6 @@
 import type { RoutineContext } from "../bot.js";
 import { readSettings, getSystemInfo, isStationPoi, isApprovedFuelStation, ensureUndocked, refuelAtStation, ensureInsured, buildDeniedStationSet } from "./common.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist } from "../web/server.js";
 import { mapStore } from "../mapstore.js";
 
 export async function ensureFueled(
@@ -26,7 +26,7 @@ if (currentStation && isApprovedFuelStation(currentStation.id, readSettings(), b
   if (ok) return true;
 }
 
-const blacklist = getSystemBlacklist();
+const blacklist = getEffectiveSystemBlacklist(bot);
 const approvedSet = new Set<string>();
 if (approvedFuelStations) {
   for (const entry of approvedFuelStations) {

@@ -10,7 +10,7 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist } from "../web/server.js";
 import { resolveStationId, getMobileCapitolSystem } from "./common.js";
 import {
   ensureDocked,
@@ -1210,7 +1210,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     let totalItems = 0;
 
     // Sort by distance (same-system first, then by jump count, avoiding blacklisted systems)
-    const blacklist = bot.isCloaked && settings.cloakIgnoreBlacklist ? [] : getSystemBlacklist();
+    const blacklist = bot.isCloaked && settings.cloakIgnoreBlacklist ? [] : getEffectiveSystemBlacklist(bot);
     stationsWithStorage.sort((a, b) => {
       const aLocal = a.systemId === bot.system ? 0 : 1;
       const bLocal = b.systemId === bot.system ? 0 : 1;

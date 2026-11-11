@@ -2,7 +2,7 @@ import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { perf } from "../perf.js";
-import { getSystemBlacklist, getStationBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist, getStationBlacklist } from "../web/server.js";
 import { writeFileSync, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import {
@@ -509,7 +509,7 @@ async function failTradeSessionWithLockRelease(botUsername: string, reason: stri
 
 // ── Settings ─────────────────────────────────────────────────
 
-function getTraderSettings(username?: string): {
+export function getTraderSettings(username?: string): {
   minProfitPerUnit: number;
   maxCargoValue: number;
   fuelCostPerJump: number;
@@ -778,7 +778,7 @@ async function recoverTradeSession(
         destPoiName: bestAlt.poiName,
         sellPricePerUnit: bestAlt.price,
         sellQuantity: Math.min(session.sellQuantity, bestAlt.quantity),
-        totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, bestAlt.systemId, settings.fuelCostPerJump).jumps,
+        totalJumps: session.jumpsCompleted + estimateFuelCost(bot, bot.system, bestAlt.systemId, settings.fuelCostPerJump).jumps,
         notes: (session.notes || "") + ` | Rerouted to ${bestAlt.poiName}`,
       });
       if (updated) session = updated;
@@ -821,7 +821,7 @@ async function recoverTradeSession(
         destPoiName: bestAlt.poiName,
         sellPricePerUnit: bestAlt.price,
         sellQuantity: Math.min(session.sellQuantity, bestAlt.quantity),
-        totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, bestAlt.systemId, settings.fuelCostPerJump).jumps,
+        totalJumps: session.jumpsCompleted + estimateFuelCost(bot, bot.system, bestAlt.systemId, settings.fuelCostPerJump).jumps,
         state: "in_transit" as const,
         notes: (session.notes || "") + ` | Rerouted from ${session.destPoiName} (no station) to ${bestAlt.poiName}`,
       });
@@ -896,6 +896,7 @@ async function collectRemoteSpreads(
   items: string[],
   currentSystem: string,
   debugLog?: (msg: string) => void,
+  bot?: { routineName: string | null },
 ): Promise<PriceSpread[]> {
   const stop = perf.isEnabled() ? perf.startSpan("trader.collectRemoteSpreads") : null;
   const out: PriceSpread[] = [];
@@ -949,7 +950,7 @@ async function collectRemoteSpreads(
     // the route is unexecutable.
     const srcSys = mapStore.getSystem(hit.remoteSystem);
     if (!srcSys || !srcSys.pois.find(p => p.id === hit.remotePoi)) continue;
-    if (!mapStore.findRoute(currentSystem, hit.remoteSystem, getSystemBlacklist())) continue;
+    if (!mapStore.findRoute(currentSystem, hit.remoteSystem, bot ? getEffectiveSystemBlacklist(bot) : [])) continue;
 
     const dests = localBuys
       .filter(b => b.itemId === hit.itemId && b.price > hit.remotePrice && b.quantity > 0)
@@ -978,8 +979,8 @@ async function collectRemoteSpreads(
 }
 
 /** Estimate fuel cost between two systems using mapStore route data. */
-function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: number): { jumps: number; cost: number } {
-  const blacklist = getSystemBlacklist();
+function estimateFuelCost(bot: { routineName: string | null }, fromSystem: string, toSystem: string, costPerJump: number): { jumps: number; cost: number } {
+  const blacklist = getEffectiveSystemBlacklist(bot);
   if (fromSystem === toSystem) return { jumps: 0, cost: 0 };
   const route = mapStore.findRoute(fromSystem, toSystem, blacklist);
   if (!route) return { jumps: 999, cost: 999 * costPerJump };
@@ -989,6 +990,7 @@ function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: num
 
 /** Find profitable trade routes from mapStore price spreads and market insights. */
 export function findTradeOpportunities(
+  bot: { routineName: string | null },
   settings: ReturnType<typeof getTraderSettings>,
   currentSystem: string,
   currentPoi: string,
@@ -1016,7 +1018,7 @@ export function findTradeOpportunities(
   const routes: TradeRoute[] = [];
 
   // Process market insights first (higher priority)
-  const insightRoutes = processMarketInsights(marketInsights, currentSystem, currentPoi, settings, cargoCapacity, debugLog);
+  const insightRoutes = processMarketInsights(bot, marketInsights, currentSystem, currentPoi, settings, cargoCapacity, debugLog);
   debugLog?.(`processMarketInsights returned ${insightRoutes.length} routes`);
   routes.push(...insightRoutes);
 
@@ -1044,8 +1046,8 @@ export function findTradeOpportunities(
     }
 
     // Calculate route: current → source → dest
-    const toSource = estimateFuelCost(currentSystem, sp.sourceSystem, settings.fuelCostPerJump);
-    const sourceToDest = estimateFuelCost(sp.sourceSystem, sp.destSystem, settings.fuelCostPerJump);
+    const toSource = estimateFuelCost(bot, currentSystem, sp.sourceSystem, settings.fuelCostPerJump);
+    const sourceToDest = estimateFuelCost(bot, sp.sourceSystem, sp.destSystem, settings.fuelCostPerJump);
     const totalJumps = toSource.jumps + sourceToDest.jumps;
     const totalFuelCost = toSource.cost + sourceToDest.cost;
 
@@ -1156,6 +1158,7 @@ export async function getRemoteItemMarketCost(itemId: string, currentSystemId?: 
  * Returns an array of potential trade routes based on fresh market intelligence.
  */
 export function processMarketInsights(
+  bot: { routineName: string | null },
   insights: Array<Record<string, unknown>>,
   currentSystem: string,
   currentPoi: string,
@@ -1233,8 +1236,8 @@ export function processMarketInsights(
         }
 
         if (sourceSystem && destSystem) {
-          const toSource = estimateFuelCost(currentSystem, sourceSystem, settings.fuelCostPerJump);
-          const sourceToDest = estimateFuelCost(sourceSystem, destSystem, settings.fuelCostPerJump);
+          const toSource = estimateFuelCost(bot, currentSystem, sourceSystem, settings.fuelCostPerJump);
+          const sourceToDest = estimateFuelCost(bot, sourceSystem, destSystem, settings.fuelCostPerJump);
           const totalJumps = toSource.jumps + sourceToDest.jumps;
           const totalFuelCost = toSource.cost + sourceToDest.cost;
 
@@ -1323,8 +1326,8 @@ export function processMarketInsights(
 
             if (sources.length > 0) {
               const source = sources[0];
-              const toSource = estimateFuelCost(currentSystem, source.systemId, settings.fuelCostPerJump);
-              const sourceToDest = estimateFuelCost(source.systemId, stationSystem, settings.fuelCostPerJump);
+              const toSource = estimateFuelCost(bot, currentSystem, source.systemId, settings.fuelCostPerJump);
+              const sourceToDest = estimateFuelCost(bot, source.systemId, stationSystem, settings.fuelCostPerJump);
               const totalJumps = toSource.jumps + sourceToDest.jumps;
               const totalFuelCost = toSource.cost + sourceToDest.cost;
 
@@ -1385,8 +1388,8 @@ export function processMarketInsights(
 
           if (sources.length > 0) {
             const source = sources[0];
-            const toSource = estimateFuelCost(currentSystem, source.systemId, settings.fuelCostPerJump);
-            const sourceToDest = estimateFuelCost(source.systemId, currentSystem, settings.fuelCostPerJump);
+            const toSource = estimateFuelCost(bot, currentSystem, source.systemId, settings.fuelCostPerJump);
+            const sourceToDest = estimateFuelCost(bot, source.systemId, currentSystem, settings.fuelCostPerJump);
             const totalJumps = toSource.jumps + sourceToDest.jumps;
             const totalFuelCost = toSource.cost + sourceToDest.cost;
 
@@ -1609,6 +1612,7 @@ async function sellUpToFloor(
  * Returns buyers that would result in a profit after fuel costs at dockable stations.
  */
 function findProfitableAlternativeBuyers(
+  bot: { routineName: string | null },
   itemId: string,
   itemName: string,
   quantity: number,
@@ -1626,7 +1630,7 @@ function findProfitableAlternativeBuyers(
       return poi?.has_base ?? false;
     })
     .map(buyer => {
-      const { jumps, cost: fuelCost } = estimateFuelCost(currentSystem, buyer.systemId, settings.fuelCostPerJump);
+      const { jumps, cost: fuelCost } = estimateFuelCost(bot, currentSystem, buyer.systemId, settings.fuelCostPerJump);
       if (jumps >= 999) return null;
 
       const sellQty = Math.min(quantity, buyer.quantity);
@@ -1699,7 +1703,7 @@ function findCargoSellRoutes(
     if (settings.debugLogging) ctx.log("trade", `    found ${buyers.length} potential buyers for ${item.name}`);
 
     for (const buy of buyers) {
-      const { jumps, cost: fuelCost } = estimateFuelCost(currentSystem, buy.systemId, settings.fuelCostPerJump);
+      const { jumps, cost: fuelCost } = estimateFuelCost(bot, currentSystem, buy.systemId, settings.fuelCostPerJump);
       if (jumps >= 999) {
         if (settings.debugLogging) ctx.log("trade", `    skipping ${buy.poiName}: no route found`);
         continue;
@@ -1767,7 +1771,7 @@ function findUnsoldItemRoutes(
 
   const homeSystem = settings.homeSystem || "";
   const homeBaseOnly = settings.unsoldItemHomeBaseOnly;
-  const blacklist = getSystemBlacklist();
+  const blacklist = getEffectiveSystemBlacklist(bot);
   
   for (const unsold of unsoldItems) {
     if (homeBaseOnly && unsold.storageSystem !== homeSystem) {
@@ -1791,8 +1795,8 @@ function findUnsoldItemRoutes(
     }
 
     const bestBuyer = buyers[0];
-    const toSource = estimateFuelCost(currentSystem, unsold.storageSystem, settings.fuelCostPerJump);
-    const sourceToDest = estimateFuelCost(unsold.storageSystem, bestBuyer.systemId, settings.fuelCostPerJump);
+    const toSource = estimateFuelCost(bot, currentSystem, unsold.storageSystem, settings.fuelCostPerJump);
+    const sourceToDest = estimateFuelCost(bot, unsold.storageSystem, bestBuyer.systemId, settings.fuelCostPerJump);
     
     if (toSource.jumps >= 999 || sourceToDest.jumps >= 999) {
       ctx.log("trade", `No route to withdraw ${unsold.itemName} from storage or deliver to buyer`);
@@ -2617,6 +2621,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             Array.from(uniqueItems).slice(0, 20),
             bot.system,
             settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined,
+            bot,
           );
           if (remoteSpreads.length === 0) {
             ctx.log("trade", describeNoMarketDeals(Math.min(uniqueItems.size, 20)));
@@ -2624,7 +2629,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
-      marketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, cargoCapacity, marketInsights, 
+      marketRoutes = findTradeOpportunities(bot, settings, bot.system, bot.poi, cargoCapacity, marketInsights, 
         settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined,
         remoteSpreads);
       unsoldRoutes = findUnsoldItemRoutes(ctx, settings, bot.system, cargoCapacity);
@@ -3723,6 +3728,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         // search evaluates profitability of the *remaining* units correctly.
         const unrecoveredCost = Math.max(0, investedCredits - sellRevenue);
         const alternatives = findProfitableAlternativeBuyers(
+          bot,
           route.itemId,
           route.itemName,
           remaining,
@@ -3805,7 +3811,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
         for (const buyer of buyers) {
           if (remaining <= 0 || bot.state !== "running") break;
-          const { jumps } = estimateFuelCost(bot.system, buyer.systemId, settings.fuelCostPerJump);
+          const { jumps } = estimateFuelCost(bot, bot.system, buyer.systemId, settings.fuelCostPerJump);
           if (jumps >= 999) continue;
 
           ctx.log("trade", `${remaining}x ${route.itemName} unsold — trying ${buyer.poiName} in ${buyer.systemId} (${buyer.price}cr/ea, ${jumps} jumps)`);
@@ -4017,6 +4023,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           Array.from(uniqueItems).slice(0, 20),
           bot.system,
           settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined,
+          bot,
         );
         if (nextRemoteSpreads.length === 0) {
           ctx.log("trade", describeNoMarketDeals(Math.min(uniqueItems.size, 20), "next-scan "));
@@ -4024,7 +4031,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    const nextMarketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, nextCargoCapacity, marketInsights, undefined, nextRemoteSpreads);
+    const nextMarketRoutes = findTradeOpportunities(bot, settings, bot.system, bot.poi, nextCargoCapacity, marketInsights, undefined, nextRemoteSpreads);
     const nextRoutes = [...nextCargoRoutes, ...nextMarketRoutes].sort((a, b) => b.totalProfit - a.totalProfit);
 
     // ── Deposit excess credits to faction storage ──

@@ -1,7 +1,7 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { extractShipModules, moduleHaystack } from "../shipmodules.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist } from "../web/server.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "../bot_chat_channel.js";
 import type { FaintSignature } from "../wildlivestore.js";
 import { safeWriteFileSync } from "../diskSpaceGuard.js";
@@ -455,7 +455,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
   // DEBUG: Log system blacklist at startup
-  const systemBlacklist = getSystemBlacklist();
+  const systemBlacklist = getEffectiveSystemBlacklist(bot);
   ctx.log("info", `Explorer starting - System blacklist contains ${systemBlacklist.length} systems: ${systemBlacklist.length > 0 ? systemBlacklist.join(', ') : 'none'}`);
 
   // Check per-bot mode
@@ -525,7 +525,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
   // ── Assign starting system for systematic exploration ──
   // Each explorer picks a system far from other explorers' starting systems for galaxy-wide coverage
-  const blacklist = getSystemBlacklist();
+  const blacklist = getEffectiveSystemBlacklist(bot);
   const startupSettings = getExplorerSettings(bot.username);
   const existingAssignment = explorerAssignmentStore.getAssignment(bot.username);
   let assignedStartSystem: { id: string; name: string } | null = null;
@@ -1335,7 +1335,7 @@ yield "deposit_cargo";
 
     // ── Direct to Unknown mode: jump directly to nearest unknown or stale system ──
     if (currentSettings.directToUnknown) {
-      const blacklist = getSystemBlacklist();
+      const blacklist = getEffectiveSystemBlacklist(bot);
       const unknowns = findUnknownSystemsWithCoordination(ctx, systemId, blacklist, fledFromSystems, currentSettings.ignoreBlacklistWhenCloaked, bot.isCloaked);
 
       if (unknowns.length > 0) {
@@ -1461,7 +1461,7 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
     // ── Systematic Exploration: find all systems needing exploration via BFS ──
     yield "find_systems_to_explore";
     
-    const blacklist = getSystemBlacklist();
+    const blacklist = getEffectiveSystemBlacklist(bot);
     const systemsNeedingExploration = await findSystemsNeedingExploration(
       ctx,
       blacklist,
@@ -2288,7 +2288,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
       if (hiddenPoi.systemId !== bot.system) {
         yield "navigate";
         await ensureUndocked(ctx);
-        const blacklist = getSystemBlacklist();
+        const blacklist = getEffectiveSystemBlacklist(bot);
         // Skip blacklisted systems (persistent + temporary) unless cloaked
         const settings = getExplorerSettings(bot.username);
         if (!bot.isCloaked && (blacklist.some(b => b.toLowerCase() === hiddenPoi.systemId.toLowerCase()) || isTemporarilyBlacklisted(hiddenPoi.systemId))) {
@@ -2639,7 +2639,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const focusSettings = getExplorerSettings(bot.username);
     const focusAreaSystem = focusSettings.focusAreaSystem;
     const maxJumps = focusSettings.maxJumps;
-    const blacklist = getSystemBlacklist();
+    const blacklist = getEffectiveSystemBlacklist(bot);
     const isCloaked = bot.isCloaked;
 
     for (const [sysId, sys] of Object.entries(allSystems)) {
@@ -3045,7 +3045,7 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     return;
   }
 
-  const blacklist = getSystemBlacklist();
+  const blacklist = getEffectiveSystemBlacklist(bot);
 
   // ── Startup: dock at local station to clear cargo, pack fuel cells & refuel ──
   yield "startup_prep";
@@ -3325,7 +3325,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     return;
   }
 
-  const blacklist = getSystemBlacklist();
+  const blacklist = getEffectiveSystemBlacklist(bot);
   const settings = getExplorerSettings(bot.username);
 
   // ── Startup: dock at local station to clear cargo & refuel ──
@@ -3921,7 +3921,7 @@ async function hasCloakModule(ctx: RoutineContext): Promise<boolean> {
 /** Build a local adjacency list (lower-cased system ids) from mapStore
  *  connections plus the two static wormholes. Dynamic wormholes are
  *  excluded. Does not mutate mapStore. */
-function buildFixedRouteGraph(cloakAvailable: boolean): Map<string, Set<string>> {
+function buildFixedRouteGraph(bot: { routineName: string | null }, cloakAvailable: boolean): Map<string, Set<string>> {
   const graph = new Map<string, Set<string>>();
   const addNode = (id: string): void => {
     const key = id.toLowerCase();
@@ -3934,7 +3934,7 @@ function buildFixedRouteGraph(cloakAvailable: boolean): Map<string, Set<string>>
     graph.get(b.toLowerCase())!.add(a.toLowerCase());
   };
 
-  const blacklistSet = new Set(getSystemBlacklist().map((b) => b.toLowerCase()));
+  const blacklistSet = new Set(getEffectiveSystemBlacklist(bot).map((b) => b.toLowerCase()));
 
   for (const sys of mapStore.getSystems()) {
     const sysId = sys.id.toLowerCase();
@@ -4258,7 +4258,7 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
       const cloakAvailable = await hasCloakModule(ctx);
       const homeBase = getGlobalHomeBase();
       const homeSystem = homeBase.system || bot.system || "sol";
-      const graph = buildFixedRouteGraph(cloakAvailable);
+      const graph = buildFixedRouteGraph(bot, cloakAvailable);
       const route = generateFixedRoute(graph, homeSystem);
       if (route.length === 0) {
         ctx.log("error", "Fixed route: no reachable systems to route through — retrying in 30s");
@@ -4349,7 +4349,7 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
           }
         }
         const cloakAvailable = fixed.cloakAvailable ?? (await hasCloakModule(ctx));
-        const graph = buildFixedRouteGraph(cloakAvailable);
+const graph = buildFixedRouteGraph(bot, cloakAvailable);
         const route = generateFixedRoute(graph, homeSystem);
         if (route.length > 0) {
           const entry: ExplorerFixedPath = {
@@ -4392,7 +4392,7 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
     const target = fixed.route[fixed.currentIndex];
 
     // ── Blocked skip: unreachable system ──
-    const blacklistSet = new Set(getSystemBlacklist().map((b) => b.toLowerCase()));
+    const blacklistSet = new Set(getEffectiveSystemBlacklist(bot).map((b) => b.toLowerCase()));
     const targetBlocked =
       (!fixed.cloakAvailable && blacklistSet.has(target.systemId.toLowerCase())) ||
       isTemporarilyBlacklisted(target.systemId) ||
@@ -5286,7 +5286,8 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  * When cloaked and ignoreBlacklistWhenCloaked is enabled, skips blacklist/flee filtering.
  */
 function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false, claimedTargets: Set<string> | null = null, explorerSystemTimeoutMins: number = 60): Connection | null {
-  const blacklist = getSystemBlacklist();
+  const { bot } = ctx;
+  const blacklist = getEffectiveSystemBlacklist(bot);
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
   const timeoutMs = explorerSystemTimeoutMins * 60 * 1000;
@@ -5437,7 +5438,8 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
  * 6. Unexplored systems (not in map.json) over explored ones
  */
 function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false, explorerSystemTimeoutMins: number = 60): Connection | null {
-  const blacklist = getSystemBlacklist();
+  const { bot } = ctx;
+  const blacklist = getEffectiveSystemBlacklist(bot);
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
   const timeoutMs = explorerSystemTimeoutMins * 60 * 1000;

@@ -11,7 +11,7 @@ import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type I
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance, BattleCombatState, BoardingPublicStatus } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
-import { getSystemBlacklist, getStationBlacklist, isCustomsDisabled } from "../web/server.js";
+import { getSystemBlacklist, getStationBlacklist, getEffectiveSystemBlacklist, isCustomsDisabled } from "../web/server.js";
 import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
   waitForCustomsInspection,
@@ -727,7 +727,7 @@ export async function ensureDocked(
   }
   const nearest = dockTarget;
   // Keep the blacklist bypass consistent for the route leg too (see ensureFueled).
-  const dockBlacklist = dockTarget.blacklistBypassed ? [] : getSystemBlacklist();
+  const dockBlacklist = dockTarget.blacklistBypassed ? [] : getEffectiveSystemBlacklist(bot);
 
   ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} hops)${dockTarget.blacklistBypassed ? " [blacklist bypassed]" : ""}`);
 
@@ -2326,7 +2326,7 @@ export async function findReachableFuelStation(
   const { bot } = ctx;
   const approvedSet = opts.skipApprovedCheck ? new Set<string>() : buildApprovedStationSet(readSettings());
   const deniedSet = buildDeniedStationSet(opts.excludePoiIds);
-  const blacklist = opts.skipBlacklist ? [] : getSystemBlacklist();
+  const blacklist = opts.skipBlacklist ? [] : getEffectiveSystemBlacklist(bot);
 
   // Strategy 1: honour the blacklist (unless explicitly skipped)
   if (blacklist.length > 0) {
@@ -2820,7 +2820,7 @@ if (looted > 0) {
     // A blacklist bypass is a last-resort escape from a blacklisted pocket: keep
     // it bypassed for the route too, otherwise findRoute() returns null and the
     // bot jumps blind or gets "stuck" again.
-    const routeBlacklist = nearest.blacklistBypassed ? [] : (opts?.skipBlacklist ? [] : getSystemBlacklist());
+    const routeBlacklist = nearest.blacklistBypassed ? [] : (opts?.skipBlacklist ? [] : getEffectiveSystemBlacklist(bot));
 
     ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)${nearest.blacklistBypassed ? " [blacklist bypassed]" : ""}`);
 
@@ -3279,7 +3279,7 @@ export async function navigateToSystem(
   // Fleet hunters BYPASS blacklist — they MUST enter pirate systems.
   // A cloaked ship also bypassses the blacklist (cloaking alone is enough)
   // unless the routine explicitly opted out via ignoreBlacklistWhenCloaked.
-  const blacklist = (opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked)) ? [] : getSystemBlacklist();
+  const blacklist = (opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked)) ? [] : getEffectiveSystemBlacklist(bot);
   const preferServerRoute = opts.preferServerRoute === true;
   const allowWormholes = opts.allowWormholes === true;
   const bypassBlacklist = (ignoreBlacklistWhenCloaked && bot.isCloaked) || !!opts.skipBlacklist;
@@ -6074,7 +6074,7 @@ export async function emergencyFleeFromPirates(
   }
 
   // Get blacklist and filter out blacklisted systems
-  const blacklist = getSystemBlacklist();
+  const blacklist = getEffectiveSystemBlacklist(bot);
   const safeConnections = connections.filter(c =>
     c.id && !blacklist.some(b => b.toLowerCase() === c.id!.toLowerCase())
   );

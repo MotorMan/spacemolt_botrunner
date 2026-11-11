@@ -3,7 +3,7 @@ import type { BotChatMessage } from "../bot_chat_channel.js";
 import { extractLibResult } from "../commandBridge.js";
 import { mapStore, isDepletionExpired } from "../mapstore.js";
 import { getBotChatChannel } from "../botmanager.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist } from "../web/server.js";
 import { onCoordinationUpdate } from "../client_sync_hooks.js";
 import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
@@ -158,9 +158,10 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
  * Get the system blacklist to use for mining navigation.
  * When the bot is cloaked and cloakIgnoreBlacklist is enabled, returns an empty array
  * to allow mining in pirate/hot zones that would otherwise be blacklisted.
+ * For non-explorers, also includes the frontier system blacklist.
  */
-function getMiningBlacklist(settings: Awaited<ReturnType<typeof getMinerSettings>>, isCloaked: boolean): string[] {
-  const baseBlacklist = getSystemBlacklist();
+function getMiningBlacklist(bot: { routineName: string | null }, settings: Awaited<ReturnType<typeof getMinerSettings>>, isCloaked: boolean): string[] {
+  const baseBlacklist = getEffectiveSystemBlacklist(bot);
   if (isCloaked && settings.cloakIgnoreBlacklist) {
     // Logging is done by the caller since ctx is not available here
     return [];
@@ -2847,7 +2848,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
       
       // Get blacklist - use empty only if bot actually has a cloaking module and is cloaked
-      const blacklist = getMiningBlacklist(settings, hasCloak && bot.isCloaked);
+      const blacklist = getMiningBlacklist(bot, settings, hasCloak && bot.isCloaked);
 
       // ── Low fuel cells check ──
       // Return home to deposit loot and resupply when fuel cells drop to or below

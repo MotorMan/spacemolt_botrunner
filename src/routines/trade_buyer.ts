@@ -1,7 +1,7 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist } from "../web/server.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -267,12 +267,12 @@ function isRecentBuyFailure(systemId: string, poiId: string, itemId: string): bo
 const BLACKLIST_CACHE_MS = 10_000;
 let blacklistCache: { at: number; systems: Set<string>; stations: Set<string> } | null = null;
 
-function getBlacklists(): { systems: Set<string>; stations: Set<string> } {
+function getBlacklists(bot: { routineName: string | null }): { systems: Set<string>; stations: Set<string> } {
   const now = Date.now();
   if (blacklistCache && now - blacklistCache.at < BLACKLIST_CACHE_MS) return blacklistCache;
   blacklistCache = {
     at: now,
-    systems: new Set(getSystemBlacklist().map(s => s.toLowerCase())),
+    systems: new Set(getEffectiveSystemBlacklist(bot).map(s => s.toLowerCase())),
     // Already folds in Settings → General → stationBlacklist plus any station
     // that denied us docking this session.
     stations: buildDeniedStationSet(),
@@ -294,13 +294,14 @@ function getBlacklists(): { systems: Set<string>; stations: Set<string> } {
  * non-blacklisted station before it is allowed to become a route.
  */
 function resolveBuyStation(
+  bot: { routineName: string | null },
   systemId: string,
   poiId: string,
   fallbackName: string,
 ): { systemId: string; poiId: string; poiName: string } | null {
   if (!systemId || !poiId) return null;
   if (isPirateSystem(systemId)) return null;
-  const { systems: systemBlacklist, stations: stationBlacklist } = getBlacklists();
+  const { systems: systemBlacklist, stations: stationBlacklist } = getBlacklists(bot);
   if (systemBlacklist.has(systemId.toLowerCase())) return null;
 
   const system = mapStore.getSystem(systemId);
@@ -389,7 +390,7 @@ async function collectMarketListings(
     if (!entry || !entry.res.ok) continue;
     for (const r of entry.res.results) {
       if (!(r.price > 0) || !(r.quantity > 0)) continue;
-      const station = resolveBuyStation(r.systemId, r.stationPoiId, r.stationName);
+      const station = resolveBuyStation(ctx.bot, r.systemId, r.stationPoiId, r.stationName);
       if (!station) {
         rejectedStations++;
         continue;
@@ -431,7 +432,7 @@ function collectMapListings(ctx: RoutineContext, settings: ReturnType<typeof get
       for (const m of poi.market) {
         if (!wanted.has(m.item_id.toLowerCase())) continue;
         if (m.best_sell === null || m.best_sell <= 0 || m.sell_quantity <= 0) continue;
-        if (stationChecked === undefined) stationChecked = resolveBuyStation(sysId, poi.id, poi.name);
+        if (stationChecked === undefined) stationChecked = resolveBuyStation(ctx.bot, sysId, poi.id, poi.name);
         if (!stationChecked) {
           nonStationRows++;
           continue;
@@ -460,8 +461,8 @@ function collectMapListings(ctx: RoutineContext, settings: ReturnType<typeof get
 // ── Buy route discovery ────────────────────────────────────
 
 /** Estimate fuel cost between two systems using mapStore route data. */
-function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: number): { jumps: number; cost: number } {
-  const blacklist = getSystemBlacklist();
+function estimateFuelCost(bot: { routineName: string | null }, fromSystem: string, toSystem: string, costPerJump: number): { jumps: number; cost: number } {
+  const blacklist = getEffectiveSystemBlacklist(bot);
   if (fromSystem === toSystem) return { jumps: 0, cost: 0 };
   const route = mapStore.findRoute(fromSystem, toSystem, blacklist);
   if (!route) return { jumps: 999, cost: 999 * costPerJump };
@@ -598,7 +599,7 @@ function findCheapestSellers(
 
     for (const seller of candidates.slice(0, 3)) { // Top 3 cheapest per item
       const where = `${seller.poiName} (${seller.systemId}) @ ${seller.price}cr [${seller.origin}, ${describeAge(seller.ageMs)}]`;
-      const { jumps, cost: fuelCost } = estimateFuelCost(currentSystem, seller.systemId, settings.fuelCostPerJump);
+      const { jumps, cost: fuelCost } = estimateFuelCost(ctx.bot, currentSystem, seller.systemId, settings.fuelCostPerJump);
       if (jumps >= 999) {
         ctx.log("trade", `>>> ${itemId}: REJECTED ${where} — no route from ${currentSystem} (unreachable or blacklisted)`);
         continue;

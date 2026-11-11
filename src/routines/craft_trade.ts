@@ -40,6 +40,7 @@ import {
 import {
   findTradeOpportunities,
   getItemMarketCost,
+  getTraderSettings,
 } from "./trader.js";
 import {
   isValidDestination,
@@ -160,14 +161,14 @@ export const craftTradeRoutine: Routine = async function* (ctx: RoutineContext) 
 
 // ── Trader loop ──────────────────────────────────────────────
 
-function buildTraderSettingsShim(s: CraftTradeSettings): Parameters<typeof findTradeOpportunities>[0] {
+function buildTraderSettingsShim(s: CraftTradeSettings): ReturnType<typeof getTraderSettings> {
   return {
     tradeItems: [],
     minProfitPerUnit: s.minProfitPerUnit,
     fuelCostPerJump: s.fuelCostPerJump,
     maxCargoValue: s.maxCargoValue,
     useRemoteMarketQuery: s.useRemoteMarketQuery,
-  } as unknown as Parameters<typeof findTradeOpportunities>[0];
+  } as unknown as ReturnType<typeof getTraderSettings>;
 }
 
 async function* traderLoop(ctx: RoutineContext, s: CraftTradeSettings): AsyncGenerator<string, void, void> {
@@ -221,7 +222,7 @@ async function* traderLoop(ctx: RoutineContext, s: CraftTradeSettings): AsyncGen
 
     const shim = buildTraderSettingsShim(s);
     const cargoCapacity = bot.cargoMax || 999;
-    const routes = findTradeOpportunities(shim, bot.system, bot.poi, cargoCapacity, marketInsights);
+    const routes = findTradeOpportunities({ routineName: bot.routineName }, shim, bot.system, bot.poi, cargoCapacity, marketInsights);
 
     let ordersCreated = 0;
     for (const route of routes) {

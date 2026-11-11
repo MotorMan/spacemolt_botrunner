@@ -959,8 +959,8 @@ async function emergencyFleeFromPirates(
   }
 
   // Filter out pirate systems and blacklisted systems
-  const { getSystemBlacklist } = await import("../web/server.js");
-  const blacklist = getSystemBlacklist();
+  const { getEffectiveSystemBlacklist } = await import("../web/server.js");
+  const blacklist = getEffectiveSystemBlacklist(bot);
 
   const safeConnections = sys.connections.filter(c => {
     const connId = c.system_id;
@@ -3036,9 +3036,9 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           }
 
 // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ─-
-          const { getSystemBlacklist } = await import("../web/server.js");
+          const { getEffectiveSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
-          const runtimeBlacklist = getSystemBlacklist();
+          const runtimeBlacklist = getEffectiveSystemBlacklist(bot);
           const bypassMaydayBlacklist = settings.dontRejectMaydaysInBlacklistSystems && settings.enableCloak && bot.isCloaked;
           const blacklist = (settings.ignoreBlacklist || bypassMaydayBlacklist) ? [] : runtimeBlacklist;
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
@@ -3621,8 +3621,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         // ── PIRATE BASE PROXIMITY CHECK: Block navigation to systems near pirate bases ──
         // This is a HARD BLOCK - do not attempt to navigate to blacklisted systems
         // (unless ignoreBlacklist is enabled)
-        const { getSystemBlacklist } = await import("../web/server.js");
-        const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+        const { getEffectiveSystemBlacklist } = await import("../web/server.js");
+        const blacklist = settings.ignoreBlacklist ? [] : getEffectiveSystemBlacklist(bot);
         const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
         
         const isTargetBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
@@ -6484,9 +6484,9 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           }
 
 // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
-          const { getSystemBlacklist } = await import("../web/server.js");
+          const { getEffectiveSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
-          const runtimeBlacklist = getSystemBlacklist();
+          const runtimeBlacklist = getEffectiveSystemBlacklist(bot);
           const bypassMaydayBlacklist = settings.dontRejectMaydaysInBlacklistSystems && settings.enableCloak && bot.isCloaked;
           const blacklist = (settings.ignoreBlacklist || bypassMaydayBlacklist) ? [] : runtimeBlacklist;
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
@@ -7351,8 +7351,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       // ── PIRATE BASE PROXIMITY CHECK: Block navigation to systems near pirate bases ──
       // This is a HARD BLOCK - do not attempt to navigate to blacklisted systems
       // (unless ignoreBlacklist is enabled)
-      const { getSystemBlacklist } = await import("../web/server.js");
-      const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+      const { getEffectiveSystemBlacklist } = await import("../web/server.js");
+      const blacklist = settings.ignoreBlacklist ? [] : getEffectiveSystemBlacklist(bot);
       const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
       
       const isTargetBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));

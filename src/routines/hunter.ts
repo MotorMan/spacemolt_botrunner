@@ -80,7 +80,7 @@ import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist } from "../web/server.js";
 import { writeSettings, isCombatDebugEnabled, getGlobalHomeBase } from "./common.js";
 import { combatDebugLog } from "../debug.js";
 import { boardingClaims, BOARDING_CLAIM_TTL_MS, pickUnclaimedBoardingTarget } from "../boardingCooperation.js";
@@ -1133,7 +1133,7 @@ function isHuntableSystem(securityLevel: string | undefined): boolean {
   return false;
 }
 
-function findNearestHuntableSystem(fromSystemId: string): string | null {
+function findNearestHuntableSystem(bot: { routineName: string | null }, fromSystemId: string): string | null {
   // Phase 1: BFS through stored connections
   const visited = new Set<string>([fromSystemId]);
   const queue: string[] = [fromSystemId];
@@ -1152,7 +1152,7 @@ function findNearestHuntableSystem(fromSystemId: string): string | null {
   }
 
   // Phase 2: scan all known systems
-  const blacklist = getSystemBlacklist();
+  const blacklist = getEffectiveSystemBlacklist(bot);
   for (const systemId of mapStore.getAllSystemIds()) {
     if (visited.has(systemId)) continue;
     // Skip blacklisted systems
@@ -1969,7 +1969,7 @@ async function checkFactionAlerts(
     if (nowMs - lastMs < ALERT_RESPONSE_COOLDOWN_MS) continue;
 
     // Check proximity via known map routes (use blacklist)
-    const blacklist = getSystemBlacklist();
+    const blacklist = getEffectiveSystemBlacklist(bot);
     const route = mapStore.findRoute(bot.system, alertSystem, blacklist);
     if (!route || route.length > responseRange) continue;
 
@@ -3586,7 +3586,7 @@ if (hullPct <= settings.repairThreshold) {
         continue;
       }
       const sys = mapStore.getSystem(alertTarget);
-      const blacklist = getSystemBlacklist();
+      const blacklist = getEffectiveSystemBlacklist(bot);
       const route = mapStore.findRoute(bot.system, alertTarget, blacklist);
       const jumps = route ? route.length : "?";
       ctx.log("combat", `Faction alert! ${sys?.name || alertTarget} is under attack (${jumps} jump(s)) â€” diverting to assist`);
@@ -3643,7 +3643,7 @@ if (hullPct <= settings.repairThreshold) {
         if (!isHuntableSystem(currentSec)) {
           ctx.log("travel", `${bot.system} is ${currentSec || "unknown"} security â€” searching for a huntable system...`);
 
-          const huntTarget = findNearestHuntableSystem(bot.system);
+const huntTarget = findNearestHuntableSystem(bot, bot.system);
           if (huntTarget) {
             const sys = mapStore.getSystem(huntTarget);
             ctx.log("travel", `Found huntable system: ${sys?.name || huntTarget} (${sys?.security_level}) â€” navigating...`);
@@ -9038,7 +9038,7 @@ async function* boardingSystemPass(
   const currentSec = mapStore.getSystem(bot.system)?.security_level;
   if (!isHuntableSystem(currentSec)) {
     ctx.log("info", `${bot.system} is ${currentSec || "unknown"} security â€” searching for a huntable system...`);
-    const huntTarget = findNearestHuntableSystem(bot.system);
+    const huntTarget = findNearestHuntableSystem(bot, bot.system);
     if (huntTarget) {
       const sys = mapStore.getSystem(huntTarget);
       ctx.log("travel", `Found huntable system: ${sys?.name || huntTarget} (${sys?.security_level}) â€” navigating...`);

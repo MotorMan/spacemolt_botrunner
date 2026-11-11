@@ -26,7 +26,7 @@ import {
   getCargoFuelCells,
 } from "./common.js";
 import { logTransportProfit } from "./transportProfitDebug.js";
-import { getSystemBlacklist, getStationBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist, getStationBlacklist } from "../web/server.js";
 import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { extractShipModules, moduleHaystack } from "../shipmodules.js";
@@ -1578,7 +1578,7 @@ async function selectPickupStation(
   }
 
   // Scan nearby known systems via mapStore
-  const blacklist = getSystemBlacklist();
+  const blacklist = getEffectiveSystemBlacklist(bot);
   const knownSystems = mapStore.getAllSystems();
 
   // Collect candidate systems within maxJumps
@@ -1693,7 +1693,7 @@ async function selectNextPickupStation(
   }
 
   // BFS over known systems from the current location, nearest first, capped at maxJumps.
-  const blacklist = getSystemBlacklist();
+  const blacklist = getEffectiveSystemBlacklist(bot);
   const knownSystems = mapStore.getAllSystems();
 
   const candidates = new Map<string, { hops: number; systemId: string }>();
@@ -1823,7 +1823,7 @@ function addRecentStation(state: TransportState, system: string, poi: string): v
 
 async function hopsBetween(a: string, b: string, bot: Bot): Promise<number> {
   if (a.toLowerCase() === b.toLowerCase()) return 0;
-  const route = mapStore.findRoute(a, b, getSystemBlacklist());
+  const route = mapStore.findRoute(a, b, getEffectiveSystemBlacklist(bot));
   if (route) return route.length - 1;
   
   const routeResp = await bot.exec("find_route", { target_system: b });

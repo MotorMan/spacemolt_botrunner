@@ -10,7 +10,7 @@ import {
   readSettings,
   stationHasMarket,
 } from "./common.js";
-import { getSystemBlacklist, getStationBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist, getStationBlacklist } from "../web/server.js";
 import { mapStore } from "../mapstore.js";
 import {
   getFreshSnapshots,
@@ -150,8 +150,8 @@ function isUsableStation(snapshot: MarketStationSnapshot): boolean {
   return stationHasMarket(poi as any);
 }
 
-function isSystemAllowed(systemId: string): boolean {
-  const blacklist = new Set(getSystemBlacklist().map((system: string) => system.toLowerCase()));
+function isSystemAllowed(bot: { routineName: string | null }, systemId: string): boolean {
+  const blacklist = new Set(getEffectiveSystemBlacklist(bot).map((system: string) => system.toLowerCase()));
   const stations = new Set(getStationBlacklist().map((station: string) => station.toLowerCase()));
   return !blacklist.has(systemId.toLowerCase()) && !isPirateSystem(systemId) &&
     ![...stations].some((station: string) => station === systemId.toLowerCase() || station.endsWith(`|${systemId.toLowerCase()}`));
@@ -569,8 +569,8 @@ export const liveTraderRoutine: Routine = async function* (ctx: RoutineContext) 
           .filter((route) => {
             const tradeItems = getTradeItemIds(readSettings()[bot.username] || readSettings().trader || {});
             return (!tradeItems.size || tradeItems.has(route.itemId)) &&
-              isSystemAllowed(route.sourceSnapshot.systemId) &&
-              isSystemAllowed(route.destSnapshot.systemId) &&
+              isSystemAllowed(bot, route.sourceSnapshot.systemId) &&
+              isSystemAllowed(bot, route.destSnapshot.systemId) &&
               isUsableStation(route.sourceSnapshot) &&
               isUsableStation(route.destSnapshot);
           })[0];

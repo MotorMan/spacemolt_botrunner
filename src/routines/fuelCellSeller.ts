@@ -46,7 +46,7 @@ import {
   fleeFromBattle,
   getItemSize,
 } from "./common.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist } from "../web/server.js";
 import { queryRemoteMarket } from "../client_sync_hooks.js";
 
 const FUEL_CELL_ITEM_ID = "fuel_cell";
@@ -235,13 +235,13 @@ let filterCache: { at: number; systems: Set<string>; stations: Set<string> } | n
 /** Current system + station exclusions. `buildDeniedStationSet()` already folds
  *  Settings → Station Blacklist together with every station that refused us
  *  docking during this process's lifetime. */
-function getBlacklistFilters(force = false): { systems: Set<string>; stations: Set<string> } {
+function getBlacklistFilters(bot: { routineName: string | null }, force = false): { systems: Set<string>; stations: Set<string> } {
   const now = Date.now();
   if (!force && filterCache && now - filterCache.at < FILTER_CACHE_MS) return filterCache;
   const settings = getFuelCellSellerSettings();
   filterCache = {
     at: now,
-    systems: new Set(getSystemBlacklist().map(s => s.toLowerCase())),
+    systems: new Set(getEffectiveSystemBlacklist(bot).map(s => s.toLowerCase())),
     stations: buildDeniedStationSet(),
   };
   for (const item of settings.sellItems) {
@@ -565,7 +565,7 @@ async function updateAllStationsFromRemote(
   data: FCStationsData,
   settings: ReturnType<typeof getFuelCellSellerSettings>,
 ): Promise<void> {
-  const filters = getBlacklistFilters(true);
+  const filters = getBlacklistFilters(ctx.bot, true);
   const { eligible, skipped } = partitionStations(data, settings, filters);
   const skipCount = data.stations.length - eligible.length;
 
@@ -869,10 +869,10 @@ function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: num
  * know we can never sell at: pirate systems, blacklisted systems/stations and
  * faction outposts. Learned verdicts are applied later (they live per entry).
  */
-function initializeFCStations(settings: ReturnType<typeof getFuelCellSellerSettings>): FCStationEntry[] {
+function initializeFCStations(bot: { routineName: string | null }, settings: ReturnType<typeof getFuelCellSellerSettings>): FCStationEntry[] {
   const entries: FCStationEntry[] = [];
   const seen = new Set<string>();
-  const filters = getBlacklistFilters(true);
+  const filters = getBlacklistFilters(bot, true);
   const systems = mapStore.getAllSystems();
   const mobileCapital = mapStore.getMobileCapitolLocation();
 
@@ -927,8 +927,8 @@ function syncFCStations(
   data: FCStationsData,
   settings: ReturnType<typeof getFuelCellSellerSettings>,
 ): boolean {
-  const filters = getBlacklistFilters(true);
-  const discovered = initializeFCStations(settings);
+  const filters = getBlacklistFilters(ctx.bot, true);
+  const discovered = initializeFCStations(ctx.bot, settings);
   const known = new Map(data.stations.map(s => [s.poiId.toLowerCase(), s]));
 
   let added = 0;
@@ -1669,7 +1669,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
   if (!fcData.homeSystem || fcData.homeSystem !== settings.homeSystem) {
     fcData.homeSystem = settings.homeSystem;
     fcData.homeStation = settings.homeStation;
-    fcData.stations = initializeFCStations(settings);
+    fcData.stations = initializeFCStations(bot, settings);
     fcData.currentStationIndex = 0;
     fcData.lastStarted = new Date().toISOString();
     saveFCStationsData(fcData);
@@ -1681,7 +1681,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
   }
 
   {
-    const { eligible, skipped } = partitionStations(fcData, settings, getBlacklistFilters(true));
+    const { eligible, skipped } = partitionStations(fcData, settings, getBlacklistFilters(bot, true));
     ctx.log(
       "fc",
       `Tracking ${fcData.stations.length} stations: ${eligible.length} sellable, ` +
@@ -1746,7 +1746,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
     // Refresh focus item based on freshest station need counts
     if (settings.sellItems.length > 1) {
-      const itemUrgencies = computeItemUrgency(fcData, settings, getBlacklistFilters());
+      const itemUrgencies = computeItemUrgency(fcData, settings, getBlacklistFilters(bot));
       currentFocusItemId = selectFocusItem(itemUrgencies, currentFocusItemId, settings);
       const focusItem = settings.sellItems.find(i => i.itemId === currentFocusItemId);
       const counts = settings.sellItems.map(i => {
@@ -1758,7 +1758,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
     // Capacity is judged over sellable stations only — a blacklisted station or
     // one without a market must not keep the routine alive forever.
-    const cycleFilters = getBlacklistFilters();
+    const cycleFilters = getBlacklistFilters(bot);
     const { eligible: sellable, skipped: cycleSkips } = partitionStations(fcData, settings, cycleFilters);
     if (fcData.stations.length > 0 && sellable.length === 0) {
       ctx.log(
@@ -2127,14 +2127,14 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       if (targetIdx < 0) {
         if (fcData.stations.length === 0) {
           ctx.log("fc", "No stations tracked — initializing station list from mapStore...");
-          fcData.stations = initializeFCStations(settings);
+          fcData.stations = initializeFCStations(bot, settings);
           fcData.currentStationIndex = 0;
         } else {
           syncFCStations(ctx, fcData, settings);
         }
         saveFCStationsData(fcData);
 
-        targetIdx = getNextStation(fcData, settings, getBlacklistFilters(true), currentFocusItemId);
+        targetIdx = getNextStation(fcData, settings, getBlacklistFilters(bot, true), currentFocusItemId);
         if (targetIdx < 0) {
           ctx.log("fc", "Every mapped station is excluded (blacklist / outpost / no market) — waiting");
           await ctx.sleep(60000);

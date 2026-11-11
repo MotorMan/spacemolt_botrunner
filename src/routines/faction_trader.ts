@@ -9,7 +9,7 @@ import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { extractShipModules, moduleHaystack } from "../shipmodules.js";
-import { getSystemBlacklist, getStationBlacklist } from "../web/server.js";
+import { getEffectiveSystemBlacklist, getStationBlacklist } from "../web/server.js";
 import { clearFactionStorageCache } from "../factionStorageCache.js";
 import {
   ensureDocked,
@@ -426,7 +426,7 @@ async function recoverFactionTradeSession(
       destPoiName: originName,
       returnToSource: true,
       sellQuantity: session.quantityBought,
-      totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, originSystem, settings.fuelCostPerJump).jumps,
+      totalJumps: session.jumpsCompleted + estimateFuelCost(bot, bot.system, originSystem, settings.fuelCostPerJump).jumps,
       notes: (session.notes || "") + ` | Buyer gone — returning to ${originName}`,
     });
     if (updated) session = updated;
@@ -451,7 +451,7 @@ async function recoverFactionTradeSession(
         destPoiName: originName,
         returnToSource: true,
         sellQuantity: session.quantityBought,
-        totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, originSystem, settings.fuelCostPerJump).jumps,
+totalJumps: session.jumpsCompleted + estimateFuelCost(bot, bot.system, originSystem, settings.fuelCostPerJump).jumps,
         notes: (session.notes || "") + ` | Price zero — returning to origin`,
       });
       if (updated) session = updated;
@@ -1028,8 +1028,8 @@ async function boosterFromCargo(
 }
 
 /** Estimate fuel cost between two systems using mapStore route data. */
-function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: number = 50): { jumps: number; cost: number } {
-  const blacklist = getSystemBlacklist();
+function estimateFuelCost(bot: { routineName: string | null }, fromSystem: string, toSystem: string, costPerJump: number = 50): { jumps: number; cost: number } {
+  const blacklist = getEffectiveSystemBlacklist(bot);
   if (fromSystem === toSystem) return { jumps: 0, cost: 0 };
   const route = mapStore.findRoute(fromSystem, toSystem, blacklist);
   if (!route) return { jumps: 999, cost: 999 * costPerJump };
@@ -1379,8 +1379,8 @@ async function findFactionSellRoutes(
         // best-effort; fall back to the global price
       }
 
-      const toDest = estimateFuelCost(currentSystem, resolved.systemId, costPerJump);
-      const returnHome = estimateFuelCost(resolved.systemId, homeSystem, costPerJump);
+      const toDest = estimateFuelCost(bot, currentSystem, resolved.systemId, costPerJump);
+      const returnHome = estimateFuelCost(bot, resolved.systemId, homeSystem, costPerJump);
       if (toDest.jumps >= 999) continue;
       const roundTripJumps = toDest.jumps + (returnHome.jumps < 999 ? returnHome.jumps : 0);
       const roundTripFuel = toDest.cost + (returnHome.jumps < 999 ? returnHome.cost : 0);
@@ -2357,8 +2357,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             continue;
           }
 
-          const toDest = estimateFuelCost(bot.system, bestBuyer.systemId, settings.fuelCostPerJump);
-          const returnHome = estimateFuelCost(bestBuyer.systemId, settings.homeSystem || bot.system, settings.fuelCostPerJump);
+          const toDest = estimateFuelCost(bot, bot.system, bestBuyer.systemId, settings.fuelCostPerJump);
+          const returnHome = estimateFuelCost(bot, bestBuyer.systemId, settings.homeSystem || bot.system, settings.fuelCostPerJump);
           const roundTripJumps = toDest.jumps + (returnHome.jumps < 999 ? returnHome.jumps : 0);
           const roundTripFuel = toDest.cost + (returnHome.jumps < 999 ? returnHome.cost : 0);
           const qty = Math.min(item.quantity, bestBuyer.quantity, verifiedQty, maxItemsForCargo(cargoCapacity, item.itemId));

@@ -19,6 +19,7 @@ import { logSkills } from "./skillTracker.js";
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord, getDirectPathfinderJump, getCorrectionPathfinderJump, getCorrectionBearingAtTick, isPathfinderLandingAtVoid, type CorrectionPathfinderJump, getMccWindowInfo, type MccWindowInfo } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate, saveFactionTaxEstimate, type FactionTaxEstimate } from "./taxData.js";
 import { chatBuffer } from "./chatbuffer.js";
+import { tryDecodeNpcMessage } from "./npc_chat_decoder.js";
 import { loadSettings, saveStoppedState, saveLastUsedRoutine, isCustomsDisabled } from "./web/server.js";
 import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
@@ -4151,11 +4152,21 @@ return {
 
             this.log("chat", `Received [${channel}] ${sender}: ${content}`);
 
+            // Try to decode encoded NPC chat messages (from "Unknown source")
+            const decodedContent = tryDecodeNpcMessage(sender, content);
+            let finalContent = content;
+            let finalSender = sender;
+            if (decodedContent) {
+              this.log("chat", `🔓 Decoded NPC message: ${decodedContent}`);
+              finalContent = decodedContent;
+              finalSender = `${sender} (decoded)`;
+            }
+
             chatBuffer.addMessage({
               botUsername: this.username,
               channel,
-              sender,
-              content,
+              sender: finalSender,
+              content: finalContent,
               timestamp: Date.now(),
               direction: "in",
               ...(channel === "private" && data.target_id ? { targetId: data.target_id as string } : {}),

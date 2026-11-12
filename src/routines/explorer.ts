@@ -4333,6 +4333,9 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
     if (modeCheck.mode !== "fixed_route") {
       ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving fixed_route...`);
       explorerFixedPathStore.removeFixedPath(bot.username);
+      if (modeCheck.mode === "frontier_exploration") {
+        yield* frontierExplorationRoutine(ctx);
+      }
       return;
     }
 

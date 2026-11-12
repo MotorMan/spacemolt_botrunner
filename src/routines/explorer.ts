@@ -4359,6 +4359,7 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
         homeSystem,
         currentIndex: 0,
         route,
+        lastRouteRegen: Date.now(),
       };
       explorerFixedPathStore.upsertFixedPath(entry);
       explorerFixedPathStore.flushSync();
@@ -4410,47 +4411,95 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
       await ensureUndocked(ctx);
     }
 
-    const homeSystem = fixed.homeSystem || getGlobalHomeBase().system || "sol";
-
-    // ── New-system detection: regenerate if get_map reveals systems not in route ──
-    const mapResp = await bot.exec("get_map");
-    if (mapResp.result && typeof mapResp.result === "object") {
-      const mapData = mapResp.result as Record<string, unknown>;
-      const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
-      const routeIds = new Set(fixed.route.map((e) => e.systemId.toLowerCase()));
-      const newSystems: Array<Record<string, unknown>> = [];
-      for (const s of systems) {
-        const id = ((s.system_id as string) || (s.id as string) || "").toLowerCase();
-        if (id && !routeIds.has(id)) newSystems.push(s);
-      }
-      if (newSystems.length > 0) {
-        const names = newSystems.map((s) => (s.name as string) || (s.system_id as string) || (s.id as string)).join(", ");
-        ctx.log("system", `NEW SYSTEM DISCOVERED: ${names} — regenerating fixed route...`);
-        if (sendBotChat && getAllBotNames) {
-          const others = getAllBotNames().filter((n) => n.toLowerCase() !== bot.username.toLowerCase());
-          if (others.length) {
-            sendBotChat(`🗺️ ${bot.username} discovered new system(s): ${names} — regenerating fixed route`, "coordination", others);
+    // ── Check if we're in a frontier system (many new systems discovered that are unreachable) ──
+    // This detects when fixed_route is being used in a frontier pocket and should switch modes
+    const currentSettings = getExplorerSettings(bot.username);
+    if (currentSettings.mode === "fixed_route") {
+      // Check if we're stuck in a frontier by seeing how many systems in our route are unreachable
+      const mapResp = await bot.exec("get_map");
+      if (mapResp.result && typeof mapResp.result === "object") {
+        const mapData = mapResp.result as Record<string, unknown>;
+        const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+        const routeIds = new Set(fixed.route.map((e) => e.systemId.toLowerCase()));
+        let newSystemCount = 0;
+        let unreachableCount = 0;
+        
+        for (const s of systems) {
+          const id = ((s.system_id as string) || (s.id as string) || "").toLowerCase();
+          if (id && !routeIds.has(id)) {
+            newSystemCount++;
           }
         }
-        const cloakAvailable = fixed.cloakAvailable ?? (await hasCloakModule(ctx));
-const graph = buildFixedRouteGraph(bot, cloakAvailable);
-        const route = generateFixedRoute(graph, homeSystem);
-        if (route.length > 0) {
-          const entry: ExplorerFixedPath = {
-            ...fixed,
-            route,
-            currentIndex: Math.min(fixed.currentIndex, Math.max(0, route.length - 1)),
-            updatedAt: now(),
-            status: "active",
-            cloakAvailable,
-          };
-          explorerFixedPathStore.upsertFixedPath(entry);
-          explorerFixedPathStore.flushSync();
-          fixed = entry;
-          ctx.log("system", `Fixed route regenerated — ${route.length} systems`);
-          logFixedRouteOverlap(bot.username, route, ctx);
+        
+        // Check how many route targets are unreachable from current position
+        const currentSystem = bot.system;
+        if (currentSystem) {
+          for (const target of fixed.route.slice(fixed.currentIndex, fixed.currentIndex + 20)) {
+            const route = mapStore.findRoute(currentSystem, target.systemId, getEffectiveSystemBlacklist(bot));
+            if (!route || route.length <= 1) {
+              unreachableCount++;
+            }
+          }
+        }
+        
+        // If we have many new systems AND many unreachable targets, we're likely in a frontier
+        if (newSystemCount > 10 && unreachableCount > 5) {
+          ctx.log("exploration", `🌌 FRONTIER DETECTED: ${newSystemCount} new systems discovered, ${unreachableCount}/20 next targets unreachable from ${bot.system}`);
+          ctx.log("exploration", `Switching to frontier_exploration mode for thorough pocket exploration...`);
+          setExplorerMode(bot.username, "frontier_exploration");
+          // The mode check at the top of the loop will handle the switch
+          continue;
         }
       }
+    }
+
+const homeSystem = fixed.homeSystem || getGlobalHomeBase().system || "sol";
+
+    // ── New-system detection: regenerate if get_map reveals systems not in route ──
+    // Only regenerate every 30 seconds to avoid spam
+    const nowTs = Date.now();
+    if (!fixed.lastRouteRegen || (nowTs - fixed.lastRouteRegen) > 30000) {
+      const mapResp = await bot.exec("get_map");
+      if (mapResp.result && typeof mapResp.result === "object") {
+        const mapData = mapResp.result as Record<string, unknown>;
+        const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+        const routeIds = new Set(fixed.route.map((e) => e.systemId.toLowerCase()));
+        const newSystems: Array<Record<string, unknown>> = [];
+        for (const s of systems) {
+          const id = ((s.system_id as string) || (s.id as string) || "").toLowerCase();
+          if (id && !routeIds.has(id)) newSystems.push(s);
+        }
+        if (newSystems.length > 0) {
+          const names = newSystems.map((s) => (s.name as string) || (s.system_id as string) || (s.id as string)).join(", ");
+          ctx.log("system", `NEW SYSTEM DISCOVERED: ${names} — regenerating fixed route...`);
+          if (sendBotChat && getAllBotNames) {
+            const others = getAllBotNames().filter((n) => n.toLowerCase() !== bot.username.toLowerCase());
+            if (others.length) {
+              sendBotChat(`🗺️ ${bot.username} discovered new system(s): ${names} — regenerating fixed route`, "coordination", others);
+            }
+          }
+          const cloakAvailable = fixed.cloakAvailable ?? (await hasCloakModule(ctx));
+          const graph = buildFixedRouteGraph(bot, cloakAvailable);
+          const route = generateFixedRoute(graph, homeSystem);
+          if (route.length > 0) {
+            const entry: ExplorerFixedPath = {
+              ...fixed,
+              route,
+              currentIndex: Math.min(fixed.currentIndex, Math.max(0, route.length - 1)),
+              updatedAt: now(),
+              status: "active",
+              cloakAvailable,
+              lastRouteRegen: nowTs,
+            };
+            explorerFixedPathStore.upsertFixedPath(entry);
+            explorerFixedPathStore.flushSync();
+            fixed = entry;
+            ctx.log("system", `Fixed route regenerated — ${route.length} systems`);
+            logFixedRouteOverlap(bot.username, route, ctx);
+          }
+        }
+      }
+      fixed.lastRouteRegen = nowTs;
     }
 
     // ── Route complete → navigate home, restock fuel cells, restart ──
@@ -4468,6 +4517,7 @@ const graph = buildFixedRouteGraph(bot, cloakAvailable);
       explorerFixedPathStore.flushSync();
       fixed = explorerFixedPathStore.getFixedPath(bot.username)!;
       fixed.currentIndex = 0;
+      fixed.lastRouteRegen = Date.now();
       consecutiveFailures = 0;
       ctx.log("system", `Fixed route cycle complete — restarted from system 1/${fixed.route.length}`);
       continue;

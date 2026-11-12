@@ -40,6 +40,7 @@ export interface ExplorerFixedPath {
   homeSystem: string;
   currentIndex: number;
   route: FixedPathRouteEntry[];
+  lastRouteRegen?: number; // Timestamp of last route regeneration to prevent spam
 }
 
 export interface ExplorerFixedPathsData {

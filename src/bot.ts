@@ -4534,6 +4534,28 @@ if (this.craftQueueTracker && jobId && recipeId) {
           }
         }
 
+        // Handle hazard warning (environmental damage from POIs)
+        if (msgType === "hazard_warning" && data && typeof data === "object") {
+          const d = data as Record<string, unknown>;
+          const poiId = (d.poi_id as string) || "";
+          const poiName = (d.poi_name as string) || "";
+          const hull = (d.hull as number) ?? 0;
+          const maxHull = (d.max_hull as number) ?? 0;
+          const dosePct = (d.dose_pct as number) ?? 0;
+          const message = (d.message as string) || "";
+          const hazard = d.hazard as Record<string, unknown> | undefined;
+          const hazardType = hazard ? (hazard.type as string) || "unknown" : "unknown";
+          const hazardSeverity = hazard ? (hazard.severity as number) || 0 : 0;
+
+          const hullPct = maxHull > 0 ? Math.round((hull / maxHull) * 100) : 100;
+
+          this.log("hazard", `⚠️ ENVIRONMENTAL DAMAGE at ${poiName} (${poiId}): ${hazardType} severity ${hazardSeverity} — Hull: ${hull}/${maxHull} (${hullPct}%) — Dose: ${dosePct}% — ${message}`);
+
+          // Update cached hull from the notification
+          if (hull !== undefined) this.hull = hull;
+          if (maxHull !== undefined) this.maxHull = maxHull;
+        }
+
         // Handle system messages
         if (type === "system" && data && typeof data === "object") {
           const d = data as Record<string, unknown>;
@@ -4587,6 +4609,23 @@ if (this.craftQueueTracker && jobId && recipeId) {
               msgLower.includes("attack") ||
               msgLower.includes("detected you") ||
               msgLower.includes("hostile");
+
+            // Check for quarter-hull warnings (75%, 50%, 25%)
+            const hullWarningMatch = msgLower.match(/hull.*?(?:at|is|reached?)\s*(\d+)\s*%/i);
+            if (hullWarningMatch) {
+              const hullPct = parseInt(hullWarningMatch[1], 10);
+              const quarterThresholds = [75, 50, 25];
+              const isQuarterWarning = quarterThresholds.some(q => hullPct <= q && hullPct > q - 5);
+              if (isQuarterWarning) {
+                this.log("hazard", `⚠️ HULL WARNING: ${message} (${hullPct}%)`);
+                // Update cached hull if we can infer it
+                if (this.maxHull > 0) {
+                  const inferredHull = Math.round((hullPct / 100) * this.maxHull);
+                  this.hull = inferredHull;
+                }
+              }
+            }
+
             this.log(isCombatWarning ? "combat" : "info", `[SYSTEM] ${message}`);
             // Combat warning chat alerts disabled — was spamming faction chat
             // if (isCombatWarning) {

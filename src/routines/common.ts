@@ -1870,6 +1870,220 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
   }
 }
 
+export interface HullCheckOptions {
+  /** Hull percentage threshold to trigger return-to-repair (default: from routine settings or 40%) */
+  hullThresholdPct?: number;
+  /** Whether to log the hull check (default: true) */
+  logCheck?: boolean;
+  /** Custom log prefix for the routine (e.g., "miner", "salvager") */
+  logPrefix?: string;
+  /** If true, immediately return home when threshold crossed (default: true) */
+  autoReturnHome?: boolean;
+}
+
+/** Result of a hull check. */
+export interface HullCheckResult {
+  /** Current hull percentage */
+  hullPct: number;
+  /** Whether hull is at or below the threshold */
+  needsRepair: boolean;
+  /** Whether return-home was initiated */
+  returnedHome: boolean;
+}
+
+/**
+ * Check hull status and optionally trigger return-to-repair.
+ * 
+ * This is a safety backup for environmental damage and combat damage that
+ * might not be caught by routine-specific hull checks. It handles:
+ * - Environmental damage from hazardous POIs (hazard_warning notifications)
+ * - Quarter-hull warnings from the server (75%, 50%, 25%)
+ * - Any other hull damage that brings the ship below the threshold
+ * 
+ * Call this periodically in routine loops (e.g., at the start of each cycle)
+ * or after any action that could damage the ship.
+ * 
+ * @param ctx - Routine context
+ * @param options - Configuration options
+ * @returns Hull check result with current status and whether return-home was triggered
+ */
+export async function checkHullAndRepair(
+  ctx: RoutineContext,
+  options: HullCheckOptions = {},
+): Promise<HullCheckResult> {
+  const { bot } = ctx;
+  const logPrefix = options.logPrefix ? `[${options.logPrefix}] ` : "";
+  const hullThresholdPct = options.hullThresholdPct ?? 40;
+  const logCheck = options.logCheck ?? true;
+  const autoReturnHome = options.autoReturnHome ?? true;
+
+  await bot.refreshShip();
+  const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+  const needsRepair = hullPct <= hullThresholdPct;
+
+  if (logCheck) {
+    const status = needsRepair ? "⚠️ NEEDS REPAIR" : "OK";
+    ctx.log("system", `${logPrefix}Hull check: ${hullPct}% (threshold: ${hullThresholdPct}%) — ${status}`);
+  }
+
+  let returnedHome = false;
+
+  if (needsRepair && autoReturnHome) {
+    ctx.log("system", `${logPrefix}Hull critical (${hullPct}% ≤ ${hullThresholdPct}%) — initiating return-to-repair...`);
+    
+    // Try to repair at current station if docked and it has repair service
+    if (bot.docked) {
+      const { pois } = await getSystemInfo(ctx);
+      const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+      if (currentStation?.services && currentStation.services.repair !== false) {
+        ctx.log("system", `${logPrefix}Attempting repair at current station...`);
+        await repairShip(ctx);
+        await bot.refreshShip();
+        const newHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        if (newHullPct > hullThresholdPct) {
+          ctx.log("system", `${logPrefix}Repaired to ${newHullPct}% — continuing routine`);
+          return { hullPct: newHullPct, needsRepair: false, returnedHome: false };
+        }
+        ctx.log("warn", `${logPrefix}Repair at current station insufficient (${newHullPct}%) — will return home`);
+      }
+    }
+
+    // Return home for repair
+    returnedHome = await returnHomeForRepair(ctx, options);
+  }
+
+  return { hullPct, needsRepair, returnedHome };
+}
+
+/**
+ * Return to home station for repair.
+ * Uses the return_home routine logic but focused on repair.
+ * 
+ * @param ctx - Routine context
+ * @param options - Options from checkHullAndRepair
+ * @returns true if successfully returned home and repaired, false otherwise
+ */
+async function returnHomeForRepair(
+  ctx: RoutineContext,
+  options: HullCheckOptions,
+): Promise<boolean> {
+  const { bot } = ctx;
+  const logPrefix = options.logPrefix ? `[${options.logPrefix}] ` : "";
+
+  // Get return_home settings for home system/station
+  const allSettings = readSettings();
+  const globalDefaults = allSettings.return_home || {};
+  const botOverrides = bot.username ? (allSettings[bot.username] || {}) : {};
+
+  const homeSystem = (botOverrides.homeSystem as string) || (globalDefaults.homeSystem as string) || "sol";
+  const homeStation = (botOverrides.homeStation as string) || (globalDefaults.homeStation as string) || "";
+
+  if (!homeSystem) {
+    ctx.log("error", `${logPrefix}No home system configured — cannot return for repair`);
+    return false;
+  }
+
+  ctx.log("system", `${logPrefix}Returning to ${homeStation || "home system"} (${homeSystem}) for repair...`);
+
+  // Ensure we have enough fuel for the journey
+  const { ensureFueled, navigateToSystem, ensureDocked, findStation, isStationPoi, isUsableFuelStation, waitForTransitCompletion } = await import("./common.js");
+
+  // Check for ongoing transit before starting
+  await bot.refreshPOI();
+  if (bot.inTransit) {
+    ctx.log("travel", `${logPrefix}Bot is in transit — waiting for completion...`);
+    const transitCompleted = await waitForTransitCompletion(ctx, 180);
+    if (!transitCompleted) {
+      ctx.log("error", `${logPrefix}Transit did not complete — cannot return home`);
+      return false;
+    }
+    await bot.refreshLocation();
+  }
+
+  // Battle check
+  const { checkAndFleeFromBattle } = await import("./common.js");
+  if (await checkAndFleeFromBattle(ctx, options.logPrefix)) {
+    ctx.log("combat", `${logPrefix}Cannot return home while in battle`);
+    return false;
+  }
+
+  // If already at home system, just dock and repair
+  await bot.refreshStatus();
+  if (bot.system === homeSystem) {
+    if (homeStation && bot.poi === homeStation) {
+      if (!bot.docked) {
+        const docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation });
+        if (!docked) return false;
+      }
+      await repairShip(ctx);
+      return true;
+    }
+    if (!homeStation && bot.docked) {
+      await repairShip(ctx);
+      return true;
+    }
+  }
+
+  // Ensure fueled before journey
+  const refuelThreshold = (botOverrides.refuelThreshold as number) ?? (globalDefaults.refuelThreshold as number) ?? 50;
+  await ensureFueled(ctx, refuelThreshold);
+
+  // Navigate to home system
+  if (bot.system !== homeSystem) {
+    ctx.log("travel", `${logPrefix}Navigating to ${homeSystem}...`);
+    const arrived = await navigateToSystem(ctx, homeSystem, {
+      fuelThresholdPct: refuelThreshold,
+      hullThresholdPct: 40,
+    });
+    if (!arrived) {
+      ctx.log("error", `${logPrefix}Failed to reach ${homeSystem}`);
+      return false;
+    }
+  }
+
+  // Find and travel to home station
+  const { pois } = await getSystemInfo(ctx);
+  let targetStation = null;
+
+  if (homeStation) {
+    targetStation = pois.find(p => p.id === homeStation && isStationPoi(p));
+  }
+  if (!targetStation) {
+    targetStation = findStation(pois);
+  }
+
+  if (!targetStation) {
+    ctx.log("error", `${logPrefix}No station found in ${homeSystem}`);
+    return false;
+  }
+
+  // Travel to station
+  if (bot.poi !== targetStation.id) {
+    ctx.log("travel", `${logPrefix}Traveling to ${targetStation.name}...`);
+    const travelResp = await bot.exec("travel", { target_poi: targetStation.id });
+    if (travelResp.error && !travelResp.error.message.includes("already")) {
+      ctx.log("error", `${logPrefix}Travel to station failed: ${travelResp.error.message}`);
+      return false;
+    }
+    await bot.refreshLocation();
+    if (bot.poi !== targetStation.id) {
+      ctx.log("error", `${logPrefix}Travel to station failed: not at target`);
+      return false;
+    }
+  }
+
+  // Dock and repair
+  const docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation || targetStation.id });
+  if (!docked) {
+    ctx.log("error", `${logPrefix}Failed to dock at home station`);
+    return false;
+  }
+
+  await repairShip(ctx);
+  ctx.log("system", `${logPrefix}Return-to-repair complete — hull restored`);
+  return true;
+}
+
 export async function treatPersonnel(
   ctx: RoutineContext,
   opts?: { crew?: number; marines?: number; provider?: "station" | "field" | "faction"; reserve?: boolean },

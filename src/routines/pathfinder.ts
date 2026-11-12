@@ -310,8 +310,8 @@ async function preflightFuelCheck(
 }
 
 /** Before each scan jump, ensure fuel is above the refuel threshold.
- *  Waits for any in-progress transit to complete, then checks fuel %.
- *  If below threshold, docks at the nearest station and refuels.
+ *  If in pathfinder transit, uses military fuel cells from cargo.
+ *  If not in transit, docks at the nearest station and refuels.
  *  Returns false if refueling fails (caller should abort the scan). */
 async function checkAndRefuelMidScan(
   ctx: RoutineContext,
@@ -319,31 +319,77 @@ async function checkAndRefuelMidScan(
 ): Promise<boolean> {
   const { bot } = ctx;
 
-  // Wait for any in-progress transit to complete before we can dock.
-  while (bot.inTransit && bot.state === "running") {
-    await ctx.sleep(2000);
-    await bot.refreshStatus();
-  }
-
-  if (bot.state !== "running") return false;
+  await bot.refreshStatus();
+  await bot.refreshCargo();
 
   const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  if (fuelPct < thresholdPct) {
-    ctx.log("system", `Fuel ${fuelPct}% below refuel threshold ${thresholdPct}% — refueling before continuing scan...`);
-    const docked = await ensureDocked(ctx);
-    if (!docked) {
-      ctx.log("error", "Cannot dock to refuel — aborting pathfinder scan");
-      return false;
-    }
-    await tryRefuel(ctx);
-    await bot.refreshShip();
-    const newPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-    if (newPct < thresholdPct) {
-      ctx.log("error", `Refuel failed — still at ${newPct}% — aborting pathfinder scan`);
-      return false;
-    }
-    ctx.log("system", `Refueled to ${newPct}% — resuming scan`);
+  if (fuelPct >= thresholdPct) {
+    return true;
   }
+
+  ctx.log("system", `Fuel ${fuelPct}% below refuel threshold ${thresholdPct}% — refueling before continuing scan...`);
+
+  // If in pathfinder transit, we CANNOT dock at a station.
+  // Use military fuel cells from cargo instead.
+  if (bot.inTransit) {
+    ctx.log("system", "In pathfinder transit — using military fuel cells from cargo to refuel");
+    const mfcItem = bot.inventory.find(i => i.itemId === "military_fuel_cell" && i.quantity > 0);
+    if (!mfcItem) {
+      ctx.log("error", "No military fuel cells in cargo — cannot refuel while in pathfinder transit");
+      return false;
+    }
+
+    // Consume MFCs via refuel command (works while undocked/in-transit)
+    let consecutiveErrors = 0;
+    for (let i = 0; i < 10 && bot.state === "running" && bot.inTransit; i++) {
+      const resp = await bot.exec("refuel");
+      if (resp.error) {
+        consecutiveErrors++;
+        const msg = resp.error.message.toLowerCase();
+        if (msg.includes("already full") || msg.includes("tank_full") || msg.includes("max")) {
+          break;
+        }
+        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("no fuel")) {
+          ctx.log("error", "Ran out of fuel cells in cargo while in transit");
+          return false;
+        }
+        if (consecutiveErrors >= 2) break;
+        continue;
+      }
+      consecutiveErrors = 0;
+      await bot.refreshShip();
+      await bot.refreshCargo();
+      const newPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (newPct >= thresholdPct) {
+        ctx.log("system", `Refueled to ${newPct}% via cargo cells — resuming scan`);
+        return true;
+      }
+    }
+
+    await bot.refreshShip();
+    const finalPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (finalPct < thresholdPct) {
+      ctx.log("error", `Refuel from cargo cells failed — still at ${finalPct}% — aborting pathfinder scan`);
+      return false;
+    }
+    ctx.log("system", `Refueled to ${finalPct}% via cargo cells — resuming scan`);
+    return true;
+  }
+
+  // Not in transit — can dock at a station normally
+  const docked = await ensureDocked(ctx);
+  if (!docked) {
+    ctx.log("error", "Cannot dock to refuel — aborting pathfinder scan");
+    return false;
+  }
+  await tryRefuel(ctx);
+  await bot.refreshShip();
+  const newPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (newPct < thresholdPct) {
+    ctx.log("error", `Refuel failed — still at ${newPct}% — aborting pathfinder scan`);
+    return false;
+  }
+  ctx.log("system", `Refueled to ${newPct}% — resuming scan`);
   return true;
 }
 

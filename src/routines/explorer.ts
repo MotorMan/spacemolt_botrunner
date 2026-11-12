@@ -4617,6 +4617,44 @@ const homeSystem = fixed.homeSystem || getGlobalHomeBase().system || "sol";
  * - Fuel-aware exploration with configurable return threshold
  * - Automatic return to known space when fuel is low or frontier is exhausted
  */
+
+/**
+ * Find a path through the frontier graph from start to target using BFS.
+ * Returns array of system IDs representing the path, or null if no path found.
+ */
+function findFrontierPath(
+  frontierMemory: Map<string, { connections: Set<string> }>,
+  startSystemId: string,
+  targetSystemId: string
+): string[] | null {
+  if (startSystemId === targetSystemId) return [startSystemId];
+  
+  const visited = new Set<string>();
+  const queue: Array<{ systemId: string; path: string[] }> = [
+    { systemId: startSystemId, path: [startSystemId] }
+  ];
+  visited.add(startSystemId);
+  
+  while (queue.length > 0) {
+    const { systemId, path } = queue.shift()!;
+    const sys = frontierMemory.get(systemId);
+    if (!sys) continue;
+    
+    for (const connId of sys.connections) {
+      if (visited.has(connId)) continue;
+      visited.add(connId);
+      
+      const newPath = [...path, connId];
+      if (connId === targetSystemId) {
+        return newPath;
+      }
+      queue.push({ systemId: connId, path: newPath });
+    }
+  }
+  
+  return null;
+}
+
 async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
   const settings = getExplorerSettings(bot.username);
@@ -4631,7 +4669,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
     poisScanned: number;
     totalPois: number;
     connections: Set<string>; // Connected frontier system IDs
-    wormholePois: string[];   // POI IDs of wormholes leading to other frontier systems
+    wormholeMap: Map<string, string>; // POI ID -> destination system ID
     lastVisit: number;
     distanceFromEntry: number; // Hops from the initial entry system
   }
@@ -4640,7 +4678,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
   const visitedFrontierSystems = new Set<string>();
   const explorationQueue: Array<{ systemId: string; distance: number }> = [];
   const fledFromSystems = new Set<string>();
-  const path: string[] = [];
+  const systemPath: string[] = [];
   let entrySystemId: string | null = null;
   let startupPrepped = false;
 
@@ -4648,7 +4686,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
   await bot.refreshLocation();
   if (bot.system) {
     entrySystemId = bot.system;
-    path.push(bot.system);
+    systemPath.push(bot.system);
     frontierMemory.set(bot.system, {
       id: bot.system,
       name: bot.system,
@@ -4656,7 +4694,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       poisScanned: 0,
       totalPois: 0,
       connections: new Set(),
-      wormholePois: [],
+      wormholeMap: new Map(),
       lastVisit: Date.now(),
       distanceFromEntry: 0,
     });
@@ -4740,7 +4778,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
 
     // Track this system in frontier memory
     visitedFrontierSystems.add(systemId);
-    path.push(systemId);
+    systemPath.push(systemId);
     
     let frontierSys = frontierMemory.get(systemId);
     if (!frontierSys) {
@@ -4751,7 +4789,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
         poisScanned: 0,
         totalPois: 0,
         connections: new Set(),
-        wormholePois: [],
+        wormholeMap: new Map(),
         lastVisit: Date.now(),
         distanceFromEntry: explorationQueue.find(q => q.systemId === systemId)?.distance ?? 0,
       };
@@ -4784,7 +4822,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
           if (wormholeExit && (wormholeExit.type === "wormhole_exit" || wormholeExit.type === "wormhole_entrance") && wormholeDestinationId) {
             ctx.log("info", `🌌 Frontier wormhole detected: ${wormholeExit.name} -> ${wormholeDestinationId}`);
             if (frontierSys) {
-              frontierSys.wormholePois.push(wormholeExit.id as string);
+              frontierSys.wormholeMap.set(wormholeExit.id as string, wormholeDestinationId);
               frontierSys.connections.add(wormholeDestinationId);
               
               // Register the connected system in memory if not already known
@@ -4796,7 +4834,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
                   poisScanned: 0,
                   totalPois: 0,
                   connections: new Set([systemId]),
-                  wormholePois: [],
+                  wormholeMap: new Map(),
                   lastVisit: 0,
                   distanceFromEntry: (frontierSys.distanceFromEntry ?? 0) + 1,
                 });
@@ -4852,7 +4890,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
             poisScanned: 0,
             totalPois: 0,
             connections: new Set([systemId]),
-            wormholePois: [],
+            wormholeMap: new Map(),
             lastVisit: 0,
             distanceFromEntry: (frontierSys?.distanceFromEntry ?? 0) + 1,
           });
@@ -4897,8 +4935,8 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
             await bot.refreshLocation();
             const actualSystemId = bot.system;
             ctx.log("combat", `Verified actual position before flee: system=${actualSystemId}`);
-            if (path.length > 1) {
-              const fleeTarget = path[path.length - 2];
+            if (systemPath.length > 1) {
+              const fleeTarget = systemPath[systemPath.length - 2];
               const fleeTargetConnected = connections.some(c => c.id === fleeTarget);
               if (fleeTargetConnected) {
                 ctx.log("combat", `Fleeing back to ${fleeTarget} (reverse path)...`);
@@ -4918,7 +4956,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
                 } else {
                   ctx.log("combat", `Successfully fled to ${fleeTarget}`);
                   bot.stats.totalSystems++;
-                  path.pop();
+                  systemPath.pop();
                   await ctx.sleep(5000);
                   continue;
                 }
@@ -5093,7 +5131,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
             // Update frontier memory with the new connection
             if (frontierSys) {
               frontierSys.connections.add(destSystemId);
-              frontierSys.wormholePois.push(poi.id);
+              frontierSys.wormholeMap.set(poi.id, destSystemId);
             }
             
             // Register the destination system in frontier memory
@@ -5105,7 +5143,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
                 poisScanned: 0,
                 totalPois: 0,
                 connections: new Set([systemId]),
-                wormholePois: [],
+                wormholeMap: new Map(),
                 lastVisit: 0,
                 distanceFromEntry: (frontierSys?.distanceFromEntry ?? 0) + 1,
               });
@@ -5283,39 +5321,89 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       continue;
     }
 
-    await ensureUndocked(ctx);
+await ensureUndocked(ctx);
 
-    // Navigate to target system - in frontier we may need to use wormholes
-    // First try direct jump if connected
-    const targetMemory = frontierMemory.get(target.systemId);
-    let arrived = false;
+    // Navigate to target system using frontier graph pathfinding
+    // Find path through frontier systems using wormholes
+    const path = findFrontierPath(frontierMemory, systemId, target.systemId);
     
-    if (targetMemory && targetMemory.connections.has(systemId)) {
-      // Directly connected - try to find the wormhole POI
-      const wormholePoi = targetMemory.wormholePois.find(poiId => {
-        // We'd need to check which POI leads to target system
-        // For now, try navigateToSystem which should find the route
-        return true;
-      });
-      if (wormholePoi) {
-        ctx.log("travel", `Using wormhole ${wormholePoi} to reach ${target.systemId}`);
-        // Travel to wormhole POI and jump
-        const travelToWh = await bot.exec("travel", { target_poi: wormholePoi });
-        if (!travelToWh.error || travelToWh.error.message.includes("already")) {
+    let arrived = false;
+    if (path && path.length > 1) {
+      // Path found: current -> ... -> target
+      // Traverse step by step
+      for (let i = 1; i < path.length; i++) {
+        const nextSystemId = path[i];
+        const currentSystemMemory = frontierMemory.get(path[i - 1]);
+        
+        if (!currentSystemMemory) {
+          ctx.log("error", `No memory for system ${path[i - 1]} in path`);
+          break;
+        }
+        
+        // Find wormhole POI that leads to next system
+        let wormholePoi: string | null = null;
+        for (const [poiId, destId] of currentSystemMemory.wormholeMap.entries()) {
+          if (destId === nextSystemId) {
+            wormholePoi = poiId;
+            break;
+          }
+        }
+        
+        if (wormholePoi) {
+          ctx.log("travel", `Using wormhole ${wormholePoi} to reach ${nextSystemId}`);
+          // Travel to wormhole POI and jump
+          const travelToWh = await bot.exec("travel", { target_poi: wormholePoi });
+          if (travelToWh.error && !travelToWh.error.message.includes("already")) {
+            ctx.log("error", `Failed to reach wormhole ${wormholePoi}: ${travelToWh.error.message}`);
+            break;
+          }
           const jumpResp = await bot.exec("jump", { target_poi: wormholePoi });
-          if (!jumpResp.error) {
-            const r = jumpResp.result as Record<string, unknown> | undefined;
-            if (r && r.action === "jumped") {
-              arrived = true;
+          if (jumpResp.error) {
+            ctx.log("error", `Wormhole jump failed: ${jumpResp.error.message}`);
+            break;
+          }
+          const r = jumpResp.result as Record<string, unknown> | undefined;
+          if (r && r.action === "jumped") {
+            // Successfully jumped, continue to next step
+            await bot.refreshLocation();
+            if (bot.system === nextSystemId) {
+              ctx.log("travel", `Arrived at ${nextSystemId} via wormhole`);
+              if (i === path.length - 1) {
+                arrived = true;
+              }
+              continue;
+            } else {
+              ctx.log("warn", `Jumped but not at expected system ${nextSystemId}, at ${bot.system}`);
+              // We might have jumped to an unexpected system, continue from there
+              continue;
             }
+          }
+        } else {
+          ctx.log("warn", `No wormhole found from ${path[i - 1]} to ${nextSystemId}, trying direct navigation`);
+          // Try direct navigation as fallback
+          const directArrived = await navigateToSystem(ctx, nextSystemId, { 
+            fuelThresholdPct: settings.refuelThreshold, 
+            hullThresholdPct: 30, 
+            skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked 
+          });
+          if (!directArrived) {
+            ctx.log("error", `Could not reach ${nextSystemId} via direct navigation`);
+            break;
+          }
+          if (i === path.length - 1) {
+            arrived = true;
           }
         }
       }
+    } else if (path && path.length === 1) {
+      // Already at target
+      ctx.log("travel", `Already at target system ${target.systemId}`);
+      arrived = true;
     }
-
+    
     if (!arrived) {
       // Fall back to navigateToSystem which uses find_route
-      ctx.log("travel", `Navigating to frontier system ${target.systemId} (${target.distance} hops)...`);
+      ctx.log("travel", `No frontier path found, trying server route to ${target.systemId}...`);
       arrived = await navigateToSystem(ctx, target.systemId, { 
         fuelThresholdPct: settings.refuelThreshold, 
         hullThresholdPct: 30, 
@@ -5328,10 +5416,10 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       await ctx.sleep(10000);
       continue;
     }
-
-    ctx.log("travel", `Arrived at frontier system ${target.systemId}`);
+    
+ctx.log("travel", `Arrived at frontier system ${target.systemId}`);
     bot.stats.totalSystems++;
-    path.push(target.systemId);
+    systemPath.push(target.systemId);
 
     // Update visited status from server after arrival
     yield "update_visited_status";

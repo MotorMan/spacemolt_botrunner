@@ -19,7 +19,7 @@ import { logSkills } from "./skillTracker.js";
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord, getDirectPathfinderJump, getCorrectionPathfinderJump, getCorrectionBearingAtTick, isPathfinderLandingAtVoid, type CorrectionPathfinderJump, getMccWindowInfo, type MccWindowInfo } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate, saveFactionTaxEstimate, type FactionTaxEstimate } from "./taxData.js";
 import { chatBuffer } from "./chatbuffer.js";
-import { tryDecodeNpcMessage } from "./npc_chat_decoder.js";
+import { tryDecodeNpcMessage, saveRepeaterMessage } from "./npc_chat_decoder.js";
 import { loadSettings, saveStoppedState, saveLastUsedRoutine, isCustomsDisabled } from "./web/server.js";
 import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
@@ -4160,6 +4160,9 @@ return {
               this.log("chat", `🔓 Decoded NPC message: ${decodedContent}`);
               finalContent = decodedContent;
               finalSender = `${sender} (decoded)`;
+              
+              // Save decoded repeater message to disk
+              saveRepeaterMessage(this.system, this.poi, sender, channel, content, decodedContent);
             }
 
             chatBuffer.addMessage({

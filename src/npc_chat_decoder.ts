@@ -1,9 +1,12 @@
 /**
  * Fibonacci Hex Decoder for NPC Chat Messages
  * 
- * Decodes 134-char hex strings (67 bytes) using Fibonacci subtraction modulo 256
- * to produce 66-char English text messages.
+ * Decodes hex strings using Fibonacci subtraction modulo 256
+ * to produce English text messages.
  */
+
+import { join } from "path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 
 export function decodeNpcChatHex(hexStr: string): string | null {
   // Validate input: hex string with reasonable length (even number of chars)
@@ -98,4 +101,80 @@ export function tryDecodeNpcMessage(sender: string, content: string): string | n
   }
   const hexStr = extractHex(content);
   return decodeNpcChatHex(hexStr);
+}
+
+/**
+ * Saved repeater message entry
+ */
+export interface RepeaterMessage {
+  timestamp: string;        // ISO timestamp
+  system: string;           // System where received
+  poi: string;              // POI where received
+  sender: string;           // Original sender (e.g., "Unknown source")
+  channel: string;          // Chat channel
+  hex: string;              // Original hex string
+  decoded: string;          // Decoded text
+}
+
+/**
+ * File path for repeater messages
+ */
+const REPEATER_MESSAGES_FILE = join(process.cwd(), "data", "repeaterMessages.json");
+
+/**
+ * Load existing repeater messages from disk
+ */
+function loadRepeaterMessages(): RepeaterMessage[] {
+  try {
+    if (existsSync(REPEATER_MESSAGES_FILE)) {
+      const content = readFileSync(REPEATER_MESSAGES_FILE, "utf-8");
+      return JSON.parse(content) as RepeaterMessage[];
+    }
+  } catch (err) {
+    // Ignore parse errors, start fresh
+  }
+  return [];
+}
+
+/**
+ * Save a decoded repeater message to disk
+ */
+export function saveRepeaterMessage(
+  system: string,
+  poi: string,
+  sender: string,
+  channel: string,
+  hex: string,
+  decoded: string
+): void {
+  try {
+    const dir = join(process.cwd(), "data");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+    const messages = loadRepeaterMessages();
+    
+    // Extract clean hex for storage
+    const cleanHex = extractHex(hex);
+    
+    const entry: RepeaterMessage = {
+      timestamp: new Date().toISOString(),
+      system,
+      poi,
+      sender,
+      channel,
+      hex: cleanHex,
+      decoded,
+    };
+
+    messages.push(entry);
+    
+    // Keep only last 5000 messages to prevent unbounded growth
+    const MAX_MESSAGES = 5000;
+    const toSave = messages.slice(-MAX_MESSAGES);
+    
+    const payload = JSON.stringify(toSave, null, 2) + "\n";
+    writeFileSync(REPEATER_MESSAGES_FILE, payload, "utf-8");
+  } catch (err) {
+    console.error("Failed to save repeater message:", err);
+  }
 }

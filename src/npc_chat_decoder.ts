@@ -6,8 +6,8 @@
  */
 
 export function decodeNpcChatHex(hexStr: string): string | null {
-  // Validate input: should be 134 hex chars (67 bytes) but we handle 132 (66 bytes) too
-  if (!hexStr || hexStr.length < 130 || hexStr.length > 136 || hexStr.length % 2 !== 0) {
+  // Validate input: hex string with reasonable length (even number of chars)
+  if (!hexStr || hexStr.length < 20 || hexStr.length > 200 || hexStr.length % 2 !== 0) {
     return null;
   }
 
@@ -62,7 +62,7 @@ export function decodeNpcChatHex(hexStr: string): string | null {
 
 /**
  * Check if a message content looks like an encoded NPC chat message
- * (134-char hex string from "Unknown source")
+ * (hex string from "Unknown source")
  */
 export function isEncodedNpcMessage(sender: string, content: string): boolean {
   const senderLower = sender.toLowerCase();
@@ -74,8 +74,8 @@ export function isEncodedNpcMessage(sender: string, content: string): boolean {
   const hexCandidate = content.trim().replace(/^source:\s*/i, '').replace(/\s+/g, '');
   
   return (
-    hexCandidate.length >= 130 &&
-    hexCandidate.length <= 136 &&
+    hexCandidate.length >= 20 &&
+    hexCandidate.length <= 200 &&
     hexCandidate.length % 2 === 0 &&
     /^[0-9a-fA-F]+$/.test(hexCandidate)
   );

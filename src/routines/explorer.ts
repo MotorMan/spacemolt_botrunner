@@ -5024,12 +5024,13 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
     for (const poi of pois) {
       const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
       if (isWormholePoi && frontierSys) {
-        // We found a wormhole POI - we don't know the destination yet
-        // But we can register the POI as a potential wormhole
-        // The destination will be discovered when we actually jump through it
+        // We found a wormhole POI - categorize by type
+        // wh_exit_* are one-way exits back to known space (don't traverse for exploration)
+        // wh_entrance_* or other wormholes may lead deeper into frontier
         if (!frontierSys.wormholeMap.has(poi.id)) {
-          frontierSys.wormholeMap.set(poi.id, "unknown");
-          ctx.log("info", `🌌 Found wormhole POI in ${systemId}: ${poi.name} (${poi.id}) - destination unknown until traversed`);
+          const destType = poi.id.startsWith("wh_exit_") ? "exit" : "unknown";
+          frontierSys.wormholeMap.set(poi.id, destType);
+          ctx.log("info", `🌌 Found wormhole POI in ${systemId}: ${poi.name} (${poi.id}) - ${destType === "exit" ? "exit to known space" : "destination unknown until traversed"}`);
         }
       }
     }
@@ -5422,10 +5423,11 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
 
     // ── Check for unexplored wormhole POIs in current system FIRST ──
     // Before picking from queue, try to traverse any unknown wormholes in this system
+    // Skip wh_exit_* wormholes as they are one-way exits back to known space
     const unexploredWormholes: string[] = [];
     if (frontierSys) {
       for (const [poiId, destId] of frontierSys.wormholeMap.entries()) {
-        if (destId === "unknown") {
+        if (destId === "unknown" && !poiId.startsWith("wh_exit_")) {
           unexploredWormholes.push(poiId);
         }
       }
@@ -5896,9 +5898,13 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
     for (const poi of pois) {
       const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
       if (isWormholePoi && frontierSys) {
+        // We found a wormhole POI - categorize by type
+        // wh_exit_* are one-way exits back to known space (don't traverse for exploration)
+        // wh_entrance_* or other wormholes may lead deeper into frontier
         if (!frontierSys.wormholeMap.has(poi.id)) {
-          frontierSys.wormholeMap.set(poi.id, "unknown");
-          ctx.log("info", `🌌 Found wormhole POI in ${systemId}: ${poi.name} (${poi.id}) - destination unknown until traversed`);
+          const destType = poi.id.startsWith("wh_exit_") ? "exit" : "unknown";
+          frontierSys.wormholeMap.set(poi.id, destType);
+          ctx.log("info", `🌌 Found wormhole POI in ${systemId}: ${poi.name} (${poi.id}) - ${destType === "exit" ? "exit to known space" : "destination unknown until traversed"}`);
         }
       }
     }
@@ -6290,10 +6296,11 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
     }
 
     // ── Check for unexplored wormhole POIs in current system FIRST ──
+    // Skip wh_exit_* wormholes as they are one-way exits back to known space
     const unexploredWormholes: string[] = [];
     if (frontierSys) {
       for (const [poiId, destId] of frontierSys.wormholeMap.entries()) {
-        if (destId === "unknown") {
+        if (destId === "unknown" && !poiId.startsWith("wh_exit_")) {
           unexploredWormholes.push(poiId);
         }
       }

@@ -4994,6 +4994,21 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       }
     }
 
+    // Also scan all POIs in this system for wormhole types and register them
+    // This discovers wormholes that the survey might have missed
+    for (const poi of pois) {
+      const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
+      if (isWormholePoi && frontierSys) {
+        // We found a wormhole POI - we don't know the destination yet
+        // But we can register the POI as a potential wormhole
+        // The destination will be discovered when we actually jump through it
+        if (!frontierSys.wormholeMap.has(poi.id)) {
+          frontierSys.wormholeMap.set(poi.id, "unknown");
+          ctx.log("info", `🌌 Found wormhole POI in ${systemId}: ${poi.name} (${poi.id}) - destination unknown until traversed`);
+        }
+      }
+    }
+
     // Update system info with newly discovered POIs
     frontierSys!.totalPois = pois.length;
     frontierSys!.poisScanned = 0;
@@ -5379,6 +5394,42 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       }
     }
 
+    // ── Check for unexplored wormhole POIs in current system FIRST ──
+    // Before picking from queue, try to traverse any unknown wormholes in this system
+    const unexploredWormholes: string[] = [];
+    if (frontierSys) {
+      for (const [poiId, destId] of frontierSys.wormholeMap.entries()) {
+        if (destId === "unknown") {
+          unexploredWormholes.push(poiId);
+        }
+      }
+    }
+    
+    if (unexploredWormholes.length > 0) {
+      // Prioritize exploring unknown wormholes in current system
+      const wormholePoi = unexploredWormholes[0];
+      ctx.log("exploration", `Found unexplored wormhole ${wormholePoi} in ${systemId} — attempting to traverse to discover new system`);
+      
+      // Travel to wormhole POI and jump
+      await ensureUndocked(ctx);
+      const travelToWh = await bot.exec("travel", { target_poi: wormholePoi });
+      if (!travelToWh.error || travelToWh.error.message.includes("already")) {
+        const jumpResp = await bot.exec("jump", { target_poi: wormholePoi });
+        if (!jumpResp.error) {
+          const r = jumpResp.result as Record<string, unknown> | undefined;
+          if (r && r.action === "jumped") {
+            ctx.log("info", `🌌 Traversed unknown wormhole ${wormholePoi} — discovering new system`);
+            await bot.refreshLocation();
+            continue; // Restart loop to scan new system
+          }
+        }
+      }
+      // If jump failed, mark as explored and continue
+      if (frontierSys) {
+        frontierSys.wormholeMap.set(wormholePoi, "failed");
+      }
+    }
+
     // ── Pick next frontier system to explore ──
     yield "pick_next_frontier_system";
 
@@ -5389,6 +5440,8 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
         return sys && !sys.visited && q.distance <= settings.frontierMaxDepth;
       })
       .sort((a, b) => a.distance - b.distance); // Nearest first (BFS order)
+
+    ctx.log("debug", `Frontier queue: ${explorationQueue.length} total, ${validTargets.length} valid targets (maxDepth=${settings.frontierMaxDepth})`);
 
     if (validTargets.length === 0) {
       ctx.log("info", "No more unvisited frontier systems within max depth — frontier exploration complete!");

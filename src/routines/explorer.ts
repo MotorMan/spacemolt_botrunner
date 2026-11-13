@@ -198,7 +198,7 @@ const RESOURCE_REFRESH_MINS = 120;
 
 // ── Per-bot settings ─────────────────────────────────────────
 
-export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all" | "achievement" | "fixed_route" | "frontier_exploration";
+export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all" | "achievement" | "fixed_route" | "frontier_exploration" | "frontier_survey";
 
 function getExplorerSettings(username?: string): {
   mode: ExplorerMode;
@@ -333,7 +333,7 @@ function getExplorerSettings(username?: string): {
       : true;
 
   return {
-    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : mode === "achievement" ? "achievement" : mode === "fixed_route" ? "fixed_route" : mode === "frontier_exploration" ? "frontier_exploration" : "explore") as ExplorerMode,
+    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : mode === "achievement" ? "achievement" : mode === "fixed_route" ? "fixed_route" : mode === "frontier_exploration" ? "frontier_exploration" : mode === "frontier_survey" ? "frontier_survey" : "explore") as ExplorerMode,
     acceptMissions,
     focusAreaSystem,
     maxJumps,
@@ -396,6 +396,13 @@ export function setExplorerFixedRoute(username: string, enabled: boolean): void 
 export function setExplorerFrontierExploration(username: string, enabled: boolean): void {
   writeSettings({
     [username]: { explorerMode: enabled ? "frontier_exploration" : "explore" },
+  });
+}
+
+/** Persist frontier_survey mode setting for a specific bot. */
+export function setExplorerFrontierSurvey(username: string, enabled: boolean): void {
+  writeSettings({
+    [username]: { explorerMode: enabled ? "frontier_survey" : "explore" },
   });
 }
 
@@ -539,6 +546,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
   if (initialSettings.mode === "frontier_exploration") {
     yield* frontierExplorationRoutine(ctx);
+    return;
+  }
+  if (initialSettings.mode === "frontier_survey") {
+    yield* frontierSurveyRoutine(ctx);
     return;
   }
 
@@ -914,6 +925,12 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("system", "Mode changed to frontier_exploration — switching routines...");
       clearExplorerPosition(bot.username);
       yield* frontierExplorationRoutine(ctx);
+      return;
+    }
+    if (modeCheck.mode === "frontier_survey") {
+      ctx.log("system", "Mode changed to frontier_survey — switching routines...");
+      clearExplorerPosition(bot.username);
+      yield* frontierSurveyRoutine(ctx);
       return;
     }
 
@@ -4427,6 +4444,9 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
       if (modeCheck.mode === "frontier_exploration") {
         yield* frontierExplorationRoutine(ctx);
       }
+      if (modeCheck.mode === "frontier_survey") {
+        yield* frontierSurveyRoutine(ctx);
+      }
       return;
     }
 
@@ -4848,8 +4868,13 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
 
     // ── Re-check mode (user may have changed it, or session restarted) ──
     const modeCheck = getExplorerSettings(bot.username);
-    if (modeCheck.mode !== "frontier_exploration") {
+    if (modeCheck.mode !== "frontier_exploration" && modeCheck.mode !== "frontier_survey") {
       ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving frontier_exploration...`);
+      return;
+    }
+    if (modeCheck.mode === "frontier_survey") {
+      ctx.log("system", "Mode changed to frontier_survey — switching routines...");
+      yield* frontierSurveyRoutine(ctx);
       return;
     }
 
@@ -5602,6 +5627,883 @@ ctx.log("travel", `Arrived at frontier system ${target.systemId}`);
     }
     
 // Continue to next iteration to explore this system's POIs
+    continue;
+  }
+}
+
+/**
+ * Frontier Survey Routine — manual exploration of a frontier pocket.
+ * 
+ * Use this when you manually encounter a frontier system (accessible via wormhole)
+ * and want to thoroughly explore the entire connected pocket. This routine:
+ * - Starts from the current system
+ * - Surveys all POIs in each system
+ * - Traverses all wormholes to discover connected systems
+ * - Builds a complete map of the frontier pocket
+ * - Returns to the entry system when complete (or when fuel is low)
+ * 
+ * Can be invoked by setting mode to "frontier_survey" or calling directly.
+ */
+export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+  const settings = getExplorerSettings(bot.username);
+
+  ctx.log("system", "Frontier Survey mode — manual exploration of unknown wormhole pocket...");
+
+  // Frontier memory: track discovered frontier systems and their connections
+  interface FrontierSystem {
+    id: string;
+    name: string;
+    visited: boolean;
+    poisScanned: number;
+    totalPois: number;
+    connections: Set<string>; // Connected frontier system IDs
+    wormholeMap: Map<string, string>; // POI ID -> destination system ID ("unknown" | "failed" | systemId)
+    lastVisit: number;
+    distanceFromEntry: number; // Hops from the initial entry system
+  }
+
+  const frontierMemory = new Map<string, FrontierSystem>();
+  const explorationQueue: Array<{ systemId: string; distance: number }> = [];
+  const fledFromSystems = new Set<string>();
+  const systemPath: string[] = [];
+  let entrySystemId: string | null = null;
+  let startupPrepped = false;
+
+  // Initialize with current system as the entry point
+  await bot.refreshLocation();
+  if (bot.system) {
+    entrySystemId = bot.system;
+    systemPath.push(bot.system);
+    frontierMemory.set(bot.system, {
+      id: bot.system,
+      name: bot.system,
+      visited: false,
+      poisScanned: 0,
+      totalPois: 0,
+      connections: new Set(),
+      wormholeMap: new Map(),
+      lastVisit: Date.now(),
+      distanceFromEntry: 0,
+    });
+    explorationQueue.push({ systemId: bot.system, distance: 0 });
+    ctx.log("exploration", `🗺️ Starting frontier survey from entry system: ${bot.system}`);
+  }
+
+  // ── Startup: dock at local station to clear cargo, pack fuel cells & refuel ──
+  while (bot.state === "running") {
+    if (!startupPrepped) {
+      startupPrepped = true;
+      yield "startup_prep";
+      ctx.log("system", "Frontier Survey: startup prep — docking to load fuel cells, refuel tank, and repair hull...");
+      const { pois: startPois } = await getSystemInfo(ctx);
+      const startStation = findStation(startPois);
+      if (startStation) {
+        if (bot.poi !== startStation.id) {
+          await ensureUndocked(ctx);
+          const tResp = await bot.exec("travel", { target_poi: startStation.id });
+          if (tResp.error && !tResp.error.message.includes("already")) {
+            ctx.log("warn", `Could not reach startup station ${startStation.name}: ${tResp.error.message}`);
+          }
+        }
+        if (!bot.docked) {
+          const dResp = await bot.exec("dock");
+          if (!dResp.error || dResp.error.message.includes("already")) {
+            bot.docked = true;
+          }
+        }
+      }
+      if (bot.docked) {
+        await collectFromStorage(ctx);
+        if (settings.loadFuelCellsAtHome) {
+          await loadFuelCellsToMax(ctx);
+        }
+        await tryRefuel(ctx);
+        await bot.refreshShip();
+        const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        if (hullPct <= 40) {
+          ctx.log("system", `Hull critical (${hullPct}%) — repairing at startup station`);
+          await repairShip(ctx);
+        }
+        await bot.refreshShip();
+        const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        ctx.log("system", `Frontier Survey startup prep complete — Fuel: ${fuelPct}% | Cargo: ${bot.cargo}/${bot.cargoMax} | Hull: ${hullPct}%`);
+      } else {
+        ctx.log("warn", "Frontier Survey: no station in current system for startup prep — proceeding with current fuel/cargo");
+      }
+      await ensureUndocked(ctx);
+    }
+
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await ctx.sleep(30000); continue; }
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "frontier_survey")) {
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // ── Re-check mode (user may have changed it, or session restarted) ──
+    const modeCheck = getExplorerSettings(bot.username);
+    if (modeCheck.mode !== "frontier_survey") {
+      ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving frontier_survey...`);
+      return;
+    }
+
+    // ── Get current system data ──
+    yield "scan_system";
+    await bot.refreshLocation();
+    await bot.refreshShip();
+    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("info", `Frontier Survey ${bot.system} — ${bot.credits} cr, ${fuelPct}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
+
+    let { pois, connections, systemId } = await getSystemInfo(ctx);
+    if (!systemId) {
+      ctx.log("error", "Could not determine current system — waiting 30s");
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    // Track this system in frontier memory
+    systemPath.push(systemId);
+    
+    let frontierSys = frontierMemory.get(systemId);
+    if (!frontierSys) {
+      frontierSys = {
+        id: systemId,
+        name: systemId,
+        visited: true,
+        poisScanned: 0,
+        totalPois: 0,
+        connections: new Set(),
+        wormholeMap: new Map(),
+        lastVisit: Date.now(),
+        distanceFromEntry: explorationQueue.find(q => q.systemId === systemId)?.distance ?? 0,
+      };
+      frontierMemory.set(systemId, frontierSys);
+    } else {
+      frontierSys.visited = true;
+      frontierSys.lastVisit = Date.now();
+    }
+
+    // Scan for wormholes in this system to discover connections to other frontier systems
+    let currentFaintSignatures: FaintSignature[] = [];
+    
+    if (settings.scanPois) {
+      yield "survey_system";
+      const surveyResp = await bot.exec("survey_system");
+      if (await checkBattleAfterCommand(ctx, surveyResp.notifications, "survey_system")) {
+        ctx.log("combat", "Battle detected during survey - fleeing!");
+        await ctx.sleep(5000);
+        continue;
+      }
+      if (!surveyResp.error) {
+        const surveyResult = surveyResp.result as Record<string, unknown> | undefined;
+        if (surveyResult && typeof surveyResult === "object") {
+          bot.trackSurveyWildlife(surveyResult);
+          currentFaintSignatures = extractFaintSignatures(surveyResult);
+          
+          // Check for wormhole exits in survey result
+          const wormholeExit = surveyResult.poi as Record<string, unknown> | undefined;
+          const wormholeDestinationId = surveyResult.wormhole_destination_id as string | undefined;
+          if (wormholeExit && (wormholeExit.type === "wormhole_exit" || wormholeExit.type === "wormhole_entrance") && wormholeDestinationId) {
+            ctx.log("info", `🌌 Frontier wormhole detected: ${wormholeExit.name} -> ${wormholeDestinationId}`);
+            if (frontierSys) {
+              frontierSys.wormholeMap.set(wormholeExit.id as string, wormholeDestinationId);
+              frontierSys.connections.add(wormholeDestinationId);
+              
+              // Register the connected system in memory if not already known
+              if (!frontierMemory.has(wormholeDestinationId)) {
+                frontierMemory.set(wormholeDestinationId, {
+                  id: wormholeDestinationId,
+                  name: wormholeDestinationId,
+                  visited: false,
+                  poisScanned: 0,
+                  totalPois: 0,
+                  connections: new Set([systemId]),
+                  wormholeMap: new Map(),
+                  lastVisit: 0,
+                  distanceFromEntry: (frontierSys.distanceFromEntry ?? 0) + 1,
+                });
+                explorationQueue.push({ systemId: wormholeDestinationId, distance: (frontierSys.distanceFromEntry ?? 0) + 1 });
+                ctx.log("exploration", `🗺️ Discovered new frontier system: ${wormholeDestinationId} (${frontierSys.distanceFromEntry + 1} hops from entry)`);
+              } else {
+                const connectedSys = frontierMemory.get(wormholeDestinationId)!;
+                connectedSys.connections.add(systemId);
+              }
+              
+              // Register wormhole in mapStore
+              mapStore.registerWormhole(systemId, {
+                id: wormholeExit.id as string,
+                name: wormholeExit.name as string,
+                exit_system_id: systemId,
+                exit_system_name: bot.system || systemId,
+                exit_poi_id: wormholeExit.id as string,
+                exit_poi_name: wormholeExit.name as string,
+                destination_system_id: wormholeDestinationId,
+                destination_system_name: wormholeDestinationId,
+                expires_in_text: surveyResult.wormhole_expires_in as string | undefined,
+              });
+            }
+          }
+        }
+        const refreshed = await getSystemInfo(ctx);
+        if (refreshed.pois.length > pois.length) {
+          ctx.log("info", `Survey revealed ${refreshed.pois.length - pois.length} new POI(s) in ${systemId}!`);
+        }
+        pois = refreshed.pois;
+        connections = refreshed.connections;
+      } else {
+        const msg = surveyResp.error.message.toLowerCase();
+        if (!msg.includes("already") && !msg.includes("cooldown")) {
+          ctx.log("info", `Survey: ${surveyResp.error.message}`);
+        }
+      }
+    } else {
+      const info = await getSystemInfo(ctx);
+      pois = info.pois;
+      connections = info.connections;
+    }
+
+    // Also check connections for wormhole-type links to other frontier systems
+    for (const conn of connections) {
+      if (conn.id && !mapStore.getSystem(conn.id)) {
+        // This connected system is not in our mapStore - likely a frontier system
+        if (!frontierMemory.has(conn.id)) {
+          frontierMemory.set(conn.id, {
+            id: conn.id,
+            name: conn.name || conn.id,
+            visited: false,
+            poisScanned: 0,
+            totalPois: 0,
+            connections: new Set([systemId]),
+            wormholeMap: new Map(),
+            lastVisit: 0,
+            distanceFromEntry: (frontierSys?.distanceFromEntry ?? 0) + 1,
+          });
+          explorationQueue.push({ systemId: conn.id, distance: (frontierSys?.distanceFromEntry ?? 0) + 1 });
+          ctx.log("exploration", `🗺️ Discovered connected frontier system: ${conn.id} (${frontierSys?.distanceFromEntry + 1} hops from entry)`);
+        }
+        if (frontierSys) {
+          frontierSys.connections.add(conn.id);
+        }
+      }
+    }
+
+    // Also scan all POIs in this system for wormhole types and register them
+    for (const poi of pois) {
+      const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
+      if (isWormholePoi && frontierSys) {
+        if (!frontierSys.wormholeMap.has(poi.id)) {
+          frontierSys.wormholeMap.set(poi.id, "unknown");
+          ctx.log("info", `🌌 Found wormhole POI in ${systemId}: ${poi.name} (${poi.id}) - destination unknown until traversed`);
+        }
+      }
+    }
+
+    // Update system info with newly discovered POIs
+    frontierSys!.totalPois = pois.length;
+    frontierSys!.poisScanned = 0;
+
+    // Try to capture security level
+    await fetchSecurityLevel(ctx, systemId);
+
+    // ── Proactive pirate stronghold proximity check (even in frontier) ──
+    const proximityResult = await checkPirateStrongholdProximity(ctx, systemId, 4);
+    if (proximityResult.nearStronghold) {
+      ctx.log("combat", `[ALERT] Within ${proximityResult.jumpsToStronghold} jumps of pirate stronghold (${proximityResult.nearestStronghold})! Enhanced vigilance mode active.`);
+      yield "proximity_pirate_check";
+      const nearbyResp = await bot.exec("get_nearby");
+      if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
+        ctx.log("combat", "Battle detected during proximity check - fleeing immediately!");
+        if (await checkAndFleeFromBattle(ctx, "frontier_survey")) {
+          await ctx.sleep(5000);
+          continue;
+        }
+      }
+      if (nearbyResp.result && typeof nearbyResp.result === "object") {
+        bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+        const { parseNearbyForPirates } = await import("./common.js");
+        const pirateResult = parseNearbyForPirates(nearbyResp.result);
+        if (!bot.isCloaked || !settings.ignorePirateFleeWhenCloaked) {
+          if (pirateResult.hasPirates) {
+            ctx.log("combat", `[CRITICAL] Pirates detected near stronghold! ${pirateResult.pirateCount} pirate(s) spotted. Fleeing immediately!`);
+            await recordPirateSighting(ctx, systemId, pirateResult.pirates);
+            addTemporaryPirateBlacklist(systemId, 10);
+            await bot.refreshLocation();
+            const actualSystemId = bot.system;
+            ctx.log("combat", `Verified actual position before flee: system=${actualSystemId}`);
+            if (systemPath.length > 1) {
+              const fleeTarget = systemPath[systemPath.length - 2];
+              const fleeTargetConnected = connections.some(c => c.id === fleeTarget);
+              if (fleeTargetConnected) {
+                ctx.log("combat", `Fleeing back to ${fleeTarget} (reverse path)...`);
+                await ensureUndocked(ctx);
+                const fleeJump = await bot.exec("jump", { target_system: fleeTarget });
+                if (fleeJump.error) {
+                  const fleeMsg = fleeJump.error.message.toLowerCase();
+                  if (fleeJump.error.code === "battle_interrupt" || fleeMsg.includes("interrupted by battle") || fleeMsg.includes("interrupted by combat")) {
+                    ctx.log("combat", `Flee jump interrupted by battle! ${fleeJump.error.message} - using emergency flee!`);
+                    const { emergencyFleeFromPirates } = await import("./common.js");
+                    await emergencyFleeFromPirates(ctx, pirateResult);
+                  } else {
+                    ctx.log("error", `Failed to flee to ${fleeTarget}: ${fleeJump.error.message}`);
+                    const { emergencyFleeFromPirates } = await import("./common.js");
+                    await emergencyFleeFromPirates(ctx, pirateResult);
+                  }
+                } else {
+                  ctx.log("combat", `Successfully fled to ${fleeTarget}`);
+                  bot.stats.totalSystems++;
+                  systemPath.pop();
+                  await ctx.sleep(5000);
+                  continue;
+                }
+              } else {
+                const { emergencyFleeFromPirates } = await import("./common.js");
+                await emergencyFleeFromPirates(ctx, pirateResult);
+              }
+            } else {
+              const { emergencyFleeFromPirates } = await import("./common.js");
+              await emergencyFleeFromPirates(ctx, pirateResult);
+            }
+            await ctx.sleep(5000);
+            continue;
+          }
+        } else if (pirateResult.hasPirates && bot.isCloaked && settings.ignorePirateFleeWhenCloaked) {
+          ctx.log("combat", `[INFO] Pirates detected but cloaked - ignoring flee (ignorePirateFleeWhenCloaked enabled)`);
+        }
+      }
+    }
+
+    // ── Classify POIs and determine what needs visiting (thorough mode) ──
+    const toVisit: Array<{ poi: SystemPOI; reason: string }> = [];
+    let skippedCount = 0;
+
+    for (const poi of pois) {
+      const isStation = isStationPoi(poi);
+      const isMinable = isMinablePoi(poi.type);
+      const isScenic = isScenicPoi(poi.type);
+      const minutesAgo = mapStore.minutesSinceExplored(systemId, poi.id);
+
+      // In frontier mode, we scan EVERYTHING thoroughly unless explicitly quick mode
+      const isQuickMode = settings.surveyMode === "quick" && !settings.frontierThoroughScan;
+      
+      if (isStation) {
+        if (isQuickMode && minutesAgo < STATION_REFRESH_MINS) { skippedCount++; continue; }
+        toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : "refresh" });
+      } else if (isMinable) {
+        const storedPoi = mapStore.getSystem(systemId)?.pois.find(p => p.id === poi.id);
+        const hasResourceData = (storedPoi?.resources?.length ?? 0) > 0;
+        if (isQuickMode && hasResourceData) {
+          if (minutesAgo < RESOURCE_REFRESH_MINS) { skippedCount++; continue; }
+        }
+        if (!hasResourceData) {
+          toVisit.push({ poi, reason: "needs-resource-scan" });
+        } else if (isQuickMode && minutesAgo < RESOURCE_REFRESH_MINS) {
+          skippedCount++; continue;
+        } else {
+          toVisit.push({ poi, reason: "refresh" });
+        }
+      } else if (isScenic) {
+        if (isQuickMode) { skippedCount++; continue; }
+        if (minutesAgo < Infinity) { skippedCount++; continue; }
+        toVisit.push({ poi, reason: "new" });
+      } else {
+        if (isQuickMode) { skippedCount++; continue; }
+        if (minutesAgo < RESOURCE_REFRESH_MINS) { skippedCount++; continue; }
+        toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : "refresh" });
+      }
+    }
+
+    // Chase faint signatures (creature hints) - always in frontier mode
+    if (currentFaintSignatures.length > 0) {
+      const sigPois = findPoisFromFaintSignatures(currentFaintSignatures, pois);
+      for (const poi of sigPois) {
+        if (!toVisit.some((t) => t.poi.id === poi.id)) {
+          toVisit.push({ poi, reason: "faint-signature" });
+        }
+      }
+      if (sigPois.length > 0) {
+        ctx.log("wildlife", `Following ${sigPois.length} faint signature(s) to potential creature location(s): ${sigPois.map((p) => p.name).join(", ")}`);
+      }
+    }
+
+    if (toVisit.length === 0) {
+      ctx.log("info", `${systemId}: all ${skippedCount} POIs up to date — moving on`);
+    } else {
+      ctx.log("info", `${systemId}: ${toVisit.length} to visit, ${skippedCount} already explored`);
+    }
+
+    // ── Hull check — repair if <= 40% ──
+    await bot.refreshShip();
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (hullPct <= 40) {
+      ctx.log("system", `Hull critical (${hullPct}%) — finding station for repair`);
+      const docked = await ensureDocked(ctx);
+      if (docked) {
+         await repairShip(ctx);
+      }
+    }
+
+    // ── Ensure fueled before exploring ──
+    yield "fuel_check";
+    const fueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
+    if (!fueled) {
+      ctx.log("error", "Could not refuel — waiting 30s before retry...");
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    // If hull repair or refueling moved us to a different system, restart the loop
+    await bot.refreshLocation();
+    if (bot.system !== systemId) {
+      ctx.log("info", `Moved to ${bot.system} during repair/refuel — restarting system scan`);
+      continue;
+    }
+
+    // ── Undock if docked ──
+    await ensureUndocked(ctx);
+
+    // Find station for emergency refueling
+    const station = findStation(pois);
+
+    // ── Visit each POI ──
+    let wormholeJumped = false;
+    for (const { poi, reason } of toVisit) {
+      if (bot.state !== "running") break;
+      updateExplorerPosition(bot.username, systemId, poi.id);
+
+      const isMinable = isMinablePoi(poi.type);
+      const isStation = isStationPoi(poi);
+
+      // Check fuel before traveling to each POI
+      yield "fuel_check";
+      const poiFueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
+      if (!poiFueled) {
+        ctx.log("error", "Could not refuel — restarting system loop...");
+        break;
+      }
+      await bot.refreshLocation();
+      if (bot.system !== systemId) {
+        ctx.log("info", `Moved to ${bot.system} during refuel — restarting system scan`);
+        break;
+      }
+      await ensureUndocked(ctx);
+
+      yield `visit_${poi.id}`;
+      const travelResp = await bot.exec("travel", { target_poi: poi.id });
+
+      if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+        ctx.log("combat", "Battle detected during travel - fleeing!");
+        await ctx.sleep(5000);
+        continue;
+      }
+
+      if (travelResp.error && !travelResp.error.message.includes("already")) {
+        ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
+        continue;
+      }
+      bot.poi = poi.id;
+
+      // ── Wormhole test: travel to wh POI then jump with same POI id ──
+      const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
+      if (isWormholePoi) {
+        ctx.log("info", `🌌 Testing frontier wormhole ${poi.id}...`);
+        yield `test_wormhole_${poi.id}`;
+        const jumpResp = await bot.exec("jump", { target_poi: poi.id });
+        if (jumpResp.error) {
+          ctx.log("warn", `Wormhole ${poi.id} jump failed: ${jumpResp.error.message} — marking POI explored and moving on`);
+          mapStore.markExplored(systemId, poi.id);
+          await bot.refreshLocation();
+          continue;
+        }
+        const r = jumpResp.result as Record<string, unknown> | undefined;
+        if (r && r.action === "jumped") {
+          const fromSystemName = (r.from_system as string) || systemId;
+          const exitPoi = (r.poi as string) || poi.id;
+          const destSystemName = (r.system as string) || "";
+          const destSystemId = (r.system_id as string)
+            || (bot.system && bot.system !== systemId ? bot.system : "");
+          ctx.log("info", `🌌 Frontier wormhole jumped: ${fromSystemName} -> ${destSystemName || destSystemId} (${exitPoi})`);
+          if (destSystemId) {
+            // Update frontier memory with the new connection
+            if (frontierSys) {
+              frontierSys.connections.add(destSystemId);
+              frontierSys.wormholeMap.set(poi.id, destSystemId);
+            }
+            
+            // Register the destination system in frontier memory
+            if (!frontierMemory.has(destSystemId)) {
+              frontierMemory.set(destSystemId, {
+                id: destSystemId,
+                name: destSystemId,
+                visited: false,
+                poisScanned: 0,
+                totalPois: 0,
+                connections: new Set([systemId]),
+                wormholeMap: new Map(),
+                lastVisit: 0,
+                distanceFromEntry: (frontierSys?.distanceFromEntry ?? 0) + 1,
+              });
+              explorationQueue.push({ systemId: destSystemId, distance: (frontierSys?.distanceFromEntry ?? 0) + 1 });
+              ctx.log("exploration", `🗺️ Discovered new frontier system via wormhole: ${destSystemId} (${frontierSys?.distanceFromEntry + 1} hops from entry)`);
+            } else {
+              const connectedSys = frontierMemory.get(destSystemId)!;
+              connectedSys.connections.add(systemId);
+            }
+
+            mapStore.registerWormhole(destSystemId, {
+              id: exitPoi,
+              name: exitPoi,
+              exit_system_id: destSystemId,
+              exit_system_name: destSystemName || destSystemId,
+              exit_poi_id: exitPoi,
+              exit_poi_name: exitPoi,
+              destination_system_id: systemId,
+              destination_system_name: fromSystemName,
+            });
+          } else {
+            ctx.log("warn", `Wormhole ${poi.id} jumped but no destination system id was reported — not recording it`);
+          }
+          mapStore.markExplored(systemId, poi.id);
+          if (destSystemId) mapStore.markExplored(destSystemId, exitPoi);
+        }
+        await bot.refreshLocation();
+        if (bot.system && bot.system !== systemId) {
+          wormholeJumped = true;
+          break;
+        }
+        continue;
+      }
+
+      // Scavenge wrecks/containers at each POI (only if enabled)
+      if (settings.scavengeEnabled) {
+        yield "scavenge";
+        const scavengeResult = await scavengeWrecks(ctx);
+        if (await checkAndFleeFromBattle(ctx, "scavenge")) {
+          await ctx.sleep(5000);
+          continue;
+        }
+      }
+
+      if (isMinable) {
+        yield* scanResourcePoi(ctx, systemId, poi);
+      } else if (isStation) {
+        yield* scanStation(ctx, systemId, poi);
+      } else {
+        yield* visitOtherPoi(ctx, systemId, poi, fledFromSystems);
+      }
+
+      frontierSys!.poisScanned++;
+
+      // Check cargo — if full with non-fuel-cell items, return to the home base to deposit
+      await bot.refreshCargoAndStorage();
+      if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
+        const cargoResp = await bot.exec("get_cargo");
+        let isOnlyFuelCells = true;
+        let fuelCellCount = 0;
+        if (cargoResp.result && typeof cargoResp.result === "object") {
+          const cResult = cargoResp.result as Record<string, unknown>;
+          const cargoItems = (
+            Array.isArray(cResult) ? cResult :
+            Array.isArray(cResult.items) ? (cResult.items as Array<Record<string, unknown>>) :
+            Array.isArray(cResult.cargo) ? (cResult.cargo as Array<Record<string, unknown>>) :
+            []
+          );
+          for (const item of cargoItems) {
+            const itemId = (item.item_id as string) || "";
+            const quantity = (item.quantity as number) || 0;
+            if (!itemId.toLowerCase().includes("fuel_cell")) {
+              isOnlyFuelCells = false;
+              break;
+            }
+            fuelCellCount += quantity;
+          }
+        }
+        if (!isOnlyFuelCells) {
+          yield "deposit_cargo";
+          await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+          await bot.refreshLocation();
+          if (bot.system !== systemId) {
+            ctx.log("info", `Moved to ${bot.system} after deposit — restarting system scan`);
+            break;
+          }
+        } else {
+          ctx.log("info", `Cargo full with fuel cells (${fuelCellCount} fuel cells, ${bot.cargo}/${bot.cargoMax} cargo) — continuing exploration`);
+        }
+      }
+    }
+
+    if (bot.state !== "running") break;
+
+    // A wormhole dropped us in a brand new system — rescan it from scratch
+    if (wormholeJumped) {
+      ctx.log("info", `Arrived in ${bot.system} via frontier wormhole — restarting system scan`);
+      continue;
+    }
+
+    // ── Check skills for level-ups ──
+    yield "check_skills";
+    await bot.checkSkills();
+
+    // ── Check fuel cell depletion — return to home base if enabled and no fuel cells left ──
+    if (settings.returnToHomeOnFuelCellDepletion) {
+      const fuelCellCheck = await checkFuelCellInventory(ctx);
+      if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
+        yield "return_to_home_fuel_cells";
+        const returned = await returnToHomeBaseForFuelCells(ctx);
+        if (returned) {
+          await bot.refreshLocation();
+          ctx.log("info", `Returned to home base — continuing frontier survey`);
+          continue;
+        }
+      }
+    }
+
+    // ── Check if we should auto-return due to low fuel ──
+    if (settings.frontierAutoReturn && fuelPct <= settings.frontierFuelThreshold) {
+      ctx.log("system", `Fuel low (${fuelPct}% <= ${settings.frontierFuelThreshold}%) — attempting to return to known space...`);
+      if (entrySystemId && systemId !== entrySystemId) {
+        // Try to navigate back towards entry system
+        ctx.log("travel", `Attempting return to entry system ${entrySystemId}...`);
+        const blacklist = getEffectiveSystemBlacklist(bot);
+        const arrived = await navigateToSystem(ctx, entrySystemId, { 
+          fuelThresholdPct: settings.frontierFuelThreshold, 
+          hullThresholdPct: 30, 
+          skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked 
+        });
+        if (arrived) {
+          ctx.log("system", `Returned to entry system ${entrySystemId} — continuing frontier survey`);
+          continue;
+        }
+      }
+      // If we can't get back to entry, try home base
+      const homeOk = await returnToHomeBaseForFuelCells(ctx);
+      if (homeOk) {
+        ctx.log("system", "Returned to home base from frontier — survey complete");
+        return; // Exit the routine
+      }
+    }
+
+    // ── Check for unexplored wormhole POIs in current system FIRST ──
+    const unexploredWormholes: string[] = [];
+    if (frontierSys) {
+      for (const [poiId, destId] of frontierSys.wormholeMap.entries()) {
+        if (destId === "unknown") {
+          unexploredWormholes.push(poiId);
+        }
+      }
+    }
+    
+    if (unexploredWormholes.length > 0) {
+      // Prioritize exploring unknown wormholes in current system
+      const wormholePoi = unexploredWormholes[0];
+      ctx.log("exploration", `Found unexplored wormhole ${wormholePoi} in ${systemId} — attempting to traverse to discover new system`);
+      
+      // Travel to wormhole POI and jump
+      await ensureUndocked(ctx);
+      const travelToWh = await bot.exec("travel", { target_poi: wormholePoi });
+      if (!travelToWh.error || travelToWh.error.message.includes("already")) {
+        const jumpResp = await bot.exec("jump", { target_poi: wormholePoi });
+        if (!jumpResp.error) {
+          const r = jumpResp.result as Record<string, unknown> | undefined;
+          if (r && r.action === "jumped") {
+            ctx.log("info", `🌌 Traversed unknown wormhole ${wormholePoi} — discovering new system`);
+            await bot.refreshLocation();
+            continue; // Restart loop to scan new system
+          }
+        }
+      }
+      // If jump failed, mark as explored and continue
+      if (frontierSys) {
+        frontierSys.wormholeMap.set(wormholePoi, "failed");
+      }
+    }
+
+    // ── Pick next frontier system to explore ──
+    yield "pick_next_frontier_system";
+
+    // Filter exploration queue: only unvisited systems within max depth
+    const validTargets = explorationQueue
+      .filter(q => {
+        const sys = frontierMemory.get(q.systemId);
+        return sys && !sys.visited && q.distance <= settings.frontierMaxDepth;
+      })
+      .sort((a, b) => a.distance - b.distance); // Nearest first (BFS order)
+
+    ctx.log("debug", `Frontier survey queue: ${explorationQueue.length} total, ${validTargets.length} valid targets (maxDepth=${settings.frontierMaxDepth})`);
+
+    if (validTargets.length === 0) {
+      ctx.log("info", "No more unvisited frontier systems within max depth — frontier survey complete!");
+      if (entrySystemId && systemId !== entrySystemId) {
+        ctx.log("travel", `Returning to entry system ${entrySystemId}...`);
+        const blacklist = getEffectiveSystemBlacklist(bot);
+        const arrived = await navigateToSystem(ctx, entrySystemId, { 
+          fuelThresholdPct: settings.frontierFuelThreshold, 
+          hullThresholdPct: 30, 
+          skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked 
+        });
+        if (arrived) {
+          ctx.log("system", `Returned to entry system ${entrySystemId} — survey complete`);
+        }
+      }
+      if (settings.frontierAutoReturn) {
+        await returnToHomeBaseForFuelCells(ctx);
+      }
+      return; // Exit the routine when complete
+    }
+
+    const target = validTargets[0];
+    ctx.log("exploration", `Frontier Survey: targeting ${target.systemId} (${target.distance} hops from entry, ${validTargets.length} systems remaining in queue)`);
+
+    // Ensure fueled before navigating
+    yield "pre_navigation_fuel";
+    const navFueled = await ensureFueled(ctx, settings.refuelThreshold);
+    if (!navFueled) {
+      ctx.log("error", "Could not refuel for navigation — waiting 30s...");
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    await ensureUndocked(ctx);
+
+    // Navigate to target system using frontier graph pathfinding
+    // Find path through frontier systems using wormholes
+    const path = findFrontierPath(frontierMemory, systemId, target.systemId);
+    
+    let arrived = false;
+    if (path && path.length > 1) {
+      // Path found: current -> ... -> target
+      // Traverse step by step
+      for (let i = 1; i < path.length; i++) {
+        const nextSystemId = path[i];
+        const currentSystemMemory = frontierMemory.get(path[i - 1]);
+        
+        if (!currentSystemMemory) {
+          ctx.log("error", `No memory for system ${path[i - 1]} in path`);
+          break;
+        }
+        
+        // Find wormhole POI that leads to next system
+        let wormholePoi: string | null = null;
+        for (const [poiId, destId] of currentSystemMemory.wormholeMap.entries()) {
+          if (destId === nextSystemId) {
+            wormholePoi = poiId;
+            break;
+          }
+        }
+        
+        if (wormholePoi) {
+          ctx.log("travel", `Using wormhole ${wormholePoi} to reach ${nextSystemId}`);
+          // Travel to wormhole POI and jump
+          const travelToWh = await bot.exec("travel", { target_poi: wormholePoi });
+          if (travelToWh.error && !travelToWh.error.message.includes("already")) {
+            ctx.log("error", `Failed to reach wormhole ${wormholePoi}: ${travelToWh.error.message}`);
+            break;
+          }
+          const jumpResp = await bot.exec("jump", { target_poi: wormholePoi });
+          if (jumpResp.error) {
+            ctx.log("error", `Wormhole jump failed: ${jumpResp.error.message}`);
+            break;
+          }
+          const r = jumpResp.result as Record<string, unknown> | undefined;
+          if (r && r.action === "jumped") {
+            // Successfully jumped, continue to next step
+            await bot.refreshLocation();
+            if (bot.system === nextSystemId) {
+              ctx.log("travel", `Arrived at ${nextSystemId} via wormhole`);
+              if (i === path.length - 1) {
+                arrived = true;
+              }
+              continue;
+            } else {
+              ctx.log("warn", `Jumped but not at expected system ${nextSystemId}, at ${bot.system}`);
+              // We might have jumped to an unexpected system, continue from there
+              continue;
+            }
+          }
+        } else {
+          ctx.log("warn", `No wormhole found from ${path[i - 1]} to ${nextSystemId}, trying direct navigation`);
+          // Try direct navigation as fallback
+          const directArrived = await navigateToSystem(ctx, nextSystemId, { 
+            fuelThresholdPct: settings.refuelThreshold, 
+            hullThresholdPct: 30, 
+            skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked 
+          });
+          if (!directArrived) {
+            ctx.log("error", `Could not reach ${nextSystemId} via direct navigation`);
+            break;
+          }
+          if (i === path.length - 1) {
+            arrived = true;
+          }
+        }
+      }
+    } else if (path && path.length === 1) {
+      // Already at target
+      ctx.log("travel", `Already at target system ${target.systemId}`);
+      arrived = true;
+    }
+    
+    if (!arrived) {
+      // Fall back to navigateToSystem which uses find_route
+      ctx.log("travel", `No frontier path found, trying server route to ${target.systemId}...`);
+      arrived = await navigateToSystem(ctx, target.systemId, { 
+        fuelThresholdPct: settings.refuelThreshold, 
+        hullThresholdPct: 30, 
+        skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked 
+      });
+    }
+    
+    if (!arrived) {
+      ctx.log("error", `Could not reach ${target.systemId} — will retry next loop`);
+      await ctx.sleep(10000);
+      continue;
+    }
+    
+    ctx.log("travel", `Arrived at frontier system ${target.systemId}`);
+    bot.stats.totalSystems++;
+    systemPath.push(target.systemId);
+
+    // Update visited status from server after arrival
+    yield "update_visited_status";
+    const updateMapResp = await bot.exec("get_map");
+    if (updateMapResp.result && typeof updateMapResp.result === "object") {
+      const mapData = updateMapResp.result as Record<string, unknown>;
+      const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+      for (const sys of systems) {
+        const sysId = (sys.system_id as string) || (sys.id as string);
+        if (sysId) {
+          mapStore.updateSystem(sys);
+        }
+      }
+    }
+    
+    await checkCustomsInspection(ctx, systemId);
+
+    // Check for pirates and battle
+    const nearbyResp = await bot.exec("get_nearby");
+    if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
+      ctx.log("error", "Battle detected after arrival - fleeing!");
+      await ctx.sleep(30000);
+      continue;
+    }
+    if (nearbyResp.result && typeof nearbyResp.result === "object") {
+      bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+      if (!bot.isCloaked || !settings.ignorePirateFleeWhenCloaked) {
+        const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+        if (fled) {
+          ctx.log("error", "Pirates detected - fled, will retry");
+          fledFromSystems.add(systemId);
+          await ctx.sleep(30000);
+          continue;
+        }
+      }
+    }
+    
+    // Continue to next iteration to explore this system's POIs
     continue;
   }
 }

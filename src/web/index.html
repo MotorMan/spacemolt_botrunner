@@ -5360,6 +5360,8 @@
         <option value="visit_all"${explorerMode === "visit_all" ? " selected" : ""}>Visit all systems</option>
         <option value="achievement"${explorerMode === "achievement" ? " selected" : ""}>Achievement (visit all 505)</option>
         <option value="fixed_route"${explorerMode === "fixed_route" ? " selected" : ""}>Fixed Route (pre-determined path)</option>
+        <option value="frontier_exploration"${explorerMode === "frontier_exploration" ? " selected" : ""}>Frontier Exploration (auto on wormhole)</option>
+        <option value="frontier_survey"${explorerMode === "frontier_survey" ? " selected" : ""}>Frontier Survey (manual pocket scan)</option>
       </select>
       <span class="profile-ore-label" style="margin-left:8px">Direct to Unknown:</span>
       <select id="profile-directToUnknown" onchange="saveProfileDirectToUnknown()" style="width:auto;padding:2px 6px;font-size:11px">

@@ -4004,7 +4004,9 @@ async function hasCloakModule(ctx: RoutineContext): Promise<boolean> {
 
 /** Build a local adjacency list (lower-cased system ids) from mapStore
  *  connections plus the two static wormholes. Dynamic wormholes are
- *  excluded. Does not mutate mapStore. */
+ *  excluded. Does not mutate mapStore.
+ *  Only includes systems in the main connected component (original 506 systems),
+ *  excluding frontier systems that are only reachable via temporary wormholes. */
 function buildFixedRouteGraph(bot: { routineName: string | null }, cloakAvailable: boolean): Map<string, Set<string>> {
   const graph = new Map<string, Set<string>>();
   const addNode = (id: string): void => {
@@ -4020,6 +4022,7 @@ function buildFixedRouteGraph(bot: { routineName: string | null }, cloakAvailabl
 
   const blacklistSet = new Set(getEffectiveSystemBlacklist(bot).map((b) => b.toLowerCase()));
 
+  // First pass: build full graph
   for (const sys of mapStore.getSystems()) {
     const sysId = sys.id.toLowerCase();
     if (!cloakAvailable && blacklistSet.has(sysId)) continue;
@@ -4034,6 +4037,94 @@ function buildFixedRouteGraph(bot: { routineName: string | null }, cloakAvailabl
 
   for (const [a, b] of STATIC_WORMHOLES) {
     addEdge(a, b);
+  }
+
+  // Second pass: find the main connected component containing the home system (or "sol")
+  // This excludes frontier systems that are only connected via temporary wormholes
+  const homeBase = getGlobalHomeBase();
+  const homeSystem = (homeBase.system || "sol").toLowerCase();
+  
+  // Find connected component from home system
+  const mainComponent = new Set<string>();
+  const queue = [homeSystem];
+  mainComponent.add(homeSystem);
+  
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const neighbors = graph.get(current);
+    if (!neighbors) continue;
+    for (const nb of neighbors) {
+      if (!mainComponent.has(nb)) {
+        mainComponent.add(nb);
+        queue.push(nb);
+      }
+    }
+  }
+
+  // If home system not in graph (e.g., first run), use largest component
+  if (mainComponent.size <= 1) {
+    // Find largest connected component
+    const visited = new Set<string>();
+    let largestComponent = new Set<string>();
+    
+    for (const node of graph.keys()) {
+      if (visited.has(node)) continue;
+      const component = new Set<string>();
+      const compQueue = [node];
+      component.add(node);
+      visited.add(node);
+      
+      while (compQueue.length > 0) {
+        const current = compQueue.shift()!;
+        const neighbors = graph.get(current);
+        if (!neighbors) continue;
+        for (const nb of neighbors) {
+          if (!visited.has(nb)) {
+            visited.add(nb);
+            component.add(nb);
+            compQueue.push(nb);
+          }
+        }
+      }
+      
+      if (component.size > largestComponent.size) {
+        largestComponent = component;
+      }
+    }
+    
+    // Keep only the largest component (main network)
+    for (const node of graph.keys()) {
+      if (!largestComponent.has(node)) {
+        graph.delete(node);
+      } else {
+        // Remove edges to nodes outside the component
+        const neighbors = graph.get(node);
+        if (neighbors) {
+          for (const nb of [...neighbors]) {
+            if (!largestComponent.has(nb)) {
+              neighbors.delete(nb);
+            }
+          }
+        }
+      }
+    }
+  } else {
+    // Keep only the main component containing home system
+    for (const node of graph.keys()) {
+      if (!mainComponent.has(node)) {
+        graph.delete(node);
+      } else {
+        // Remove edges to nodes outside the component
+        const neighbors = graph.get(node);
+        if (neighbors) {
+          for (const nb of [...neighbors]) {
+            if (!mainComponent.has(nb)) {
+              neighbors.delete(nb);
+            }
+          }
+        }
+      }
+    }
   }
 
   return graph;

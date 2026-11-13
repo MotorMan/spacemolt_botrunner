@@ -1318,7 +1318,12 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           // Check if this is a NEW frontier system (not in mapStore at all)
           const isNewFrontierSystem = !mapStore.getSystem(bot.system);
           
-          if (isNewFrontierSystem && explorerSettings.mode !== "frontier_exploration") {
+          // Also check if the destination is in the main network (original 506 systems)
+          // If so, don't switch to frontier mode - we just used a regular galaxy wormhole
+          const mainNetwork = getMainNetworkSystems();
+          const isInMainNetwork = mainNetwork.has(bot.system.toLowerCase());
+          
+          if (isNewFrontierSystem && !isInMainNetwork && explorerSettings.mode !== "frontier_exploration") {
             ctx.log("exploration", `🌌 NEW FRONTIER SYSTEM DISCOVERED: ${bot.system} — switching to frontier_exploration mode!`);
             ctx.log("exploration", `This system was not in our map — it's a previously unknown system accessible only via wormhole.`);
             
@@ -1329,6 +1334,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             // and switch to frontierExplorationRoutine
             wormholeJumped = true;
             break;
+          }
+          
+          if (isInMainNetwork) {
+            ctx.log("travel", `Wormhole jump arrived in main network system ${bot.system} — staying in ${explorerSettings.mode} mode`);
           }
           
           wormholeJumped = true;
@@ -4147,6 +4156,95 @@ function buildFixedRouteGraph(bot: { routineName: string | null }, cloakAvailabl
   return graph;
 }
 
+/**
+ * Get the set of system IDs in the main connected component (the original ~506 systems).
+ * Uses the same logic as buildFixedRouteGraph to identify the main network.
+ * Returns a Set of lowercase system IDs.
+ */
+export function getMainNetworkSystems(): Set<string> {
+  // Build a temporary graph to find the main component
+  const graph = new Map<string, Set<string>>();
+  const addNode = (id: string): void => {
+    const key = id.toLowerCase();
+    if (!graph.has(key)) graph.set(key, new Set());
+  };
+  const addEdge = (a: string, b: string): void => {
+    addNode(a);
+    addNode(b);
+    graph.get(a.toLowerCase())!.add(b.toLowerCase());
+    graph.get(b.toLowerCase())!.add(a.toLowerCase());
+  };
+
+  const blacklistSet = new Set(getGlobalHomeBase().system ? [] : []); // No blacklist for network detection
+
+  for (const sys of mapStore.getSystems()) {
+    addNode(sys.id);
+    for (const conn of sys.connections || []) {
+      if (!conn.system_id) continue;
+      addEdge(sys.id, conn.system_id);
+    }
+  }
+
+  for (const [a, b] of STATIC_WORMHOLES) {
+    addEdge(a, b);
+  }
+
+  // Find connected component from home system
+  const homeBase = getGlobalHomeBase();
+  const homeSystem = (homeBase.system || "sol").toLowerCase();
+  
+  const mainComponent = new Set<string>();
+  const queue = [homeSystem];
+  mainComponent.add(homeSystem);
+  
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const neighbors = graph.get(current);
+    if (!neighbors) continue;
+    for (const nb of neighbors) {
+      if (!mainComponent.has(nb)) {
+        mainComponent.add(nb);
+        queue.push(nb);
+      }
+    }
+  }
+
+  // If home system not in graph, use largest component
+  if (mainComponent.size <= 1) {
+    const visited = new Set<string>();
+    let largestComponent = new Set<string>();
+    
+    for (const node of graph.keys()) {
+      if (visited.has(node)) continue;
+      const component = new Set<string>();
+      const compQueue = [node];
+      component.add(node);
+      visited.add(node);
+      
+      while (compQueue.length > 0) {
+        const current = compQueue.shift()!;
+        const neighbors = graph.get(current);
+        if (!neighbors) continue;
+        for (const nb of neighbors) {
+          if (!visited.has(nb)) {
+            visited.add(nb);
+            component.add(nb);
+            compQueue.push(nb);
+          }
+        }
+      }
+      
+      if (component.size > largestComponent.size) {
+        largestComponent = component;
+      }
+    }
+    
+    return largestComponent;
+  }
+
+  return mainComponent;
+}
+
 /** BFS hop distances from `start` over the local fixed-route graph. */
 function graphDistances(graph: Map<string, Set<string>>, start: string): Map<string, number> {
   const dist = new Map<string, number>();
@@ -4876,6 +4974,16 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       ctx.log("system", "Mode changed to frontier_survey — switching routines...");
       yield* frontierSurveyRoutine(ctx);
       return;
+    }
+
+    // ── Check if we're back in the main network (original 506 systems) ──
+    // If so, switch back to fixed_route mode since we've exited the frontier pocket
+    const mainNetwork = getMainNetworkSystems();
+    if (mainNetwork.has(bot.system?.toLowerCase() || "")) {
+      ctx.log("system", `Back in main network (${bot.system}) — switching to fixed_route mode`);
+      setExplorerMode(bot.username, "fixed_route");
+      // The mode check at the top of the loop will handle the switch
+      continue;
     }
 
     // ── Get current system data ──
@@ -5752,6 +5860,16 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
     if (modeCheck.mode !== "frontier_survey") {
       ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving frontier_survey...`);
       return;
+    }
+
+    // ── Check if we're back in the main network (original 506 systems) ──
+    // If so, switch back to fixed_route mode since we've exited the frontier pocket
+    const mainNetwork = getMainNetworkSystems();
+    if (mainNetwork.has(bot.system?.toLowerCase() || "")) {
+      ctx.log("system", `Back in main network (${bot.system}) — switching to fixed_route mode`);
+      setExplorerMode(bot.username, "fixed_route");
+      // The mode check at the top of the loop will handle the switch
+      continue;
     }
 
     // ── Get current system data ──

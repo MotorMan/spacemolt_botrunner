@@ -1419,10 +1419,10 @@ yield "deposit_cargo";
       const fuelCellCheck = await checkFuelCellInventory(ctx);
       // Only return if we previously had fuel cells (cargo was full with them) but now they're gone
       // This prevents unnecessary trips when we never loaded fuel cells in the first place
-      if (fuelCellCheck.totalFuelCells < 3) {
-        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock military fuel cells`);
+if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
         yield "return_to_home_fuel_cells";
-        const returned = await returnToHomeBaseForFuelCells(ctx);
+        const returned = await returnToHomeBaseForFuelCells(ctx, true);
         if (returned) {
           await bot.refreshLocation();
           ctx.log("info", `Returned to home base — continuing exploration`);
@@ -5404,7 +5404,8 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
         const arrived = await navigateToSystem(ctx, entrySystemId, { 
           fuelThresholdPct: settings.frontierFuelThreshold, 
           hullThresholdPct: 30, 
-          skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked 
+          skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked,
+          allowWormholes: true
         });
         if (arrived) {
           ctx.log("system", `Returned to entry system ${entrySystemId} — continuing frontier exploration`);
@@ -5412,7 +5413,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
         }
       }
       // If we can't get back to entry, try home base
-      const homeOk = await returnToHomeBaseForFuelCells(ctx);
+      const homeOk = await returnToHomeBaseForFuelCells(ctx, true);
       if (homeOk) {
         ctx.log("system", "Returned to home base from frontier — will re-enter when ready");
         // Don't break - continue in case we're back in known space
@@ -5472,7 +5473,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       ctx.log("info", "No more unvisited frontier systems within max depth — frontier exploration complete!");
       if (settings.frontierAutoReturn) {
         ctx.log("system", "Returning to home base...");
-        await returnToHomeBaseForFuelCells(ctx);
+        await returnToHomeBaseForFuelCells(ctx, true);
       }
       await ctx.sleep(60000);
       continue;
@@ -6272,7 +6273,8 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
         const arrived = await navigateToSystem(ctx, entrySystemId, { 
           fuelThresholdPct: settings.frontierFuelThreshold, 
           hullThresholdPct: 30, 
-          skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked 
+          skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked,
+          allowWormholes: true
         });
         if (arrived) {
           ctx.log("system", `Returned to entry system ${entrySystemId} — continuing frontier survey`);
@@ -6280,7 +6282,7 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
         }
       }
       // If we can't get back to entry, try home base
-      const homeOk = await returnToHomeBaseForFuelCells(ctx);
+      const homeOk = await returnToHomeBaseForFuelCells(ctx, true);
       if (homeOk) {
         ctx.log("system", "Returned to home base from frontier — survey complete");
         return; // Exit the routine
@@ -6350,7 +6352,7 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
         }
       }
       if (settings.frontierAutoReturn) {
-        await returnToHomeBaseForFuelCells(ctx);
+        await returnToHomeBaseForFuelCells(ctx, true);
       }
       return; // Exit the routine when complete
     }
@@ -7134,7 +7136,7 @@ async function checkFuelCellInventory(ctx: RoutineContext): Promise<{
  * cells. Navigates to the home system, docks at the home station, and loads fuel
  * cells to max cargo. No longer hardcodes Sol Central / sol_station.
  */
-async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolean> {
+async function returnToHomeBaseForFuelCells(ctx: RoutineContext, allowWormholes: boolean = false): Promise<boolean> {
   const { bot } = ctx;
 
   const home = getGlobalHomeBase();
@@ -7146,7 +7148,7 @@ async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolea
   // Navigate to the configured home system
   if (bot.system !== homeSystem) {
     await ensureUndocked(ctx);
-    const arrived = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 30, skipBlacklist: true, homeSystem, homeStation: home.station });
+    const arrived = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 30, skipBlacklist: true, homeSystem, homeStation: home.station, allowWormholes });
     if (!arrived) {
       ctx.log("error", `Could not reach ${homeSystem} — aborting fuel cell reload`);
       return false;

@@ -5478,7 +5478,7 @@
           const hunterMode = normalizeHunterMode(botSettings.hunterMode || "roam_systems");
           actions += `
       <span class="profile-ore-label">Mode:</span>
-      <select id="profile-hunterMode" onchange="saveProfileHunterMode()">
+<select id="profile-hunterMode" onchange="saveProfileHunterMode()">
         <option value="roam_systems"${hunterMode === "roam_systems" ? " selected" : ""}>Roam systems</option>
         <option value="roam_system"${hunterMode === "roam_system" ? " selected" : ""}>Roam current system</option>
         <option value="stationary"${hunterMode === "stationary" ? " selected" : ""}>Stationary</option>
@@ -5486,13 +5486,14 @@
         <option value="cycle_patrols"${hunterMode === "cycle_patrols" ? " selected" : ""}>Cycle patrols</option>
         <option value="patrol_radius"${hunterMode === "patrol_radius" ? " selected" : ""}>Patrol radius</option>
         <option value="station_protection"${hunterMode === "station_protection" ? " selected" : ""}>Station Protection</option>
+        <option value="protect_here"${hunterMode === "protect_here" ? " selected" : ""}>Protect Here (stationary, 3-tick delay)</option>
         <option value="creature_farm"${hunterMode === "creature_farm" ? " selected" : ""}>Creature Farm</option>
         <option value="creature_farm_random"${hunterMode === "creature_farm_random" ? " selected" : ""}>Creature Farm (Random Systems)</option>
         <option value="hunt_big_creatures"${hunterMode === "hunt_big_creatures" ? " selected" : ""}>Hunt Big Creatures (explorer data)</option>
         <option value="fleet_arena"${hunterMode === "fleet_arena" ? " selected" : ""}>Fleet/Arena Mode (idle until battle)</option>
         <option value="pvp"${hunterMode === "pvp" ? " selected" : ""}>PVP (camp POI, attack player)</option>
         <option value="boarding"${hunterMode === "boarding" ? " selected" : ""}>Boarding (patrol + board eligible targets)</option>
-          </select>`;
+      </select>`;
 
           // Per-bot PVP target player override (only shown in pvp mode).
           if (hunterMode === "pvp") {
@@ -33179,6 +33180,7 @@ ignoreBlacklist: document.getElementById(
           <option value="cycle_patrols">Cycle patrols</option>
           <option value="patrol_radius">Patrol radius</option>
           <option value="station_protection">Station Protection</option>
+          <option value="protect_here">Protect Here (stationary, 3-tick delay)</option>
           <option value="creature_farm">Creature Farm</option>
           <option value="creature_farm_random">Creature Farm (Random Systems)</option>
           <option value="hunt_big_creatures">Hunt Big Creatures (explorer data)</option>

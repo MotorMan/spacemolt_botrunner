@@ -6348,11 +6348,36 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
         }
         if (!isOnlyFuelCells) {
           yield "deposit_cargo";
-          await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
-          await bot.refreshLocation();
-          if (bot.system !== systemId) {
-            ctx.log("info", `Moved to ${bot.system} after deposit — restarting system scan`);
-            break;
+          // In frontier survey, try to return to entry system instead of global home base
+          if (entrySystemId && systemId !== entrySystemId) {
+            ctx.log("travel", `Cargo full — attempting return to entry system ${entrySystemId} to deposit...`);
+            const blacklist = getEffectiveSystemBlacklist(bot);
+            const arrived = await navigateToSystem(ctx, entrySystemId, { 
+              fuelThresholdPct: FUEL_SAFETY_PCT, 
+              hullThresholdPct: 30, 
+              skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked,
+              allowWormholes: true
+            });
+            if (arrived) {
+              await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+              await bot.refreshLocation();
+              if (bot.system !== systemId) {
+                ctx.log("info", `Moved to ${bot.system} after deposit — restarting system scan`);
+                break;
+              }
+            } else {
+              ctx.log("warn", `Could not reach entry system ${entrySystemId} — keeping cargo aboard (${bot.cargo}/${bot.cargoMax}), continuing survey`);
+            }
+          } else if (systemId === entrySystemId) {
+            // We're already at entry system, try normal deposit
+            await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+            await bot.refreshLocation();
+            if (bot.system !== systemId) {
+              ctx.log("info", `Moved to ${bot.system} after deposit — restarting system scan`);
+              break;
+            }
+          } else {
+            ctx.log("warn", `Cargo full but no entry system tracked — keeping cargo aboard (${bot.cargo}/${bot.cargoMax}), continuing survey`);
           }
         } else {
           ctx.log("info", `Cargo full with fuel cells (${fuelCellCount} fuel cells, ${bot.cargo}/${bot.cargoMax} cargo) — continuing exploration`);
@@ -6376,12 +6401,32 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
     if (settings.returnToHomeOnFuelCellDepletion) {
       const fuelCellCheck = await checkFuelCellInventory(ctx);
       if (fuelCellCheck.totalFuelCells < 3) {
-        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — attempting return to entry system ${entrySystemId}...`);
         yield "return_to_home_fuel_cells";
-        const returned = await returnToHomeBaseForFuelCells(ctx);
+        // In frontier survey, try to return to entry system instead of global home base
+        let returned = false;
+        if (entrySystemId && systemId !== entrySystemId) {
+          ctx.log("travel", `Fuel cells low — attempting return to entry system ${entrySystemId} to reload...`);
+          const blacklist = getEffectiveSystemBlacklist(bot);
+          const arrived = await navigateToSystem(ctx, entrySystemId, { 
+            fuelThresholdPct: FUEL_SAFETY_PCT, 
+            hullThresholdPct: 30, 
+            skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked,
+            allowWormholes: true
+          });
+          if (arrived) {
+            returned = await returnToHomeBaseForFuelCells(ctx);
+          } else {
+            ctx.log("warn", `Could not reach entry system ${entrySystemId} for fuel cell reload — continuing survey`);
+          }
+        } else if (systemId === entrySystemId) {
+          returned = await returnToHomeBaseForFuelCells(ctx);
+        } else {
+          ctx.log("warn", `Fuel cells low but no entry system tracked — continuing survey`);
+        }
         if (returned) {
           await bot.refreshLocation();
-          ctx.log("info", `Returned to home base — continuing frontier survey`);
+          ctx.log("info", `Returned to entry system — continuing frontier survey`);
           continue;
         }
       }

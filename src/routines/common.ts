@@ -5000,7 +5000,8 @@ export async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boo
 /**
  * Wait for the bot to finish any ongoing transit (jump/travel).
  * Returns true if bot was in transit and completed it, false if not in transit.
- * Waits up to maxWaitSeconds (default 120s) before giving up.
+ * Uses ticksRemaining to calculate dynamic timeout (10s per tick + buffer).
+ * Falls back to maxWaitSeconds if ticksRemaining is unavailable.
  */
 export async function waitForTransitCompletion(
   ctx: RoutineContext,
@@ -5016,12 +5017,24 @@ export async function waitForTransitCompletion(
   
   const transitType = bot.transitType || "unknown";
   const ticksRemaining = bot.ticksRemaining;
-  ctx.log("travel", `Bot is in transit (${transitType}) with ${ticksRemaining} ticks remaining - waiting...`);
+  
+  // Calculate dynamic timeout: ~10 seconds per tick + 60s buffer
+  // If ticksRemaining is null/undefined, fall back to maxWaitSeconds
+  const tickDurationMs = 10000; // ~10 seconds per game tick
+  const bufferMs = 60000; // 60 second buffer for safety
+  let dynamicMaxWaitMs: number;
+  
+  if (ticksRemaining != null && ticksRemaining > 0) {
+    dynamicMaxWaitMs = ticksRemaining * tickDurationMs + bufferMs;
+    ctx.log("travel", `Bot is in transit (${transitType}) with ${ticksRemaining} ticks remaining - waiting (dynamic timeout: ${Math.round(dynamicMaxWaitMs / 1000)}s)...`);
+  } else {
+    dynamicMaxWaitMs = maxWaitSeconds * 1000;
+    ctx.log("travel", `Bot is in transit (${transitType}) - waiting (fallback timeout: ${maxWaitSeconds}s)...`);
+  }
   
   const startTime = Date.now();
-  const maxWaitMs = maxWaitSeconds * 1000;
   
-  while (bot.state === "running" && Date.now() - startTime < maxWaitMs) {
+  while (bot.state === "running" && Date.now() - startTime < dynamicMaxWaitMs) {
     await bot.refreshPOI();
     
     if (!bot.inTransit) {
@@ -5033,7 +5046,8 @@ export async function waitForTransitCompletion(
     await ctx.sleep(10000);
   }
   
-  ctx.log("warn", `Transit wait timeout after ${maxWaitSeconds}s - bot still in transit`);
+  const actualWaitSeconds = Math.round((Date.now() - startTime) / 1000);
+  ctx.log("warn", `Transit wait timeout after ${actualWaitSeconds}s - bot still in transit`);
   return false;
 }
 

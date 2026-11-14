@@ -6,7 +6,37 @@ import { safeCopyFileSync, safeWriteFileSync } from "./diskSpaceGuard.js";
 import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
 import { onPoiUpdate } from "./client_sync_hooks.js";
 import { perf } from "./perf.js";
-import { getGlobalHomeBase } from "./common.js";
+import { join } from "path";
+import { readFileSync, existsSync } from "fs";
+
+const DATA_DIR = join(process.cwd(), "data");
+const SETTINGS_FILE = join(DATA_DIR, "settings.json");
+
+function readSettingsFile(): Record<string, unknown> {
+  if (existsSync(SETTINGS_FILE)) {
+    try {
+      return JSON.parse(readFileSync(SETTINGS_FILE, "utf-8")) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function getGlobalHomeBase(): { system: string; station: string; name: string } {
+  const all = readSettingsFile();
+  const general = (all.general || {}) as Record<string, unknown>;
+  const rawSystem = (general.factionStorageSystem as string) || "";
+  let station = (general.factionStorageStation as string) || "";
+  let system = rawSystem;
+  if (station.includes("|")) {
+    const [sysPart, poiPart] = station.split("|");
+    if (!system && sysPart) system = sysPart;
+    station = poiPart || "";
+  }
+  const name = station || system || "Home";
+  return { system, station, name };
+}
 
 // ── Data model ──────────────────────────────────────────────
 

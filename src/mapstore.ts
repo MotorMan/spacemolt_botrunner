@@ -2976,6 +2976,12 @@ const locations = this.findOreLocations(oreId, blacklist);
       graph.get(b.toLowerCase())!.add(a.toLowerCase());
     };
 
+    // Static wormholes that are always usable as bidirectional routing edges
+    const STATIC_WORMHOLES: Array<[string, string]> = [
+      ["alzirr", "praecipua"],
+      ["hadar", "gsc_0036"],
+    ];
+
     for (const sys of this.getSystems()) {
       addNode(sys.id);
       for (const conn of sys.connections || []) {
@@ -2985,7 +2991,6 @@ const locations = this.findOreLocations(oreId, blacklist);
     }
 
     // Add static wormholes
-    const { STATIC_WORMHOLES } = require("./explorer.js");
     for (const [a, b] of STATIC_WORMHOLES) {
       addEdge(a, b);
     }

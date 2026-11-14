@@ -5,7 +5,7 @@ import type { BotStatus } from "../bot.js";
 import { perf } from "../perf.js";
 import { getBot, getTotalBandwidth, getDiscoveredBots, getBotStatuses } from "../botmanager.js";
 import { chatBuffer, type ChatMessage } from "../chatbuffer.js";
-import { mapStore } from "../mapstore.js";
+import { mapStore, getMainNetworkSystems } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
@@ -432,16 +432,37 @@ export function getFrontierSystemBlacklist(): string[] {
 }
 
 /** Get the effective system blacklist for a specific bot.
- *  Combines the global system blacklist with the frontier system blacklist,
+ *  Combines the global system blacklist with auto-detected frontier systems (systems outside the main ~506 network),
  *  but excludes frontier systems for explorers (who have pathfinder drives). */
-export function getEffectiveSystemBlacklist(bot: { routineName: string | null }): string[] {
+export function getEffectiveSystemBlacklist(bot: { routineName: string | null; username?: string }): string[] {
   const systemBlacklist = getSystemBlacklist();
   const routine = bot?.routineName?.toLowerCase();
   if (routine === "explorer" || routine === "pathfinder") {
     return systemBlacklist;
   }
-  const frontierBlacklist = getFrontierSystemBlacklist();
-  return [...systemBlacklist, ...frontierBlacklist];
+
+  // Check if frontier blocking is enabled for this bot
+  const settings = loadSettings();
+  const minerSettings = settings.miner || {};
+  const botSettings = bot?.username ? (settings[bot.username] || {}) : {};
+  const globalBlockFrontier = minerSettings.blockFrontierSystems !== false;
+  const botBlockFrontier = botSettings.blockFrontierSystems !== undefined ? botSettings.blockFrontierSystems : globalBlockFrontier;
+
+  if (!botBlockFrontier) {
+    return systemBlacklist;
+  }
+
+  // Auto-detect frontier systems: any system NOT in the main network
+  const mainNetworkSystems = getMainNetworkSystems();
+  const allSystems = mapStore.getAllSystems();
+  const frontierSystems: string[] = [];
+  for (const sysId of Object.keys(allSystems)) {
+    if (!mainNetworkSystems.has(sysId.toLowerCase())) {
+      frontierSystems.push(sysId);
+    }
+  }
+
+  return [...systemBlacklist, ...frontierSystems];
 }
 
 /** Get the global station blacklist from settings. These are POI ids (or

@@ -160,7 +160,7 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
  * to allow mining in pirate/hot zones that would otherwise be blacklisted.
  * For non-explorers, also includes the frontier system blacklist.
  */
-function getMiningBlacklist(bot: { routineName: string | null }, settings: Awaited<ReturnType<typeof getMinerSettings>>, isCloaked: boolean): string[] {
+function getMiningBlacklist(bot: { routineName: string | null; username?: string }, settings: Awaited<ReturnType<typeof getMinerSettings>>, isCloaked: boolean): string[] {
   const baseBlacklist = getEffectiveSystemBlacklist(bot);
   if (isCloaked && settings.cloakIgnoreBlacklist) {
     // Logging is done by the caller since ctx is not available here
@@ -2848,7 +2848,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
       
       // Get blacklist - use empty only if bot actually has a cloaking module and is cloaked
-      const blacklist = getMiningBlacklist(bot, settings, hasCloak && bot.isCloaked);
+      const blacklist = getMiningBlacklist({ routineName: bot.routineName, username: bot.username }, settings, hasCloak && bot.isCloaked);
 
       // ── Low fuel cells check ──
       // Return home to deposit loot and resupply when fuel cells drop to or below

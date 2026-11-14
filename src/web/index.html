@@ -5307,6 +5307,7 @@
 
           const globalHome = (settings.miner || {}).homeSystem || "";
           const botHome = botSettings.homeSystem || "";
+          const botBlockFrontier = botSettings.blockFrontierSystems !== undefined ? botSettings.blockFrontierSystems : (settings.miner || {}).blockFrontierSystems !== false;
           const sysOpts = [
             `<option value=""${!botHome ? " selected" : ""}>(global: ${globalHome ? esc(globalHome) : "start system"})</option>`,
           ];
@@ -5327,7 +5328,11 @@
         <span class="profile-ore-label">Target:</span>
         <select id="profile-minerTarget" onchange="saveProfileMinerTarget()">${combinedOpts.join("")}</select>
         <span class="profile-ore-label" style="margin-left:8px">Home:</span>
-        <select id="profile-homeSystem" onchange="saveProfileHomeSystem()">${sysOpts.join("")}</select>`;
+        <select id="profile-homeSystem" onchange="saveProfileHomeSystem()">${sysOpts.join("")}</select>
+        <label class="profile-ore-label" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:8px">
+          <input type="checkbox" id="profile-blockFrontierSystems" onchange="saveProfileBlockFrontierSystems()"${botBlockFrontier ? " checked" : ""}>
+          Block Frontier
+        </label>`;
         }
 
         // Per-bot explorer mode selector (visible when explorer is selected or running)
@@ -6338,6 +6343,23 @@
         if (!sel) return;
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { homeSystem: sel.value });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfileBlockFrontierSystems() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const cb = document.getElementById("profile-blockFrontierSystems");
+        if (!cb) return;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, {
+          blockFrontierSystems: cb.checked,
+        });
         send({
           type: "saveSettings",
           routine: bot.username,
@@ -31774,7 +31796,7 @@ async function fetchPersonalFacilityTypes(username) {
         <input type="number" id="set-miner-deepSleepIntervalMin" min="1" max="1440" value="${m.deepSleepIntervalMin ?? 30}" style="width:80px" />
       </div>
 
-      <div class="setting-row">
+<div class="setting-row">
         <div>
           <div class="setting-label">Ignore Depletion Markings</div>
           <div class="setting-hint">When enabled, miners will ignore depletion markings and continue mining at target POIs. Useful when multiple ores exist at a POI and one gets marked depleted prematurely.</div>
@@ -31784,8 +31806,18 @@ async function fetchPersonalFacilityTypes(username) {
           <span>Ignore depletion</span>
         </label>
       </div>
-    </div>
 
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Block Frontier Systems</div>
+          <div class="setting-hint">When enabled (default), miners will automatically avoid one-way wormhole systems (frontier systems) that have no return path. Only the original ~506 connected systems are considered safe. Disable this only if you have pathfinder drives on your miners or intentionally want to mine in frontier systems.</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="set-miner-blockFrontierSystems"${m.blockFrontierSystems !== false ? " checked" : ""} />
+          <span>Block frontier systems (one-way wormholes)</span>
+        </label>
+      </div>
+    </div>
 
 
       <div class="setting-row">
@@ -32393,6 +32425,9 @@ async function fetchPersonalFacilityTypes(username) {
               );
               return Number.isNaN(v) ? 3 : v;
             })(),
+          blockFrontierSystems: document.getElementById(
+            "set-miner-blockFrontierSystems",
+          ).checked,
 
           // Note: oreQuotas, gasQuotas, iceQuotas, deepCoreQuotas, radioactiveQuotas are managed in Miner Quotas settings page
           // They are preserved from existing settings when saving from this page

@@ -6,6 +6,7 @@ import { safeCopyFileSync, safeWriteFileSync } from "./diskSpaceGuard.js";
 import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
 import { onPoiUpdate } from "./client_sync_hooks.js";
 import { perf } from "./perf.js";
+import { getGlobalHomeBase } from "./common.js";
 
 // ── Data model ──────────────────────────────────────────────
 
@@ -2930,6 +2931,94 @@ const locations = this.findOreLocations(oreId, blacklist);
     return Object.keys(this.data.systems).length > 0;
   }
 
+  /**
+   * Get the set of system IDs in the main connected component (the original ~506 systems).
+   * Uses the same logic as buildFixedRouteGraph in explorer.ts to identify the main network.
+   * Returns a Set of lowercase system IDs.
+   */
+  getMainNetworkSystems(): Set<string> {
+    const graph = new Map<string, Set<string>>();
+    const addNode = (id: string): void => {
+      const key = id.toLowerCase();
+      if (!graph.has(key)) graph.set(key, new Set());
+    };
+    const addEdge = (a: string, b: string): void => {
+      addNode(a);
+      addNode(b);
+      graph.get(a.toLowerCase())!.add(b.toLowerCase());
+      graph.get(b.toLowerCase())!.add(a.toLowerCase());
+    };
+
+    for (const sys of this.getSystems()) {
+      addNode(sys.id);
+      for (const conn of sys.connections || []) {
+        if (!conn.system_id) continue;
+        addEdge(sys.id, conn.system_id);
+      }
+    }
+
+    // Add static wormholes
+    const { STATIC_WORMHOLES } = require("./explorer.js");
+    for (const [a, b] of STATIC_WORMHOLES) {
+      addEdge(a, b);
+    }
+
+    // Find connected component from home system
+    const homeBase = getGlobalHomeBase();
+    const homeSystem = (homeBase.system || "sol").toLowerCase();
+
+    const mainComponent = new Set<string>();
+    const queue = [homeSystem];
+    mainComponent.add(homeSystem);
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      const neighbors = graph.get(current);
+      if (!neighbors) continue;
+      for (const nb of neighbors) {
+        if (!mainComponent.has(nb)) {
+          mainComponent.add(nb);
+          queue.push(nb);
+        }
+      }
+    }
+
+    // If home system not in graph, use largest component
+    if (mainComponent.size <= 1) {
+      const visited = new Set<string>();
+      let largestComponent = new Set<string>();
+
+      for (const node of graph.keys()) {
+        if (visited.has(node)) continue;
+        const component = new Set<string>();
+        const compQueue = [node];
+        component.add(node);
+        visited.add(node);
+
+        while (compQueue.length > 0) {
+          const current = compQueue.shift()!;
+          const neighbors = graph.get(current);
+          if (!neighbors) continue;
+          for (const nb of neighbors) {
+            if (!visited.has(nb)) {
+              visited.add(nb);
+              component.add(nb);
+              compQueue.push(nb);
+            }
+          }
+        }
+
+        if (component.size > largestComponent.size) {
+          largestComponent = component;
+        }
+      }
+
+      return largestComponent;
+    }
+
+    return mainComponent;
+  }
+
   /** Get debug info about the map state. */
   getDebugInfo(): {
     totalSystems: number;
@@ -2957,3 +3046,8 @@ function now(): string {
 
 /** Singleton instance shared by all bots. */
 export const mapStore = new MapStore();
+
+/** Get the set of system IDs in the main connected component (original ~506 systems). */
+export function getMainNetworkSystems(): Set<string> {
+  return mapStore.getMainNetworkSystems();
+}

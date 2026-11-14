@@ -3615,6 +3615,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const nearbyResp = await bot.exec("get_nearby");
         if (nearbyResp.result && typeof nearbyResp.result === "object") {
           bot.trackWildlife(nearbyResp.result);
+          bot.trackRepeaters(nearbyResp.result);
           // Cloaked ships cannot be ambushed — skip the pirate flee when enabled.
           if (!(settings.ignorePiratesWhenCloaked !== false && bot.isCloaked)) {
             const { checkAndFleeFromPirates } = await import("./common.js");

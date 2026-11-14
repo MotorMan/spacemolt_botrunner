@@ -12,6 +12,7 @@ import { marketStreamStore } from "./marketstreamstore.js";
 import { addMaydayRequest, parseMaydayMessage, isIgnoredMaydaySender, shouldLogIgnoredMayday } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
 import { wildlifeStore, type SurveyWildlifeEntry, type FaintSignature, type ObservedCreature } from "./wildlivestore.js";
+import { repeaterStore, type ObservedRepeater } from "./repeaterstore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
@@ -2404,6 +2405,7 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       if (!resp.error && resp.result) {
         this.trackNearbyPlayers(resp.result);
         this.trackWildlife(resp.result);
+        this.trackRepeaters(resp.result);
       }
     } catch (e) {
       // Never let a scan failure interrupt navigation/routines
@@ -5073,6 +5075,56 @@ if (this.craftQueueTracker && jobId && recipeId) {
           `Pruned ${result.prunedIds} gone creature(s) / ${result.prunedTypes} type(s) at ${this.system}/${poi}`);
       }
     }
+
+  /**
+   * Feed one `get_nearby` result into the repeater store.
+   *
+   * A nearby scan is the COMPLETE repeater list for the POI we are sitting in,
+   * so it is handed to `repeaterStore.reconcile()` as a single "present set"
+   * instead of one `add()` per repeater: that adds what we now see and prunes
+   * the repeaterIds we no longer see (destroyed / despawned), which is what keeps
+   * data/repeaters from growing forever.
+   */
+  trackRepeaters(nearbyResult: unknown): void {
+    if (!nearbyResult || typeof nearbyResult !== "object") {
+      return;
+    }
+
+    const data = nearbyResult as Record<string, unknown>;
+    // Only a response that actually carries a repeater list may reconcile —
+    // a partial/unrelated payload must never be read as "no repeaters here".
+    if (!Array.isArray(data.repeaters)) return;
+    const repeatersArray = data.repeaters as Array<Record<string, unknown>>;
+
+    const observed: ObservedRepeater[] = [];
+    for (const entity of repeatersArray) {
+      const name = (entity.name as string) || "";
+      if (!name || !name.trim()) continue;
+      observed.push({
+        name: name.trim(),
+        repeaterId: (entity.repeater_id as string) || "",
+        shipClass: (entity.ship_class as string) || "",
+        hull: (entity.hull as number) || 0,
+        maxHull: (entity.max_hull as number) || 0,
+        shield: (entity.shield as number) || 0,
+        maxShield: (entity.max_shield as number) || 0,
+        inBattle: (entity.in_battle as boolean) || false,
+      });
+    }
+
+    const nearbyData = nearbyResult as Record<string, unknown>;
+    const poi = (nearbyData.poi_id as string) || this.poi;
+
+    const result = repeaterStore.reconcile(this.system, poi, observed);
+
+    if (result.newTypes > 0) {
+      this.log("wildlife", `Discovered ${result.newTypes} new repeater(s) from nearby scan`);
+    }
+    if (result.prunedIds > 0 || result.prunedTypes > 0) {
+      debugLogForBot(this.username, "repeater:prune", `${this.username}`,
+        `Pruned ${result.prunedIds} gone repeater(s) / ${result.prunedTypes} type(s) at ${this.system}/${poi}`);
+    }
+  }
 
   /** Register a captured prize ship from a ship_captured WebSocket notification.
    *  Stores the mapping so we can find the prize_id in get_nearby by matching ship_id.

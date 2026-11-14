@@ -2496,6 +2496,7 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   if (!resp.error && resp.result && command === "get_nearby") {
     bot.trackNearbyPlayers(resp.result);
     bot.trackWildlife(resp.result);
+    bot.trackRepeaters(resp.result);
   }
 
 // Broadcast skills update for get_skills command

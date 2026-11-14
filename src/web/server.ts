@@ -12,6 +12,7 @@ import type { ServerWebSocket } from "bun";
 import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, setLoadoutForceFullDelivery, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
 import { playerNameStore } from "../playernamestore.js";
 import { wildlifeStore, type WildlifeFullData, type SystemWildlife } from "../wildlivestore.js";
+import { repeaterStore, type RepeaterFullData } from "../repeaterstore.js";
 import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse, type MarketQueryRequest, type MarketQueryResult } from "../client_sync_master.js";
 import { listSyncedFiles, readSyncedFile, mergeIntoFile, seedIntoFile, isPathSynced, type FileEntry } from "../client_sync_files.js";
 import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate, setMarketQueryFn, setPushFn, resolveMarketSource } from "../client_sync_hooks.js";
@@ -629,6 +630,12 @@ const MAX_LOG_BUFFER = 200;
 const WILDLIFE_JSON_TTL_MS = 10_000;
 /** Drop the snapshot entirely once nothing has asked for it for this long. */
 const WILDLIFE_JSON_IDLE_MS = 60_000;
+
+/** How long a built repeater snapshot may be reused before it is rebuilt. */
+const REPEATER_JSON_TTL_MS = 10_000;
+/** Drop the snapshot entirely once nothing has asked for it for this long. */
+const REPEATER_JSON_IDLE_MS = 60_000;
+
 const MAIN_LOG_SAVE_DEBOUNCE_MS = 5000;
 
 export class WebServer {
@@ -693,6 +700,8 @@ export class WebServer {
 
   // Memoized creature snapshot (see getWildlifeJson)
   private wildlifeJsonCache: { json: string; builtAt: number; lastUsed: number } | null = null;
+  // Memoized repeater snapshot (see getRepeatersJson)
+  private repeaterJsonCache: { json: string; builtAt: number; lastUsed: number } | null = null;
 
 constructor(port: number = 3000) {
     this.port = port;
@@ -812,6 +821,7 @@ if (!this.settings.fuel_service) {
     this.wsBytesTimer = setInterval(() => {
       this.logWsBytesSummary();
       this.evictWildlifeJson();
+      this.evictRepeaterJson();
     }, 10000);
   }
 
@@ -847,6 +857,32 @@ if (!this.settings.fuel_service) {
   }
 
   /**
+   * Serialized repeater snapshot for the repeaters page / sync pull.
+   */
+  private getRepeatersJson(): string {
+    const now = Date.now();
+    if (this.repeaterJsonCache && now - this.repeaterJsonCache.builtAt < REPEATER_JSON_TTL_MS) {
+      this.repeaterJsonCache.lastUsed = now;
+      return this.repeaterJsonCache.json;
+    }
+    const json = JSON.stringify(repeaterStore.getFullData());
+    this.repeaterJsonCache = { json, builtAt: now, lastUsed: now };
+    return json;
+  }
+
+  private evictRepeaterJson(): void {
+    if (!this.repeaterJsonCache) return;
+    if (Date.now() - this.repeaterJsonCache.lastUsed > REPEATER_JSON_IDLE_MS) {
+      this.repeaterJsonCache = null;
+    }
+  }
+
+  /** Force-invalidate the repeater JSON cache. */
+  private invalidateRepeaterJson(): void {
+    this.repeaterJsonCache = null;
+  }
+
+  /**
    * Wire up the wildlife push hook so that when the master node's OWN bots
    * discover creatures (wildlivestore.drainPushes → onWildlifeUpdate), the
    * change is recorded on the master's wildlife version + changelog. This makes
@@ -865,6 +901,7 @@ if (!this.settings.fuel_service) {
       if (!sysData || !sysId) return;
       this.syncMaster?.recordWildlifeUpdate("local", { system: sysId, data: sysData });
       this.invalidateWildlifeJson();
+      this.invalidateRepeaterJson();
     });
   }
 
@@ -1628,6 +1665,11 @@ if (!this.settings.fuel_service) {
             headers: { "Content-Type": "application/json" },
           });
         }
+        if (url.pathname === "/api/repeaters") {
+          return new Response(this.getRepeatersJson(), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
         if (url.pathname === "/data/wildlifeInfo.json") {
           return new Response(this.getWildlifeJson(), {
             headers: { "Content-Type": "application/json" },
@@ -2172,12 +2214,14 @@ if (!this.settings.fuel_service) {
                 // internally so light clients only get notified about real changes.
                 const result = this.syncMaster.recordWildlifeUpdate(clientId, body as import("../client_sync_types.js").WildlifeDeltaPayload | WildlifeFullData);
                 this.invalidateWildlifeJson();
+                this.invalidateRepeaterJson();
                 return Response.json({ ok: result.ok, version: result.version, changed: result.changed }, { headers: cors });
               }
               // Fallback: non-master or no syncMaster instance — still merge for
               // backward-compat with any direct callers.
               wildlifeStore.mergeFrom(body as WildlifeFullData);
               this.invalidateWildlifeJson();
+              this.invalidateRepeaterJson();
               return Response.json({ ok: true }, { headers: cors });
             } catch {
               return Response.json({ ok: false, error: "invalid json" }, { status: 500, headers: cors });
@@ -3406,6 +3450,17 @@ if (!this.settings.fuel_service) {
           });
         }
 
+        // Serve repeaters.html for repeaters route
+        if (url.pathname === "/repeaters.html") {
+          const repeatersPath = join(import.meta.dir, "repeaters.html");
+          return new Response(readFileSync(repeatersPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve commandall.html for command all route
         if (url.pathname === "/commandall.html") {
           const commandallPath = join(import.meta.dir, "commandall.html");
@@ -3630,6 +3685,17 @@ if (!this.settings.fuel_service) {
         if (url.pathname === "/creatures.html") {
           const creaturesPath = join(import.meta.dir, "creatures.html");
           return new Response(readFileSync(creaturesPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve repeaters.html for repeaters iframe
+        if (url.pathname === "/repeaters.html") {
+          const repeatersPath = join(import.meta.dir, "repeaters.html");
+          return new Response(readFileSync(repeatersPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",

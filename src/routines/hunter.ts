@@ -1672,7 +1672,7 @@ async function* protectHereRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // Track player names and wildlife from observation or nearby scan
     bot.trackNearbyPlayers(nearbyData);
-    bot.trackWildlife(nearbyData);
+    bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
 
     // Check if we got pulled into battle during scanning
     await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
@@ -1687,7 +1687,7 @@ async function* protectHereRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           const scanNearby = await bot.exec("get_nearby");
           if (!scanNearby.error) {
             bot.trackNearbyPlayers(scanNearby.result);
-            bot.trackWildlife(scanNearby.result);
+            bot.trackWildlife(scanNearby.result); bot.trackRepeaters(scanNearby.result);
             const scanEntities = parseNearby(scanNearby.result);
             const scanTargets = sortTargetsByPriority([...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode)]);
             for (const t of scanTargets) {
@@ -2209,7 +2209,7 @@ continue;
       continue;
     }
     bot.trackNearbyPlayers(nearbyData);
-    bot.trackWildlife(nearbyData);
+    bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
 
     const entities = parseNearby(nearbyData);
     const match = entities.find(e =>
@@ -2937,7 +2937,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
             break;
           }
           bot.trackNearbyPlayers(nearbyData);
-          bot.trackWildlife(nearbyData);
+          bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
 
           await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
@@ -2949,7 +2949,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
             break;
           }
           bot.trackNearbyPlayers(afterBattleData);
-          bot.trackWildlife(afterBattleData);
+          bot.trackWildlife(afterBattleData); bot.trackRepeaters(afterBattleData);
 
           const entities = parseNearby(afterBattleData);
           const creatures = pickCreatureTargets(entities, bot, true, settings.maxCreaturesPerScan, settings.coordinationMode);
@@ -2986,7 +2986,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
             let freshEntities: NearbyEntity[] = [];
             if (!freshScanResp.error && freshScanResp.result) {
               bot.trackNearbyPlayers(freshScanResp.result);
-              bot.trackWildlife(freshScanResp.result);
+              bot.trackWildlife(freshScanResp.result); bot.trackRepeaters(freshScanResp.result);
               freshEntities = parseNearby(freshScanResp.result);
             }
             const stillPresent = freshEntities.find(e => e.id === target.id || e.name === target.name);
@@ -3552,13 +3552,13 @@ async function farmSystemForBigCreature(
       if (!nearbyData) break;
 
       bot.trackNearbyPlayers(nearbyData);
-      bot.trackWildlife(nearbyData);
+      bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
 
       const afterBattleResp = await getObservationOrNearby(bot);
       const afterBattleData = afterBattleResp.result;
       if (!afterBattleData) break;
       bot.trackNearbyPlayers(afterBattleData);
-      bot.trackWildlife(afterBattleData);
+      bot.trackWildlife(afterBattleData); bot.trackRepeaters(afterBattleData);
 
       const entities = parseNearby(afterBattleData);
       const allCreatures = applyCloudWhalePackRule(entities.filter(e => isCreatureTarget(e, true) && !isStationEntity(e) && !isBrandedCreature(e.name) && !isProtectedCreature(e.name)));
@@ -3597,7 +3597,7 @@ async function farmSystemForBigCreature(
         let freshEntities: NearbyEntity[] = [];
         if (!freshScanResp.error && freshScanResp.result) {
           bot.trackNearbyPlayers(freshScanResp.result);
-          bot.trackWildlife(freshScanResp.result);
+          bot.trackWildlife(freshScanResp.result); bot.trackRepeaters(freshScanResp.result);
           freshEntities = parseNearby(freshScanResp.result);
         }
         const stillPresent = freshEntities.find(e => e.id === t.id || e.name === t.name);
@@ -3795,13 +3795,13 @@ async function creatureFarmRandomFallbackCycle(
         const nearbyData = obsResult.result;
         if (!nearbyData) break;
         bot.trackNearbyPlayers(nearbyData);
-        bot.trackWildlife(nearbyData);
+        bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
 
         const afterBattleResp = await getObservationOrNearby(bot);
         const afterBattleData = afterBattleResp.result;
         if (!afterBattleData) break;
         bot.trackNearbyPlayers(afterBattleData);
-        bot.trackWildlife(afterBattleData);
+        bot.trackWildlife(afterBattleData); bot.trackRepeaters(afterBattleData);
 
         const entities = parseNearby(afterBattleData);
         const creatures = pickCreatureTargets(entities, bot, true, settings.maxCreaturesPerScan, settings.coordinationMode);
@@ -4098,7 +4098,7 @@ const huntTarget = findNearestHuntableSystem(bot, bot.system);
          const nearbyData = nearbyResult.result;
          if (nearbyData) {
            bot.trackNearbyPlayers(nearbyData);
-           bot.trackWildlife(nearbyData);
+           bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
             const entities = parseNearby(nearbyData);
               const nonStationThreats = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e));
               const stationThreats = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && isStationEntity(e));
@@ -4150,7 +4150,7 @@ const huntTarget = findNearestHuntableSystem(bot, bot.system);
 
       // Track player names and wildlife from observation or nearby scan
       bot.trackNearbyPlayers(nearbyData);
-      bot.trackWildlife(nearbyData);
+      bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
 
       // Check if we got pulled into battle during scanning
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
@@ -4165,7 +4165,7 @@ const huntTarget = findNearestHuntableSystem(bot, bot.system);
             const scanNearby = await bot.exec("get_nearby");
             if (!scanNearby.error) {
               bot.trackNearbyPlayers(scanNearby.result);
-              bot.trackWildlife(scanNearby.result);
+              bot.trackWildlife(scanNearby.result); bot.trackRepeaters(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
                 const scanTargets = sortTargetsByPriority([...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode)]);
               for (const t of scanTargets) {
@@ -4270,7 +4270,7 @@ const huntTarget = findNearestHuntableSystem(bot, bot.system);
           const safetyCheckResp = await bot.exec("get_nearby");
           if (!safetyCheckResp.error) {
             bot.trackNearbyPlayers(safetyCheckResp.result);
-            bot.trackWildlife(safetyCheckResp.result);
+            bot.trackWildlife(safetyCheckResp.result); bot.trackRepeaters(safetyCheckResp.result);
             const nearbyEntities = parseNearby(safetyCheckResp.result);
              const newThreats = nearbyEntities.filter(e => 
                isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
@@ -4643,7 +4643,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
       // Track player names and wildlife from observation or nearby scan
       bot.trackNearbyPlayers(nearbyData);
-      bot.trackWildlife(nearbyData);
+      bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
 
       // Check if we got pulled into battle during scanning
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
@@ -4658,7 +4658,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             const scanNearby = await bot.exec("get_nearby");
             if (!scanNearby.error) {
               bot.trackNearbyPlayers(scanNearby.result);
-              bot.trackWildlife(scanNearby.result);
+              bot.trackWildlife(scanNearby.result); bot.trackRepeaters(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
                 const scanTargets = sortTargetsByPriority([...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode)]);
               for (const t of scanTargets) {
@@ -4742,7 +4742,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           const safetyCheckResp = await bot.exec("get_nearby");
           if (!safetyCheckResp.error) {
             bot.trackNearbyPlayers(safetyCheckResp.result);
-            bot.trackWildlife(safetyCheckResp.result);
+            bot.trackWildlife(safetyCheckResp.result); bot.trackRepeaters(safetyCheckResp.result);
             const nearbyEntities = parseNearby(safetyCheckResp.result);
             const newThreats = nearbyEntities.filter(e =>
               isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
@@ -5065,7 +5065,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // Track player names and wildlife from observation or nearby scan
     bot.trackNearbyPlayers(nearbyData);
-    bot.trackWildlife(nearbyData);
+    bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
 
     // Check if we got pulled into battle during scanning
     await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
@@ -5080,7 +5080,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             const scanNearby = await bot.exec("get_nearby");
             if (!scanNearby.error) {
               bot.trackNearbyPlayers(scanNearby.result);
-              bot.trackWildlife(scanNearby.result);
+              bot.trackWildlife(scanNearby.result); bot.trackRepeaters(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
                 const scanTargets = sortTargetsByPriority([...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot, settings.huntCreatures, settings.maxCreaturesPerScan, settings.coordinationMode)]);
               for (const t of scanTargets) {
@@ -9115,7 +9115,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
     return [totalKills, totalBoardings];
   }
   bot.trackNearbyPlayers(nearbyData);
-  bot.trackWildlife(nearbyData);
+  bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
   await serviceAnyStalledPrizes(ctx);
 
   const entities = parseNearby(nearbyData);
@@ -9155,7 +9155,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
       let freshEntities: NearbyEntity[] = [];
       if (!freshScanResp.error && freshScanResp.result) {
         bot.trackNearbyPlayers(freshScanResp.result);
-        bot.trackWildlife(freshScanResp.result);
+        bot.trackWildlife(freshScanResp.result); bot.trackRepeaters(freshScanResp.result);
         freshEntities = parseNearby(freshScanResp.result);
       }
       const stillPresent = freshEntities.find(e => e.id === target.id || e.name === target.name);
@@ -9227,7 +9227,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
             const postCaptureResp = await bot.exec("get_nearby");
             if (!postCaptureResp.error) {
               bot.trackNearbyPlayers(postCaptureResp.result);
-              bot.trackWildlife(postCaptureResp.result);
+              bot.trackWildlife(postCaptureResp.result); bot.trackRepeaters(postCaptureResp.result);
             }
             continue;
           } else if (result === "target_eliminated") {
@@ -9243,7 +9243,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
             const postKillResp = await bot.exec("get_nearby");
             if (!postKillResp.error) {
               bot.trackNearbyPlayers(postKillResp.result);
-              bot.trackWildlife(postKillResp.result);
+              bot.trackWildlife(postKillResp.result); bot.trackRepeaters(postKillResp.result);
               const nearbyEntities = parseNearby(postKillResp.result);
               const newThreats = nearbyEntities.filter(e =>
                 isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
@@ -9292,7 +9292,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
         const postKillResp2 = await bot.exec("get_nearby");
         if (!postKillResp2.error) {
           bot.trackNearbyPlayers(postKillResp2.result);
-          bot.trackWildlife(postKillResp2.result);
+          bot.trackWildlife(postKillResp2.result); bot.trackRepeaters(postKillResp2.result);
           const nearbyEntities2 = parseNearby(postKillResp2.result);
           const newThreats2 = nearbyEntities2.filter(e =>
             isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
@@ -9447,7 +9447,7 @@ async function* boardingSystemPass(
       continue;
     }
     bot.trackNearbyPlayers(nearbyData);
-    bot.trackWildlife(nearbyData);
+    bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
 
     // Service any stalled prizes at this POI (refuel, resume, etc.)
     await serviceAnyStalledPrizes(ctx);
@@ -9498,7 +9498,7 @@ async function* boardingSystemPass(
       let freshEntities: NearbyEntity[] = [];
       if (!freshScanResp.error && freshScanResp.result) {
         bot.trackNearbyPlayers(freshScanResp.result);
-        bot.trackWildlife(freshScanResp.result);
+        bot.trackWildlife(freshScanResp.result); bot.trackRepeaters(freshScanResp.result);
         freshEntities = parseNearby(freshScanResp.result);
       }
       const stillPresent = freshEntities.find(e => e.id === target.id || e.name === target.name);
@@ -9574,7 +9574,7 @@ async function* boardingSystemPass(
           const postCaptureResp = await bot.exec("get_nearby");
           if (!postCaptureResp.error) {
             bot.trackNearbyPlayers(postCaptureResp.result);
-            bot.trackWildlife(postCaptureResp.result);
+            bot.trackWildlife(postCaptureResp.result); bot.trackRepeaters(postCaptureResp.result);
           }
          continue;
         } else if (result === "target_eliminated") {
@@ -9590,7 +9590,7 @@ async function* boardingSystemPass(
           const postKillResp = await bot.exec("get_nearby");
           if (!postKillResp.error) {
             bot.trackNearbyPlayers(postKillResp.result);
-            bot.trackWildlife(postKillResp.result);
+            bot.trackWildlife(postKillResp.result); bot.trackRepeaters(postKillResp.result);
             const nearbyEntities = parseNearby(postKillResp.result);
             const newThreats = nearbyEntities.filter(e =>
               isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
@@ -9641,7 +9641,7 @@ async function* boardingSystemPass(
          const postKillResp2 = await bot.exec("get_nearby");
          if (!postKillResp2.error) {
            bot.trackNearbyPlayers(postKillResp2.result);
-           bot.trackWildlife(postKillResp2.result);
+           bot.trackWildlife(postKillResp2.result); bot.trackRepeaters(postKillResp2.result);
            const nearbyEntities2 = parseNearby(postKillResp2.result);
            const newThreats2 = nearbyEntities2.filter(e =>
              isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&

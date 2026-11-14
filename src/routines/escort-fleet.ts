@@ -875,6 +875,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       if (!nearbyResp.error && nearbyResp.result) {
         bot.trackNearbyPlayers(nearbyResp.result);
         bot.trackWildlife(nearbyResp.result);
+        bot.trackRepeaters(nearbyResp.result);
         const entities = parseNearby(nearbyResp.result);
         const targets = entities.filter(e => isPirateTarget(e, false, "boss"));
 

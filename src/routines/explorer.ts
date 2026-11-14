@@ -981,7 +981,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check for pirates in the area
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
         // Track wildlife from nearby scan
-        bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+        bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
         
         const { parseNearbyForPirates } = await import("./common.js");
         const pirateResult = parseNearbyForPirates(nearbyResp.result);
@@ -1548,7 +1548,7 @@ if (fuelCellCheck.totalFuelCells < 3) {
         }
 if (nearbyResp.result && typeof nearbyResp.result === "object") {
            // Track wildlife from nearby scan
-           bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+           bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
            
            // Skip pirate flee if cloaked and ignorePirateFleeWhenCloaked is enabled
            if (!bot.isCloaked || !currentSettings.ignorePirateFleeWhenCloaked) {
@@ -1685,7 +1685,7 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
     }
     if (nearbyResp.result && typeof nearbyResp.result === "object") {
       // Track wildlife from nearby scan
-      bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+      bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
       
       // Skip pirate flee if cloaked and ignorePirateFleeWhenCloaked is enabled
       if (!bot.isCloaked || !currentSettings.ignorePirateFleeWhenCloaked) {
@@ -2252,7 +2252,7 @@ async function* visitOtherPoi(
 
     // Track player names from nearby scan
     bot.trackNearbyPlayers(nearbyResp.result);
-    bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+    bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
 
     // Check for pirates and flee if detected (skip if cloaked and ignorePirateFleeWhenCloaked is enabled)
     const { checkAndFleeFromPirates } = await import("./common.js");
@@ -2867,7 +2867,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const nearbyResp = await bot.exec("get_nearby");
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
         // Track wildlife from nearby scan
-        bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+        bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
         
         const tradeSettings = getExplorerSettings(bot.username);
         if (!bot.isCloaked || !tradeSettings.ignorePirateFleeWhenCloaked) {
@@ -3731,7 +3731,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const nearbyResp = await bot.exec("get_nearby");
     if (nearbyResp.result && typeof nearbyResp.result === "object") {
       // Track wildlife from nearby scan
-      bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+      bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
       
       const { checkAndFleeFromPirates } = await import("./common.js");
       if (!bot.isCloaked || !cloakSettings.ignorePirateFleeWhenCloaked) {
@@ -5164,7 +5164,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
         }
       }
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
-        bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+        bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
         const { parseNearbyForPirates } = await import("./common.js");
         const pirateResult = parseNearbyForPirates(nearbyResp.result);
         if (!bot.isCloaked || !settings.ignorePirateFleeWhenCloaked) {
@@ -5725,7 +5725,7 @@ ctx.log("travel", `Arrived at frontier system ${target.systemId}`);
       continue;
     }
     if (nearbyResp.result && typeof nearbyResp.result === "object") {
-      bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+      bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
       if (!bot.isCloaked || !settings.ignorePirateFleeWhenCloaked) {
         const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
         if (fled) {
@@ -6048,7 +6048,7 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
         }
       }
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
-        bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+        bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
         const { parseNearbyForPirates } = await import("./common.js");
         const pirateResult = parseNearbyForPirates(nearbyResp.result);
         if (!bot.isCloaked || !settings.ignorePirateFleeWhenCloaked) {
@@ -6663,7 +6663,7 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
       continue;
     }
     if (nearbyResp.result && typeof nearbyResp.result === "object") {
-      bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result);
+      bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
       if (!bot.isCloaked || !settings.ignorePirateFleeWhenCloaked) {
         const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
         if (fled) {

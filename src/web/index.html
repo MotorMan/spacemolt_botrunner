@@ -84,7 +84,7 @@
           <div class="top-tab" data-tab="catalog" onclick="switchTab('catalog')">
             Catalog
           </div>
-          <div class="top-tab" data-tab="creatures" onclick="switchTab('creatures')">
+          <div class="top-tab" data-tab="creatures" onclick="switchTab('creatures'); switchCreaturesView('creatures')">
             Creatures
           </div>
 
@@ -1390,7 +1390,16 @@
 
       <!-- ══ Creatures Tab ══ -->
       <div class="tab-page" id="page-creatures" style="padding: 0; gap: 0;">
-        <iframe id="creaturesFrame" src="/creatures.html" style="position: absolute; inset: 0; width: 100%; height: 100%; border: none;"></iframe>
+        <div class="market-subtabs" style="display: flex; gap: 8px; border-bottom: 1px solid var(--border); padding: 12px 16px 0 16px;">
+          <button class="active" onclick="switchCreaturesView('creatures')" id="creaturesViewCreatures">Creatures</button>
+          <button onclick="switchCreaturesView('repeaters')" id="creaturesViewRepeaters">Repeaters</button>
+        </div>
+        <div id="creaturesView" style="display: flex; flex: 1; min-height: 0; position: relative;">
+          <iframe id="creaturesFrame" src="/creatures.html" style="position: absolute; inset: 0; width: 100%; height: 100%; border: none;"></iframe>
+        </div>
+        <div id="repeatersView" style="display: none; flex: 1; min-height: 0; position: relative;">
+          <iframe id="repeatersFrame" src="/repeaters.html" style="position: absolute; inset: 0; width: 100%; height: 100%; border: none;"></iframe>
+        </div>
       </div>
 
 
@@ -1756,6 +1765,13 @@
             }
           }
         }
+      }
+
+      function switchCreaturesView(view) {
+        document.getElementById("creaturesViewCreatures").classList.toggle("active", view === "creatures");
+        document.getElementById("creaturesViewRepeaters").classList.toggle("active", view === "repeaters");
+        document.getElementById("creaturesView").style.display = view === "creatures" ? "" : "none";
+        document.getElementById("repeatersView").style.display = view === "repeaters" ? "" : "none";
       }
 
       function switchShipyardView(view) {

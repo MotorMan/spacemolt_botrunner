@@ -5466,6 +5466,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
     const isCloakedIgnoringBlacklist = hasCloak && bot.isCloaked && settings.cloakIgnoreBlacklist;
     if (!isCloakedIgnoringBlacklist && nearbyResp.structuredContent && typeof nearbyResp.structuredContent === "object") {
       bot.trackWildlife(nearbyResp.structuredContent);
+      bot.trackRepeaters(nearbyResp.structuredContent);
       const { checkAndFleeFromPirates } = await import("./common.js");
       const fled = await checkAndFleeFromPirates(ctx, nearbyResp.structuredContent);
       if (fled) {
@@ -5484,6 +5485,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
       const nearbyResp = await bot.commands.spacemolt.get_nearby();
       if (nearbyResp.structuredContent && typeof nearbyResp.structuredContent === "object") {
         bot.trackWildlife(nearbyResp.structuredContent);
+        bot.trackRepeaters(nearbyResp.structuredContent);
         const { parseNearbyEntities } = await import("./common.js");
         const nearbyResult = parseNearbyEntities(nearbyResp.structuredContent);
 
@@ -5532,6 +5534,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
       const nearbyResp2 = await bot.commands.spacemolt.get_nearby();
       if (nearbyResp2.structuredContent && typeof nearbyResp2.structuredContent === "object") {
         bot.trackWildlife(nearbyResp2.structuredContent);
+        bot.trackRepeaters(nearbyResp2.structuredContent);
         const { parseNearbyEntities } = await import("./common.js");
         const nearbyResult2 = parseNearbyEntities(nearbyResp2.structuredContent);
 

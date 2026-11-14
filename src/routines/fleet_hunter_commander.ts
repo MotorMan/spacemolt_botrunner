@@ -1376,6 +1376,7 @@ const currentSettings = getFleetHunterSettings();
         // Track player names from nearby scan
         bot.trackNearbyPlayers(nearbyResp.result);
         bot.trackWildlife(nearbyResp.result);
+        bot.trackRepeaters(nearbyResp.result);
 
         const entities = parseNearby(nearbyResp.result);
         const pirates = entities.filter(e => e.isPirate && isPirateTarget(e, true, currentSettings.maxAttackTier));
@@ -1808,6 +1809,7 @@ const safetyOpts = {
     // Track player names from nearby scan
     bot.trackNearbyPlayers(nearbyResp.result);
     bot.trackWildlife(nearbyResp.result);
+    bot.trackRepeaters(nearbyResp.result);
 
     const entities = parseNearby(nearbyResp.result);
     const pirates = entities.filter(e => e.isPirate && isPirateTarget(e, true, currentSettings.maxAttackTier));

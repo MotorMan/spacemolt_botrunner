@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Repeaters - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background: var(--bg); color: var(--text); }
+    body { padding: 14px; display:flex; flex-direction:column; overflow:hidden; font-family: inherit; }
+    .repeaters-layout { flex:1; min-height:0; display:flex; flex-direction:column; gap:10px; }
+    .repeaters-header { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+    .repeaters-header h3 { margin:0; color:var(--text-bright); }
+    .repeaters-stats { color:var(--text-dim); font-size:12px; }
+    .repeaters-stats b { color:var(--text-bright); font-weight:600; }
+    .repeaters-stats .battle-count { color:#ff5cc8; }
+    .repeaters-stats .idle-count { color:#5cc8ff; }
+
+    .toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .search-input { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:12px; flex:1; min-width:200px; max-width:420px; }
+    .filter-select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:12px; }
+    .chk { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--text-dim); cursor:pointer; user-select:none; }
+    .chk input { accent-color:#ff3db2; }
+    .btn { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--card-bg); color:var(--text); font-size:12px; cursor:pointer; }
+    .btn:hover { border-color:var(--accent); }
+
+    .table-wrap { flex:1; min-height:0; overflow:auto; border:1px solid var(--border); border-radius:6px; background: var(--card-bg); }
+    table.repeaters-table { width:100%; border-collapse:collapse; font-size:12px; }
+    table.repeaters-table thead th {
+      position:sticky; top:0; z-index:2;
+      text-align:left; padding:7px 10px;
+      background:#161b22; border-bottom:1px solid var(--border);
+      color:var(--text-dim); font-weight:600; white-space:nowrap; cursor:pointer;
+    }
+    table.repeaters-table thead th:hover { color:var(--text); }
+    table.repeaters-table thead th .arrow { color:var(--accent); font-size:10px; }
+    table.repeaters-table td { padding:5px 10px; border-bottom:1px solid var(--border); white-space:nowrap; }
+    table.repeaters-table tbody tr:hover { background:var(--hover); }
+    .r-name { color:var(--text-bright); font-weight:600; }
+    .r-ship { color:var(--text); }
+    .r-hull { text-align:right; font-variant-numeric:tabular-nums; color:var(--text); }
+    .r-count { text-align:right; font-variant-numeric:tabular-nums; color:var(--text-dim); }
+    .r-system, .r-poi { color:var(--text-dim); }
+    .r-seen { color:var(--text-dim); font-size:11px; }
+    .r-battle { text-align:center; }
+    .badge { display:inline-block; padding:1px 6px; border-radius:3px; font-size:10px; font-weight:700; letter-spacing:.3px; }
+    .badge-battle { background:#ff3db2; color:#fff; box-shadow:0 0 6px rgba(255,61,178,.7); }
+    .badge-idle { background:#0ea5e9; color:#fff; box-shadow:0 0 6px rgba(14,165,233,.7); }
+
+    tr.in-battle td { background: rgba(255, 61, 178, 0.14); border-bottom-color: rgba(255,61,178,.35); }
+    tr.in-battle td.r-name { color:#ff8fe0; text-shadow:0 0 6px rgba(255,80,200,.7); }
+    tr.in-battle:hover td { background: rgba(255, 61, 178, 0.22); }
+    tr.in-battle td:first-child { box-shadow: inset 3px 0 0 #ff3db2; }
+
+    tr.idle td { background: rgba(90, 200, 255, 0.10); border-bottom-color: rgba(90,200,255,.32); }
+    tr.idle td.r-name { color:#8fd8ff; text-shadow:0 0 6px rgba(90,200,255,.6); }
+    tr.idle:hover td { background: rgba(90, 200, 255, 0.18); }
+    tr.idle td:first-child { box-shadow: inset 3px 0 0 #38bdf8; }
+
+    .empty-state { text-align:center; padding:40px; color:var(--text-dim); }
+    .pill { display:inline-block; padding:1px 7px; border-radius:10px; background:var(--border); color:var(--text); font-size:11px; }
+  </style>
+</head>
+<body>
+  <div class="repeaters-layout">
+    <div class="repeaters-header">
+      <h3>Repeaters</h3>
+      <span class="repeaters-stats" id="repeatersStats">Loading…</span>
+    </div>
+
+    <div class="toolbar">
+      <input type="text" class="search-input" id="search" placeholder="Search name, ship class, system, POI…" oninput="onFilterChange()">
+      <select class="filter-select" id="shipFilter" onchange="onFilterChange()"><option value="">All Ship Classes</option></select>
+      <select class="filter-select" id="systemFilter" onchange="onFilterChange()"><option value="">All Systems</option></select>
+      <label class="chk"><input type="checkbox" id="battleOnly" onchange="onFilterChange()"> In Battle only</label>
+      <label class="chk"><input type="checkbox" id="idleOnly" onchange="onFilterChange()"> Idle only</label>
+      <select class="filter-select" id="sortBy" onchange="onFilterChange()">
+        <option value="name">Sort: Name</option>
+        <option value="hull">Sort: Max Hull</option>
+        <option value="count">Sort: Count</option>
+        <option value="seen">Sort: Last Seen</option>
+        <option value="system">Sort: System</option>
+      </select>
+      <button class="btn" onclick="loadData(true)">Refresh</button>
+    </div>
+
+    <div class="table-wrap" id="tableWrap">
+      <div class="empty-state">Loading repeater data…</div>
+    </div>
+  </div>
+
+  <script>
+    let allRows = [];
+    let lastUpdated = "";
+    let ws = null;
+    let reconnectDelay = 1000;
+    let wsManualClose = false;
+    let wsConnectTimer = null;
+    let wsInitTimer = null;
+    let wsHeartbeatTimer = null;
+    let wsWatchdogTimer = null;
+    let wsLastMsg = Date.now();
+    let sortDir = 1;
+    let sortKey = "name";
+
+    function normName(s) { return (s || "").toLowerCase().replace(/_/g, " "); }
+
+    function esc(s) {
+      if (s === undefined || s === null) return "";
+      const d = document.createElement("div");
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    function getTimeAgo(iso) {
+      if (!iso) return "—";
+      const diff = Date.now() - new Date(iso).getTime();
+      const m = Math.floor(diff / 60000);
+      if (m < 1) return "just now";
+      if (m < 60) return m + "m ago";
+      const h = Math.floor(m / 60);
+      if (h < 24) return h + "h " + (m % 60) + "m ago";
+      const d = Math.floor(h / 24);
+      return d + "d ago";
+    }
+
+    async function loadData(force) {
+      try {
+        const res = await fetch("/api/repeaters?_=" + Date.now());
+        const data = await res.json();
+        if (!force && data.lastUpdated === lastUpdated) return;
+        lastUpdated = data.lastUpdated || "";
+        allRows = flatten(data);
+        populateFilters();
+        render();
+      } catch (e) {
+        console.error("Failed to load repeater data:", e);
+        const wrap = document.getElementById("tableWrap");
+        if (wrap) wrap.innerHTML = '<div class="empty-state">Failed to load repeater data.</div>';
+      }
+    }
+
+    function flatten(data) {
+      const rows = [];
+      const systems = data.systems || {};
+      for (const sysName of Object.keys(systems)) {
+        const sys = systems[sysName];
+        const pois = sys.pois || {};
+        for (const poiName of Object.keys(pois)) {
+          for (const e of (pois[poiName] || [])) {
+            rows.push({
+              name: e.n,
+              shipClass: e.c || "",
+              maxHull: e.h || 0,
+              count: (e.ids || []).length,
+              ids: e.ids || [],
+              system: sysName,
+              poi: poiName,
+              seen: e.seen || "",
+              inBattle: e.b || false,
+            });
+          }
+        }
+      }
+      return rows;
+    }
+
+    function populateFilters() {
+      const shipSel = document.getElementById("shipFilter");
+      const sysSel = document.getElementById("systemFilter");
+      const curShip = shipSel.value;
+      const curSys = sysSel.value;
+      const ships = [...new Set(allRows.map(r => r.shipClass).filter(Boolean))].sort();
+      const systems = [...new Set(allRows.map(r => r.system).filter(Boolean))].sort();
+      shipSel.innerHTML = '<option value="">All Ship Classes</option>' +
+        ships.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+      sysSel.innerHTML = '<option value="">All Systems</option>' +
+        systems.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+      shipSel.value = curShip;
+      sysSel.value = curSys;
+    }
+
+    function onFilterChange() { render(); }
+
+    function getFiltered() {
+      const q = (document.getElementById("search").value || "").toLowerCase().trim();
+      const ship = document.getElementById("shipFilter").value;
+      const system = document.getElementById("systemFilter").value;
+      const battleOnly = document.getElementById("battleOnly").checked;
+      const idleOnly = document.getElementById("idleOnly").checked;
+      const sortBy = document.getElementById("sortBy").value;
+
+      let rows = allRows.filter(r => {
+        if (battleOnly && !r.inBattle) return false;
+        if (idleOnly && r.inBattle) return false;
+        if (ship && r.shipClass !== ship) return false;
+        if (system && r.system !== system) return false;
+        if (q) {
+          const hay = (r.name + " " + r.shipClass + " " + r.system + " " + r.poi).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+
+      const k = sortBy;
+      const field = (k === "hull") ? "maxHull" : k;
+      const numeric = (k === "hull" || k === "count");
+      if (sortKey !== k) { sortKey = k; sortDir = (k === "hull" || k === "count" || k === "seen") ? -1 : 1; }
+      const dir = sortDir;
+      rows.sort((a, b) => {
+        let av, bv;
+        if (k === "seen") { av = a.seen; bv = b.seen; return dir * (av > bv ? -1 : av < bv ? 1 : 0); }
+        av = a[field]; bv = b[field];
+        if (numeric) return dir * ((av || 0) - (bv || 0));
+        av = String(av || ""); bv = String(bv || "");
+        return dir * (av < bv ? -1 : av > bv ? 1 : 0);
+      });
+      return rows;
+    }
+
+    function render() {
+      const rows = getFiltered();
+      const wrap = document.getElementById("tableWrap");
+
+      const totalTypes = allRows.length;
+      const totalIndividuals = allRows.reduce((s, r) => s + r.count, 0);
+      const systemsCovered = new Set(allRows.map(r => r.system)).size;
+      const battleCount = allRows.filter(r => r.inBattle).length;
+      const idleCount = allRows.filter(r => !r.inBattle).length;
+
+      document.getElementById("repeatersStats").innerHTML =
+        `<b>${rows.length}</b> shown · ` +
+        `<b>${totalTypes}</b> types · ` +
+        `<b>${totalIndividuals}</b> individuals · ` +
+        `<b>${systemsCovered}</b> systems · ` +
+        `<span class="battle-count">${battleCount} in battle</span> · ` +
+        `<span class="idle-count">${idleCount} idle</span>`;
+
+      if (!rows.length) {
+        wrap.innerHTML = '<div class="empty-state">No repeaters match the current filters.</div>';
+        return;
+      }
+
+      const body = rows.map(r => {
+        const rowCls = r.inBattle ? "in-battle" : "idle";
+        let battleCell = r.inBattle ? `<span class="badge badge-battle">BATTLE</span>` : `<span class="badge badge-idle">IDLE</span>`;
+        return `<tr class="${rowCls}">
+          <td class="r-name">${esc(r.name)}</td>
+          <td class="r-ship">${esc(r.shipClass)}</td>
+          <td class="r-hull">${r.maxHull.toLocaleString()}</td>
+          <td class="r-count">${r.count}</td>
+          <td class="r-system">${esc(r.system)}</td>
+          <td class="r-poi">${esc(r.poi)}</td>
+          <td class="r-seen">${getTimeAgo(r.seen)}</td>
+          <td class="r-battle">${battleCell}</td>
+        </tr>`;
+      }).join("");
+
+      wrap.innerHTML = `<table class="repeaters-table">
+        <thead><tr>
+          <th onclick="setSort('name')">Name</th>
+          <th onclick="setSort('ship')">Ship Class</th>
+          <th class="r-hull" onclick="setSort('hull')">Max Hull</th>
+          <th class="r-count" onclick="setSort('count')">Count</th>
+          <th onclick="setSort('system')">System</th>
+          <th>POI</th>
+          <th onclick="setSort('seen')">Last Seen</th>
+          <th>Status</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>`;
+    }
+
+    function setSort(key) {
+      const sel = document.getElementById("sortBy");
+      const map = { name: "name", ship: "shipClass", hull: "hull", count: "count", seen: "seen", system: "system" };
+      const k = map[key];
+      if (sel.value === k) {
+        sortDir = -sortDir;
+      } else {
+        sortDir = (k === "hull" || k === "count" || k === "seen") ? -1 : 1;
+      }
+      sel.value = k;
+      sortKey = k;
+      render();
+    }
+
+    function connect() {
+      if (wsManualClose) return;
+      clearTimeout(wsConnectTimer);
+
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      let host = location.host;
+      if (!host) host = (location.hostname || 'localhost') + (location.port ? ':' + location.port : '');
+      let url;
+      try {
+        url = `${proto}//${host}/ws`;
+        ws = new WebSocket(url);
+      } catch (err) {
+        console.warn('WebSocket constructor failed, retrying in 1s:', err);
+        wsConnectTimer = setTimeout(connect, 1000);
+        return;
+      }
+
+      wsLastMsg = Date.now();
+
+      clearTimeout(wsInitTimer);
+      wsInitTimer = setTimeout(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          console.warn('WebSocket not open after 4s — REST fallback + reconnect');
+          try { loadData(true); } catch (e) {}
+          try { ws && ws.close(); } catch {}
+        }
+      }, 4000);
+
+      ws.onopen = () => {
+        clearTimeout(wsInitTimer);
+        reconnectDelay = 1000;
+        loadData(true);
+        clearInterval(wsHeartbeatTimer);
+        wsHeartbeatTimer = setInterval(() => {
+          try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+        }, 15000);
+        clearInterval(wsWatchdogTimer);
+        wsWatchdogTimer = setInterval(() => {
+          if (ws && ws.readyState === WebSocket.OPEN && Date.now() - wsLastMsg > 30000) {
+            console.warn('WebSocket silent for 30s, forcing reconnect');
+            try { ws.close(); } catch {}
+          }
+        }, 5000);
+      };
+
+      ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        if (msg.type === 'pong') return;
+        wsLastMsg = Date.now();
+        if (msg.type === 'init') loadData(true);
+      };
+
+      ws.onclose = () => {
+        clearTimeout(wsInitTimer);
+        clearInterval(wsHeartbeatTimer);
+        clearInterval(wsWatchdogTimer);
+        if (wsManualClose) return;
+        wsConnectTimer = setTimeout(connect, 1000);
+      };
+
+      ws.onerror = () => {
+        try { ws && ws.close(); } catch {}
+      };
+    }
+
+    connect();
+    loadData(true);
+    setInterval(() => loadData(false), 5000);
+  </script>
+</body>
+</html>

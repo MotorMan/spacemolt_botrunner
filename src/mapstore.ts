@@ -6,8 +6,6 @@ import { safeCopyFileSync, safeWriteFileSync } from "./diskSpaceGuard.js";
 import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
 import { onPoiUpdate } from "./client_sync_hooks.js";
 import { perf } from "./perf.js";
-import { join } from "path";
-import { readFileSync, existsSync } from "fs";
 
 const DATA_DIR = join(process.cwd(), "data");
 const SETTINGS_FILE = join(DATA_DIR, "settings.json");
@@ -289,7 +287,6 @@ export interface ResolvedStation {
 
 // ── MapStore singleton ──────────────────────────────────────
 
-const DATA_DIR = join(process.cwd(), "data");
 const MAP_FILE = join(DATA_DIR, "map.json");
 const SAVE_DEBOUNCE_MS = 5000;
 const BACKUP_DIR = join(DATA_DIR, "Backups");

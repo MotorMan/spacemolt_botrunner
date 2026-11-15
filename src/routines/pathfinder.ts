@@ -11,6 +11,8 @@ import {
   tryRefuel,
   ensureFueled,
   repairShip,
+  PIRATE_SYSTEMS,
+  isPirateSystem,
 } from "./common.js";
 import { formatBearing, PATHFINDER_SPEED, generateScanPattern } from "../pathfinder.js";
 
@@ -433,19 +435,221 @@ async function checkPathfinderFuelSafety(ctx: RoutineContext, estimatedJumps: nu
   return { safe: true };
 }
 
+/** Check if a system is a pirate stronghold. */
+function isPirateStronghold(systemId: string): boolean {
+  return PIRATE_SYSTEMS.some(ps => systemId.toLowerCase() === ps || systemId.toLowerCase().includes(ps));
+}
+
+/** Check if the path from origin to target passes within captureRadius of any pirate stronghold.
+ *  Returns the pirate stronghold if one is in the path, null otherwise. */
+function checkPirateStrongholdInPath(
+  ctx: RoutineContext,
+  originX: number,
+  originY: number,
+  targetX: number,
+  targetY: number,
+  captureRadius: number = 100
+): { systemId: string; distance: number } | null {
+  const dx = targetX - originX;
+  const dy = targetY - originY;
+  const pathLength = Math.sqrt(dx * dx + dy * dy);
+  
+  if (pathLength === 0) return null;
+  
+  // Unit vector along the path
+  const ux = dx / pathLength;
+  const uy = dy / pathLength;
+  
+  for (const pirateSystem of PIRATE_SYSTEMS) {
+    const sys = mapStore.getSystem(pirateSystem);
+    if (!sys?.position) continue;
+    
+    // Vector from origin to pirate system
+    const px = sys.position.x - originX;
+    const py = sys.position.y - originY;
+    
+    // Project onto path line to find closest point on path
+    const proj = px * ux + py * uy;
+    
+    // If projection is outside the segment, check endpoints
+    let closestX: number, closestY: number;
+    if (proj <= 0) {
+      closestX = originX;
+      closestY = originY;
+    } else if (proj >= pathLength) {
+      closestX = targetX;
+      closestY = targetY;
+    } else {
+      closestX = originX + proj * ux;
+      closestY = originY + proj * uy;
+    }
+    
+    // Distance from pirate system to closest point on path
+    const distToPath = Math.sqrt(
+      Math.pow(sys.position.x - closestX, 2) + 
+      Math.pow(sys.position.y - closestY, 2)
+    );
+    
+    if (distToPath < captureRadius) {
+      ctx.log("warn", `🏴‍☠️ PIRATE STRONGHOLD IN PATH: ${pirateSystem} is ${distToPath.toFixed(1)} GU from jump path (capture radius: ${captureRadius} GU)`);
+      return { systemId: pirateSystem, distance: distToPath };
+    }
+  }
+  
+  return null;
+}
+
+/** Find the nearest main network system that is NOT a pirate stronghold. */
+function findNearestMainNetworkSystemSafe(
+  ctx: RoutineContext,
+  currentX: number,
+  currentY: number
+): { systemId: string; systemName: string; distance: number; position: { x: number; y: number } } | null {
+  const mainNetwork = new Set<string>();
+  
+  // Build main network using same logic as getMainNetworkSystems in explorer.ts
+  const graph = new Map<string, Set<string>>();
+  const addNode = (id: string): void => {
+    const key = id.toLowerCase();
+    if (!graph.has(key)) graph.set(key, new Set());
+  };
+  const addEdge = (a: string, b: string): void => {
+    addNode(a);
+    addNode(b);
+    graph.get(a.toLowerCase())!.add(b.toLowerCase());
+    graph.get(b.toLowerCase())!.add(a.toLowerCase());
+  };
+
+  const STATIC_WORMHOLES: Array<[string, string]> = [
+    ["alzirr", "praecipua"],
+    ["hadar", "gsc_0036"],
+  ];
+
+  for (const sys of mapStore.getSystems()) {
+    addNode(sys.id);
+    for (const conn of sys.connections || []) {
+      if (!conn.system_id) continue;
+      addEdge(sys.id, conn.system_id);
+    }
+  }
+  for (const [a, b] of STATIC_WORMHOLES) {
+    addEdge(a, b);
+  }
+
+  // Find connected component from home system
+  const homeSystem = "sol";
+  const mainComponent = new Set<string>();
+  const queue = [homeSystem.toLowerCase()];
+  mainComponent.add(homeSystem.toLowerCase());
+  
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const neighbors = graph.get(current);
+    if (!neighbors) continue;
+    for (const nb of neighbors) {
+      if (!mainComponent.has(nb)) {
+        mainComponent.add(nb);
+        queue.push(nb);
+      }
+    }
+  }
+
+  // If home system not in graph, use largest component
+  if (mainComponent.size <= 1) {
+    const visited = new Set<string>();
+    let largestComponent = new Set<string>();
+    
+    for (const node of graph.keys()) {
+      if (visited.has(node)) continue;
+      const component = new Set<string>();
+      const compQueue = [node];
+      component.add(node);
+      visited.add(node);
+      
+      while (compQueue.length > 0) {
+        const current = compQueue.shift()!;
+        const neighbors = graph.get(current);
+        if (!neighbors) continue;
+        for (const nb of neighbors) {
+          if (!visited.has(nb)) {
+            visited.add(nb);
+            component.add(nb);
+            compQueue.push(nb);
+          }
+        }
+      }
+      
+      if (component.size > largestComponent.size) {
+        largestComponent = component;
+      }
+    }
+    
+    for (const node of largestComponent) {
+      mainNetwork.add(node);
+    }
+  } else {
+    for (const node of mainComponent) {
+      mainNetwork.add(node);
+    }
+  }
+
+  // Now find the nearest main network system with position data (EXCLUDING PIRATE STRONGHOLDS)
+  let nearest: { systemId: string; systemName: string; distance: number; position: { x: number; y: number } } | null = null;
+  let minDist = Infinity;
+
+  for (const sys of mapStore.getSystems()) {
+    const sysIdLower = sys.id.toLowerCase();
+    if (!mainNetwork.has(sysIdLower)) continue;
+    if (!sys.position || typeof sys.position.x !== "number" || typeof sys.position.y !== "number") continue;
+    if (isPirateStronghold(sys.id)) {
+      ctx.log("debug", `Skipping pirate stronghold ${sys.id} as pathfinder target`);
+      continue;
+    }
+    
+    const dx = sys.position.x - currentX;
+    const dy = sys.position.y - currentY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    
+    if (dist < minDist) {
+      minDist = dist;
+      nearest = {
+        systemId: sys.id,
+        systemName: sys.name || sys.id,
+        distance: dist,
+        position: sys.position
+      };
+    }
+  }
+
+  return nearest;
+}
+
+/** Options for navigateFrontierToMainNetwork */
+export interface NavigateFrontierOptions {
+  maxJumps?: number;
+  fuelThresholdPct?: number;
+  hullThresholdPct?: number;
+  scanWaitMinutes?: number;
+  scanDelayTicks?: number;
+  /** Known frontier systems from explorer memory with their wormhole connections */
+  frontierMemory?: Map<string, { 
+    id: string; 
+    name: string; 
+    position?: { x: number; y: number }; 
+    distanceFromEntry?: number;
+    connections: Set<string>; // Connected frontier system IDs via wormholes
+  }>;
+}
+
 /** Navigate from a frontier dead-end back to the main network using pathfinder jumps.
  *  Uses galactic coordinates to find the nearest main network system and jumps toward it.
  *  Avoids repeat jumps in the same direction to save fuel.
+ *  Checks known frontier systems first for better intermediate targets.
+ *  Bans pirate strongholds as targets and checks path for pirate capture radius.
  *  Returns true if successfully reached main network, false otherwise. */
 export async function navigateFrontierToMainNetwork(
   ctx: RoutineContext,
-  options: { 
-    maxJumps?: number; 
-    fuelThresholdPct?: number;
-    hullThresholdPct?: number;
-    scanWaitMinutes?: number;
-    scanDelayTicks?: number;
-  } = {}
+  options: NavigateFrontierOptions
 ): Promise<boolean> {
   const { bot } = ctx;
   const { 
@@ -454,7 +658,8 @@ export async function navigateFrontierToMainNetwork(
     hullThresholdPct = 30,
     scanWaitMinutes = 5,
     scanDelayTicks = 0,
-  } = options;
+    frontierMemory = new Map(),
+  } = options || {} as NavigateFrontierOptions;
 
   // Get current position
   await bot.refreshLocation();
@@ -473,23 +678,131 @@ export async function navigateFrontierToMainNetwork(
 
   const originPos = { x: currentSys.position.x, y: currentSys.position.y };
 
-  // Find nearest main network system
-  const target = findNearestMainNetworkSystem(originPos.x, originPos.y);
-  if (!target) {
-    ctx.log("error", "No main network system found with position data — cannot navigate back");
+  // ── FIND NEAREST SAFE MAIN NETWORK SYSTEM ────────────────────────────────
+  const mainNetworkTarget = findNearestMainNetworkSystemSafe(ctx, originPos.x, originPos.y);
+  if (!mainNetworkTarget) {
+    ctx.log("error", "No safe main network system found");
     return false;
   }
 
-  ctx.log("travel", `Frontier return: targeting nearest main network system ${target.systemName} (${target.systemId}) at distance ${target.distance.toFixed(1)} GU`);
+  // Calculate current distance to main network
+  const currentMainDist = Math.sqrt(
+    Math.pow(mainNetworkTarget.position.x - originPos.x, 2) + 
+    Math.pow(mainNetworkTarget.position.y - originPos.y, 2)
+  );
+
+  // ── TRAVERSE FRONTIER GRAPH TO FIND BEST INTERMEDIATE TARGET ─────────────
+  // Use BFS through wormhole connections to find ALL reachable frontier systems
+  // that have positions, then pick the one closest to main network
+  let bestIntermediate: { 
+    systemId: string; 
+    systemName: string; 
+    position: { x: number; y: number }; 
+    distanceToMain: number;
+    distanceFromCurrent: number;
+    path: string[];
+  } | null = null;
+
+  if (frontierMemory && frontierMemory.size > 0) {
+    ctx.log("system", `Traversing frontier graph (${frontierMemory.size} systems) to find best return path...`);
+    
+    // BFS from current system through wormhole connections
+    const visited = new Set<string>();
+    const queue: Array<{ systemId: string; path: string[] }> = [
+      { systemId: currentSystem, path: [currentSystem] }
+    ];
+    visited.add(currentSystem);
+    
+    while (queue.length > 0) {
+      const { systemId, path } = queue.shift()!;
+      const fs = frontierMemory.get(systemId);
+      if (!fs) continue;
+      
+      // Check if this system has a position and is closer to main network
+      if (fs.position && systemId !== currentSystem) {
+        const distToMain = Math.sqrt(
+          Math.pow(mainNetworkTarget.position.x - fs.position.x, 2) + 
+          Math.pow(mainNetworkTarget.position.y - fs.position.y, 2)
+        );
+        
+        if (distToMain < currentMainDist) {
+          // Calculate distance from current position
+          const distFromCurrent = Math.sqrt(
+            Math.pow(fs.position.x - originPos.x, 2) + 
+            Math.pow(fs.position.y - originPos.y, 2)
+          );
+          
+          // Check if this is the best so far (closest to main network)
+          if (!bestIntermediate || distToMain < bestIntermediate.distanceToMain) {
+            bestIntermediate = {
+              systemId: fs.id,
+              systemName: fs.name,
+              position: fs.position,
+              distanceToMain: distToMain,
+              distanceFromCurrent: distFromCurrent,
+              path: [...path]
+            };
+            ctx.log("travel", `Found better intermediate: ${fs.name} (${fs.id}) - ${distToMain.toFixed(1)} GU to main (vs current ${currentMainDist.toFixed(1)} GU), ${path.length - 1} wormhole hop(s)`);
+          }
+        }
+      }
+      
+      // Traverse wormhole connections
+      for (const connId of fs.connections) {
+        if (visited.has(connId)) continue;
+        visited.add(connId);
+        queue.push({ systemId: connId, path: [...path, connId] });
+      }
+    }
+    
+    if (bestIntermediate) {
+      ctx.log("travel", `Best intermediate target: ${bestIntermediate.systemName} (${bestIntermediate.systemId}) - ${bestIntermediate.distanceToMain.toFixed(1)} GU to main, ${bestIntermediate.path.length - 1} hop(s) via wormholes`);
+    } else {
+      ctx.log("system", `No frontier system closer to main network than current position (${currentMainDist.toFixed(1)} GU)`);
+    }
+  } else {
+    ctx.log("warn", "No frontier memory available - cannot check for better intermediate targets");
+  }
+
+  // ── DECIDE TARGET AND NAVIGATION METHOD ──────────────────────────────────
+  let target: { systemId: string; systemName: string; distance: number; position: { x: number; y: number } } | null = null;
+  let usePathfinder = true;
+  let intermediateTarget: { systemId: string; systemName: string; distance: number; position: { x: number; y: number } } | null = null;
+
+  if (bestIntermediate) {
+    // Use wormhole navigation to reach the intermediate target
+    target = {
+      systemId: bestIntermediate.systemId,
+      systemName: bestIntermediate.systemName,
+      distance: bestIntermediate.distanceFromCurrent,
+      position: bestIntermediate.position
+    };
+    usePathfinder = false;
+    intermediateTarget = {
+      systemId: bestIntermediate.systemId,
+      systemName: bestIntermediate.systemName,
+      distance: bestIntermediate.distanceFromCurrent,
+      position: bestIntermediate.position
+    };
+  } else {
+    // No better intermediate - use pathfinder directly to main network
+    target = mainNetworkTarget;
+    usePathfinder = true;
+  }
+
+  if (!target) {
+    ctx.log("error", "No valid target found for frontier return (all main network systems may be pirate strongholds)");
+    return false;
+  }
+
+  ctx.log("travel", `Frontier return: targeting ${usePathfinder ? 'main network' : 'intermediate frontier'} system ${target.systemName} (${target.systemId}) at distance ${Math.sqrt(Math.pow(target.position.x - originPos.x, 2) + Math.pow(target.position.y - originPos.y, 2)).toFixed(1)} GU`);
 
   // Calculate initial bearing
   let bearing = calculateBearingToTarget(originPos.x, originPos.y, target.position.x, target.position.y);
   ctx.log("travel", `Initial bearing to ${target.systemName}: ${formatBearing(bearing, 2)}°`);
 
   // ── PRE-FLIGHT FUEL SAFETY LOCKOUT ─────────────────────────────────────
-  // Estimate jumps needed based on distance (rough: ~1000 GU per jump at 10 GU/tick)
-  // Actually use target.distance and PATHFINDER_SPEED to estimate
-  const estimatedJumps = Math.max(1, Math.ceil(target.distance / 1000)); // rough estimate
+  const estimatedJumps = usePathfinder ? Math.max(1, Math.ceil(Math.sqrt(Math.pow(target.position.x - originPos.x, 2) + Math.pow(target.position.y - originPos.y, 2)) / 1000)) : 1;
   const safetyCheck = await checkPathfinderFuelSafety(ctx, estimatedJumps, 3);
   if (!safetyCheck.safe) {
     ctx.log("error", `🚫 PATHFINDER LOCKOUT: ${safetyCheck.reason}`);
@@ -497,6 +810,17 @@ export async function navigateFrontierToMainNetwork(
     return false;
   }
   ctx.log("system", `[Pathfinder Fuel Safety] ✅ Pre-flight check PASSED — ${estimatedJumps} estimated jumps, sufficient fuel confirmed.`);
+
+  // ── PRE-FLIGHT PIRATE PATH CHECK ───────────────────────────────────────
+  if (usePathfinder) {
+    const pirateInPath = checkPirateStrongholdInPath(ctx, originPos.x, originPos.y, target.position.x, target.position.y, 100);
+    if (pirateInPath) {
+      ctx.log("error", `🚫 PATHFINDER LOCKOUT: Pirate stronghold ${pirateInPath.systemId} is ${pirateInPath.distance.toFixed(1)} GU from jump path (capture radius: 100 GU)`);
+      ctx.log("error", `🚫 Cannot safely jump to ${target.systemName} — path blocked by pirate stronghold.`);
+      return false;
+    }
+    ctx.log("system", `[Pirate Path Safety] ✅ Path to ${target.systemName} clear of pirate strongholds (100 GU radius).`);
+  }
 
   let jumpsPerformed = 0;
   let lastBearing: number | null = null;
@@ -506,12 +830,22 @@ export async function navigateFrontierToMainNetwork(
 
   while (jumpsPerformed < maxJumps && bot.state === "running") {
     // ── PER-JUMP FUEL SAFETY LOCKOUT ─────────────────────────────────────
-    // Re-check fuel before EVERY jump - if we fall below safety threshold, ABORT
     const perJumpSafety = await checkPathfinderFuelSafety(ctx, maxJumps - jumpsPerformed, 2);
     if (!perJumpSafety.safe) {
       ctx.log("error", `🚫 PATHFINDER LOCKOUT (mid-journey): ${perJumpSafety.reason}`);
       ctx.log("error", `🚫 Aborting pathfinder return at jump ${jumpsPerformed}/${maxJumps} — falling back to normal nav.`);
       return false;
+    }
+
+    // ── PER-JUMP PIRATE PATH CHECK ───────────────────────────────────────
+    // Before each jump, verify the path from current position to target is still clear
+    if (usePathfinder) {
+      const pirateInPath = checkPirateStrongholdInPath(ctx, currentPos.x, currentPos.y, target.position.x, target.position.y, 100);
+      if (pirateInPath) {
+        ctx.log("error", `🚫 PATHFINDER LOCKOUT (mid-journey): Pirate stronghold ${pirateInPath.systemId} entered capture radius of jump path!`);
+        ctx.log("error", `🚫 Aborting pathfinder return at jump ${jumpsPerformed}/${maxJumps} — path blocked by pirate stronghold.`);
+        return false;
+      }
     }
 
     // Check fuel and hull before each jump

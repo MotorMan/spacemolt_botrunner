@@ -5597,12 +5597,17 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       // If we're at a dead-end or frontier is exhausted, use pathfinder jumps to return to main network
       if ((isDeadEnd || settings.frontierAutoReturn) && bot.hasPathfinderDrive) {
         ctx.log("system", `Frontier exhausted${isDeadEnd ? " (dead-end system)" : ""} — using pathfinder jumps to return to main network...`);
+        
+        // Pass full frontier memory (with wormhole connections) to pathfinder
+        const pathfinderFrontierMemory = new Map(frontierMemory);
+        
         const returned = await navigateFrontierToMainNetwork(ctx, {
           maxJumps: 15,
           fuelThresholdPct: settings.frontierFuelThreshold,
           hullThresholdPct: 30,
           scanWaitMinutes: 5,
           scanDelayTicks: 0,
+          frontierMemory: pathfinderFrontierMemory,
         });
         if (returned) {
           ctx.log("system", "Successfully returned to main network via pathfinder jumps!");
@@ -6550,12 +6555,18 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
       // If we're at a dead-end or survey is exhausted, use pathfinder jumps to return to main network
       if ((isDeadEnd || settings.frontierAutoReturn) && bot.hasPathfinderDrive) {
         ctx.log("system", `Frontier survey exhausted${isDeadEnd ? " (dead-end system)" : ""} — using pathfinder jumps to return to main network...`);
+        
+        // Build known frontier systems array with positions from mapStore
+        // Pass full frontier memory (with wormhole connections) to pathfinder
+        const pathfinderFrontierMemory = new Map(frontierMemory);
+        
         const returned = await navigateFrontierToMainNetwork(ctx, {
           maxJumps: 15,
           fuelThresholdPct: settings.frontierFuelThreshold,
           hullThresholdPct: 30,
           scanWaitMinutes: 5,
           scanDelayTicks: 0,
+          frontierMemory: pathfinderFrontierMemory,
         });
         if (returned) {
           ctx.log("system", "Successfully returned to main network via pathfinder jumps!");

@@ -772,6 +772,7 @@
               <div class="ore-filter-list" id="oreFilterList">
                 <!-- filled by JS -->
               </div>
+              <div id="resourceSummaryPanel" class="resource-summary-panel" style="display: none;"></div>
               <label>Sort By</label>
               <select id="mapSortBy" onchange="renderMap()">
                 <option value="updated">Last Updated</option>
@@ -13215,6 +13216,7 @@
             })
             .join("") +
           `<div class="ore-chip${activeOreFilters.size === 0 ? " active" : ""}" onclick="clearOreFilters()">All</div>`;
+        updateResourceSummaryPanel();
       }
 
       function toggleOreFilter(oreId) {
@@ -13228,6 +13230,78 @@
         activeOreFilters.clear();
         buildOreFilters();
         renderMap();
+      }
+
+      /** Calculate total max and remaining for a specific resource across all POIs */
+      function getResourceTotals(resourceId) {
+        let totalMax = 0;
+        let totalRemaining = 0;
+        let poiCount = 0;
+        for (const sys of Object.values(mapData)) {
+          for (const poi of sys.pois || []) {
+            // Check new-style resource scan data
+            for (const res of poi.resources || []) {
+              if (res.resource_id === resourceId) {
+                totalMax += res.max_remaining || 0;
+                totalRemaining += res.remaining || 0;
+                if ((res.max_remaining || 0) > 0) poiCount++;
+              }
+            }
+          }
+        }
+        return { totalMax, totalRemaining, poiCount };
+      }
+
+      /** Update the resource summary panel in the left filter pane */
+      function updateResourceSummaryPanel() {
+        const panel = document.getElementById("resourceSummaryPanel");
+        if (!panel) return;
+
+        if (activeOreFilters.size === 1) {
+          const resourceId = [...activeOreFilters][0];
+          const resourceName = catalogName(resourceId) || resourceId;
+          const { totalMax, totalRemaining, poiCount } = getResourceTotals(resourceId);
+
+          if (totalMax === 0 && totalRemaining === 0) {
+            panel.style.display = "none";
+            return;
+          }
+
+          const depletionPercent = totalMax > 0
+            ? Math.round((1 - totalRemaining / totalMax) * 100)
+            : 0;
+          const fullness = 100 - depletionPercent;
+          const depletionColor =
+            fullness > 80 ? "#4caf50" : fullness > 50 ? "#ff9800" : "#f44336";
+
+          panel.style.display = "block";
+          panel.innerHTML = `
+            <div class="resource-summary-header">
+              <span class="resource-summary-title">${esc(resourceName)}</span>
+              <span class="resource-summary-poi-count">${poiCount} POI${poiCount !== 1 ? "s" : ""}</span>
+            </div>
+            <div class="resource-summary-stats">
+              <div class="resource-summary-row">
+                <span class="resource-summary-label">Total Capacity:</span>
+                <span class="resource-summary-value">${totalMax.toLocaleString()}</span>
+              </div>
+              <div class="resource-summary-row">
+                <span class="resource-summary-label">Available Now:</span>
+                <span class="resource-summary-value" style="color: var(--green)">${totalRemaining.toLocaleString()}</span>
+              </div>
+              <div class="resource-summary-row">
+                <span class="resource-summary-label">Depletion:</span>
+                <span class="resource-summary-value">${depletionPercent}%</span>
+              </div>
+            </div>
+            <div class="resource-summary-bar">
+              <div class="resource-summary-fill" style="width:${fullness}%; background: ${depletionColor}"></div>
+              <div class="resource-summary-text">${fullness}% full</div>
+            </div>
+          `;
+        } else {
+          panel.style.display = "none";
+        }
       }
 
       function toggleSystem(sysId) {

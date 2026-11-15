@@ -256,6 +256,18 @@ export async function executePathfinderJumpToBearing(
   const originSystem = bot.system;
   const bearing = ((bearingDegrees % 360) + 360) % 360;
 
+  // Track cloak state - disable for pathfinder jump (saves fuel, can't be attacked in transit)
+  const wasCloaked = bot.isCloaked || false;
+  if (wasCloaked) {
+    ctx.log("travel", "Disabling cloak for pathfinder jump (fuel conservation)...");
+    const decloakResp = await bot.exec("cloak", { state: "off" });
+    if (decloakResp.error) {
+      ctx.log("warn", `Failed to disable cloak: ${decloakResp.error.message}`);
+    } else {
+      ctx.log("travel", "Cloak disabled for pathfinder jump");
+    }
+  }
+
   const startTick = await bot.pollCurrentTick();
 
   ctx.log("travel", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° from ${originSystem} (returning to main network)`);
@@ -263,6 +275,10 @@ export async function executePathfinderJumpToBearing(
   const jumpResp = await bot.exec("jump", { target_system: bearing });
   if (jumpResp.error) {
     ctx.log("error", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° failed: ${jumpResp.error.message}`);
+    // Re-enable cloak if we disabled it
+    if (wasCloaked) {
+      await bot.exec("cloak", { state: "on" });
+    }
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
@@ -295,6 +311,10 @@ export async function executePathfinderJumpToBearing(
 
   if (!inTransit && bot.state === "running") {
     ctx.log("error", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° — transit never started`);
+    // Re-enable cloak if we disabled it
+    if (wasCloaked) {
+      await bot.exec("cloak", { state: "on" });
+    }
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
@@ -327,11 +347,19 @@ export async function executePathfinderJumpToBearing(
 
   if (poll >= maxPolls && inTransit && bot.state === "running") {
     ctx.log("error", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° — transit did not complete after ${Math.round(maxPolls * 5 / 1000)}s, aborting`);
+    // Re-enable cloak if we disabled it
+    if (wasCloaked) {
+      await bot.exec("cloak", { state: "on" });
+    }
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
   if (bot.state !== "running") {
     ctx.log("system", "Pathfinder jump aborted — bot stopped");
+    // Re-enable cloak if we disabled it
+    if (wasCloaked) {
+      await bot.exec("cloak", { state: "on" });
+    }
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
@@ -339,6 +367,10 @@ export async function executePathfinderJumpToBearing(
 
   if (bot.state !== "running") {
     ctx.log("system", "Pathfinder jump aborted — bot stopped");
+    // Re-enable cloak if we disabled it
+    if (wasCloaked) {
+      await bot.exec("cloak", { state: "on" });
+    }
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
@@ -359,6 +391,17 @@ export async function executePathfinderJumpToBearing(
 
   const landed = bot.system;
   ctx.log("travel", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° complete: arrived at ${landed}`);
+
+  // Re-enable cloak if we disabled it for the jump
+  if (wasCloaked) {
+    ctx.log("travel", "Re-enabling cloak after pathfinder jump...");
+    const recloakResp = await bot.exec("cloak", { state: "on" });
+    if (recloakResp.error) {
+      ctx.log("warn", `Failed to re-enable cloak: ${recloakResp.error.message}`);
+    } else {
+      ctx.log("travel", "Cloak re-enabled");
+    }
+  }
 
   if (arrivalPos === null) {
     const landedSys = mapStore.getSystem(landed);
@@ -1038,6 +1081,18 @@ async function pathfinderJumpAtBearing(
   const originSystem = bot.system;
   const bearing = ((bearingDegrees % 360) + 360) % 360;
 
+  // Track cloak state - disable for pathfinder jump (saves fuel, can't be attacked in transit)
+  const wasCloaked = bot.isCloaked || false;
+  if (wasCloaked) {
+    ctx.log("travel", "Disabling cloak for pathfinder jump (fuel conservation)...");
+    const decloakResp = await bot.exec("cloak", { state: "off" });
+    if (decloakResp.error) {
+      ctx.log("warn", `Failed to disable cloak: ${decloakResp.error.message}`);
+    } else {
+      ctx.log("travel", "Cloak disabled for pathfinder jump");
+    }
+  }
+
   // Record the tick we depart on so we can compute distance traveled.
   const startTick = await bot.pollCurrentTick();
 
@@ -1046,6 +1101,10 @@ async function pathfinderJumpAtBearing(
   const jumpResp = await bot.exec("jump", { target_system: bearing });
   if (jumpResp.error) {
     ctx.log("error", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° failed: ${jumpResp.error.message}`);
+    // Re-enable cloak if we disabled it
+    if (wasCloaked) {
+      await bot.exec("cloak", { state: "on" });
+    }
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
@@ -1082,6 +1141,10 @@ async function pathfinderJumpAtBearing(
 
   if (!inTransit && bot.state === "running") {
     ctx.log("error", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° — transit never started`);
+    // Re-enable cloak if we disabled it
+    if (wasCloaked) {
+      await bot.exec("cloak", { state: "on" });
+    }
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
@@ -1119,12 +1182,20 @@ async function pathfinderJumpAtBearing(
 
   if (poll >= maxPolls && inTransit && bot.state === "running") {
     ctx.log("error", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° — transit did not complete after ${Math.round(maxPolls * 5 / 1000)}s, aborting`);
+    // Re-enable cloak if we disabled it
+    if (wasCloaked) {
+      await bot.exec("cloak", { state: "on" });
+    }
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
   // Honor an immediate stop request — don't poll tick or continue processing.
   if (bot.state !== "running") {
     ctx.log("system", "Pathfinder jump aborted — bot stopped");
+    // Re-enable cloak if we disabled it
+    if (wasCloaked) {
+      await bot.exec("cloak", { state: "on" });
+    }
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
@@ -1133,6 +1204,10 @@ async function pathfinderJumpAtBearing(
 
   if (bot.state !== "running") {
     ctx.log("system", "Pathfinder jump aborted — bot stopped");
+    // Re-enable cloak if we disabled it
+    if (wasCloaked) {
+      await bot.exec("cloak", { state: "on" });
+    }
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
@@ -1155,6 +1230,17 @@ async function pathfinderJumpAtBearing(
 
   const landed = bot.system;
   ctx.log("travel", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° complete: arrived at ${landed}`);
+
+  // Re-enable cloak if we disabled it for the jump
+  if (wasCloaked) {
+    ctx.log("travel", "Re-enabling cloak after pathfinder jump...");
+    const recloakResp = await bot.exec("cloak", { state: "on" });
+    if (recloakResp.error) {
+      ctx.log("warn", `Failed to re-enable cloak: ${recloakResp.error.message}`);
+    } else {
+      ctx.log("travel", "Cloak re-enabled");
+    }
+  }
 
   // If we landed at a known system in mapStore, prefer its exact position over our computed one.
   if (arrivalPos === null) {

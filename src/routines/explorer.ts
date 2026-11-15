@@ -38,6 +38,14 @@ import {
   getItemSize,
   getCargoFuelCells,
 } from "./common.js";
+import {
+  calculateBearingToTarget,
+  findNearestMainNetworkSystem,
+  executePathfinderJumpToBearing,
+  navigateFrontierToMainNetwork,
+  formatBearing,
+  PATHFINDER_SPEED,
+} from "../pathfinder.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { marketDetailsStore, type MarketItemObservation } from "../marketdetailsstore.js";
@@ -5579,8 +5587,33 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
 
     ctx.log("debug", `Frontier queue: ${explorationQueue.length} total, ${validTargets.length} valid targets (maxDepth=${settings.frontierMaxDepth})`);
 
+    // Check if current system is a dead-end (no forward wormholes, only exits back to known space)
+    const isDeadEnd = frontierSys && frontierSys.wormholeMap.size > 0 && 
+      Array.from(frontierSys.wormholeMap.values()).every(v => v === "exit" || v === "failed");
+
     if (validTargets.length === 0) {
       ctx.log("info", "No more unvisited frontier systems within max depth — frontier exploration complete!");
+      
+      // If we're at a dead-end or frontier is exhausted, use pathfinder jumps to return to main network
+      if ((isDeadEnd || settings.frontierAutoReturn) && bot.hasPathfinderDrive) {
+        ctx.log("system", `Frontier exhausted${isDeadEnd ? " (dead-end system)" : ""} — using pathfinder jumps to return to main network...`);
+        const returned = await navigateFrontierToMainNetwork(ctx, {
+          maxJumps: 15,
+          fuelThresholdPct: settings.frontierFuelThreshold,
+          hullThresholdPct: 30,
+          scanWaitMinutes: 5,
+          scanDelayTicks: 0,
+        });
+        if (returned) {
+          ctx.log("system", "Successfully returned to main network via pathfinder jumps!");
+          // Switch back to fixed_route mode since we're back in known space
+          setExplorerMode(bot.username, "fixed_route");
+          continue;
+        } else {
+          ctx.log("warn", "Pathfinder return to main network failed — falling back to home base return");
+        }
+      }
+      
       if (settings.frontierAutoReturn) {
         ctx.log("system", "Returning to home base...");
         await returnToHomeBaseForFuelCells(ctx, true);
@@ -6507,8 +6540,33 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
 
     ctx.log("debug", `Frontier survey queue: ${explorationQueue.length} total, ${validTargets.length} valid targets (maxDepth=${settings.frontierMaxDepth})`);
 
+    // Check if current system is a dead-end (no forward wormholes, only exits back to known space)
+    const isDeadEnd = frontierSys && frontierSys.wormholeMap.size > 0 && 
+      Array.from(frontierSys.wormholeMap.values()).every(v => v === "exit" || v === "failed");
+
     if (validTargets.length === 0) {
       ctx.log("info", "No more unvisited frontier systems within max depth — frontier survey complete!");
+      
+      // If we're at a dead-end or survey is exhausted, use pathfinder jumps to return to main network
+      if ((isDeadEnd || settings.frontierAutoReturn) && bot.hasPathfinderDrive) {
+        ctx.log("system", `Frontier survey exhausted${isDeadEnd ? " (dead-end system)" : ""} — using pathfinder jumps to return to main network...`);
+        const returned = await navigateFrontierToMainNetwork(ctx, {
+          maxJumps: 15,
+          fuelThresholdPct: settings.frontierFuelThreshold,
+          hullThresholdPct: 30,
+          scanWaitMinutes: 5,
+          scanDelayTicks: 0,
+        });
+        if (returned) {
+          ctx.log("system", "Successfully returned to main network via pathfinder jumps!");
+          // Switch back to fixed_route mode since we're back in known space
+          setExplorerMode(bot.username, "fixed_route");
+          return;
+        } else {
+          ctx.log("warn", "Pathfinder return to main network failed — falling back to entry system return");
+        }
+      }
+      
       if (entrySystemId && systemId !== entrySystemId) {
         ctx.log("travel", `Returning to entry system ${entrySystemId}...`);
         const blacklist = getEffectiveSystemBlacklist(bot);

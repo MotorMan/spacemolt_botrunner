@@ -368,6 +368,71 @@ export async function executePathfinderJumpToBearing(
   return { success: true, landedSystem: landed, arrivalPos, ticksTraveled: endTick !== null && startTick !== null ? Math.max(0, endTick - startTick) : 0 };
 }
 
+/** Calculate total available fuel (tank + military fuel cells in cargo) and fuel per pathfinder jump. */
+async function calculateAvailableFuel(ctx: RoutineContext): Promise<{ tankFuel: number; mfcFuel: number; totalFuel: number; fuelPerJump: number }> {
+  const { bot } = ctx;
+  await bot.refreshShip();
+  await bot.refreshCargo();
+
+  const tankFuel = bot.fuel;
+  
+  // Calculate MFC fuel in cargo
+  let mfcFuel = 0;
+  for (const item of bot.inventory) {
+    if (item.itemId === "military_fuel_cell" && item.quantity > 0) {
+      mfcFuel += item.quantity * 100; // Military fuel cell = 100 fuel each
+    }
+  }
+
+  // Estimate pathfinder fuel per jump (5x normal jump cost)
+  let pathfinderFuelPerJump = 25; // fallback
+  const currentSystem = bot.system;
+  if (currentSystem) {
+    const route = await estimateRouteFuel(ctx, currentSystem);
+    if (route && route.fuelPerJump > 0) {
+      pathfinderFuelPerJump = route.fuelPerJump * 5;
+    }
+  }
+
+  return {
+    tankFuel,
+    mfcFuel,
+    totalFuel: tankFuel + mfcFuel,
+    fuelPerJump: pathfinderFuelPerJump
+  };
+}
+
+/** Safety check: verify we have enough fuel for pathfinder return journey.
+ *  Returns true if safe to proceed, false if lockout should engage. */
+async function checkPathfinderFuelSafety(ctx: RoutineContext, estimatedJumps: number, minReserveJumps: number = 3): Promise<{ safe: boolean; reason?: string }> {
+  const { bot } = ctx;
+  const fuelInfo = await calculateAvailableFuel(ctx);
+  
+  const neededFuel = estimatedJumps * fuelInfo.fuelPerJump;
+  const reserveFuel = minReserveJumps * fuelInfo.fuelPerJump;
+  const totalRequired = neededFuel + reserveFuel;
+  
+  ctx.log("system", `[Pathfinder Fuel Safety] Tank: ${fuelInfo.tankFuel} | MFCs: ${fuelInfo.mfcFuel} | Total: ${fuelInfo.totalFuel} | Per jump: ${fuelInfo.fuelPerJump} | Need: ${totalRequired} (${estimatedJumps} jumps + ${minReserveJumps} reserve)`);
+  
+  if (fuelInfo.totalFuel < totalRequired) {
+    const deficit = totalRequired - fuelInfo.totalFuel;
+    return { 
+      safe: false, 
+      reason: `INSUFFICIENT FUEL: need ${totalRequired} (${estimatedJumps} jumps + ${minReserveJumps} reserve) but only have ${fuelInfo.totalFuel} (tank: ${fuelInfo.tankFuel}, MFCs: ${fuelInfo.mfcFuel}). Deficit: ${deficit}. LOCKOUT ENGAGED.`
+    };
+  }
+  
+  // Also check if tank alone is critically low without MFCs
+  if (fuelInfo.tankFuel < fuelInfo.fuelPerJump * 2 && fuelInfo.mfcFuel === 0) {
+    return { 
+      safe: false, 
+      reason: `CRITICAL: Tank fuel (${fuelInfo.tankFuel}) below 2 jumps (${fuelInfo.fuelPerJump * 2}) and NO MFCs in cargo. LOCKOUT ENGAGED.`
+    };
+  }
+  
+  return { safe: true };
+}
+
 /** Navigate from a frontier dead-end back to the main network using pathfinder jumps.
  *  Uses galactic coordinates to find the nearest main network system and jumps toward it.
  *  Avoids repeat jumps in the same direction to save fuel.
@@ -421,6 +486,18 @@ export async function navigateFrontierToMainNetwork(
   let bearing = calculateBearingToTarget(originPos.x, originPos.y, target.position.x, target.position.y);
   ctx.log("travel", `Initial bearing to ${target.systemName}: ${formatBearing(bearing, 2)}°`);
 
+  // ── PRE-FLIGHT FUEL SAFETY LOCKOUT ─────────────────────────────────────
+  // Estimate jumps needed based on distance (rough: ~1000 GU per jump at 10 GU/tick)
+  // Actually use target.distance and PATHFINDER_SPEED to estimate
+  const estimatedJumps = Math.max(1, Math.ceil(target.distance / 1000)); // rough estimate
+  const safetyCheck = await checkPathfinderFuelSafety(ctx, estimatedJumps, 3);
+  if (!safetyCheck.safe) {
+    ctx.log("error", `🚫 PATHFINDER LOCKOUT: ${safetyCheck.reason}`);
+    ctx.log("error", `🚫 Falling back to normal navigation — pathfinder jumps DISABLED.`);
+    return false;
+  }
+  ctx.log("system", `[Pathfinder Fuel Safety] ✅ Pre-flight check PASSED — ${estimatedJumps} estimated jumps, sufficient fuel confirmed.`);
+
   let jumpsPerformed = 0;
   let lastBearing: number | null = null;
   let consecutiveSameDirection = 0;
@@ -428,6 +505,15 @@ export async function navigateFrontierToMainNetwork(
   let mainNetwork = new Set<string>();
 
   while (jumpsPerformed < maxJumps && bot.state === "running") {
+    // ── PER-JUMP FUEL SAFETY LOCKOUT ─────────────────────────────────────
+    // Re-check fuel before EVERY jump - if we fall below safety threshold, ABORT
+    const perJumpSafety = await checkPathfinderFuelSafety(ctx, maxJumps - jumpsPerformed, 2);
+    if (!perJumpSafety.safe) {
+      ctx.log("error", `🚫 PATHFINDER LOCKOUT (mid-journey): ${perJumpSafety.reason}`);
+      ctx.log("error", `🚫 Aborting pathfinder return at jump ${jumpsPerformed}/${maxJumps} — falling back to normal nav.`);
+      return false;
+    }
+
     // Check fuel and hull before each jump
     await bot.refreshShip();
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
@@ -438,6 +524,12 @@ export async function navigateFrontierToMainNetwork(
       const fueled = await ensureFueled(ctx, fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Could not refuel — aborting frontier return");
+        return false;
+      }
+      // Re-check safety after refuel attempt
+      const postRefuelSafety = await checkPathfinderFuelSafety(ctx, maxJumps - jumpsPerformed, 2);
+      if (!postRefuelSafety.safe) {
+        ctx.log("error", `🚫 PATHFINDER LOCKOUT (post-refuel): ${postRefuelSafety.reason}`);
         return false;
       }
     }

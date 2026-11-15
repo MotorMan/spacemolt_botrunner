@@ -5110,10 +5110,15 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       connections = info.connections;
     }
 
-    // Also check connections for wormhole-type links to other frontier systems
+    //     // Also check connections for wormhole-type links to other frontier systems
     for (const conn of connections) {
-      if (conn.id && !mapStore.getSystem(conn.id)) {
-        // This connected system is not in our mapStore - likely a frontier system
+      if (!conn.id) continue;
+      const connIdLower = conn.id.toLowerCase();
+      const isFrontierSystem = !mainNetwork.has(connIdLower);
+      
+      // Add to frontier memory if it's a frontier system (not in main network)
+      // regardless of whether it's in mapStore already
+      if (isFrontierSystem) {
         if (!frontierMemory.has(conn.id)) {
           frontierMemory.set(conn.id, {
             id: conn.id,
@@ -5125,16 +5130,7 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
             wormholeMap: new Map(),
             lastVisit: 0,
             distanceFromEntry: (frontierSys?.distanceFromEntry ?? 0) + 1,
-          });
-          explorationQueue.push({ systemId: conn.id, distance: (frontierSys?.distanceFromEntry ?? 0) + 1 });
-          ctx.log("exploration", `🗺️ Discovered connected frontier system: ${conn.id} (${frontierSys?.distanceFromEntry + 1} hops from entry)`);
-        }
-        if (frontierSys) {
-          frontierSys.connections.add(conn.id);
-        }
-      }
-    }
-
+          });          explorationQueue.push({ systemId: conn.id, distance: (frontierSys?.distanceFromEntry ?? 0) + 1 });          ctx.log("exploration", `🗺️ Discovered connected frontier system: ${conn.id} (${frontierSys?.distanceFromEntry + 1} hops from entry)`);        }        if (frontierSys) {          frontierSys.connections.add(conn.id);        }      }    }
     // Also scan all POIs in this system for wormhole types and register them
     // This discovers wormholes that the survey might have missed
     for (const poi of pois) {
@@ -6025,10 +6021,15 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
       connections = info.connections;
     }
 
-    // Also check connections for wormhole-type links to other frontier systems
+    //     // Also check connections for wormhole-type links to other frontier systems
     for (const conn of connections) {
-      if (conn.id && !mapStore.getSystem(conn.id)) {
-        // This connected system is not in our mapStore - likely a frontier system
+      if (!conn.id) continue;
+      const connIdLower = conn.id.toLowerCase();
+      const isFrontierSystem = !mainNetwork.has(connIdLower);
+      
+      // Add to frontier memory if it's a frontier system (not in main network)
+      // regardless of whether it's in mapStore already
+      if (isFrontierSystem) {
         if (!frontierMemory.has(conn.id)) {
           frontierMemory.set(conn.id, {
             id: conn.id,
@@ -6040,16 +6041,7 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
             wormholeMap: new Map(),
             lastVisit: 0,
             distanceFromEntry: (frontierSys?.distanceFromEntry ?? 0) + 1,
-          });
-          explorationQueue.push({ systemId: conn.id, distance: (frontierSys?.distanceFromEntry ?? 0) + 1 });
-          ctx.log("exploration", `🗺️ Discovered connected frontier system: ${conn.id} (${frontierSys?.distanceFromEntry + 1} hops from entry)`);
-        }
-        if (frontierSys) {
-          frontierSys.connections.add(conn.id);
-        }
-      }
-    }
-
+          });          explorationQueue.push({ systemId: conn.id, distance: (frontierSys?.distanceFromEntry ?? 0) + 1 });          ctx.log("exploration", `🗺️ Discovered connected frontier system: ${conn.id} (${frontierSys?.distanceFromEntry + 1} hops from entry)`);        }        if (frontierSys) {          frontierSys.connections.add(conn.id);        }      }    }
     // Also scan all POIs in this system for wormhole types and register them
     for (const poi of pois) {
       const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");

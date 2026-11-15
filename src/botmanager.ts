@@ -2,6 +2,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { Bot, type Routine, type BotStatus } from "./bot.js";
 import { minerRoutine } from "./routines/miner.js";
+import { glassMinerRoutine } from "./routines/glass_miner.js";
 import { explorerRoutine, fixedRouteRoutine } from "./routines/explorer.js";
 import { crafterRoutine } from "./routines/crafter.js";
 import { rescueRoutine } from "./routines/rescue.js";
@@ -518,6 +519,7 @@ export function sendBotChatMessage(
 
 const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   miner: { name: "Miner", fn: minerRoutine },
+  glass_miner: { name: "Glass Miner", fn: glassMinerRoutine },
   explorer: { name: "Explorer", fn: explorerRoutine },
   fixed_route: { name: "Explorer (Fixed Route)", fn: fixedRouteRoutine },
   crafter: { name: "Crafter", fn: crafterRoutine },

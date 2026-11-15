@@ -5955,16 +5955,19 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
  * Attempt to flee from an active battle.
  * Uses "battle stance flee" command which takes 3 ticks to complete.
  * Optionally waits for disengage confirmation notification.
+ * Optionally forces a system exit after disengaging to avoid re-engagement (e.g., Mirage/Leviathan).
  * 
  * @param ctx - Routine context
  * @param waitForDisengage - If true, waits for "You have disengaged from battle" notification (default: true)
  * @param maxWaitMs - Maximum time to wait for disengage confirmation in ms (default: 35000ms = 3.5 ticks)
+ * @param forceSystemExit - If true, jumps to a different system after successfully disengaging (default: false)
  * @returns true if successfully fled and disengaged, false otherwise
  */
 export async function fleeFromBattle(
   ctx: RoutineContext,
   waitForDisengage: boolean = true,
   maxWaitMs: number = 35000,
+  forceSystemExit: boolean = false
 ): Promise<boolean> {
   const { bot } = ctx;
 
@@ -6015,6 +6018,50 @@ export async function fleeFromBattle(
       ctx.log("warn", "Flee timeout - battle may still be active");
       return false;
     }
+  }
+
+  // If forceSystemExit is requested, jump to a different system to avoid re-engagement
+  if (forceSystemExit) {
+    ctx.log("combat", "Force system exit requested after flee - jumping to adjacent system...");
+    
+    // Verify actual current system
+    await bot.refreshLocation();
+    const actualCurrentSystem = bot.system;
+    const systemInfo = await getSystemInfo(ctx);
+    const { connections } = systemInfo;
+    
+    if (!connections || connections.length === 0) {
+      ctx.log("error", "No jump connections available - cannot exit system!");
+      return false;
+    }
+
+    // Filter out blacklisted systems
+    const blacklist = getEffectiveSystemBlacklist(bot);
+    const safeConnections = connections.filter(c =>
+      c.id && !blacklist.some(b => b.toLowerCase() === c.id!.toLowerCase())
+    );
+    const candidates = safeConnections.length > 0 ? safeConnections : connections;
+    
+    if (candidates.length === 0) {
+      ctx.log("error", "No valid jump targets available for system exit!");
+      return false;
+    }
+
+    // Pick a random safe connection
+    const randomConnection = candidates[Math.floor(Math.random() * candidates.length)];
+    if (!randomConnection || !randomConnection.id) {
+      ctx.log("error", "Could not select jump target for system exit!");
+      return false;
+    }
+
+    ctx.log("travel", `Force system exit: jumping to ${randomConnection.name || randomConnection.id}`);
+    const jumpResp = await bot.exec("jump", { target_system: randomConnection.id });
+    if (jumpResp.error) {
+      ctx.log("error", `Force system exit jump failed: ${jumpResp.error.message}`);
+      return false;
+    }
+    
+    ctx.log("combat", "Successfully exited system after Mirage flee!");
   }
 
   return true;
@@ -6191,6 +6238,10 @@ export async function checkAndFleeFromBattle(
       ctx.bot.clearBattleState("stale-websocket-fallback");
       return false;
     }
+    // Check for Mirages/Leviathans in battle participants
+    if (status.participants && await checkAndFleeFromBattleMirages(ctx, status.participants)) {
+      return true;
+    }
     ctx.log("combat", `${prefix}BATTLE DETECTED [WebSocket]! - fleeing immediately!`);
     await fleeFromBattle(ctx, true, 35000);
     return true;
@@ -6200,6 +6251,10 @@ export async function checkAndFleeFromBattle(
   const battleStatus = await getBattleStatus(ctx);
   if (battleStatus && battleStatus.is_participant) {
     const prefix = logPrefix ? `[${logPrefix}] ` : "";
+    // Check for Mirages/Leviathans in battle participants
+    if (battleStatus.participants && await checkAndFleeFromBattleMirages(ctx, battleStatus.participants)) {
+      return true;
+    }
     ctx.log("combat", `${prefix}BATTLE DETECTED! Battle ID: ${battleStatus.battle_id} - fleeing!`);
     await fleeFromBattle(ctx, true, 35000);
     return true;
@@ -6247,6 +6302,15 @@ export async function checkBattleAfterCommand(
       await fleeFromBattle(ctx, true, 35000);
       return true;
     }
+    
+    // Check for Mirages/Leviathans in battle participants from notifications
+    for (const notif of battleNotifs) {
+      if (notif.participants && Array.isArray(notif.participants)) {
+        if (await checkAndFleeFromBattleMirages(ctx, notif.participants)) {
+          return true;
+        }
+      }
+    }
   }
 
   // Fallback: check battle status directly
@@ -6266,11 +6330,13 @@ export async function checkBattleAfterCommand(
  * 
  * @param ctx - Routine context
  * @param pirateResult - Result from parseNearbyForPirates
+ * @param forceSystemExit - If true and in battle, jumps to different system after fleeing (default: false)
  * @returns true if successfully escaped/fled, false if failed
  */
 export async function emergencyFleeFromPirates(
   ctx: RoutineContext,
   pirateResult: PirateDetectionResult,
+  forceSystemExit: boolean = false
 ): Promise<boolean> {
   const { bot } = ctx;
 
@@ -6280,7 +6346,7 @@ export async function emergencyFleeFromPirates(
   const battleStatus = await getBattleStatus(ctx);
   if (battleStatus) {
     ctx.log("combat", "Already in battle - using flee stance");
-    return await fleeFromBattle(ctx);
+    return await fleeFromBattle(ctx, true, 35000, forceSystemExit);
   }
 
   // Not in battle - need to jump away immediately
@@ -6886,4 +6952,164 @@ export async function travelToStationWithHint(
   }
 
   return { success: false, usedHint, hintSystem: hintSystem || undefined };
+}
+
+/** Result of Mirage/Leviathan detection in nearby entities */
+export interface MirageDetectionResult {
+  hasMirages: boolean;
+  mirageCount: number;
+  mirages: NearbyEntity[];
+}
+
+/** Parse get_nearby response to detect Mirages/Leviathans (invisible leviathans that attack while cloaked).
+ *  @param result - The result from get_nearby API call
+ *  @returns Detection result with mirage count and details
+ */
+export function parseNearbyForMirages(result: unknown): MirageDetectionResult {
+  if (!result || typeof result !== "object") {
+    return { hasMirages: false, mirageCount: 0, mirages: [] };
+  }
+
+  const r = result as Record<string, unknown>;
+  const mirages: NearbyEntity[] = [];
+
+  // Handle different response formats
+  let rawEntities: Array<Record<string, unknown>> = [];
+
+  if (Array.isArray(r)) {
+    rawEntities = r;
+  } else if (Array.isArray(r.entities)) {
+    rawEntities = r.entities as Array<Record<string, unknown>>;
+  } else if (Array.isArray(r.players) && r.players.length > 0) {
+    rawEntities = r.players as Array<Record<string, unknown>>;
+  } else if (Array.isArray(r.nearby)) {
+    rawEntities = r.nearby as Array<Record<string, unknown>>;
+  }
+
+  // Parse entities looking for Mirages/Leviathans
+  for (const e of rawEntities) {
+    const id = (e.id as string) || (e.player_id as string) || (e.entity_id as string) || "";
+    if (!id) continue;
+
+    const name = (e.name as string) || (e.username as string) || "";
+    const type = (e.type as string) || (e.entity_type as string) || "";
+    const species = (e.species as string) || "";
+
+    // Check for Mirage/Leviathan identifiers
+    // Mirages have "lev_" prefix in their ID and "Mirage" in name
+    // Leviathans have "leviathan" in name or species
+    const isMirage = id.startsWith("lev_") || name.toLowerCase().includes("mirage");
+    const isLeviathan = name.toLowerCase().includes("leviathan") || species.toLowerCase().includes("leviathan");
+
+    if (!isMirage && !isLeviathan) continue;
+
+    mirages.push({
+      id,
+      name: name || id,
+      type: isMirage ? "mirage" : "leviathan",
+      faction: "creature",
+      isNPC: true,
+      isPirate: false,
+      tier: "boss",
+      isBoss: true,
+      hull: e.hull as number,
+      maxHull: e.max_hull as number,
+      shield: e.shield as number,
+      maxShield: e.max_shield as number,
+      status: e.status as string,
+    });
+  }
+
+  return { hasMirages: mirages.length > 0, mirageCount: mirages.length, mirages };
+}
+
+/** Result of Mirage/Leviathan detection from battle participants */
+export interface BattleMirageDetectionResult {
+  hasMirages: boolean;
+  mirageCount: number;
+  mirageNames: string[];
+}
+
+/** Parse battle participants to detect Mirages/Leviathans.
+ *  @param battleParticipants - Array of battle participants from battle_update or get_battle_status
+ *  @returns Detection result with mirage count and names
+ */
+export function parseMiragesFromBattleParticipants(battleParticipants: unknown[]): BattleMirageDetectionResult {
+  if (!Array.isArray(battleParticipants)) {
+    return { hasMirages: false, mirageCount: 0, mirageNames: [] };
+  }
+
+  const mirageNames: string[] = [];
+
+  for (const participant of battleParticipants) {
+    if (!participant || typeof participant !== "object") continue;
+    const p = participant as Record<string, unknown>;
+
+    const playerId = (p.player_id as string) || "";
+    const username = (p.username as string) || (p.name as string) || "";
+    const isNpc = (p.is_npc as boolean) || false;
+
+    // Only check NPCs
+    if (!isNpc) continue;
+
+    // Check for Mirage/Leviathan identifiers in username
+    const isMirage = playerId.startsWith("lev_") || username.toLowerCase().includes("mirage");
+    const isLeviathan = username.toLowerCase().includes("leviathan");
+
+    if (isMirage || isLeviathan) {
+      mirageNames.push(username || playerId);
+    }
+  }
+
+  return { hasMirages: mirageNames.length > 0, mirageCount: mirageNames.length, mirageNames };
+}
+
+/** Check for Mirage/Leviathan in nearby and flee immediately if detected.
+ *  Mirages are invisible leviathans that can attack even while cloaked.
+ *  @param ctx - Routine context
+ *  @param nearbyResult - Result from get_nearby API call
+ *  @returns true if mirage detected and flee initiated, false otherwise
+ */
+export async function checkAndFleeFromMirages(
+  ctx: RoutineContext,
+  nearbyResult: unknown
+): Promise<boolean> {
+  const mirageResult = parseNearbyForMirages(nearbyResult);
+
+  if (!mirageResult.hasMirages) {
+    return false;
+  }
+
+  // Mirages detected! These are invisible leviathans that attack while cloaked.
+  // Flee immediately - they can hit through cloak.
+  // After fleeing battle, force system exit to avoid re-engagement.
+  ctx.log("combat", `🚨 MIRAGE/LEVIATHAN DETECTED in nearby! (${mirageResult.mirageCount}) - FLEEING IMMEDIATELY & EXITING SYSTEM!`);
+  await emergencyFleeFromPirates(ctx, { 
+    hasPirates: true, 
+    pirateCount: mirageResult.mirageCount, 
+    highestTier: "boss", 
+    pirates: mirageResult.mirages 
+  }, true); // forceSystemExit = true
+  return true;
+}
+
+/** Check for Mirage/Leviathan in battle participants and flee immediately if detected.
+ *  @param ctx - Routine context
+ *  @param battleParticipants - Array of battle participants from battle_update or get_battle_status
+ *  @returns true if mirage detected and flee initiated, false otherwise
+ */
+export async function checkAndFleeFromBattleMirages(
+  ctx: RoutineContext,
+  battleParticipants: unknown[]
+): Promise<boolean> {
+  const mirageResult = parseMiragesFromBattleParticipants(battleParticipants);
+
+  if (!mirageResult.hasMirages) {
+    return false;
+  }
+
+  // Mirage/Leviathan detected in battle! Flee immediately AND exit system to avoid re-engagement.
+  ctx.log("combat", `🚨 MIRAGE/LEVIATHAN IN BATTLE! (${mirageResult.mirageCount}: ${mirageResult.mirageNames.join(", ")}) - FLEEING IMMEDIATELY & EXITING SYSTEM!`);
+  await fleeFromBattle(ctx, true, 35000, true); // forceSystemExit = true
+  return true;
 }

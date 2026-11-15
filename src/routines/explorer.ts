@@ -37,6 +37,10 @@ import {
   type BattleState,
   getItemSize,
   getCargoFuelCells,
+  parseNearbyForMirages,
+  checkAndFleeFromMirages,
+  parseMiragesFromBattleParticipants,
+  checkAndFleeFromBattleMirages,
 } from "./common.js";
 import {
   calculateBearingToTarget,
@@ -990,6 +994,12 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
         // Track wildlife from nearby scan
         bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
+        
+        // Check for Mirages/Leviathans FIRST (they attack while cloaked!)
+        if (await checkAndFleeFromMirages(ctx, nearbyResp.result)) {
+          await ctx.sleep(5000);
+          continue;
+        }
         
         const { parseNearbyForPirates } = await import("./common.js");
         const pirateResult = parseNearbyForPirates(nearbyResp.result);
@@ -5169,6 +5179,13 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       }
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
         bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
+        
+        // Check for Mirages/Leviathans FIRST (they attack while cloaked!)
+        if (await checkAndFleeFromMirages(ctx, nearbyResp.result)) {
+          await ctx.sleep(5000);
+          continue;
+        }
+        
         const { parseNearbyForPirates } = await import("./common.js");
         const pirateResult = parseNearbyForPirates(nearbyResp.result);
         if (!bot.isCloaked || !settings.ignorePirateFleeWhenCloaked) {
@@ -6079,6 +6096,13 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
       }
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
         bot.trackNearbyPlayers(nearbyResp.result); bot.trackWildlife(nearbyResp.result); bot.trackRepeaters(nearbyResp.result);
+        
+        // Check for Mirages/Leviathans FIRST (they attack while cloaked!)
+        if (await checkAndFleeFromMirages(ctx, nearbyResp.result)) {
+          await ctx.sleep(5000);
+          continue;
+        }
+        
         const { parseNearbyForPirates } = await import("./common.js");
         const pirateResult = parseNearbyForPirates(nearbyResp.result);
         if (!bot.isCloaked || !settings.ignorePirateFleeWhenCloaked) {

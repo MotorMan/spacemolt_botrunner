@@ -4024,6 +4024,7 @@ const CLOAK_MODULE_IDS = [
   "phase_cloaking_device",
   "voidborn_phase_cloak",
   "emergency_cloaking_system",
+  "lensing_veil",
 ];
 
 /** Static wormholes that are always usable as bidirectional routing edges. */

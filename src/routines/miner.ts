@@ -109,7 +109,7 @@ async function hasCloakingModule(ctx: RoutineContext, cachedModules?: unknown[])
     const modSpecial = ((modObj?.special as string) || "").toLowerCase();
 
     const checkStr = `${modId} ${modName} ${modSpecial}`;
-    if (checkStr.includes("cloak")) {
+    if (checkStr.includes("cloak") || checkStr.includes("lensing_veil")) {
       return true;
     }
   }

@@ -543,7 +543,10 @@ async function buildFacilityAtStation(
         const shipResp = await bot.exec("get_ship");
         if (shipResp.result) {
           const { modules } = extractShipModules(shipResp.result);
-          const hasCloak = modules.some(mod => moduleHaystack(mod).includes("cloak"));
+          const hasCloak = modules.some(mod => {
+            const haystack = moduleHaystack(mod);
+            return haystack.includes("cloak") || haystack.includes("lensing_veil");
+          });
           if (hasCloak) {
             ctx.log("fuel", "Enabling cloak for transport...");
             await bot.exec("cloak", { enable: true });

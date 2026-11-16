@@ -100,7 +100,8 @@ async function hasCloakingModule(ctx: RoutineContext): Promise<boolean> {
   const { modules } = extractShipModules(shipResp.result);
 
   for (const mod of modules) {
-    if (moduleHaystack(mod).includes("cloak")) return true;
+    const haystack = moduleHaystack(mod);
+    if (haystack.includes("cloak") || haystack.includes("lensing_veil")) return true;
   }
   return false;
 }

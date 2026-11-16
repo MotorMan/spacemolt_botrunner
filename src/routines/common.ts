@@ -2984,19 +2984,8 @@ if (looted > 0) {
         });
         if (!candidate) break;
 
-        // Skip stations that explicitly report 0 fuel (Sol is always stocked).
-        if (candidate.poiId !== "sol_station" && candidate.poiId !== "sol_central") {
-          let fuelAtStation: number | null = null;
-          try {
-            const poiResp = await bot.exec("get_poi", { poi_id: candidate.poiId });
-            fuelAtStation = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
-          } catch {}
-          if (fuelAtStation !== null && fuelAtStation !== undefined && fuelAtStation <= 0) {
-            ctx.log("system", `Skipping ${candidate.poiName} — station reports 0 fuel`);
-            rejected.add(candidate.poiId.toLowerCase());
-            continue;
-          }
-        }
+        // Trust approved stations - if they're on the approved list, they're good to refuel at.
+        // Skip the fuel check that was incorrectly reporting 0 fuel for valid stations.
 
         // Don't fly to a station we can't afford to reach — check the server route
         // (unless we're already there, or we already validated it via checkRouteFuel).

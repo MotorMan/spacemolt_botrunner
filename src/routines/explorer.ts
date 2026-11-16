@@ -5389,12 +5389,23 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
             || (bot.system && bot.system !== systemId ? bot.system : "");
           ctx.log("info", `🌌 Frontier wormhole jumped: ${fromSystemName} -> ${destSystemName || destSystemId} (${exitPoi})`);
           if (destSystemId) {
-            // Update frontier memory with the new connection
+            // Determine if this is a one-way wormhole jump
+            // If we jumped from an entrance (wh_entrance_*) and arrived at an exit (wh_exit_*),
+            // the wormhole is one-way and we cannot return
+            const jumpedFromEntrance = poi.id.startsWith("wh_entrance_");
+            const arrivedAtExit = exitPoi.startsWith("wh_exit_");
+            const isOneWayWormhole = jumpedFromEntrance && arrivedAtExit;
+
+            if (isOneWayWormhole) {
+              ctx.log("info", `🌌 One-way wormhole detected: ${poi.id} (entrance) -> ${exitPoi} (exit). Cannot return to ${systemId}.`);
+            }
+
+            // Update frontier memory with the new connection (forward only for one-way)
             if (frontierSys) {
               frontierSys.connections.add(destSystemId);
               frontierSys.wormholeMap.set(poi.id, destSystemId);
             }
-            
+
             // Register the destination system in frontier memory
             if (!frontierMemory.has(destSystemId)) {
               frontierMemory.set(destSystemId, {
@@ -5403,7 +5414,8 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
                 visited: false,
                 poisScanned: 0,
                 totalPois: 0,
-                connections: new Set([systemId]),
+                // Only add reverse connection if NOT a one-way wormhole
+                connections: isOneWayWormhole ? new Set() : new Set([systemId]),
                 wormholeMap: new Map(),
                 lastVisit: 0,
                 distanceFromEntry: (frontierSys?.distanceFromEntry ?? 0) + 1,
@@ -5411,8 +5423,39 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
               explorationQueue.push({ systemId: destSystemId, distance: (frontierSys?.distanceFromEntry ?? 0) + 1 });
               ctx.log("exploration", `🗺️ Discovered new frontier system via wormhole: ${destSystemId} (${frontierSys?.distanceFromEntry + 1} hops from entry)`);
             } else {
-              const connectedSys = frontierMemory.get(destSystemId)!;
-              connectedSys.connections.add(systemId);
+              // Only add reverse connection if NOT a one-way wormhole
+              if (!isOneWayWormhole) {
+                const connectedSys = frontierMemory.get(destSystemId)!;
+                connectedSys.connections.add(systemId);
+              }
+            }
+
+            // If this was a one-way wormhole, clear exploration queue of systems
+            // that are no longer reachable (i.e., systems behind the wormhole)
+            if (isOneWayWormhole) {
+              ctx.log("exploration", `One-way wormhole jump — clearing exploration queue of unreachable systems`);
+              // Keep only the newly discovered system and any systems discovered from it
+              // Clear the queue and repopulate from current frontier memory reachable from destSystemId
+              explorationQueue.length = 0;
+              // Rebuild queue from systems reachable from the new system
+              const reachable = new Set<string>();
+              const queue: string[] = [destSystemId];
+              while (queue.length > 0) {
+                const sysId = queue.shift()!;
+                if (reachable.has(sysId)) continue;
+                reachable.add(sysId);
+                const sysMem = frontierMemory.get(sysId);
+                if (sysMem && !sysMem.visited) {
+                  explorationQueue.push({ systemId: sysId, distance: sysMem.distanceFromEntry ?? 0 });
+                }
+                if (sysMem) {
+                  for (const connId of sysMem.connections) {
+                    if (!reachable.has(connId)) queue.push(connId);
+                  }
+                }
+              }
+              // Sort by distance (BFS order)
+              explorationQueue.sort((a, b) => a.distance - b.distance);
             }
 
             mapStore.registerWormhole(destSystemId, {
@@ -6306,12 +6349,23 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
             || (bot.system && bot.system !== systemId ? bot.system : "");
           ctx.log("info", `🌌 Frontier wormhole jumped: ${fromSystemName} -> ${destSystemName || destSystemId} (${exitPoi})`);
           if (destSystemId) {
-            // Update frontier memory with the new connection
+            // Determine if this is a one-way wormhole jump
+            // If we jumped from an entrance (wh_entrance_*) and arrived at an exit (wh_exit_*),
+            // the wormhole is one-way and we cannot return
+            const jumpedFromEntrance = poi.id.startsWith("wh_entrance_");
+            const arrivedAtExit = exitPoi.startsWith("wh_exit_");
+            const isOneWayWormhole = jumpedFromEntrance && arrivedAtExit;
+
+            if (isOneWayWormhole) {
+              ctx.log("info", `🌌 One-way wormhole detected: ${poi.id} (entrance) -> ${exitPoi} (exit). Cannot return to ${systemId}.`);
+            }
+
+            // Update frontier memory with the new connection (forward only for one-way)
             if (frontierSys) {
               frontierSys.connections.add(destSystemId);
               frontierSys.wormholeMap.set(poi.id, destSystemId);
             }
-            
+
             // Register the destination system in frontier memory
             if (!frontierMemory.has(destSystemId)) {
               frontierMemory.set(destSystemId, {
@@ -6320,7 +6374,8 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
                 visited: false,
                 poisScanned: 0,
                 totalPois: 0,
-                connections: new Set([systemId]),
+                // Only add reverse connection if NOT a one-way wormhole
+                connections: isOneWayWormhole ? new Set() : new Set([systemId]),
                 wormholeMap: new Map(),
                 lastVisit: 0,
                 distanceFromEntry: (frontierSys?.distanceFromEntry ?? 0) + 1,
@@ -6328,8 +6383,39 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
               explorationQueue.push({ systemId: destSystemId, distance: (frontierSys?.distanceFromEntry ?? 0) + 1 });
               ctx.log("exploration", `🗺️ Discovered new frontier system via wormhole: ${destSystemId} (${frontierSys?.distanceFromEntry + 1} hops from entry)`);
             } else {
-              const connectedSys = frontierMemory.get(destSystemId)!;
-              connectedSys.connections.add(systemId);
+              // Only add reverse connection if NOT a one-way wormhole
+              if (!isOneWayWormhole) {
+                const connectedSys = frontierMemory.get(destSystemId)!;
+                connectedSys.connections.add(systemId);
+              }
+            }
+
+            // If this was a one-way wormhole, clear exploration queue of systems
+            // that are no longer reachable (i.e., systems behind the wormhole)
+            if (isOneWayWormhole) {
+              ctx.log("exploration", `One-way wormhole jump — clearing exploration queue of unreachable systems`);
+              // Keep only the newly discovered system and any systems discovered from it
+              // Clear the queue and repopulate from current frontier memory reachable from destSystemId
+              explorationQueue.length = 0;
+              // Rebuild queue from systems reachable from the new system
+              const reachable = new Set<string>();
+              const queue: string[] = [destSystemId];
+              while (queue.length > 0) {
+                const sysId = queue.shift()!;
+                if (reachable.has(sysId)) continue;
+                reachable.add(sysId);
+                const sysMem = frontierMemory.get(sysId);
+                if (sysMem && !sysMem.visited) {
+                  explorationQueue.push({ systemId: sysId, distance: sysMem.distanceFromEntry ?? 0 });
+                }
+                if (sysMem) {
+                  for (const connId of sysMem.connections) {
+                    if (!reachable.has(connId)) queue.push(connId);
+                  }
+                }
+              }
+              // Sort by distance (BFS order)
+              explorationQueue.sort((a, b) => a.distance - b.distance);
             }
 
             mapStore.registerWormhole(destSystemId, {

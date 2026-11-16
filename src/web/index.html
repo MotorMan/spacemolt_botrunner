@@ -655,6 +655,9 @@
             >
               Flock Grouping
             </div>
+            <div class="sidebar-item" onclick="switchSettingsTab('glass_miner')">
+              Glass Miner
+            </div>
             <div class="sidebar-item" onclick="switchSettingsTab('salvager')">
               Salvager
             </div>
@@ -14204,6 +14207,7 @@
           client_sync: renderClientSyncSettings,
           fuel_service: renderFuelServiceSettings,
           market: renderMarketSettings,
+          glass_miner: renderGlassMinerSettings,
         };
         const fn = dispatch[activeSettingsTab];
         if (!fn) return;
@@ -32546,6 +32550,1055 @@ async function fetchPersonalFacilityTypes(username) {
           body: JSON.stringify({ miner: s }),
         }).catch(() => {});
         window.saveMinerSettings = saveMinerSettings;
+      }
+
+      // ── Glass Miner Settings ────────────────────────────────────────────
+
+      function renderGlassMinerSettings(panel) {
+        const g = settings.glass_miner || {};
+        const miningType = g.miningType || "auto";
+        const depositMode = g.depositMode || "storage";
+        const depositFallback = g.depositFallback || "storage";
+        const cargoThreshold = g.cargoThreshold ?? 80;
+        const refuelThreshold = g.refuelThreshold ?? 50;
+        const repairThreshold = g.repairThreshold ?? 40;
+        const homeSystem = g.homeSystem || "";
+        const systemOre = g.systemOre || "";
+        const systemGas = g.systemGas || "";
+        const systemIce = g.systemIce || "";
+        const systemRadioactive = g.systemRadioactive || "";
+        const systemDeepCore = g.systemDeepCore || "";
+        const depositBot = g.depositBot || "";
+        const targetOre = g.targetOre || "";
+        const targetGas = g.targetGas || "";
+        const targetIce = g.targetIce || "";
+        const targetRadioactive = g.targetRadioactive || "";
+        const targetDeepCore = g.targetDeepCore || "";
+        const jettisonOres = g.jettisonOres || [];
+        const deepCoreJettisonOres = g.deepCoreJettisonOres || [];
+        const radioactiveJettisonOres = g.radioactiveJettisonOres || [];
+        const jettisonGas = g.jettisonGas || [];
+        const jettisonIce = g.jettisonIce || [];
+        const depletionTimeoutHours = g.depletionTimeoutHours ?? 3;
+        const ignoreDepletion = g.ignoreDepletion ?? false;
+        const stayOutUntilFull = g.stayOutUntilFull ?? false;
+        const maxJumps = g.maxJumps ?? 10;
+        const minimumFuelCells = g.minimumFuelCells ?? 20;
+        const returnHomeOnFuelCellsRemaining = g.returnHomeOnFuelCellsRemaining ?? 2;
+        const noMidMiningRetarget = g.noMidMiningRetarget ?? false;
+        const enableCloak = g.enableCloak ?? false;
+        const cloakIgnoreBlacklist = g.cloakIgnoreBlacklist ?? false;
+        const enableMissions = g.enableMissions ?? true;
+        const deepSleepIntervalMin = g.deepSleepIntervalMin ?? 30;
+        const enableCoordination = g.enableCoordination ?? true;
+        const maxBotsPerSystem = g.maxBotsPerSystem ?? 3;
+        const flockEnabled = g.flockEnabled ?? false;
+        const flockName = g.flockName || "";
+        const flockRole = g.flockRole || "follower";
+        const desiredEmergencyWarpDevices = g.desiredEmergencyWarpDevices ?? 3;
+        const desiredShieldCharges = g.desiredShieldCharges ?? 20;
+        const desiredRepairKits = g.desiredRepairKits ?? 12;
+        const desiredAmmoBoxes = g.desiredAmmoBoxes ?? -1;
+        const disableResupply = g.disableResupply ?? false;
+        const enableFighting = g.enableFighting ?? true;
+        
+        // Glass Miner specific
+        const shieldRechargePct = g.shieldRechargePct ?? 80;
+        const shieldMonitorThresholdPct = g.shieldMonitorThresholdPct ?? 50;
+        const repairKitThresholdPct = g.repairKitThresholdPct ?? 50;
+        const fleeSystemThresholdPct = g.fleeSystemThresholdPct ?? 30;
+        const desiredAdvancedRepairKits = g.desiredAdvancedRepairKits ?? 10;
+        const enableFullTimeShieldMonitor = g.enableFullTimeShieldMonitor ?? true;
+        const maxRepeaterTierToEngage = g.maxRepeaterTierToEngage || "large";
+        const fleeFromSpireMonolith = g.fleeFromSpireMonolith ?? true;
+        const cloakOnStart = g.cloakOnStart ?? false;
+
+        // Routing profiles
+        const routeProfiles = g.routeProfiles || [];
+        const activeRouteProfile = g.activeRouteProfile || "";
+
+        // Complete mineable-resource list from the catalogue
+        const catalogMiningOres = Object.values(catalog.items || {})
+          .filter((it) => it.category === "ore" && isMineableResource(it.id || it.item_id))
+          .map((it) => ({ item_id: it.id || it.item_id, name: it.name || it.id }));
+        allMiningOres = catalogMiningOres.slice();
+        for (const o of knownOres) {
+          if (!allMiningOres.find((mm) => mm.item_id === o.item_id)) {
+            allMiningOres.push(o);
+          }
+        }
+        allMiningOres.sort((a, b) => a.name.localeCompare(b.name));
+
+        // Deep core ore IDs (for filtering)
+        const deepCoreOreIds = new Set([
+          "void_essence", "fury_crystal", "legacy_ore", "prismatic_nebulite",
+          "exotic_matter", "dark_matter_residue", "adamantite_ore", "nebulium",
+        ]);
+
+        // Build ore filter lists
+        const oreOres = allMiningOres.filter((o) => {
+          const n = o.name.toLowerCase();
+          return (
+            !n.includes("gas") && !n.includes("nebula") && !n.includes("hydrogen") &&
+            !n.includes("helium") && !n.includes("ice") && !n.includes("frost") &&
+            !n.includes("cryo") && !n.includes("polonium") && !n.includes("radium") &&
+            !n.includes("uranium") && !n.includes("thorium") && !deepCoreOreIds.has(o.item_id)
+          );
+        });
+        const gasOres = allMiningOres.filter((o) => {
+          const n = o.name.toLowerCase();
+          return n.includes("gas") || n.includes("nebula") || n.includes("hydrogen") || n.includes("helium");
+        });
+        const iceOres = allMiningOres.filter((o) => {
+          const n = o.name.toLowerCase();
+          return n.includes("ice") || n.includes("frost") || n.includes("cryo") || n.includes("water");
+        });
+        const radioactiveOres = [
+          { item_id: "polonium_ore", name: "Polonium Ore" },
+          { item_id: "radium_ore", name: "Radium Ore" },
+          { item_id: "uranium_ore", name: "Uranium Ore" },
+          { item_id: "thorium_ore", name: "Thorium Ore" },
+        ];
+        const deepCoreOres = [
+          { item_id: "void_essence", name: "Void Essence" },
+          { item_id: "fury_crystal", name: "Fury Crystal" },
+          { item_id: "legacy_ore", name: "Legacy Ore" },
+          { item_id: "prismatic_nebulite", name: "Prismatic Nebulite" },
+          { item_id: "exotic_matter", name: "Exotic Matter" },
+          { item_id: "dark_matter_residue", name: "Dark Matter Residue" },
+          { item_id: "adamantite_ore", name: "Adamantite Ore" },
+          { item_id: "nebulium", name: "Nebulium" },
+        ];
+
+        const oreOpts = ['<option value="">(any ore — harvest whatever is available)</option>'];
+        for (const ore of [...oreOres].sort((a, b) => (a.name || "").localeCompare(b.name || ""))) {
+          const sel = ore.item_id === targetOre ? " selected" : "";
+          oreOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
+        }
+        if (targetOre && !oreOres.find((o) => o.item_id === targetOre)) {
+          oreOpts.push(`<option value="${esc(targetOre)}" selected>${esc(targetOre)}</option>`);
+        }
+
+        const gasOpts = ['<option value="">(any gas — harvest whatever is available)</option>'];
+        for (const ore of [...gasOres].sort((a, b) => (a.name || "").localeCompare(b.name || ""))) {
+          const sel = ore.item_id === targetGas ? " selected" : "";
+          gasOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
+        }
+        if (targetGas && !gasOres.find((o) => o.item_id === targetGas)) {
+          gasOpts.push(`<option value="${esc(targetGas)}" selected>${esc(targetGas)}</option>`);
+        }
+
+        const iceOpts = ['<option value="">(any ice — harvest whatever is available)</option>'];
+        for (const ore of [...iceOres].sort((a, b) => (a.name || "").localeCompare(b.name || ""))) {
+          const sel = ore.item_id === targetIce ? " selected" : "";
+          iceOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
+        }
+        if (targetIce && !iceOres.find((o) => o.item_id === targetIce)) {
+          iceOpts.push(`<option value="${esc(targetIce)}" selected>${esc(targetIce)}</option>`);
+        }
+
+        const radioactiveOpts = ['<option value="">(any radioactive — harvest whatever is available)</option>'];
+        for (const ore of [...radioactiveOres].sort((a, b) => (a.name || "").localeCompare(b.name || ""))) {
+          const sel = ore.item_id === targetRadioactive ? " selected" : "";
+          radioactiveOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
+        }
+        if (targetRadioactive && !radioactiveOres.find((o) => o.item_id === targetRadioactive)) {
+          radioactiveOpts.push(`<option value="${esc(targetRadioactive)}" selected>${esc(targetRadioactive)}</option>`);
+        }
+
+        const deepCoreOpts = ['<option value="">(any deep core — harvest whatever is available)</option>'];
+        for (const ore of [...deepCoreOres].sort((a, b) => (a.name || "").localeCompare(b.name || ""))) {
+          const sel = ore.item_id === targetDeepCore ? " selected" : "";
+          deepCoreOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
+        }
+        if (targetDeepCore && !deepCoreOres.find((o) => o.item_id === targetDeepCore)) {
+          deepCoreOpts.push(`<option value="${esc(targetDeepCore)}" selected>${esc(targetDeepCore)}</option>`);
+        }
+
+        // System options
+        const systemOpts = ['<option value="">(current system)</option>'];
+        for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || "").localeCompare(b.name || b.id || ""))) {
+          const sel = sys.id === systemOre ? " selected" : "";
+          const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+          systemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+        }
+        if (systemOre && !knownSystems.find((s) => s.id === systemOre)) {
+          systemOpts.push(`<option value="${esc(systemOre)}" selected>${esc(systemOre)}</option>`);
+        }
+
+        const homeOpts = ['<option value="">(start system)</option>'];
+        for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || "").localeCompare(b.name || b.id || ""))) {
+          const sel = sys.id === homeSystem ? " selected" : "";
+          const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+          homeOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+        }
+        if (homeSystem && !knownSystems.find((s) => s.id === homeSystem)) {
+          homeOpts.push(`<option value="${esc(homeSystem)}" selected>${esc(homeSystem)}</option>`);
+        }
+
+        // Build jettison rows
+        function buildJettisonRows(ores, allOres) {
+          let rows = "";
+          for (const oreId of ores) {
+            const oreName = allOres.find((o) => o.item_id === oreId)?.name || oreId;
+            rows += `<tr data-ore-id="${esc(oreId)}"><td style="padding:4px 8px">${esc(oreName)}</td><td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td></tr>`;
+          }
+          return rows;
+        }
+
+        function buildJettisonOreOpts(ores) {
+          const opts = ['<option value="">-- select --</option>'];
+          for (const ore of ores) {
+            opts.push(`<option value="${esc(ore.item_id)}">${esc(ore.name)}</option>`);
+          }
+          return opts.join("");
+        }
+
+        const jettisonRows = buildJettisonRows(jettisonOres, oreOres);
+        const jettisonOreOpts = buildJettisonOreOpts(oreOres);
+
+        function minerDepositOpts(current) {
+          const opts = [];
+          opts.push(`<option value="storage"${"storage" === current ? " selected" : ""}>Station storage</option>`);
+          opts.push(`<option value="faction"${"faction" === current ? " selected" : ""}>Faction storage</option>`);
+          opts.push(`<option value="sell"${"sell" === current ? " selected" : ""}>Sell at market</option>`);
+          for (const bot of [...bots].sort((a, b) => (a.username || "").localeCompare(b.username || ""))) {
+            const val = `bot:${bot.username}`;
+            opts.push(`<option value="${esc(val)}"${val === current ? " selected" : ""}>${esc(bot.username)}</option>`);
+          }
+          return opts.join("");
+        }
+
+        // Build route profile options for activeRouteProfile dropdown
+        const routeProfileOpts = ['<option value="">-- none --</option>'];
+        for (const rp of routeProfiles) {
+          const sel = rp.name === activeRouteProfile ? " selected" : "";
+          routeProfileOpts.push(`<option value="${esc(rp.name)}"${sel}>${esc(rp.name)}</option>`);
+        }
+
+        panel.innerHTML = `
+    <h3>Glass Miner Settings</h3>
+    <div class="settings-desc">Glass Miner — combat-capable mining routine for hazardous areas. Combines mining with hunter-style battle abilities. Designed for seam_glass and other rare ores in hostile POIs with repeater NPCs.</div>
+
+    <div class="setting-section">
+      <h4>🔮 Core Mining Settings</h4>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Mining Type</div>
+          <div class="setting-hint">Auto-detect from ship modules, or force ore/gas/ice/radioactive mode.</div>
+        </div>
+        <select id="set-glass_miner-miningType">
+          <option value="auto"${miningType === "auto" ? " selected" : ""}>Auto-detect (recommended)</option>
+          <option value="ore"${miningType === "ore" ? " selected" : ""}>Ore Mining (asteroid belts)</option>
+          <option value="gas"${miningType === "gas" ? " selected" : ""}>Gas Harvesting (gas clouds)</option>
+          <option value="ice"${miningType === "ice" ? " selected" : ""}>Ice Mining (ice fields)</option>
+          <option value="radioactive"${miningType === "radioactive" ? " selected" : ""}>Radioactive Mining</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Target Ore</div>
+          <div class="setting-hint">Seek a specific ore type. Bot will look for asteroid belts with this resource.</div>
+        </div>
+        <select id="set-glass_miner-targetOre">${oreOpts.join("")}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Target Gas</div>
+          <div class="setting-hint">Specific gas to harvest from gas clouds.</div>
+        </div>
+        <select id="set-glass_miner-targetGas">${gasOpts.join("")}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Target Ice</div>
+          <div class="setting-hint">Specific ice to mine from ice fields.</div>
+        </div>
+        <select id="set-glass_miner-targetIce">${iceOpts.join("")}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Target Radioactive</div>
+          <div class="setting-hint">Specific radioactive ore to mine.</div>
+        </div>
+        <select id="set-glass_miner-targetRadioactive">${radioactiveOpts.join("")}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Target Deep Core</div>
+          <div class="setting-hint">Specific deep core ore to mine (requires deep core equipment).</div>
+        </div>
+        <select id="set-glass_miner-targetDeepCore">${deepCoreOpts.join("")}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Deposit Mode</div>
+          <div class="setting-hint">Where to deposit mined resources.</div>
+        </div>
+        <select id="set-glass_miner-depositMode">${minerDepositOpts(depositMode)}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Deposit Fallback</div>
+          <div class="setting-hint">Fallback deposit method if primary fails.</div>
+        </div>
+        <select id="set-glass_miner-depositFallback">${minerDepositOpts(depositFallback)}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Deposit Bot</div>
+          <div class="setting-hint">Bot name to transfer cargo to (when depositMode is bot:NAME).</div>
+        </div>
+        <input type="text" id="set-glass_miner-depositBot" value="${esc(depositBot)}" placeholder="Bot username">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Cargo Threshold %</div>
+          <div class="setting-hint">Return home when cargo reaches this percentage.</div>
+        </div>
+        <input type="number" id="set-glass_miner-cargoThreshold" value="${cargoThreshold}" min="10" max="100">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Refuel Threshold %</div>
+          <div class="setting-hint">Refuel when fuel drops below this percentage.</div>
+        </div>
+        <input type="number" id="set-glass_miner-refuelThreshold" value="${refuelThreshold}" min="5" max="100">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Repair Threshold %</div>
+          <div class="setting-hint">Return for repairs when hull drops below this percentage.</div>
+        </div>
+        <input type="number" id="set-glass_miner-repairThreshold" value="${repairThreshold}" min="5" max="100">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Home System</div>
+          <div class="setting-hint">System to return to for depositing and resupply.</div>
+        </div>
+        <select id="set-glass_miner-homeSystem">${homeOpts.join("")}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Max Jumps</div>
+          <div class="setting-hint">Maximum jumps to travel for a mining target.</div>
+        </div>
+        <input type="number" id="set-glass_miner-maxJumps" value="${maxJumps}" min="1" max="50">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Min Fuel Cells</div>
+          <div class="setting-hint">Minimum fuel cells to keep in cargo.</div>
+        </div>
+        <input type="number" id="set-glass_miner-minimumFuelCells" value="${minimumFuelCells}" min="0" max="100">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Return Home Fuel Cells Remaining</div>
+          <div class="setting-hint">Return home when this many fuel cells remain.</div>
+        </div>
+        <input type="number" id="set-glass_miner-returnHomeOnFuelCellsRemaining" value="${returnHomeOnFuelCellsRemaining}" min="0" max="20">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Depletion Timeout (hours)</div>
+          <div class="setting-hint">Hours before a depleted deposit is considered available again.</div>
+        </div>
+        <input type="number" id="set-glass_miner-depletionTimeoutHours" value="${depletionTimeoutHours}" min="0.5" max="24" step="0.5">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Enable Cloak</div>
+          <div class="setting-hint">Keep cloaked while mining (requires cloaking module).</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-enableCloak"${enableCloak ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Cloak Ignore Blacklist</div>
+          <div class="setting-hint">When cloaked, ignore system blacklist for mining navigation.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-cloakIgnoreBlacklist"${cloakIgnoreBlacklist ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Enable Missions</div>
+          <div class="setting-hint">Accept and complete mining missions at stations.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-enableMissions"${enableMissions ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Ignore Depletion</div>
+          <div class="setting-hint">Ignore depletion status and mine anyway.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-ignoreDepletion"${ignoreDepletion ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Stay Out Until Full</div>
+          <div class="setting-hint">Don't return home until cargo is 95%+ full.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-stayOutUntilFull"${stayOutUntilFull ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">No Mid-Mining Retarget</div>
+          <div class="setting-hint">Don't switch targets mid-mining session.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-noMidMiningRetarget"${noMidMiningRetarget ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Deep Sleep Interval (min)</div>
+          <div class="setting-hint">Minutes to sleep when no viable targets found anywhere.</div>
+        </div>
+        <input type="number" id="set-glass_miner-deepSleepIntervalMin" value="${deepSleepIntervalMin}" min="5" max="120">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Enable Miner Coordination</div>
+          <div class="setting-hint">Coordinate with other miners to avoid overcrowding.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-enableCoordination"${enableCoordination ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Max Bots Per System</div>
+          <div class="setting-hint">Maximum miners allowed in the same system when coordination is enabled.</div>
+        </div>
+        <input type="number" id="set-glass_miner-maxBotsPerSystem" value="${maxBotsPerSystem}" min="1" max="10">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Flock Enabled</div>
+          <div class="setting-hint">Enable flock mining mode.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-flockEnabled"${flockEnabled ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Flock Name</div>
+          <div class="setting-hint">Name of the flock to join.</div>
+        </div>
+        <input type="text" id="set-glass_miner-flockName" value="${esc(flockName)}" placeholder="Flock name">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Flock Role</div>
+          <div class="setting-hint">Leader or follower in flock.</div>
+        </div>
+        <select id="set-glass_miner-flockRole">
+          <option value="leader"${flockRole === "leader" ? " selected" : ""}>Leader</option>
+          <option value="follower"${flockRole === "follower" ? " selected" : ""}>Follower</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="setting-section">
+      <h4>🛡️ Combat & Shield Settings</h4>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Enable Fighting</div>
+          <div class="setting-hint">Engage hostile NPCs (repeaters) instead of fleeing.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-enableFighting"${enableFighting ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Shield Recharge %</div>
+          <div class="setting-hint">Target shield percentage when recharging with shield_charge items.</div>
+        </div>
+        <input type="number" id="set-glass_miner-shieldRechargePct" value="${shieldRechargePct}" min="10" max="100">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Shield Monitor Threshold %</div>
+          <div class="setting-hint">Auto-recharge shields when they drop below this percentage (full-time monitoring).</div>
+        </div>
+        <input type="number" id="set-glass_miner-shieldMonitorThresholdPct" value="${shieldMonitorThresholdPct}" min="10" max="100">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Repair Kit Threshold %</div>
+          <div class="setting-hint">Use advanced_repair_kit when hull drops below this percentage.</div>
+        </div>
+        <input type="number" id="set-glass_miner-repairKitThresholdPct" value="${repairKitThresholdPct}" min="10" max="100">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Flee System Threshold %</div>
+          <div class="setting-hint">Flee the entire system when hull drops below this percentage.</div>
+        </div>
+        <input type="number" id="set-glass_miner-fleeSystemThresholdPct" value="${fleeSystemThresholdPct}" min="5" max="90">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Desired Shield Charges</div>
+          <div class="setting-hint">Number of shield_charge items to keep stocked.</div>
+        </div>
+        <input type="number" id="set-glass_miner-desiredShieldCharges" value="${desiredShieldCharges}" min="0" max="200">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Desired Repair Kits</div>
+          <div class="setting-hint">Number of repair_kit items to keep stocked.</div>
+        </div>
+        <input type="number" id="set-glass_miner-desiredRepairKits" value="${desiredRepairKits}" min="0" max="100">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Desired Advanced Repair Kits</div>
+          <div class="setting-hint">Number of advanced_repair_kit items to keep stocked (150 hull each).</div>
+        </div>
+        <input type="number" id="set-glass_miner-desiredAdvancedRepairKits" value="${desiredAdvancedRepairKits}" min="0" max="100">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Desired Ammo Boxes</div>
+          <div class="setting-hint">Number of ammo boxes to withdraw (-1 = auto).</div>
+        </div>
+        <input type="number" id="set-glass_miner-desiredAmmoBoxes" value="${desiredAmmoBoxes}" min="-1" max="50">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Desired Emergency Warp Devices</div>
+          <div class="setting-hint">Number of emergency_warp_device items to keep stocked.</div>
+        </div>
+        <input type="number" id="set-glass_miner-desiredEmergencyWarpDevices" value="${desiredEmergencyWarpDevices}" min="0" max="20">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Disable Resupply</div>
+          <div class="setting-hint">Skip withdrawing shield charges, repair kits, and warp devices.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-disableResupply"${disableResupply ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Max Repeater Tier to Engage</div>
+          <div class="setting-hint">Highest tier of repeater NPC to fight (silver/pane are usually tier small/medium).</div>
+        </div>
+        <select id="set-glass_miner-maxRepeaterTierToEngage">
+          <option value="small"${maxRepeaterTierToEngage === "small" ? " selected" : ""}>Small</option>
+          <option value="medium"${maxRepeaterTierToEngage === "medium" ? " selected" : ""}>Medium</option>
+          <option value="large"${maxRepeaterTierToEngage === "large" ? " selected" : ""}>Large</option>
+          <option value="capitol"${maxRepeaterTierToEngage === "capitol" ? " selected" : ""}>Capitol</option>
+          <option value="boss"${maxRepeaterTierToEngage === "boss" ? " selected" : ""}>Boss</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Flee from Spire/Monolith Repeaters</div>
+          <div class="setting-hint">Automatically flee system when Spire or Monolith variant repeaters detected.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-fleeFromSpireMonolith"${fleeFromSpireMonolith ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Enable Full-Time Shield Monitor</div>
+          <div class="setting-hint">Continuously monitor shields and hull during mining/navigation/combat.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-enableFullTimeShieldMonitor"${enableFullTimeShieldMonitor ? " checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Cloak on Battle Start</div>
+          <div class="setting-hint">Re-enable cloak immediately after battle ends.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-cloakOnStart"${cloakOnStart ? " checked" : ""}> Enabled</label>
+      </div>
+    </div>
+
+    <div class="setting-section">
+      <h4>🗺️ Routing Profiles (Fixed Paths)</h4>
+      <div class="setting-desc">Define fixed routes with optional pathfinder jumps for hazardous mining areas. Each profile defines an outbound route, optional pathfinder jump to target system/POI, and return route.</div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Active Route Profile</div>
+          <div class="setting-hint">Select which routing profile to use for this bot.</div>
+        </div>
+        <select id="set-glass_miner-activeRouteProfile">${routeProfileOpts.join("")}</select>
+      </div>
+
+      <div class="setting-row">
+        <div style="flex:1"></div>
+        <button class="btn" onclick="addGlassMinerRouteProfile()">+ Add Route Profile</button>
+      </div>
+
+      <div id="glassMinerRouteProfilesContainer">
+        ${routeProfiles.map((rp, idx) => 
+        '<div class="route-profile-card" data-index="' + idx + '" style="border:1px solid #333;border-radius:8px;padding:12px;margin-top:12px;background:#1e1e1e">' +
+          '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
+            '<h4 style="margin:0">Route Profile: <input type="text" value="' + esc(rp.name) + '" onchange="updateGlassMinerRouteProfile(' + idx + ', \'name\', this.value)" style="width:200px;margin-left:8px"></h4>' +
+            '<button class="btn sm danger" onclick="removeGlassMinerRouteProfile(' + idx + ')">Remove</button>' +
+          '</div>' +
+          
+          '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Cycle Mode</div>' +
+            '</div>' +
+            '<select onchange="updateGlassMinerRouteProfile(' + idx + ', \'cycleMode\', this.value)">' +
+              '<option value="sequential"' + (rp.cycleMode === "sequential" ? " selected" : "") + '>Sequential</option>' +
+              '<option value="random"' + (rp.cycleMode === "random" ? " selected" : "") + '>Random</option>' +
+            '</select>' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Outbound Route Systems (comma-separated)</div>' +
+              '<div class="setting-hint">Regular jump path to reach pathfinder start system.</div>' +
+            '</div>' +
+            '<input type="text" value="' + esc((rp.routeSystems || []).join(", ")) + '" onchange="updateGlassMinerRouteProfile(' + idx + ', \'routeSystems\', this.value.split(\',\').map(s=>s.trim()).filter(Boolean))" placeholder="system_a, system_b, system_c" style="width:100%">' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Pathfinder Start System</div>' +
+              '<div class="setting-hint">System to jump FROM using pathfinder drive.</div>' +
+            '</div>' +
+            '<input type="text" value="' + esc(rp.pathfinderStartSystem || "") + '" onchange="updateGlassMinerRouteProfile(' + idx + ', \'pathfinderStartSystem\', this.value)" placeholder="system_c">' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Pathfinder Target System</div>' +
+              '<div class="setting-hint">Hazardous mining area system to jump TO.</div>' +
+            '</div>' +
+            '<input type="text" value="' + esc(rp.pathfinderTargetSystem || "") + '" onchange="updateGlassMinerRouteProfile(' + idx + ', \'pathfinderTargetSystem\', this.value)" placeholder="hazardous_system">' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Pathfinder Bearing (degrees, optional)</div>' +
+              '<div class="setting-hint">Pre-calculated bearing. Leave empty to auto-calculate from galactic coordinates.</div>' +
+            '</div>' +
+            '<input type="number" value="' + (rp.pathfinderBearing !== undefined ? rp.pathfinderBearing : "") + '" step="0.01" onchange="updateGlassMinerRouteProfile(' + idx + ', \'pathfinderBearing\', this.value ? parseFloat(this.value) : undefined)" placeholder="Auto-calculated" style="width:150px">' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Mining POI ID</div>' +
+              '<div class="setting-hint">Specific POI to mine in the hazardous system.</div>' +
+            '</div>' +
+            '<input type="text" value="' + esc(rp.miningPoiId || "") + '" onchange="updateGlassMinerRouteProfile(' + idx + ', \'miningPoiId\', this.value)" placeholder="poi_123">' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Mining POI Name</div>' +
+              '<div class="setting-hint">POI name for display/logging.</div>' +
+            '</div>' +
+            '<input type="text" value="' + esc(rp.miningPoiName || "") + '" onchange="updateGlassMinerRouteProfile(' + idx + ', \'miningPoiName\', this.value)" placeholder="Glass Asteroid Field">' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Mining Resource ID</div>' +
+              '<div class="setting-hint">Resource to mine (e.g., seam_glass).</div>' +
+            '</div>' +
+            '<input type="text" value="' + esc(rp.miningResourceId || "") + '" onchange="updateGlassMinerRouteProfile(' + idx + ', \'miningResourceId\', this.value)" placeholder="seam_glass">' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Use Pathfinder Jump</div>' +
+            '</div>' +
+            '<label class="checkbox-label"><input type="checkbox"' + (rp.usePathfinderJump ? " checked" : "") + ' onchange="updateGlassMinerRouteProfile(' + idx + ', \'usePathfinderJump\', this.checked)"> Enabled</label>' +
+          '</div>'
+
+        + '<hr style="margin:12px 0;border-color:#333">'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Return Route Systems (comma-separated)</div>' +
+              '<div class="setting-hint">Return path (can differ from outbound).</div>' +
+            '</div>' +
+            '<input type="text" value="' + esc((rp.returnRouteSystems || []).join(", ")) + '" onchange="updateGlassMinerRouteProfile(' + idx + ', \'returnRouteSystems\', this.value.split(\',\').map(s=>s.trim()).filter(Boolean))" placeholder="system_c, system_b, system_a" style="width:100%">' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Pathfinder Return Start System</div>' +
+            '</div>' +
+            '<input type="text" value="' + esc(rp.pathfinderReturnStartSystem || "") + '" onchange="updateGlassMinerRouteProfile(' + idx + ', \'pathfinderReturnStartSystem\', this.value)" placeholder="hazardous_system">' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Pathfinder Return Target System</div>' +
+            '</div>' +
+            '<input type="text" value="' + esc(rp.pathfinderReturnTargetSystem || "") + '" onchange="updateGlassMinerRouteProfile(' + idx + ', \'pathfinderReturnTargetSystem\', this.value)" placeholder="system_a">' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
+              '<div class="setting-label">Pathfinder Return Bearing (degrees, optional)</div>' +
+            '</div>' +
+            '<input type="number" value="' + (rp.pathfinderReturnBearing !== undefined ? rp.pathfinderReturnBearing : "") + '" step="0.01" onchange="updateGlassMinerRouteProfile(' + idx + ', \'pathfinderReturnBearing\', this.value ? parseFloat(this.value) : undefined)" placeholder="Auto-calculated" style="width:150px">' +
+          '</div>' +
+        '</div>'
+        ).join("")}
+      </div>
+    </div>
+
+    <div class="setting-section">
+      <h4>🗑️ Jettison Lists</h4>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Jettison Ores (regular)</div>
+          <div class="setting-hint">Ores to automatically jettison when found in cargo during ore mining.</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <select id="glass_miner-jettisonOreSelect">${jettisonOreOpts}</select>
+          <button class="btn sm" onclick="addGlassMinerJettisonOre()">Add</button>
+        </div>
+        <table style="width:100%;margin-top:8px;font-size:12px;border-collapse:collapse">
+          <thead><tr style="background:#2a2a2a"><th style="padding:4px 8px;text-align:left">Ore</th><th style="padding:4px 8px;text-align:center;width:40px">Action</th></tr></thead>
+          <tbody id="glass_miner-jettisonOresTable">${jettisonRows}</tbody>
+        </table>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Jettison Ores (deep core)</div>
+          <div class="setting-hint">Ores to jettison when mining deep core ores in hidden POIs.</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <select id="glass_miner-deepCoreJettisonOreSelect">${buildJettisonOreOpts(oreOres)}</select>
+          <button class="btn sm" onclick="addGlassMinerDeepCoreJettisonOre()">Add</button>
+        </div>
+        <table style="width:100%;margin-top:8px;font-size:12px;border-collapse:collapse">
+          <thead><tr style="background:#2a2a2a"><th style="padding:4px 8px;text-align:left">Ore</th><th style="padding:4px 8px;text-align:center;width:40px">Action</th></tr></thead>
+          <tbody id="glass_miner-deepCoreJettisonOresTable">${buildJettisonRows(deepCoreJettisonOres, oreOres)}</tbody>
+        </table>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Jettison Ores (radioactive)</div>
+          <div class="setting-hint">Ores to jettison when mining radioactive ores.</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <select id="glass_miner-radioactiveJettisonOreSelect">
+            <option value="">-- select --</option>
+            ${radioactiveOres.map(o => `<option value="${esc(o.item_id)}">${esc(o.name)}</option>`).join("")}
+          </select>
+          <button class="btn sm" onclick="addGlassMinerRadioactiveJettisonOre()">Add</button>
+        </div>
+        <table style="width:100%;margin-top:8px;font-size:12px;border-collapse:collapse">
+          <thead><tr style="background:#2a2a2a"><th style="padding:4px 8px;text-align:left">Ore</th><th style="padding:4px 8px;text-align:center;width:40px">Action</th></tr></thead>
+          <tbody id="glass_miner-radioactiveJettisonOresTable">${buildJettisonRows(radioactiveJettisonOres, radioactiveOres)}</tbody>
+        </table>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Jettison Gas</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <select id="glass_miner-jettisonGasSelect">
+            <option value="">-- select --</option>
+            ${gasOres.map(o => `<option value="${esc(o.item_id)}">${esc(o.name)}</option>`).join("")}
+          </select>
+          <button class="btn sm" onclick="addGlassMinerJettisonGas()">Add</button>
+        </div>
+        <table style="width:100%;margin-top:8px;font-size:12px;border-collapse:collapse">
+          <thead><tr style="background:#2a2a2a"><th style="padding:4px 8px;text-align:left">Gas</th><th style="padding:4px 8px;text-align:center;width:40px">Action</th></tr></thead>
+          <tbody id="glass_miner-jettisonGasTable">${buildJettisonRows(jettisonGas, gasOres)}</tbody>
+        </table>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Jettison Ice</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <select id="glass_miner-jettisonIceSelect">
+            <option value="">-- select --</option>
+            ${iceOres.map(o => `<option value="${esc(o.item_id)}">${esc(o.name)}</option>`).join("")}
+          </select>
+          <button class="btn sm" onclick="addGlassMinerJettisonIce()">Add</button>
+        </div>
+        <table style="width:100%;margin-top:8px;font-size:12px;border-collapse:collapse">
+          <thead><tr style="background:#2a2a2a"><th style="padding:4px 8px;text-align:left">Ice</th><th style="padding:4px 8px;text-align:center;width:40px">Action</th></tr></thead>
+          <tbody id="glass_miner-jettisonIceTable">${buildJettisonRows(jettisonIce, iceOres)}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="settings-actions">
+      <button class="btn primary" onclick="saveGlassMinerSettings()">Save Glass Miner Settings</button>
+    </div>
+        `;
+
+        // Helper functions for jettison lists
+        function collectJettisonOres() {
+          return Array.from(document.querySelectorAll("#glass_miner-jettisonOresTable tr"))
+            .map(tr => tr.dataset.oreId)
+            .filter(Boolean);
+        }
+        function collectDeepCoreJettisonOres() {
+          return Array.from(document.querySelectorAll("#glass_miner-deepCoreJettisonOresTable tr"))
+            .map(tr => tr.dataset.oreId)
+            .filter(Boolean);
+        }
+        function collectRadioactiveJettisonOres() {
+          return Array.from(document.querySelectorAll("#glass_miner-radioactiveJettisonOresTable tr"))
+            .map(tr => tr.dataset.oreId)
+            .filter(Boolean);
+        }
+        function collectGasJettisonOres() {
+          return Array.from(document.querySelectorAll("#glass_miner-jettisonGasTable tr"))
+            .map(tr => tr.dataset.oreId)
+            .filter(Boolean);
+        }
+        function collectIceJettisonOres() {
+          return Array.from(document.querySelectorAll("#glass_miner-jettisonIceTable tr"))
+            .map(tr => tr.dataset.oreId)
+            .filter(Boolean);
+        }
+
+        function saveGlassMinerSettings() {
+          const s = {
+            miningType: document.getElementById("set-glass_miner-miningType").value,
+            depositMode: document.getElementById("set-glass_miner-depositMode").value,
+            depositFallback: document.getElementById("set-glass_miner-depositFallback").value,
+            cargoThreshold: parseInt(document.getElementById("set-glass_miner-cargoThreshold").value) || 80,
+            refuelThreshold: parseInt(document.getElementById("set-glass_miner-refuelThreshold").value) || 50,
+            repairThreshold: parseInt(document.getElementById("set-glass_miner-repairThreshold").value) || 40,
+            homeSystem: document.getElementById("set-glass_miner-homeSystem").value,
+            systemOre: document.getElementById("set-glass_miner-systemOre")?.value || "",
+            systemGas: document.getElementById("set-glass_miner-systemGas")?.value || "",
+            systemIce: document.getElementById("set-glass_miner-systemIce")?.value || "",
+            systemRadioactive: document.getElementById("set-glass_miner-systemRadioactive")?.value || "",
+            systemDeepCore: document.getElementById("set-glass_miner-systemDeepCore")?.value || "",
+            depositBot: document.getElementById("set-glass_miner-depositBot").value,
+            targetOre: document.getElementById("set-glass_miner-targetOre").value,
+            targetGas: document.getElementById("set-glass_miner-targetGas").value,
+            targetIce: document.getElementById("set-glass_miner-targetIce").value,
+            targetRadioactive: document.getElementById("set-glass_miner-targetRadioactive").value,
+            targetDeepCore: document.getElementById("set-glass_miner-targetDeepCore").value,
+            jettisonOres: collectJettisonOres(),
+            deepCoreJettisonOres: collectDeepCoreJettisonOres(),
+            radioactiveJettisonOres: collectRadioactiveJettisonOres(),
+            jettisonGas: collectGasJettisonOres(),
+            jettisonIce: collectIceJettisonOres(),
+            depletionTimeoutHours: parseFloat(document.getElementById("set-glass_miner-depletionTimeoutHours").value) || 3,
+            ignoreDepletion: document.getElementById("set-glass_miner-ignoreDepletion").checked,
+            stayOutUntilFull: document.getElementById("set-glass_miner-stayOutUntilFull").checked,
+            maxJumps: parseInt(document.getElementById("set-glass_miner-maxJumps").value) || 10,
+            minimumFuelCells: parseInt(document.getElementById("set-glass_miner-minimumFuelCells").value) || 20,
+            returnHomeOnFuelCellsRemaining: parseInt(document.getElementById("set-glass_miner-returnHomeOnFuelCellsRemaining").value) || 2,
+            noMidMiningRetarget: document.getElementById("set-glass_miner-noMidMiningRetarget").checked,
+            enableCloak: document.getElementById("set-glass_miner-enableCloak").checked,
+            cloakIgnoreBlacklist: document.getElementById("set-glass_miner-cloakIgnoreBlacklist").checked,
+            enableMissions: document.getElementById("set-glass_miner-enableMissions").checked,
+            deepSleepIntervalMin: parseInt(document.getElementById("set-glass_miner-deepSleepIntervalMin").value) || 30,
+            enableCoordination: document.getElementById("set-glass_miner-enableCoordination").checked,
+            maxBotsPerSystem: parseInt(document.getElementById("set-glass_miner-maxBotsPerSystem").value) || 3,
+            flockEnabled: document.getElementById("set-glass_miner-flockEnabled").checked,
+            flockName: document.getElementById("set-glass_miner-flockName").value,
+            flockRole: document.getElementById("set-glass_miner-flockRole").value,
+            desiredEmergencyWarpDevices: parseInt(document.getElementById("set-glass_miner-desiredEmergencyWarpDevices").value) || 3,
+            desiredShieldCharges: parseInt(document.getElementById("set-glass_miner-desiredShieldCharges").value) || 20,
+            desiredRepairKits: parseInt(document.getElementById("set-glass_miner-desiredRepairKits").value) || 12,
+            desiredAmmoBoxes: parseInt(document.getElementById("set-glass_miner-desiredAmmoBoxes").value) || -1,
+            disableResupply: document.getElementById("set-glass_miner-disableResupply").checked,
+            enableFighting: document.getElementById("set-glass_miner-enableFighting").checked,
+            
+            // Glass Miner specific
+            shieldRechargePct: parseInt(document.getElementById("set-glass_miner-shieldRechargePct").value) || 80,
+            shieldMonitorThresholdPct: parseInt(document.getElementById("set-glass_miner-shieldMonitorThresholdPct").value) || 50,
+            repairKitThresholdPct: parseInt(document.getElementById("set-glass_miner-repairKitThresholdPct").value) || 50,
+            fleeSystemThresholdPct: parseInt(document.getElementById("set-glass_miner-fleeSystemThresholdPct").value) || 30,
+            desiredAdvancedRepairKits: parseInt(document.getElementById("set-glass_miner-desiredAdvancedRepairKits").value) || 10,
+            enableFullTimeShieldMonitor: document.getElementById("set-glass_miner-enableFullTimeShieldMonitor").checked,
+            maxRepeaterTierToEngage: document.getElementById("set-glass_miner-maxRepeaterTierToEngage").value,
+            fleeFromSpireMonolith: document.getElementById("set-glass_miner-fleeFromSpireMonolith").checked,
+            cloakOnStart: document.getElementById("set-glass_miner-cloakOnStart").checked,
+            
+            // Routing profiles
+            routeProfiles: routeProfiles,
+            activeRouteProfile: document.getElementById("set-glass_miner-activeRouteProfile").value,
+          };
+
+          send({ type: "saveSettings", routine: "glass_miner", settings: s });
+          settings.glass_miner = s;
+          fetch("/api/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ glass_miner: s }),
+          }).catch(() => {});
+          window.saveGlassMinerSettings = saveGlassMinerSettings;
+      }
+    }
+
+      // ── Glass Miner Route Profile Helpers ──────────────────────────────
+
+      function addGlassMinerRouteProfile() {
+        const g = settings.glass_miner || {};
+        if (!g.routeProfiles) g.routeProfiles = [];
+        const newProfile = {
+          name: "New Route " + (g.routeProfiles.length + 1),
+          routeSystems: [],
+          pathfinderStartSystem: "",
+          pathfinderTargetSystem: "",
+          miningPoiId: "",
+          miningPoiName: "",
+          miningResourceId: "",
+          pathfinderBearing: undefined,
+          usePathfinderJump: false,
+          cycleMode: "sequential",
+          returnRouteSystems: [],
+          pathfinderReturnStartSystem: "",
+          pathfinderReturnTargetSystem: "",
+          pathfinderReturnBearing: undefined,
+        };
+        g.routeProfiles.push(newProfile);
+        settings.glass_miner = g;
+        renderGlassMinerSettings(document.getElementById("settingsContent"));
+      }
+
+      function removeGlassMinerRouteProfile(index) {
+        const g = settings.glass_miner || {};
+        if (!g.routeProfiles) return;
+        g.routeProfiles.splice(index, 1);
+        // If we removed the active profile, clear it
+        if (g.activeRouteProfile === g.routeProfiles[index]?.name) {
+          g.activeRouteProfile = "";
+        }
+        settings.glass_miner = g;
+        renderGlassMinerSettings(document.getElementById("settingsContent"));
+      }
+
+      function updateGlassMinerRouteProfile(index, field, value) {
+        const g = settings.glass_miner || {};
+        if (!g.routeProfiles || !g.routeProfiles[index]) return;
+        if (field === "routeSystems" || field === "returnRouteSystems") {
+          // value is already an array from the onchange handler
+          g.routeProfiles[index][field] = value;
+        } else if (field === "pathfinderBearing" || field === "pathfinderReturnBearing") {
+          g.routeProfiles[index][field] = value === "" ? undefined : parseFloat(value);
+        } else if (field === "usePathfinderJump") {
+          g.routeProfiles[index][field] = Boolean(value);
+        } else {
+          g.routeProfiles[index][field] = value;
+        }
+        settings.glass_miner = g;
+        // Don't re-render for every keystroke - just update the settings object
+      }
+
+      function addGlassMinerJettisonOre() {
+        const select = document.getElementById("glass_miner-jettisonOreSelect");
+        const oreId = select.value;
+        if (!oreId) return;
+        const g = settings.glass_miner || {};
+        if (!g.jettisonOres) g.jettisonOres = [];
+        if (!g.jettisonOres.includes(oreId)) {
+          g.jettisonOres.push(oreId);
+          settings.glass_miner = g;
+          renderGlassMinerSettings(document.getElementById("settingsContent"));
+        }
+      }
+
+      function addGlassMinerDeepCoreJettisonOre() {
+        const select = document.getElementById("glass_miner-deepCoreJettisonOreSelect");
+        const oreId = select.value;
+        if (!oreId) return;
+        const g = settings.glass_miner || {};
+        if (!g.deepCoreJettisonOres) g.deepCoreJettisonOres = [];
+        if (!g.deepCoreJettisonOres.includes(oreId)) {
+          g.deepCoreJettisonOres.push(oreId);
+          settings.glass_miner = g;
+          renderGlassMinerSettings(document.getElementById("settingsContent"));
+        }
+      }
+
+      function addGlassMinerRadioactiveJettisonOre() {
+        const select = document.getElementById("glass_miner-radioactiveJettisonOreSelect");
+        const oreId = select.value;
+        if (!oreId) return;
+        const g = settings.glass_miner || {};
+        if (!g.radioactiveJettisonOres) g.radioactiveJettisonOres = [];
+        if (!g.radioactiveJettisonOres.includes(oreId)) {
+          g.radioactiveJettisonOres.push(oreId);
+          settings.glass_miner = g;
+          renderGlassMinerSettings(document.getElementById("settingsContent"));
+        }
+      }
+
+      function addGlassMinerJettisonGas() {
+        const select = document.getElementById("glass_miner-jettisonGasSelect");
+        const oreId = select.value;
+        if (!oreId) return;
+        const g = settings.glass_miner || {};
+        if (!g.jettisonGas) g.jettisonGas = [];
+        if (!g.jettisonGas.includes(oreId)) {
+          g.jettisonGas.push(oreId);
+          settings.glass_miner = g;
+          renderGlassMinerSettings(document.getElementById("settingsContent"));
+        }
+      }
+
+      function addGlassMinerJettisonIce() {
+        const select = document.getElementById("glass_miner-jettisonIceSelect");
+        const oreId = select.value;
+        if (!oreId) return;
+        const g = settings.glass_miner || {};
+        if (!g.jettisonIce) g.jettisonIce = [];
+        if (!g.jettisonIce.includes(oreId)) {
+          g.jettisonIce.push(oreId);
+          settings.glass_miner = g;
+          renderGlassMinerSettings(document.getElementById("settingsContent"));
+        }
       }
 
       // ── Miner Quotas Settings ───────────────────────────────────────

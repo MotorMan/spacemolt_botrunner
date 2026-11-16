@@ -4995,13 +4995,13 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
     }
 
     // ── Check if we're back in the main network (original 506 systems) ──
-    // If so, switch back to fixed_route mode since we've exited the frontier pocket
+    // If so, switch to fixed_route mode since we've exited the frontier pocket
     const mainNetwork = getMainNetworkSystems();
     if (mainNetwork.has(bot.system?.toLowerCase() || "")) {
       ctx.log("system", `Back in main network (${bot.system}) — switching to fixed_route mode`);
       setExplorerMode(bot.username, "fixed_route");
-      // The mode check at the top of the loop will handle the switch
-      continue;
+      yield* fixedRouteRoutine(ctx);
+      return;
     }
 
     // ── Get current system data ──
@@ -5914,13 +5914,13 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
     }
 
     // ── Check if we're back in the main network (original 506 systems) ──
-    // If so, switch back to fixed_route mode since we've exited the frontier pocket
+    // If so, switch to fixed_route mode since we've exited the frontier pocket
     const mainNetwork = getMainNetworkSystems();
     if (mainNetwork.has(bot.system?.toLowerCase() || "")) {
       ctx.log("system", `Back in main network (${bot.system}) — switching to fixed_route mode`);
       setExplorerMode(bot.username, "fixed_route");
-      // The mode check at the top of the loop will handle the switch
-      continue;
+      yield* fixedRouteRoutine(ctx);
+      return;
     }
 
     // ── Get current system data ──

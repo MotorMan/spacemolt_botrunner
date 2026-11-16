@@ -44,6 +44,10 @@ import {
   fleeFromBattle,
 } from "./common.js";
 import {
+  calculateBearingToTarget,
+  executePathfinderJumpToBearing,
+} from "./pathfinder.js";
+import {
   getRadioactiveCapability,
   getRadioactiveCapabilityCached,
   hasRadioactiveEquipmentCached,
@@ -474,6 +478,39 @@ interface FlockGroupConfig {
   [key: string]: unknown;
 }
 
+// ── Glass Miner Routing Profiles ────────────────────────────────
+// Similar to HunterPatrolProfile but for mining routes with pathfinder support
+
+export interface GlassMinerRouteProfile {
+  name: string;
+  /** Ordered list of system IDs/names to jump through using regular jumps */
+  routeSystems: string[];
+  /** Optional: Pathfinder jump from this system to the hazardous area */
+  pathfinderStartSystem?: string;
+  /** Optional: Target system for the pathfinder jump (hazardous mining area) */
+  pathfinderTargetSystem?: string;
+  /** Optional: Specific POI to mine in the hazardous system */
+  miningPoiId?: string;
+  /** Optional: Specific POI name to mine in the hazardous system */
+  miningPoiName?: string;
+  /** Optional: Resource ID to mine in the hazardous area */
+  miningResourceId?: string;
+  /** Optional: Bearing override for pathfinder jump (if pre-calculated) */
+  pathfinderBearing?: number;
+  /** Whether to use pathfinder jump for this route */
+  usePathfinderJump: boolean;
+  /** Cycle mode for the route */
+  cycleMode: "sequential" | "random";
+  /** Optional: return route (if different from outbound) */
+  returnRouteSystems?: string[];
+  /** Optional: pathfinder jump back from hazardous area */
+  pathfinderReturnStartSystem?: string;
+  /** Optional: pathfinder return target system */
+  pathfinderReturnTargetSystem?: string;
+  /** Optional: bearing override for return pathfinder jump */
+  pathfinderReturnBearing?: number;
+}
+
 export interface GlassMinerSettings {
   miningType: MiningType;
   autoDetectMiningType: boolean;
@@ -536,8 +573,11 @@ export interface GlassMinerSettings {
   desiredAdvancedRepairKits: number;
   enableFullTimeShieldMonitor: boolean;
   maxRepeaterTierToEngage: PirateTier;
-  fleeFromSpireMonolith: boolean;
+fleeFromSpireMonolith: boolean;
   cloakOnStart: boolean;
+  // Routing profiles
+  routeProfiles: GlassMinerRouteProfile[];
+  activeRouteProfile: string;
 }
 
 async function getGlassMinerSettings(username?: string): Promise<GlassMinerSettings> {
@@ -569,6 +609,26 @@ async function getGlassMinerSettings(username?: string): Promise<GlassMinerSetti
     const tiers: PirateTier[] = ["small", "medium", "large", "capitol", "boss"];
     if (typeof val === "string" && tiers.includes(val as PirateTier)) return val as PirateTier;
     return null;
+  }
+
+  function parseRouteProfiles(val: unknown): GlassMinerRouteProfile[] {
+    if (!Array.isArray(val)) return [];
+    return val.map((p: Record<string, unknown>) => ({
+      name: (p.name as string) || "unnamed_route",
+      routeSystems: Array.isArray(p.routeSystems) ? (p.routeSystems as string[]) : [],
+      pathfinderStartSystem: (p.pathfinderStartSystem as string) || undefined,
+      pathfinderTargetSystem: (p.pathfinderTargetSystem as string) || undefined,
+      miningPoiId: (p.miningPoiId as string) || undefined,
+      miningPoiName: (p.miningPoiName as string) || undefined,
+      miningResourceId: (p.miningResourceId as string) || undefined,
+      pathfinderBearing: typeof p.pathfinderBearing === "number" ? p.pathfinderBearing : undefined,
+      usePathfinderJump: (p.usePathfinderJump as boolean) ?? false,
+      cycleMode: (p.cycleMode as "sequential" | "random") ?? "sequential",
+      returnRouteSystems: Array.isArray(p.returnRouteSystems) ? (p.returnRouteSystems as string[]) : [],
+      pathfinderReturnStartSystem: (p.pathfinderReturnStartSystem as string) || undefined,
+      pathfinderReturnTargetSystem: (p.pathfinderReturnTargetSystem as string) || undefined,
+      pathfinderReturnBearing: typeof p.pathfinderReturnBearing === "number" ? p.pathfinderReturnBearing : undefined,
+    }));
   }
 
   const rawFlockGroups = flockCfg.flockGroups || [];
@@ -655,6 +715,9 @@ async function getGlassMinerSettings(username?: string): Promise<GlassMinerSetti
     fleeFromSpireMonolith: (m.fleeFromSpireMonolith as boolean) ?? true,
     cloakOnStart: (m.cloakOnStart as boolean) ?? false,
     autoDetectMiningType: (m.miningType === "auto" || m.miningType === "Auto" || m.miningType === "AUTO"),
+    // Routing profiles
+    routeProfiles: parseRouteProfiles(m.routeProfiles),
+    activeRouteProfile: (botOverrides.activeRouteProfile as string) || (m.activeRouteProfile as string) || "",
   };
 }
 
@@ -1564,6 +1627,136 @@ async function ensureGlassMinerResupply(ctx: RoutineContext): Promise<void> {
   }
 }
 
+// ── Glass Miner Routing Helpers ──────────────────────────────────
+
+interface GalacticPos {
+  x: number;
+  y: number;
+}
+
+interface JumpResult {
+  success: boolean;
+  landedSystem: string;
+  arrivalPos: GalacticPos | null;
+  ticksTraveled: number;
+}
+
+/** Get the active route profile for this bot */
+function getActiveRouteProfile(settings: GlassMinerSettings): GlassMinerRouteProfile | null {
+  if (!settings.activeRouteProfile) return null;
+  return settings.routeProfiles.find(p => p.name === settings.activeRouteProfile) || null;
+}
+
+/** Resolve system ID from name or ID */
+function resolveSystemId(systemRef: string): string | null {
+  if (!systemRef) return null;
+  // Try exact match first
+  if (mapStore.getSystem(systemRef)) return systemRef;
+  // Try case-insensitive match
+  const normalized = systemRef.toLowerCase().replace(/_/g, ' ');
+  for (const sys of mapStore.getSystems()) {
+    const sysName = (sys.name || sys.id).toLowerCase().replace(/_/g, ' ');
+    if (sysName === normalized) return sys.id;
+    if (sys.id.toLowerCase() === normalized) return sys.id;
+  }
+  return null;
+}
+
+/** Get galactic position for a system */
+function getSystemPosition(systemId: string): GalacticPos | null {
+  const sys = mapStore.getSystem(systemId);
+  if (!sys?.position) return null;
+  return { x: sys.position.x, y: sys.position.y };
+}
+
+/** Calculate bearing from origin system to target system */
+function calculateRouteBearing(originSystemId: string, targetSystemId: string): number | undefined {
+  const originPos = getSystemPosition(originSystemId);
+  const targetPos = getSystemPosition(targetSystemId);
+  if (!originPos || !targetPos) return undefined;
+  return calculateBearingToTarget(originPos.x, originPos.y, targetPos.x, targetPos.y);
+}
+
+/** Execute a pathfinder jump at a calculated bearing */
+async function executePathfinderJump(
+  ctx: RoutineContext,
+  bearing: number,
+  originPos: GalacticPos | null
+): Promise<JumpResult> {
+  const result = await executePathfinderJumpToBearing(ctx, bearing, originPos, {
+    waitForCompletion: true,
+    midTransitWaitMs: 30000, // Wait 30 seconds mid-transit to get away from origin
+  });
+  return {
+    success: result.success,
+    landedSystem: result.landedSystem,
+    arrivalPos: result.arrivalPos,
+    ticksTraveled: result.ticksTraveled,
+  };
+}
+
+/** Navigate through a list of systems using regular jumps */
+async function navigateRouteSystems(
+  ctx: RoutineContext,
+  systems: string[],
+  settings: GlassMinerSettings,
+  direction: "outbound" | "return"
+): Promise<boolean> {
+  const { bot } = ctx;
+  const safetyOpts = {
+    fuelThresholdPct: settings.refuelThreshold,
+    hullThresholdPct: settings.repairThreshold,
+    autoCloak: settings.enableCloak,
+    skipBlacklist: false,
+    isCombatBot: true,
+    joinBattles: true,
+  };
+
+  for (const systemRef of systems) {
+    const systemId = resolveSystemId(systemRef);
+    if (!systemId) {
+      ctx.log("error", `Could not resolve system: ${systemRef}`);
+      return false;
+    }
+    if (bot.system === systemId) {
+      ctx.log("travel", `Already in ${systemId} (${direction})`);
+      continue;
+    }
+    ctx.log("travel", `Navigating to ${systemId} (${direction})...`);
+    const arrived = await navigateToSystem(ctx, systemId, safetyOpts);
+    if (!arrived) {
+      ctx.log("error", `Failed to reach ${systemId} on ${direction} route`);
+      return false;
+    }
+    // Check for threats after each jump
+    await fullTimeShieldMonitor(ctx, settings);
+    const threatHandled = await checkAndHandleNearbyThreats(ctx, settings);
+    if (threatHandled) {
+      ctx.log("combat", `Threat handled during ${direction} route, continuing...`);
+    }
+    await ctx.sleep(2000);
+  }
+  return true;
+}
+
+/** Travel to a specific POI in the current system */
+async function travelToPoi(ctx: RoutineContext, poiId: string, poiName: string): Promise<boolean> {
+  const { bot } = ctx;
+  if (bot.poi === poiId) {
+    ctx.log("travel", `Already at POI ${poiName} (${poiId})`);
+    return true;
+  }
+  ctx.log("travel", `Traveling to POI ${poiName} (${poiId})...`);
+  const travelResp = await bot.exec("travel", { target_poi: poiId });
+  if (travelResp.error && !travelResp.error.message.includes("already")) {
+    ctx.log("error", `Travel to POI failed: ${travelResp.error.message}`);
+    return false;
+  }
+  bot.poi = poiId;
+  await ctx.sleep(2000);
+  return true;
+}
+
 // ── Main Routine ──────────────────────────────────────────────
 export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
@@ -1621,6 +1814,72 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
     if (cargoPct >= settings.cargoThreshold || (settings.stayOutUntilFull && cargoPct >= 95)) {
       ctx.log("system", `Cargo at ${cargoPct.toFixed(1)}% — returning to deposit`);
       yield "return_home";
+      
+      const activeRoute = getActiveRouteProfile(settings);
+      
+      // Use return route if configured in active profile
+      if (activeRoute && activeRoute.returnRouteSystems && activeRoute.returnRouteSystems.length > 0) {
+        ctx.log("system", `Using return route from profile: ${activeRoute.name}`);
+        const routeSuccess = await navigateRouteSystems(ctx, activeRoute.returnRouteSystems, settings, "return");
+        if (!routeSuccess) {
+          ctx.log("error", "Return route failed — trying direct navigation to home");
+        } else {
+          // Check if we're home
+          const homeSystem = settings.systemOre || settings.system || settings.homeSystem;
+          if (homeSystem && bot.system === homeSystem) {
+            await ensureDocked(ctx);
+            await collectFromStorage(ctx);
+            await ensureGlassMinerResupply(ctx);
+            await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
+            await ensureUndocked(ctx);
+            continue;
+          }
+        }
+      }
+      
+      // Handle pathfinder return jump if configured
+      if (activeRoute && activeRoute.usePathfinderJump && activeRoute.pathfinderReturnStartSystem && activeRoute.pathfinderReturnTargetSystem) {
+        const startSystemId = resolveSystemId(activeRoute.pathfinderReturnStartSystem);
+        const targetSystemId = resolveSystemId(activeRoute.pathfinderReturnTargetSystem);
+        
+        if (startSystemId && targetSystemId) {
+          // Navigate to return pathfinder start system if needed
+          if (bot.system !== startSystemId) {
+            const safetyOpts = {
+              fuelThresholdPct: 10,
+              hullThresholdPct: settings.repairThreshold,
+              autoCloak: settings.enableCloak,
+              skipBlacklist: false,
+              isCombatBot: true,
+              joinBattles: true,
+            };
+            const arrived = await navigateToSystem(ctx, startSystemId, safetyOpts);
+            if (!arrived) {
+              ctx.log("error", `Could not reach pathfinder return start system ${startSystemId}`);
+            }
+          }
+          
+          if (bot.system === startSystemId) {
+            let bearing = activeRoute.pathfinderReturnBearing;
+            if (bearing === undefined) {
+              bearing = calculateRouteBearing(startSystemId, targetSystemId);
+            }
+            
+            if (bearing !== undefined) {
+              const originPos = getSystemPosition(startSystemId);
+              ctx.log("system", `Executing pathfinder return jump at bearing ${bearing.toFixed(2)}°...`);
+              yield "pathfinder_return_jump";
+              const jumpResult = await executePathfinderJump(ctx, bearing, originPos);
+              
+              if (jumpResult.success) {
+                ctx.log("system", `Pathfinder return jump successful, landed in ${jumpResult.landedSystem}`);
+              }
+            }
+          }
+        }
+      }
+      
+      // Fallback to direct navigation to home system
       const homeSystem = settings.systemOre || settings.system || settings.homeSystem;
       const homeStation = settings.depositBot;
       if (homeSystem) {
@@ -1672,19 +1931,121 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
        (radioactiveCap.canMineBasicRadioactive && await hasDeepCoreSurveyScanner(ctx)));
     const canMineHiddenIce = miningType === "ice" && deepCoreCap.hasExtractor;
 
-    // Find mining target
-    const target = await findBestMiningTarget(
-      ctx,
-      settings,
-      miningType,
-      totalMiningPower,
-      blacklist,
-      canMineHiddenRadioactive,
-      canMineHiddenIce,
-      hasModulatedLaser,
-      fieldTestActive,
-      cachedModules
-    );
+    // Find mining target - use routing profile if active
+    let target: { systemId: string; poiId: string; resourceId: string; poiName: string } | null = null;
+    const activeRoute = getActiveRouteProfile(settings);
+    
+    if (activeRoute) {
+      ctx.log("system", `Using routing profile: ${activeRoute.name}`);
+      
+      // Navigate outbound route systems
+      if (activeRoute.routeSystems && activeRoute.routeSystems.length > 0) {
+        const routeSuccess = await navigateRouteSystems(ctx, activeRoute.routeSystems, settings, "outbound");
+        if (!routeSuccess) {
+          ctx.log("error", "Outbound route failed — deep sleeping");
+          await ctx.sleep(settings.deepSleepIntervalMin * 60 * 1000);
+          continue;
+        }
+      }
+      
+      // Handle pathfinder jump to hazardous area
+      if (activeRoute.usePathfinderJump && activeRoute.pathfinderStartSystem && activeRoute.pathfinderTargetSystem) {
+        const startSystemId = resolveSystemId(activeRoute.pathfinderStartSystem);
+        const targetSystemId = resolveSystemId(activeRoute.pathfinderTargetSystem);
+        
+        if (!startSystemId || !targetSystemId) {
+          ctx.log("error", "Could not resolve pathfinder start/target systems");
+          await ctx.sleep(settings.deepSleepIntervalMin * 60 * 1000);
+          continue;
+        }
+        
+        // Navigate to pathfinder start system if not already there
+        if (bot.system !== startSystemId) {
+          ctx.log("travel", `Navigating to pathfinder start system ${startSystemId}...`);
+          const safetyOpts = {
+            fuelThresholdPct: settings.refuelThreshold,
+            hullThresholdPct: settings.repairThreshold,
+            autoCloak: settings.enableCloak,
+            skipBlacklist: false,
+            isCombatBot: true,
+            joinBattles: true,
+          };
+          const arrived = await navigateToSystem(ctx, startSystemId, safetyOpts);
+          if (!arrived) {
+            ctx.log("error", `Could not reach pathfinder start system ${startSystemId}`);
+            await ctx.sleep(settings.deepSleepIntervalMin * 60 * 1000);
+            continue;
+          }
+        }
+        
+        // Calculate bearing if not provided
+        let bearing = activeRoute.pathfinderBearing;
+        if (bearing === undefined) {
+          bearing = calculateRouteBearing(startSystemId, targetSystemId);
+          if (bearing === undefined) {
+            ctx.log("error", "Could not calculate bearing for pathfinder jump");
+            await ctx.sleep(settings.deepSleepIntervalMin * 60 * 1000);
+            continue;
+          }
+          ctx.log("system", `Calculated bearing: ${bearing.toFixed(2)}° from ${startSystemId} to ${targetSystemId}`);
+        } else {
+          ctx.log("system", `Using configured bearing: ${bearing}°`);
+        }
+        
+        // Get origin position for pathfinder jump
+        const originPos = getSystemPosition(startSystemId);
+        
+        // Execute pathfinder jump
+        ctx.log("system", `Executing pathfinder jump at bearing ${bearing.toFixed(2)}°...`);
+        yield "pathfinder_jump";
+        const jumpResult = await executePathfinderJump(ctx, bearing, originPos);
+        
+        if (!jumpResult.success) {
+          ctx.log("error", "Pathfinder jump failed — deep sleeping");
+          await ctx.sleep(settings.deepSleepIntervalMin * 60 * 1000);
+          continue;
+        }
+        
+        ctx.log("system", `Pathfinder jump successful, landed in ${jumpResult.landedSystem}`);
+        
+        // Verify we're in the target system
+        if (jumpResult.landedSystem !== targetSystemId) {
+          ctx.log("warn", `Landed in ${jumpResult.landedSystem}, expected ${targetSystemId} — continuing anyway`);
+        }
+      }
+      
+      // Set target from route profile
+      if (activeRoute.miningPoiId && activeRoute.miningResourceId) {
+        const targetSystemId = activeRoute.pathfinderTargetSystem 
+          ? resolveSystemId(activeRoute.pathfinderTargetSystem)
+          : bot.system;
+        
+        if (targetSystemId) {
+          target = {
+            systemId: targetSystemId,
+            poiId: activeRoute.miningPoiId,
+            resourceId: activeRoute.miningResourceId,
+            poiName: activeRoute.miningPoiName || activeRoute.miningPoiId,
+          };
+        }
+      }
+    }
+    
+    // Fallback to automatic target finding if no route profile or profile didn't set target
+    if (!target) {
+      target = await findBestMiningTarget(
+        ctx,
+        settings,
+        miningType,
+        totalMiningPower,
+        blacklist,
+        canMineHiddenRadioactive,
+        canMineHiddenIce,
+        hasModulatedLaser,
+        fieldTestActive,
+        cachedModules
+      );
+    }
 
     if (!target) {
       ctx.log("mining", "No viable mining target found — deep sleeping");

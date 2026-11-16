@@ -7045,7 +7045,29 @@
         // Refresh cargo-gated item action buttons (appear/disappear/qty change)
         const itemActionsEl = document.getElementById("mc-item-actions");
         if (itemActionsEl) {
+          // Preserve quantity input values before rebuilding
+          const savedQtyValues = {};
+          for (const action of MC_ITEM_ACTIONS) {
+            if (action.askQty) {
+              const btnId = `mc-use-${action.itemId}`;
+              const input = document.getElementById(`${btnId}-qty`);
+              if (input) {
+                savedQtyValues[action.itemId] = Number(input.value) || 1;
+              }
+            }
+          }
           itemActionsEl.innerHTML = mcBuildItemActionsHTML(cargoItems);
+          // Restore quantity input values (clamped to new max)
+          for (const action of MC_ITEM_ACTIONS) {
+            if (action.askQty && savedQtyValues[action.itemId] !== undefined) {
+              const btnId = `mc-use-${action.itemId}`;
+              const input = document.getElementById(`${btnId}-qty`);
+              if (input) {
+                const max = Number(input.max) || 1;
+                input.value = Math.min(savedQtyValues[action.itemId], max);
+              }
+            }
+          }
         }
 
         // Update storage dropdowns (withdraw, faction deposit)

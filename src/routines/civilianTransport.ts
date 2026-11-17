@@ -2206,12 +2206,22 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
   let idleStartTime = 0;
   const IDLE_RETURN_THRESHOLD_MS = 60 * 60 * 1000; // Return home after 1 hour of idle time
 
-  // Get current ship info via get_ship
+  // Get current ship info via get_ship (with retry on client restart)
   const currentShipId = bot.shipId || "";
-  const currentShipInfo = currentShipId ? await getCurrentShipInfo(ctx, currentShipId) : null;
+  let currentShipInfo = currentShipId ? await getCurrentShipInfo(ctx, currentShipId) : null;
+  let shipAttempts = 0;
+  const MAX_SHIP_ATTEMPTS = 5;
+  const SHIP_RETRY_DELAY_MS = 3000;
+  
+  while ((!currentShipInfo || currentShipInfo.berths.economy + currentShipInfo.berths.business + currentShipInfo.berths.first === 0) && shipAttempts < MAX_SHIP_ATTEMPTS) {
+    shipAttempts++;
+    ctx.log("transport", `Ship info unavailable (attempt ${shipAttempts}/${MAX_SHIP_ATTEMPTS}), retrying in ${SHIP_RETRY_DELAY_MS}ms...`);
+    await ctx.sleep(SHIP_RETRY_DELAY_MS);
+    currentShipInfo = currentShipId ? await getCurrentShipInfo(ctx, currentShipId) : null;
+  }
   
   if (!currentShipInfo || currentShipInfo.berths.economy + currentShipInfo.berths.business + currentShipInfo.berths.first === 0) {
-    ctx.log("error", "Current ship has no passenger berths or cannot be verified. Routine cannot run.");
+    ctx.log("error", "Current ship has no passenger berths or cannot be verified after retries. Routine cannot run.");
     return;
   }
 

@@ -9,6 +9,7 @@ import {
   parseSystemData,
   cargoUsedFromInventory,
   maxItemsForCargo,
+  tryRefuel,
 } from "./common.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
@@ -501,6 +502,11 @@ async function dockAtStation(ctx: RoutineContext, systemId: string, stationId: s
   const dockResp = await bot.exec("dock");
   if (!dockResp.error || dockResp.error.message.includes("already")) {
     bot.docked = true;
+    
+    // Refuel after docking if needed
+    ctx.log("system", "Checking fuel and refueling if needed...");
+    await tryRefuel(ctx);
+    
     return true;
   }
 

@@ -35,6 +35,7 @@ import { stealthSkillGrindRoutine } from "./routines/stealthSkillGrind.js";
 import { idleRoutine } from "./routines/1-idle.js";
 import { marketRoutine } from "./routines/market.js";
 import { lbCRefRoutine } from "./routines/lb-c-ref.js";
+import { missionsRoutine } from "./routines/missions.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { wildlifeStore } from "./wildlivestore.js";
@@ -553,6 +554,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   "1-idle": { name: "1-Idle", fn: idleRoutine },
   market: { name: "Market", fn: marketRoutine },
   lb_c_ref: { name: "LB-C-ReF", fn: lbCRefRoutine },
+  missions: { name: "Missions", fn: missionsRoutine },
 };
 
 /** Categories that go to the broadcast panel instead of bot log. */

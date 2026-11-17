@@ -719,6 +719,9 @@
             <div class="sidebar-item" onclick="switchSettingsTab('market')">
               Market
             </div>
+            <div class="sidebar-item" onclick="switchSettingsTab('missions')">
+              Missions
+            </div>
             <div
               class="sidebar-item"
               onclick="switchSettingsTab('client_sync')"
@@ -14230,6 +14233,7 @@
           fuel_service: renderFuelServiceSettings,
           market: renderMarketSettings,
           glass_miner: renderGlassMinerSettings,
+          missions: renderMissionsSettings,
         };
         const fn = dispatch[activeSettingsTab];
         if (!fn) return;
@@ -33502,6 +33506,212 @@ async function fetchPersonalFacilityTypes(username) {
           window.saveGlassMinerSettings = saveGlassMinerSettings;
       }
     }
+
+      // ── Missions Settings ────────────────────────────────────────────────
+
+      function renderMissionsSettings(panel) {
+        const m = settings.missions || {};
+        const chain = m.chain || "The Signal - Main Chain";
+        const autoAccept = m.autoAccept !== false;
+        const autoComplete = m.autoComplete !== false;
+        const preGrabItems = m.preGrabItems !== false;
+        const homeSystem = m.homeSystem || "";
+        const disablePathfinderJumps = m.disablePathfinderJumps === true;
+        const minFuelForPathfinder = m.minFuelForPathfinder ?? 80;
+
+        // Available chains from MISSION_CHAINS
+        const chainOpts = ['<option value="">-- select --</option>'];
+        const knownChains = ["The Signal - Main Chain"];
+        for (const c of knownChains) {
+          const sel = c === chain ? " selected" : "";
+          chainOpts.push(`<option value="${esc(c)}"${sel}>${esc(c)}</option>`);
+        }
+
+        // System options
+        const systemOpts = ['<option value="">(start system)</option>'];
+        for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || "").localeCompare(b.name || b.id || ""))) {
+          const sel = sys.id === homeSystem ? " selected" : "";
+          const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+          systemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+        }
+        if (homeSystem && !knownSystems.find((s) => s.id === homeSystem)) {
+          systemOpts.push(`<option value="${esc(homeSystem)}" selected>${esc(homeSystem)}</option>`);
+        }
+
+        panel.innerHTML = `
+    <h3>Missions Settings</h3>
+    <div class="settings-desc">Configure the automated mission chain runner. Based on the_signal.txt documented mission chain.</div>
+
+    <div class="setting-section">
+      <h4>📋 Mission Chain</h4>
+      
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Mission Chain</div>
+          <div class="setting-hint">Which documented mission chain to run. Currently only "The Signal - Main Chain" is available.</div>
+        </div>
+        <select id="set-missions-chain">${chainOpts.join("")}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Home System</div>
+          <div class="setting-hint">System to return to when the chain completes or for emergency returns.</div>
+        </div>
+        <select id="set-missions-homeSystem">${systemOpts.join("")}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Auto Accept Missions</div>
+          <div class="setting-hint">Automatically accept missions when arriving at the correct station.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-missions-autoAccept" ${autoAccept ? "checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Auto Complete Missions</div>
+          <div class="setting-hint">Automatically complete missions when all objectives are met at the station.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-missions-autoComplete" ${autoComplete ? "checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Pre-Grab All Items</div>
+          <div class="setting-hint">Before starting the chain, gather all required items (focused_crystal, anomaly_probe, fuel_cell, etc.) from storage/faction/market. Highly recommended to avoid mid-chain stops.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-missions-preGrabItems" ${preGrabItems ? "checked" : ""}> Enabled</label>
+      </div>
+    </div>
+
+    <div class="setting-section">
+      <h4>🛸 Pathfinder Jump Safety</h4>
+      <div class="setting-hint">Pathfinder jumps are the most dangerous module in the game. One wrong number with low fuel = lost ship forever. These settings protect against accidental misuse.</div>
+      
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Allow Pathfinder Jumps</div>
+          <div class="setting-hint">Enable automatic pathfinder jumps for mission steps that require them (e.g., Into The Sanctum, No Lane). When DISABLED, the routine will STOP at the pathfinder jump step and notify you to do it manually.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-missions-allowPathfinder" ${!disablePathfinderJumps ? "checked" : ""}> Enabled</label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Minimum Fuel % for Pathfinder Jumps</div>
+          <div class="setting-hint">The routine will refuse to execute a pathfinder jump if fuel is below this percentage. It will attempt to refuel first. Set high (80-90%) for safety.</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="number" id="set-missions-minFuelPathfinder" min="50" max="100" step="5" value="${minFuelForPathfinder}" style="width:80px" />
+          <span style="color:var(--text-secondary);font-size:12px">%</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-section">
+      <h4>📦 Required Items Summary</h4>
+      <div class="setting-hint">These items are needed for the full mission chain. The routine will attempt to gather them all at startup if "Pre-Grab All Items" is enabled.</div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:8px">
+        <thead><tr style="background:#2a2a2a"><th style="padding:4px 8px;text-align:left">Item</th><th style="padding:4px 8px;text-align:center">Total Qty</th></tr></thead>
+        <tbody>
+          <tr><td style="padding:4px 8px">focused_crystal</td><td style="padding:4px 8px;text-align:center">12</td></tr>
+          <tr><td style="padding:4px 8px">anomaly_probe</td><td style="padding:4px 8px;text-align:center">4</td></tr>
+          <tr><td style="padding:4px 8px">fuel_cell</td><td style="padding:4px 8px;text-align:center">200</td></tr>
+          <tr><td style="padding:4px 8px">circuit_board</td><td style="padding:4px 8px;text-align:center">6 (given)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="setting-section">
+      <h4>🗺️ Mission Steps Overview</h4>
+      <div class="setting-hint">The mission chain has 37 steps across 25 unique missions. Each step will be executed in order, with automatic docking, mission acceptance, and completion.</div>
+      <div style="max-height:300px;overflow-y:auto;font-size:11px;font-family:monospace;background:#1a1a1a;padding:8px;border-radius:4px;border:1px solid #333">
+${generateMissionStepsHtml()}
+      </div>
+    </div>
+
+    <div class="settings-actions">
+      <button class="btn primary" onclick="saveMissionsSettings()">Save Missions Settings</button>
+    </div>
+        `;
+
+        // Populate the mission steps HTML (already done via template, but ensure it's there)
+        const stepsContainer = panel.querySelector("[style*='max-height:300px']");
+        if (stepsContainer && !stepsContainer.innerHTML.trim()) {
+          stepsContainer.innerHTML = generateMissionStepsHtml();
+        }
+      }
+
+      function generateMissionStepsHtml() {
+        const steps = [
+          "1. the_memorial — Dock at First Step Memorial Station",
+          "2. the_expeditionary_mandate — Dock at Alpha Centauri Colonial Station",
+          "3. the_expeditionary_mandate_sol — Dock at Sol Central",
+          "4. the_other_side — Dock at War Citadel (Krynn)",
+          "5. the_other_side_ironhearth — Dock at Ironhearth Station",
+          "6. the_dossier — Deliver 8× focused_crystal to Mobile Capital (Frontier Station)",
+          "7. survey_equipment — Dock at Sirius Observatory (given 6× circuit_board, 4× focused_crystal)",
+          "8. survey_equipment_return — Return to FSMS",
+          "9. environmental_sampling — Visit Unknown Edge Waystation",
+          "10. environmental_sampling_void_gate — Dock at Void Gate Outpost",
+          "11. environmental_sampling_last_light — Dock at Last Light Station",
+          "12. environmental_sampling_fsms — Return to FSMS",
+          "13. the_archive_report — Deliver 4× focused_crystal to Sol Central",
+          "14. observation_points — Go to Markab",
+          "15. observation_points_timberline — Dock at Timberline Station",
+          "16. observation_points_fsms — Return to FSMS",
+          "17. parallel_installations — Dock at Bharani Station",
+          "18. parallel_installations_trappist — Dock at TRAPPIST-1 Station",
+          "19. parallel_installations_fsms — Return to FSMS",
+          "20. the_third_signature — Dock at Etamin Station",
+          "21. the_third_signature_fsms — Return to FSMS",
+          "22. what_the_void_remembers — Dock at Central Nexus (Nexus Prime)",
+          "23. processing_the_data — Return to FSMS",
+          "24. joining_the_investigators — Go to The Telescope",
+          "25. joining_the_investigators_fsms — Return to FSMS",
+          "26. the_allocation_pattern — Pass through Node Alpha",
+          "27. the_allocation_pattern_beta — Pass through Node Beta",
+          "28. the_allocation_pattern_gamma — Pass through Node Gamma",
+          "29. the_allocation_pattern_fsms — Return to FSMS",
+          "30. the_frequency_gap — Pass through The Experiment",
+          "31. the_frequency_gap_fsms — Return to FSMS",
+          "32. the_cover_story — Dock at Starfall Salvage Station",
+          "33. the_cover_story_fsms — Return to FSMS",
+          "34. the_listening_foundry — Deliver 4× anomaly_probe to FSMS",
+          "35. the_foundry_points_somewhere — Dock at Central Nexus",
+          "36. a_line_with_no_address — Return to FSMS (bearing 144.2 from Nexus)",
+          "37. into_the_sanctum — ⚠️ PATHFINDER JUMP bearing 144.2 from Nexus, interact POIs",
+          "38. no_lane — ⚠️ PATHFINDER JUMP bearing 144.2, install survey_scanner_ii, scan, visit hidden POI, return to FSMS",
+          "39. lanes_do_not_disappear — Dock at Frontier Station (The Patchwork)",
+          "40. larkin_says_no — Deliver 200× fuel_cell to Deep Range Outpost",
+          "41. the_pickup — Jump bearing 226.5 from Deep Range, 1500 out, turn around",
+          "42. larkins_seven — Visit 7 systems, recover data at Frame Yard & Empty Berth, return to Patchwork",
+        ];
+        return steps.map(s => `<div style="padding:2px 0">${esc(s)}</div>`).join("");
+      }
+
+      function saveMissionsSettings() {
+        const s = {
+          chain: document.getElementById("set-missions-chain").value,
+          homeSystem: document.getElementById("set-missions-homeSystem").value,
+          autoAccept: document.getElementById("set-missions-autoAccept").checked,
+          autoComplete: document.getElementById("set-missions-autoComplete").checked,
+          preGrabItems: document.getElementById("set-missions-preGrabItems").checked,
+          disablePathfinderJumps: !document.getElementById("set-missions-allowPathfinder").checked,
+          minFuelForPathfinder: parseInt(document.getElementById("set-missions-minFuelPathfinder").value) || 80,
+        };
+
+        send({ type: "saveSettings", routine: "missions", settings: s });
+        settings.missions = s;
+        fetch("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ missions: s }),
+        }).catch(() => {});
+        window.saveMissionsSettings = saveMissionsSettings;
+      }
 
       // ── Glass Miner Route Profile Helpers ──────────────────────────────
 

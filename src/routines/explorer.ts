@@ -1287,7 +1287,16 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // ── Wormhole test: travel to wh POI then jump with same POI id ──
       const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
       if (isWormholePoi) {
-        ctx.log("info", `🌌 Testing wormhole ${poi.id}...`);
+        // Check fuel cells before testing wormhole - if we get dropped in a frontier
+        // system with no station and no fuel cells, we'll be stuck
+        await bot.refreshCargo();
+        const cargoCells = getCargoFuelCells(bot);
+        if (cargoCells.cells === 0) {
+          ctx.log("warn", `🌌 Wormhole ${poi.id} found but NO FUEL CELLS in cargo — skipping to avoid getting stranded in frontier system`);
+          mapStore.markExplored(systemId, poi.id);
+          continue;
+        }
+        ctx.log("info", `🌌 Testing wormhole ${poi.id} (${cargoCells.cells} fuel cells available)...`);
         yield `test_wormhole_${poi.id}`;
         const jumpResp = await bot.exec("jump", { target_poi: poi.id });
         if (jumpResp.error) {
@@ -4494,7 +4503,16 @@ async function* exploreFixedRouteSystem(ctx: RoutineContext, systemId: string): 
     // ── Wormhole test ──
     const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
     if (isWormholePoi) {
-      ctx.log("info", `🌌 Testing wormhole ${poi.id}...`);
+      // Check fuel cells before testing wormhole - if we get dropped in a frontier
+      // system with no station and no fuel cells, we'll be stuck
+      await bot.refreshCargo();
+      const cargoCells = getCargoFuelCells(bot);
+      if (cargoCells.cells === 0) {
+        ctx.log("warn", `🌌 Wormhole ${poi.id} found but NO FUEL CELLS in cargo — skipping to avoid getting stranded in frontier system`);
+        mapStore.markExplored(systemId, poi.id);
+        continue;
+      }
+      ctx.log("info", `🌌 Testing wormhole ${poi.id} (${cargoCells.cells} fuel cells available)...`);
       const jumpResp = await bot.exec("jump", { target_poi: poi.id });
       if (jumpResp.error) {
         mapStore.markExplored(systemId, poi.id);
@@ -5372,6 +5390,15 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       // ── Wormhole test: travel to wh POI then jump with same POI id ──
       const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
       if (isWormholePoi) {
+        // Check fuel cells before testing wormhole - if we get dropped in a frontier
+        // system with no station and no fuel cells, we'll be stuck
+        await bot.refreshCargo();
+        const cargoCells = getCargoFuelCells(bot);
+        if (cargoCells.cells === 0) {
+          ctx.log("warn", `🌌 Frontier wormhole ${poi.id} found but NO FUEL CELLS in cargo — skipping to avoid getting stranded`);
+          mapStore.markExplored(systemId, poi.id);
+          continue;
+        }
         ctx.log("info", `🌌 Testing frontier wormhole ${poi.id}...`);
         yield `test_wormhole_${poi.id}`;
         const jumpResp = await bot.exec("jump", { target_poi: poi.id });
@@ -6332,6 +6359,15 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
       // ── Wormhole test: travel to wh POI then jump with same POI id ──
       const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
       if (isWormholePoi) {
+        // Check fuel cells before testing wormhole - if we get dropped in a frontier
+        // system with no station and no fuel cells, we'll be stuck
+        await bot.refreshCargo();
+        const cargoCells = getCargoFuelCells(bot);
+        if (cargoCells.cells === 0) {
+          ctx.log("warn", `🌌 Frontier wormhole ${poi.id} found but NO FUEL CELLS in cargo — skipping to avoid getting stranded`);
+          mapStore.markExplored(systemId, poi.id);
+          continue;
+        }
         ctx.log("info", `🌌 Testing frontier wormhole ${poi.id}...`);
         yield `test_wormhole_${poi.id}`;
         const jumpResp = await bot.exec("jump", { target_poi: poi.id });

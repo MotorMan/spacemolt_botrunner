@@ -994,20 +994,52 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
     ctx.log("mission", `Executing step: ${nextStep.name} (${nextStep.id})`);
 
+    // For dock-type steps with a mission ID, we need to be at the right station
     if (autoAccept && nextStep.type === "dock" && nextStep.id) {
+      // First, ensure we're at the correct station for this mission
+      if (nextStep.system && nextStep.station) {
+        const atCorrectStation = bot.system?.toLowerCase() === nextStep.system.toLowerCase() && 
+                                bot.poi === nextStep.station && bot.docked;
+        
+        if (!atCorrectStation) {
+          ctx.log("mission", `Navigating to ${nextStep.station} in ${nextStep.system} for mission ${nextStep.id}...`);
+          const docked = await dockAtStation(ctx, nextStep.system, nextStep.station);
+          if (!docked) {
+            ctx.log("error", `Failed to dock at ${nextStep.station} for mission ${nextStep.id} — stopping routine for investigation. Fix the issue and restart to resume from this step.`);
+            return; // Stop the routine instead of retrying
+          }
+        }
+      }
+
+      // Now try to accept the mission
       const activeMissions = await getActiveMissions(ctx);
       const hasMission = activeMissions.some(m => m.id === nextStep.id);
+      
       if (!hasMission) {
-        await acceptMission(ctx, nextStep.id);
+        const acceptResult = await acceptMission(ctx, nextStep.id);
+        if (!acceptResult) {
+          // Check if error was "already completed" - if so, mark as done and continue
+          // The acceptMission function logs the error, so we check the active missions again
+          await ctx.sleep(1000);
+          const recheckMissions = await getActiveMissions(ctx);
+          const stillNotActive = !recheckMissions.some(m => m.id === nextStep.id);
+          if (stillNotActive) {
+            // Mission might already be completed - check if we can complete it or if it's done
+            ctx.log("mission", `Mission ${nextStep.id} not accepted (already completed or unavailable), marking step as done`);
+            completedSteps.add(nextStep.id);
+            saveProgress(bot.username, chainName, completedSteps);
+            await ctx.sleep(2000);
+            continue;
+          }
+        }
         await ctx.sleep(2000);
       }
     }
 
     const success = await executeMissionStep(ctx, nextStep);
     if (!success) {
-      ctx.log("error", `Step ${nextStep.id} failed, retrying in 30s...`);
-      await ctx.sleep(30000);
-      continue;
+      ctx.log("error", `Step ${nextStep.id} failed — stopping routine for investigation. Fix the issue and restart to resume from this step.`);
+      return; // Stop the routine instead of retrying
     }
 
     if (autoComplete && nextStep.type === "dock" && nextStep.id) {

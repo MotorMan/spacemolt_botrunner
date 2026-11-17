@@ -541,7 +541,11 @@ async function getActiveMissions(ctx: RoutineContext): Promise<Array<{ id: strin
   const resp = await bot.exec("get_active_missions");
   if (resp.error || !resp.result) return [];
   const result = resp.result as Record<string, unknown>;
-  const missions = (result.missions as Array<Record<string, unknown>>) || [];
+  // API can return array directly or object with missions property
+  const missions = (
+    Array.isArray(result) ? result :
+    Array.isArray(result.missions) ? result.missions : []
+  ) as Array<Record<string, unknown>>;
   return missions.map(m => ({
     id: (m.mission_id as string) || (m.id as string) || "",
     objectives: (m.objectives as unknown[]) || [],

@@ -10,6 +10,8 @@ import {
   cargoUsedFromInventory,
   maxItemsForCargo,
   tryRefuel,
+  getMobileCapitolSystem,
+  resolveStationId,
 } from "./common.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
@@ -29,6 +31,8 @@ interface MissionStep {
   distance?: number;
   poi?: string;
   completeAfter?: string[];
+  isMobileStation?: boolean;
+  mobileStationId?: string;
 }
 
 interface MissionChain {
@@ -90,8 +94,9 @@ const MISSION_CHAINS: MissionChain[] = [
         name: "The Dossier",
         description: "Bring 8 Focused Crystal to Mobile Capital (Frontier Station)",
         type: "deliver",
-        system: "distant_light",
         station: "mobile_capital",
+        isMobileStation: true,
+        mobileStationId: "mobile_capital",
         items: [{ itemId: "focused_crystal", quantity: 8 }],
         completeAfter: ["the_other_side_ironhearth"],
       },
@@ -395,8 +400,9 @@ const MISSION_CHAINS: MissionChain[] = [
         name: "Lanes Do Not Disappear",
         description: "Dock at Frontier Station (The Patchwork)",
         type: "dock",
-        system: "distant_light",
         station: "frontier_station",
+        isMobileStation: true,
+        mobileStationId: "frontier_station",
         completeAfter: ["no_lane"],
       },
       {
@@ -442,6 +448,80 @@ function getMissionSettings(bot: Bot): Record<string, unknown> {
 
 function getHomeSystem(settings: Record<string, unknown>): string | undefined {
   return (settings.general as Record<string, unknown>)?.homeSystem as string | undefined;
+}
+
+async function resolveStationSystem(ctx: RoutineContext, step: MissionStep): Promise<string | null> {
+  if (step.isMobileStation && step.mobileStationId) {
+    // For mobile stations, use the tracked location from mapStore
+    const system = getMobileCapitolSystem();
+    if (system) {
+      ctx.log("mission", `Mobile station ${step.mobileStationId} currently at ${system}`);
+      return system;
+    }
+    // Fallback: try to find it in mapStore
+    const resolved = resolveStationId(step.mobileStationId);
+    if (resolved && resolved !== step.mobileStationId) {
+      // We have a resolved station ID, try to find its system
+      // mapStore might have the system info
+    }
+    ctx.log("warn", `Mobile station ${step.mobileStationId} location unknown, using fallback`);
+  }
+  return step.system || null;
+}
+
+async function navigateToStation(ctx: RoutineContext, step: MissionStep): Promise<boolean> {
+  const { bot } = ctx;
+  
+  // Resolve the system for this step (handles mobile stations)
+  const targetSystem = await resolveStationSystem(ctx, step);
+  if (!targetSystem) {
+    ctx.log("error", `Cannot determine target system for step ${step.id}`);
+    return false;
+  }
+  
+  // Check if already at the correct station
+  if (bot.system?.toLowerCase() === targetSystem.toLowerCase() && 
+      bot.poi === step.station && bot.docked) {
+    return true;
+  }
+  
+  // Navigate to the system
+  const navigated = await navigateToSystem(ctx, targetSystem);
+  if (!navigated) return false;
+  
+  // Find and travel to the station
+  const { pois } = await getSystemInfo(ctx);
+  const station = pois.find(p => p.id === step.station && isStationPoi(p));
+  if (!station) {
+    ctx.log("error", `Station ${step.station} not found in ${targetSystem}`);
+    return false;
+  }
+  
+  if (bot.poi !== station.id) {
+    ctx.log("travel", `Traveling to ${station.name}...`);
+    const travelResp = await bot.exec("travel", { target_poi: station.id });
+    if (travelResp.error && !travelResp.error.message.includes("already")) {
+      ctx.log("error", `Travel failed: ${travelResp.error.message}`);
+      return false;
+    }
+    bot.poi = station.id;
+    await bot.refreshLocation();
+  }
+  
+  ctx.log("system", "Docking...");
+  const dockResp = await bot.exec("dock");
+  if (!dockResp.error || dockResp.error.message.includes("already")) {
+    bot.docked = true;
+    
+    // Refuel after docking if needed
+    ctx.log("system", "Checking fuel and refueling if needed...");
+    await tryRefuel(ctx);
+    
+    return true;
+  }
+  
+  ctx.log("error", `Dock failed: ${dockResp.error.message}`);
+  return false;
 }
 
 async function navigateToSystem(ctx: RoutineContext, targetSystem: string): Promise<boolean> {
@@ -680,8 +760,8 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
       return true;
     }
     case "dock": {
-      if (step.system && step.station) {
-        return await dockAtStation(ctx, step.system, step.station);
+      if (step.station) {
+        return await navigateToStation(ctx, step);
       }
       return true;
     }
@@ -690,7 +770,7 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
         const navigated = await navigateToSystem(ctx, step.system);
         if (!navigated) return false;
         if (step.station) {
-          return await dockAtStation(ctx, step.system, step.station);
+          return await navigateToStation(ctx, step);
         }
         if (step.poi) {
           const { pois } = await getSystemInfo(ctx);
@@ -907,32 +987,74 @@ function saveProgress(botUsername: string, chainName: string, completedSteps: Se
   }
 }
 
-async function detectCompletedFromActiveMissions(ctx: RoutineContext, chain: MissionChain): Promise<Set<string>> {
+async function detectChainPositionFromGameState(ctx: RoutineContext, chain: MissionChain, savedCompleted: Set<string>): Promise<Set<string>> {
   const { bot } = ctx;
-  const completed = new Set<string>();
+  const completed = new Set(savedCompleted);
   
-  // Query active missions from the game
+  // Get all active missions from the game
   const activeMissions = await getActiveMissions(ctx);
+  const activeMissionIds = new Set(activeMissions.map(m => m.id));
   
-  // Check each step in the chain - if mission is not in active missions,
-  // it might be completed (or not started yet). We need to be careful.
-  // For now, we'll only mark as complete if we can verify.
+  // Get all missions from the chain that have IDs
+  const chainMissionIds = chain.steps
+    .filter(s => s.id)
+    .map(s => s.id!);
   
-  // Also check if any missions in the chain are currently active
-  // If a mission is active, all previous steps in the chain are likely done
+  // For each mission in the chain, check its status
   for (const step of chain.steps) {
-    if (step.type !== "dock" || !step.id) continue;
+    if (!step.id) continue;
     
-    const activeMission = activeMissions.find(m => m.id === step.id);
-    if (!activeMission) {
-      // Mission not in active list - could be completed or not started
-      // We'll conservatively NOT mark it complete unless we have saved progress
-    } else {
-      // Mission is active - check if objectives are complete
-      const objectives = (activeMission.objectives as Array<Record<string, unknown>>) || [];
+    // If already in saved completed, keep it
+    if (completed.has(step.id)) continue;
+    
+    // If mission is currently active, it's not completed yet
+    if (activeMissionIds.has(step.id)) {
+      // Check if objectives are complete
+      const activeMission = activeMissions.find(m => m.id === step.id);
+      const objectives = (activeMission?.objectives as Array<Record<string, unknown>>) || [];
       const allComplete = objectives.every((obj) => obj.completed === true || obj.progress === obj.quantity);
       if (allComplete) {
         completed.add(step.id);
+      }
+      continue;
+    }
+    
+    // Mission is not active - could be completed or not started
+    // If all its prerequisites are in completed, and it's not active, it's likely completed
+    if (step.completeAfter) {
+      const prereqsMet = step.completeAfter.every(id => completed.has(id));
+      if (prereqsMet) {
+        // All prerequisites done, mission not active = likely completed
+        completed.add(step.id);
+        ctx.log("mission", `Detected completed mission from game state: ${step.id}`);
+      }
+    }
+  }
+  
+  // Also detect based on current location for steps without mission IDs
+  // (e.g., "goto" steps that just require being in a system)
+  for (const step of chain.steps) {
+    if (completed.has(step.id)) continue;
+    if (!step.id) continue;
+    
+    // For dock steps, if we're already at the target station docked, the step is likely done
+    if (step.type === "dock" && step.system && step.station) {
+      if (bot.system?.toLowerCase() === step.system.toLowerCase() && 
+          bot.poi === step.station && bot.docked) {
+        completed.add(step.id);
+        ctx.log("mission", `Detected completed step from current location: ${step.id}`);
+      }
+    }
+    
+    // For goto steps, if we're at the target system/poi
+    if (step.type === "goto" && step.system) {
+      if (bot.system?.toLowerCase() === step.system.toLowerCase()) {
+        if (!step.station || bot.poi === step.station) {
+          if (!step.poi || bot.poi === step.poi) {
+            completed.add(step.id);
+            ctx.log("mission", `Detected completed step from current location: ${step.id}`);
+          }
+        }
       }
     }
   }
@@ -956,9 +1078,10 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
   // Load saved progress
   const completedSteps = loadProgress(bot.username, chainName);
   
-  // Also detect from active missions (in case progress file is missing/outdated)
-  const detected = await detectCompletedFromActiveMissions(ctx, chain);
-  for (const id of detected) completedSteps.add(id);
+  // Detect current position in chain from game state (location, active missions, etc.)
+  // This reconciles saved progress with reality
+  const reconciled = await detectChainPositionFromGameState(ctx, chain, completedSteps);
+  for (const id of reconciled) completedSteps.add(id);
   
   if (completedSteps.size > 0) {
     ctx.log("mission", `Resuming from step ${completedSteps.size + 1}/${chain.steps.length} (${completedSteps.size} steps already completed)`);
@@ -997,13 +1120,16 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     // For dock-type steps with a mission ID, we need to be at the right station
     if (autoAccept && nextStep.type === "dock" && nextStep.id) {
       // First, ensure we're at the correct station for this mission
-      if (nextStep.system && nextStep.station) {
-        const atCorrectStation = bot.system?.toLowerCase() === nextStep.system.toLowerCase() && 
+      if (nextStep.station) {
+        // Check if already at the correct station (resolving mobile station system)
+        const targetSystem = await resolveStationSystem(ctx, nextStep);
+        const atCorrectStation = targetSystem && 
+                                bot.system?.toLowerCase() === targetSystem.toLowerCase() && 
                                 bot.poi === nextStep.station && bot.docked;
         
         if (!atCorrectStation) {
-          ctx.log("mission", `Navigating to ${nextStep.station} in ${nextStep.system} for mission ${nextStep.id}...`);
-          const docked = await dockAtStation(ctx, nextStep.system, nextStep.station);
+          ctx.log("mission", `Navigating to ${nextStep.station} for mission ${nextStep.id}...`);
+          const docked = await navigateToStation(ctx, nextStep);
           if (!docked) {
             ctx.log("error", `Failed to dock at ${nextStep.station} for mission ${nextStep.id} — stopping routine for investigation. Fix the issue and restart to resume from this step.`);
             return; // Stop the routine instead of retrying

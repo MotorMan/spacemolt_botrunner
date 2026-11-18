@@ -2173,9 +2173,12 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           return !!targetStation && (tb === ts || tb === ss || tb.includes(ts) || ts.includes(tb) || tb.includes(ss) || ss.includes(tb));
         });
         if (matchingObj) {
-          // Only consider the step done when ALL objectives of the mission are complete.
-          // A dock step whose matching objective is done but others remain must retry.
-          stepDone = allComplete;
+          // A dock step is done when its own matching objective is complete, even
+          // if the mission has further objectives handled by later chain steps.
+          const objDone = matchingObj.completed === true
+            || (matchingObj.current !== undefined && matchingObj.current === matchingObj.required)
+            || (matchingObj.progress !== undefined && matchingObj.progress === matchingObj.quantity);
+          stepDone = objDone;
         } else if (!allComplete) {
           // If the step's objective is a visit_system (no dock required), consider
           // it done since navigation to the system succeeded.

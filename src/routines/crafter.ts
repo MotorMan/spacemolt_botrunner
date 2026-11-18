@@ -219,7 +219,7 @@ function normalizeRecipeTriggers(
   return out;
 }
 
-async function getCrafterSettings(): Promise<{
+export async function getCrafterSettings(): Promise<{
   crafters: CrafterProfile[];
   botCrafterAssignments: Record<string, string>;
   enabledCategories: string[];
@@ -1401,6 +1401,11 @@ interface FinalVenue {
   preset?: string;
   blocked: boolean;
   rentalFee: number;
+  // Labor and total credits for the quoted job, pulled from the dry_run quote so
+  // the crafter can surface the real per-craft cost (labor + fees) to the log.
+  labor: number;
+  creditsTotal: number;
+  fee: number;
   label: string;
 }
 
@@ -1462,17 +1467,21 @@ export async function resolveFinalVenue(
       resp = await dryRun("workshop", undefined);
       if (resp.error) {
         log("error", `🔴 CRAFT VENUE UNVERIFIED: dry_run failed for ${recipeName} (${resp.error.message}). Blocking to avoid an accidental external facility rental.`);
-        return { blocked: true, rentalFee: 0, label: "unverified" };
+        return { blocked: true, rentalFee: 0, labor: 0, creditsTotal: 0, fee: 0, label: "unverified" };
       }
-      return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (fallback)" };
+      return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, labor: parseCraftQuote(resp.result).labor, creditsTotal: parseCraftQuote(resp.result).creditsTotal, fee: parseCraftQuote(resp.result).fee, label: "workshop (fallback)" };
     } else {
       // Rental allowed but venue still errored unexpectedly — block closed.
       log("error", `🔴 CRAFT VENUE UNVERIFIED: dry_run failed for ${recipeName} (${errMsg}). Blocking to avoid an accidental external facility rental.`);
-      return { blocked: true, rentalFee: 0, label: "unverified" };
+      return { blocked: true, rentalFee: 0, labor: 0, creditsTotal: 0, fee: 0, label: "unverified" };
     }
   }
 
   let quote = parseCraftQuote(resp.result);
+
+  // Surface the real per-craft cost (labor + fees) from the dry-run quote so the
+  // operator can see what each craft round actually costs.
+  log("craft", `${recipeName}: cost labor ${HTML_YELLOW}${quote.labor}${HTML_RESET}cr, fees ${HTML_YELLOW}${quote.fee}${HTML_RESET}cr, total ${HTML_GREEN}${quote.creditsTotal}${HTML_RESET}cr`);
 
   // If auto-routing would rent an external facility but rental isn't allowed,
   // fall back to the Station Workshop (hand-crafting) so we still produce it.
@@ -1488,13 +1497,13 @@ export async function resolveFinalVenue(
       // impossible. Since rental is disabled by config, we can't run this here.
       if (isFacilityOnlyError(ws.error.message)) {
         log("warn", `${recipeName} can only be made at a facility and rental is disabled - skipping (enable allowRentalPurchase/allowExternalFacilities to craft it).`);
-        return { blocked: true, rentalFee: 0, label: "facility-only (rental disabled)" };
+        return { blocked: true, rentalFee: 0, labor: 0, creditsTotal: 0, fee: 0, label: "facility-only (rental disabled)" };
       }
       log("error", `🔴 CRAFT VENUE UNVERIFIED: workshop dry_run failed for ${recipeName} (${ws.error.message}). Blocking.`);
-      return { blocked: true, rentalFee: 0, label: "workshop-failed" };
+      return { blocked: true, rentalFee: 0, labor: 0, creditsTotal: 0, fee: 0, label: "workshop-failed" };
     }
     quote = parseCraftQuote(ws.result);
-    return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (rental avoided)" };
+    return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, labor: quote.labor, creditsTotal: quote.creditsTotal, fee: quote.fee, label: "workshop (rental avoided)" };
   }
 
     // External rental is allowed — enforce the spending limit.
@@ -1520,15 +1529,15 @@ export async function resolveFinalVenue(
               rentalFee = 0;
             } else {
               log("warn", `${recipeName} can only be made at a facility (${rentalFee}cr), exceeds the rental spending limit (${settings.rentalSpendingLimit}cr, spent ${rentalSpentThisSession}cr), and isn't affordable - blocking. Raise rentalSpendingLimit or fund the faction treasury to craft it.`);
-              return { blocked: true, rentalFee: 0, label: "facility-only (limit reached)" };
+              return { blocked: true, rentalFee: 0, labor: 0, creditsTotal: 0, fee: 0, label: "facility-only (limit reached)" };
             }
           } else {
             log("error", `🔴 CRAFT VENUE UNVERIFIED: workshop dry_run failed for ${recipeName} (${ws.error.message}). Blocking.`);
-            return { blocked: true, rentalFee: 0, label: "workshop-failed" };
+            return { blocked: true, rentalFee: 0, labor: 0, creditsTotal: 0, fee: 0, label: "workshop-failed" };
           }
         } else {
           quote = parseCraftQuote(ws.result);
-          return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (limit reached)" };
+          return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, labor: quote.labor, creditsTotal: quote.creditsTotal, fee: quote.fee, label: "workshop (limit reached)" };
         }
       }
     }
@@ -1537,11 +1546,14 @@ export async function resolveFinalVenue(
   const label = attemptedFacility
     ? `facility ${attemptedFacility}`
     : `preset=${attemptedPreset}`;
-  return {
+return {
     facilityId: attemptedFacility,
     preset: attemptedPreset,
     blocked: false,
     rentalFee,
+    labor: quote.labor,
+    creditsTotal: quote.creditsTotal,
+    fee: quote.fee,
     label,
   };
 }
@@ -1595,7 +1607,7 @@ export async function queueCraftJob(
   outputPerRun: number = 0,
   rawCountItemFn?: (itemId: string) => number,
   allowDuplicateJobs = false,
-): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number }> {
+): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number; labor?: number; creditsTotal?: number; fee?: number }> {
   const { log } = ctx;
 
    const recipe = recipes?.find(r => r.recipe_id === recipeId);
@@ -1653,6 +1665,9 @@ export async function queueCraftJob(
   }
 
   let totalQueuedRuns = 0;
+  let totalLabor = 0;
+  let totalCredits = 0;
+  let totalFee = 0;
   let firstError: string | undefined;
 
   for (const chunk of chunks) {
@@ -1670,7 +1685,7 @@ export async function queueCraftJob(
       continue;
     }
 
-    log("craft", `Queueing ${chunk.runs} runs of ${recipeId} (${finalVenue.label})...`);
+    log("craft", `Queueing ${chunk.runs} runs of ${recipeId} (${finalVenue.label})... (cost: labor ${HTML_YELLOW}${finalVenue.labor}${HTML_RESET}cr, fees ${HTML_YELLOW}${finalVenue.fee}${HTML_RESET}cr, total ${HTML_GREEN}${finalVenue.creditsTotal}${HTML_RESET}cr; ${HTML_CYAN}${Math.round(finalVenue.labor / Math.max(1, chunk.runs))}${HTML_RESET}cr labor/run)`);
     const craftPayload: Record<string, unknown> = { id: recipeId, quantity: craftCommandQuantity };
     if (finalVenue.facilityId) craftPayload.facility_id = finalVenue.facilityId;
     if (finalVenue.preset) craftPayload.preset = finalVenue.preset;
@@ -1685,10 +1700,13 @@ export async function queueCraftJob(
           : "";
         log("craft", `Rented external facility for ${recipe?.name || recipeId}: ${finalVenue.rentalFee}cr${limitNote}`);
       }
-      const res = handleSuccess(craftResp, recipeId, chunk.runs, log, tracker, bot);
-      if (res.success) {
-        totalQueuedRuns += chunk.runs;
-      } else {
+       const res = handleSuccess(craftResp, recipeId, chunk.runs, log, tracker, bot);
+       if (res.success) {
+         totalQueuedRuns += chunk.runs;
+         totalLabor += finalVenue.labor;
+         totalCredits += finalVenue.creditsTotal;
+         totalFee += finalVenue.fee;
+       } else {
         firstError = firstError || res.error;
       }
     } else {
@@ -1701,10 +1719,10 @@ export async function queueCraftJob(
     }
   }
 
-  if (totalQueuedRuns === 0) {
-    return { success: false, error: firstError || "no_jobs_queued" };
-  }
-  return { success: true, queuedRuns: totalQueuedRuns };
+   if (totalQueuedRuns === 0) {
+     return { success: false, error: firstError || "no_jobs_queued", labor: totalLabor, creditsTotal: totalCredits, fee: totalFee };
+   }
+   return { success: true, queuedRuns: totalQueuedRuns, labor: totalLabor, creditsTotal: totalCredits, fee: totalFee };
 }
 
 

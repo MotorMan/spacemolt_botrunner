@@ -33714,7 +33714,35 @@ ${generateMissionStepsHtml()}
         window.saveMissionsSettings = saveMissionsSettings;
       }
 
-      // ── Glass Miner Route Profile Helpers ──────────────────────────────
+       // ── Civilian Transport Isolated Route Helpers ──────────────────────
+       function addCivilianTransportIsolatedStep() {
+         const ct = settings.civilian_transport || (settings.civilian_transport = {});
+         if (!Array.isArray(ct.isolatedRoute)) ct.isolatedRoute = [];
+         ct.isolatedRoute.push({ system: "", degree: null, station: "", dock: false });
+         settings.civilian_transport = ct;
+         renderCivilianTransportSettings(document.getElementById("settingsContent"));
+       }
+       function removeCivilianTransportIsolatedStep(index) {
+         const ct = settings.civilian_transport || {};
+         if (!Array.isArray(ct.isolatedRoute)) return;
+         ct.isolatedRoute.splice(index, 1);
+         settings.civilian_transport = ct;
+         renderCivilianTransportSettings(document.getElementById("settingsContent"));
+       }
+       function updateCivilianTransportIsolatedStep(index, field, value) {
+         const ct = settings.civilian_transport || {};
+         if (!Array.isArray(ct.isolatedRoute) || !ct.isolatedRoute[index]) return;
+         if (field === "degree") {
+           ct.isolatedRoute[index].degree = value === "" ? null : parseFloat(value);
+         } else if (field === "dock") {
+           ct.isolatedRoute[index].dock = Boolean(value);
+         } else {
+           ct.isolatedRoute[index][field] = value;
+         }
+         settings.civilian_transport = ct;
+       }
+
+       // ── Glass Miner Route Profile Helpers ──────────────────────────────
 
       function addGlassMinerRouteProfile() {
         const g = settings.glass_miner || {};
@@ -38903,19 +38931,28 @@ ignoreBlacklist: document.getElementById(
            homeStationOpts += `<option value="${esc(val)}"${sel}>${label} (${esc(sysName)})</option>`;
          }
 
-         // Isolated transport options
-         let isolatedSystemOpts = '<option value="">(none)</option>';
-         for (const sysId of Object.keys(mapData).sort()) {
-           const sys = mapData[sysId];
-           const sysName = sys.name || sysId;
-           const sel = sysId === (ct.isolatedSystem || "") ? " selected" : "";
-           isolatedSystemOpts += `<option value="${esc(sysId)}"${sel}>${esc(sysName)} (${esc(sysId)})</option>`;
+         // Isolated transport route helpers
+         function isolatedSystemOpts(selected) {
+           let opts = '<option value="">(none)</option>';
+           for (const sysId of Object.keys(mapData).sort()) {
+             const sys = mapData[sysId];
+             const sysName = sys.name || sysId;
+             const sel = sysId === (selected || "") ? " selected" : "";
+             opts += `<option value="${esc(sysId)}"${sel}>${esc(sysName)} (${esc(sysId)})</option>`;
+           }
+           return opts;
          }
-         let isolatedStationOpts = '<option value="">(none)</option>';
-         for (const { val, label, sysName } of stationList) {
-           const sel = val === (ct.isolatedStation || "") ? " selected" : "";
-           isolatedStationOpts += `<option value="${esc(val)}"${sel}>${label} (${esc(sysName)})</option>`;
+         function isolatedStationOpts(selected) {
+           let opts = '<option value="">(none)</option>';
+           for (const { val, label, sysName } of stationList) {
+             const sel = val === (selected || "") ? " selected" : "";
+             opts += `<option value="${esc(val)}"${sel}>${label} (${esc(sysName)})</option>`;
+           }
+           return opts;
          }
+
+         const ctIsolated = settings.civilian_transport || {};
+         const isolatedRoute = Array.isArray(ctIsolated.isolatedRoute) ? ctIsolated.isolatedRoute : [];
 
         panel.innerHTML = `
     <h3>Civilian Transport Settings</h3>
@@ -39105,32 +39142,37 @@ ignoreBlacklist: document.getElementById(
       <input type="number" id="set-civilian_transport-minFuelCellsToDepart" min="0" max="200" value="${esc(String(ct.minFuelCellsToDepart ?? 6))}">
     </div>
 
-    <div style="margin-top:18px;padding:10px;border:1px solid #3a5a5a;border-radius:6px;background:#1d2a2a">
-      <div class="setting-label" style="color:#9be7ff">Isolated Transport (pathfinder to isolated station)</div>
-      <div class="setting-desc" style="margin-bottom:8px">Special mode: pathfinder-jumps from a main-network system to an isolated station, picks up all passengers there, and returns them to the faction Transit Lounge at home base. Configure the jump below.</div>
+     <div style="margin-top:18px;padding:10px;border:1px solid #3a5a5a;border-radius:6px;background:#1d2a2a">
+      <div class="setting-label" style="color:#9be7ff">Isolated Transport Route (fixed path)</div>
+      <div class="setting-desc" style="margin-bottom:8px">Ordered steps. Each step can navigate to a system, optionally dock at a station, and optionally perform a pathfinder jump (degree) from that system. Used to reach an isolated station; passengers are then returned to the home Transit Lounge.</div>
       <div class="setting-row">
-        <div>
-          <div class="setting-label">Origin system (pathfinder jump from)</div>
-          <div class="setting-hint">Main-network system the bot jumps from toward the isolated island.</div>
-        </div>
-        <select id="set-civilian_transport-isolatedSystem">${isolatedSystemOpts}</select>
+        <div style="flex:1"></div>
+        <button class="btn" onclick="addCivilianTransportIsolatedStep()">+ Add Step</button>
       </div>
-      <div class="setting-row">
-        <div>
-          <div class="setting-label">Pathfinder jump angle (degrees)</div>
-          <div class="setting-hint">Compass bearing (0-360) for the pathfinder jump. Leave 0 if not used.</div>
-        </div>
-        <input type="number" id="set-civilian_transport-isolatedDegree" min="0" max="360" step="0.01" value="${esc(String(ct.isolatedDegree ?? 0))}">
-      </div>
-      <div class="setting-row">
-        <div>
-          <div class="setting-label">Origin station (optional)</div>
-          <div class="setting-hint">Station to dock at in the origin system before jumping. Or check "dock at station here".</div>
-        </div>
-        <select id="set-civilian_transport-isolatedStation">${isolatedStationOpts}</select>
-      </div>
-      <div style="margin-top:8px">
-        <label><input type="checkbox" id="set-civilian_transport-isolatedDockAtStation" ${ct.isolatedDockAtStation ? "checked" : ""}> Dock at the station here (origin system)</label>
+      <div id="civilianTransportIsolatedRouteContainer">
+        ${isolatedRoute.map((step, idx) =>
+          '<div class="route-step-card" data-index="' + idx + '" style="border:1px solid #333;border-radius:8px;padding:10px;margin-top:10px;background:#1e1e1e">' +
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">' +
+              '<strong>Step ' + (idx + 1) + '</strong>' +
+              '<button class="btn sm danger" onclick="removeCivilianTransportIsolatedStep(' + idx + ')">Remove</button>' +
+            '</div>' +
+            '<div class="setting-row">' +
+              '<div><div class="setting-label">System</div></div>' +
+              '<select onchange="updateCivilianTransportIsolatedStep(' + idx + ', \'system\', this.value)">' + isolatedSystemOpts(step.system || "") + '</select>' +
+            '</div>' +
+            '<div class="setting-row">' +
+              '<div><div class="setting-label">Pathfinder jump angle (deg, optional)</div></div>' +
+              '<input type="number" step="0.01" value="' + (step.degree !== null && step.degree !== undefined ? step.degree : "") + '" onchange="updateCivilianTransportIsolatedStep(' + idx + ', \'degree\', this.value)" placeholder="none">' +
+            '</div>' +
+            '<div class="setting-row">' +
+              '<div><div class="setting-label">Station (optional)</div></div>' +
+              '<select onchange="updateCivilianTransportIsolatedStep(' + idx + ', \'station\', this.value)">' + isolatedStationOpts(step.station || "") + '</select>' +
+            '</div>' +
+            '<div style="margin-top:6px">' +
+              '<label><input type="checkbox"' + (step.dock ? " checked" : "") + ' onchange="updateCivilianTransportIsolatedStep(' + idx + ', \'dock\', this.checked)"> Dock at station here</label>' +
+            '</div>' +
+          '</div>'
+        ).join("")}
       </div>
     </div>
 
@@ -39233,19 +39275,7 @@ ignoreBlacklist: document.getElementById(
           const allowRepeatPassengers =
             document.getElementById("set-civilian_transport-allowRepeatPassengers")
               ?.checked ?? false;
-          const isolatedSystem =
-            document.getElementById("set-civilian_transport-isolatedSystem")?.value || "";
-          const isolatedDegree = Number(
-            document.getElementById("set-civilian_transport-isolatedDegree")?.value || 0,
-          );
-          const isolatedStation =
-            document.getElementById("set-civilian_transport-isolatedStation")?.value || "";
-          const isolatedDockAtStation =
-            document.getElementById("set-civilian_transport-isolatedDockAtStation")
-              ?.checked ?? false;
-
-
-        const s = {};
+         const s = {};
         if (homeStation && homeStation.includes("|")) {
           const [sys, poi] = homeStation.split("|");
           s.homeSystem = sys;
@@ -39277,10 +39307,7 @@ ignoreBlacklist: document.getElementById(
         s.minFuelCellsToDepart = minFuelCellsToDepart;
          s.mode = mode;
           s.allowRepeatPassengers = allowRepeatPassengers;
-          s.isolatedSystem = isolatedSystem;
-          s.isolatedDegree = isolatedDegree;
-          s.isolatedStation = isolatedStation;
-          s.isolatedDockAtStation = isolatedDockAtStation;
+          s.isolatedRoute = isolatedRoute;
 
 
         send({

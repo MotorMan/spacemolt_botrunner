@@ -669,6 +669,13 @@ interface ListPassengersResponse {
   berths_used: { economy: number; business: number; first: number };
 }
 
+interface IsolatedRouteStep {
+  system: string;
+  degree: number | null;
+  station: string;
+  dock: boolean;
+}
+
 type CivilianTransportMode = "normal" | "lounge_transport" | "achievement" | "isolated_transport";
 
 interface CivilianTransportSettings {
@@ -699,11 +706,13 @@ interface CivilianTransportSettings {
   buyFuelCells: boolean;
   minFuelCellsToDepart: number;
   mode: CivilianTransportMode;
-  // Isolated transport settings (pathfinder jump to an isolated station)
-  isolatedSystem: string;
-  isolatedDegree: number;
-  isolatedStation: string;
-  isolatedDockAtStation: boolean;
+  // Isolated transport fixed route
+  isolatedRoute: IsolatedRouteStep[];
+  // legacy single-jump fields (optional)
+  isolatedSystem?: string;
+  isolatedDegree?: number;
+  isolatedStation?: string;
+  isolatedDockAtStation?: boolean;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -742,6 +751,15 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     buyFuelCells: (t.buyFuelCells as boolean) ?? false,
     minFuelCellsToDepart: Number((t.minFuelCellsToDepart as number) ?? 6),
     mode: (botOverrides.mode as CivilianTransportMode) || (t.mode as CivilianTransportMode) || "normal",
+    isolatedRoute: Array.isArray((botOverrides.isolatedRoute as any)) ? (botOverrides.isolatedRoute as IsolatedRouteStep[]) :
+      Array.isArray((t.isolatedRoute as any)) ? (t.isolatedRoute as IsolatedRouteStep[]) :
+      // legacy fallback
+      ((botOverrides.isolatedSystem || t.isolatedSystem) ? [{
+        system: (botOverrides.isolatedSystem as string) || (t.isolatedSystem as string) || "",
+        degree: Number((botOverrides.isolatedDegree as number) ?? (t.isolatedDegree as number) ?? 0) || null,
+        station: (botOverrides.isolatedStation as string) || (t.isolatedStation as string) || "",
+        dock: (botOverrides.isolatedDockAtStation as boolean) ?? (t.isolatedDockAtStation as boolean) ?? false,
+      }] : []),
     isolatedSystem: (botOverrides.isolatedSystem as string) || (t.isolatedSystem as string) || "",
     isolatedDegree: Number((botOverrides.isolatedDegree as number) ?? (t.isolatedDegree as number) ?? 0),
     isolatedStation: (botOverrides.isolatedStation as string) || (t.isolatedStation as string) || "",
@@ -2209,6 +2227,55 @@ function hasUndeliveredLoungeCandidates(botUsername: string): boolean {
 
 // ── Main routine ─────────────────────────────────────────────
 
+async function executeIsolatedRoute(ctx: RoutineContext, bot: Bot, settings: CivilianTransportSettings, route: IsolatedRouteStep[]): Promise<boolean> {
+  for (const step of route) {
+    if (step.system && (!bot.system || bot.system.toLowerCase() !== step.system.toLowerCase())) {
+      ctx.log("transport", `Isolated route: navigating to system ${step.system}...`);
+      const ok = await navigateToSystem(ctx, step.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+      if (!ok) return false;
+      await bot.refreshLocation();
+    }
+    if (step.station) {
+      const stId = step.station.includes("|") ? step.station.split("|")[1] : step.station;
+      if (bot.poi && bot.poi.toLowerCase() !== stId.toLowerCase()) {
+        const tr = await bot.exec("travel", { target_poi: stId });
+        if (tr.error) {
+          ctx.log("transport", `Isolated route: travel to station failed: ${tr.error.message}`);
+          return false;
+        }
+        await bot.refreshStatus(true);
+      }
+      await ensureDocked(ctx);
+    } else if (step.dock) {
+      await ensureDocked(ctx);
+    }
+    if (step.degree !== null && step.degree !== undefined) {
+      const originPos = mapStore.getSystem(bot.system)?.position;
+      ctx.log("transport", `Isolated route: pathfinder jump at ${step.degree}° from ${bot.system}...`);
+      const res = await executePathfinderJumpToBearing(ctx, step.degree, originPos ? { x: originPos.x, y: originPos.y } : null);
+      if (!res.success) return false;
+      await bot.refreshLocation();
+      await ensureDocked(ctx);
+    }
+  }
+  return true;
+}
+
+async function executeIsolatedReturn(ctx: RoutineContext, bot: Bot, settings: CivilianTransportSettings): Promise<boolean> {
+  const route = settings.isolatedRoute || [];
+  const jumps = route.filter((s) => s.degree !== null && s.degree !== undefined).reverse();
+  for (const j of jumps) {
+    const originPos = mapStore.getSystem(bot.system)?.position;
+    const bearing = (j.degree as number) + 180;
+    ctx.log("transport", `Isolated return: pathfinder jump at ${bearing}° from ${bot.system}...`);
+    const res = await executePathfinderJumpToBearing(ctx, bearing, originPos ? { x: originPos.x, y: originPos.y } : null);
+    if (!res.success) return false;
+    await bot.refreshLocation();
+    await ensureDocked(ctx);
+  }
+  return true;
+}
+
 export const civilianTransportRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
   const settings = getCivilianTransportSettings(bot.username);
@@ -2545,46 +2612,27 @@ if (state && state.status !== "idle") {
         return;
       }
 
-       // ── Isolated transport: pathfinder jump from home to the isolated station ──
-       if (settings.mode === "isolated_transport" && isAtHomeBase(ctx, settings) && state.onboardPassengers.length === 0) {
-         const originSystem = settings.isolatedSystem || bot.system || "";
-         if (originSystem && bot.system && bot.system.toLowerCase() !== originSystem.toLowerCase()) {
-           ctx.log("transport", `Isolated transport: navigating to pathfinder origin ${originSystem}...`);
-           const ok = await navigateToSystem(ctx, originSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
-           if (!ok) { await ctx.sleep(30000); continue; }
-           await bot.refreshLocation();
-         }
-         // Dock at the configured station in the origin system (if any)
-         if (settings.isolatedStation) {
-           const stId = settings.isolatedStation.includes("|") ? settings.isolatedStation.split("|")[1] : settings.isolatedStation;
-           if (bot.poi && bot.poi.toLowerCase() !== stId.toLowerCase()) {
-             const tr = await bot.exec("travel", { target_poi: stId });
-             if (tr.error) {
-               ctx.log("transport", `Isolated transport: travel to origin station failed: ${tr.error.message}`);
-               await ctx.sleep(30000); continue;
-             }
-             await bot.refreshStatus(true);
-           }
-           await ensureDocked(ctx);
-         } else if (settings.isolatedDockAtStation) {
-           await ensureDocked(ctx);
-         }
-         const originPos = mapStore.getSystem(bot.system)?.position;
-         ctx.log("transport", `Isolated transport: pathfinder jump at ${settings.isolatedDegree}° from ${bot.system}...`);
-         const res = await executePathfinderJumpToBearing(ctx, settings.isolatedDegree ?? 0, originPos ? { x: originPos.x, y: originPos.y } : null);
-         if (!res.success) { await ctx.sleep(30000); continue; }
-         await bot.refreshLocation();
-         // Dock at the first station available in the isolated system
-         await ensureDocked(ctx);
-         state.pickupStation = bot.poi || state.pickupStation;
-         state.pickupSystem = bot.system;
-         state.needsTravel = false;
-         state.roundsWithoutPassengers = 0;
-         state.awayPickupAttempts = 0;
-         saveTransportState(state);
-         await ctx.sleep(2000);
-         continue;
-       }
+        // ── Isolated transport: execute fixed route to the isolated station ──
+        if (settings.mode === "isolated_transport" && isAtHomeBase(ctx, settings) && state.onboardPassengers.length === 0) {
+          const route = settings.isolatedRoute || [];
+          if (route.length === 0) {
+            ctx.log("transport", "Isolated transport: no route steps configured");
+            await ctx.sleep(30000); continue;
+          }
+          ctx.log("transport", `Isolated transport: executing ${route.length} route step(s)...`);
+          const ok = await executeIsolatedRoute(ctx, bot, settings, route);
+          if (!ok) { await ctx.sleep(30000); continue; }
+          await bot.refreshLocation();
+          await ensureDocked(ctx);
+          state.pickupStation = bot.poi || state.pickupStation;
+          state.pickupSystem = bot.system;
+          state.needsTravel = false;
+          state.roundsWithoutPassengers = 0;
+          state.awayPickupAttempts = 0;
+          saveTransportState(state);
+          await ctx.sleep(2000);
+          continue;
+        }
       // Other CT bots park passengers here. Deliver any not-yet-transported
       // expired lounge passenger first; only fall back to remote station
       // pickup when the lounge has nothing new to deliver.
@@ -3624,12 +3672,11 @@ if (state && state.status !== "idle") {
 
          // Navigate to home system if not there
         if (bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
-          if (settings.mode === "isolated_transport" && settings.isolatedSystem && bot.system.toLowerCase() !== settings.isolatedSystem.toLowerCase()) {
-            // isolated island: reverse pathfinder jump back toward origin system
-            const originPos = mapStore.getSystem(bot.system)?.position;
-            ctx.log("transport", `Isolated transport: reverse pathfinder jump (${(settings.isolatedDegree ?? 0) + 180}°) from ${bot.system}...`);
-            const res = await executePathfinderJumpToBearing(ctx, (settings.isolatedDegree ?? 0) + 180, originPos ? { x: originPos.x, y: originPos.y } : null);
-            if (!res.success) { await ctx.sleep(30000); continue; }
+          if (settings.mode === "isolated_transport" && settings.isolatedRoute && settings.isolatedRoute.length > 0 && bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase() && !mapStore.getSystem(bot.system)) {
+            // isolated island (unknown system): execute reverse pathfinder jumps back toward the main network
+            ctx.log("transport", `Isolated transport: returning via reverse route...`);
+            const ok = await executeIsolatedReturn(ctx, bot, settings);
+            if (!ok) { await ctx.sleep(30000); continue; }
             await bot.refreshLocation();
             continue;
           }

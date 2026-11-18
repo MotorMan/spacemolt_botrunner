@@ -1061,71 +1061,137 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("mission", `Resuming from step ${completedSteps.size + 1}/${chain.steps.length} (${completedSteps.size} steps already completed)`);
   }
 
-  // Verify each completed step by attempting to accept the mission
-  // This catches cases where the progress file is wrong (e.g., marked done but mission failed)
-  ctx.log("mission", "Verifying completed steps...");
-  for (const stepId of completedSteps) {
-    const step = chain.steps.find(s => s.id === stepId);
-    if (!step || step.type !== "dock" || !step.station) continue;
+  // === Smart Chain Position Detection ===
+  // Walk through the chain from the beginning, trying to accept each mission
+  // - "already completed" → mark done, continue to next
+  // - "only available at X" → go to X, accept it, that's our next step
+  // - accepted successfully → that's our next step
+  // - other error → stop for investigation
+  ctx.log("mission", "Detecting current position in mission chain...");
+  let firstIncompleteIndex = -1;
+  
+  for (let i = 0; i < chain.steps.length; i++) {
+    const step = chain.steps[i];
+    if (!step.id || step.type !== "dock" || !step.station) continue;
     
-    // Determine the POI ID to use (for mobile stations, use mobileStationPoiId)
+    // Skip if already verified as completed
+    if (completedSteps.has(step.id)) {
+      // Quick verify - try accept at the right station
+      const targetSystem = await resolveStationSystem(ctx, step);
+      if (!targetSystem) continue;
+      const poiId = step.isMobileStation && step.mobileStationPoiId 
+        ? step.mobileStationPoiId 
+        : step.station;
+      if (bot.system?.toLowerCase() !== targetSystem.toLowerCase() || 
+          bot.poi !== poiId || !bot.docked) {
+        ctx.log("mission", `Verifying ${step.id}: navigating to ${poiId}...`);
+        const docked = await navigateToStation(ctx, step);
+        if (!docked) continue;
+      }
+      const acceptResult = await acceptMission(ctx, step.id);
+      if (!acceptResult.success) {
+        if (acceptResult.error?.includes("already completed")) {
+          ctx.log("mission", `Verified ${step.id}: already completed (server confirmed)`);
+          continue;
+        }
+        if (acceptResult.error?.includes("already have an active instance")) {
+          // Mission already active - it's our next step
+          completedSteps.delete(step.id);
+          saveProgress(bot.username, chainName, completedSteps);
+          firstIncompleteIndex = i;
+          ctx.log("mission", `Mission ${step.id} already active, this is our next step`);
+          break;
+        }
+        // Not actually completed - found our position
+        completedSteps.delete(step.id);
+        saveProgress(bot.username, chainName, completedSteps);
+        firstIncompleteIndex = i;
+        ctx.log("mission", `Found incomplete step: ${step.id} (index ${i})`);
+        break;
+      } else {
+        // Wasn't actually completed
+        completedSteps.delete(step.id);
+        saveProgress(bot.username, chainName, completedSteps);
+        firstIncompleteIndex = i;
+        ctx.log("mission", `Found incomplete step (just accepted): ${step.id} (index ${i})`);
+        break;
+      }
+      await ctx.sleep(500);
+      continue;
+    }
+    
+    // This step is not in completed - try to accept it
+    const targetSystem = await resolveStationSystem(ctx, step);
+    if (!targetSystem) {
+      ctx.log("error", `Cannot resolve system for ${step.id}`);
+      firstIncompleteIndex = i;
+      break;
+    }
+    
     const poiId = step.isMobileStation && step.mobileStationPoiId 
       ? step.mobileStationPoiId 
       : step.station;
-    
-    // Navigate to the mission's station
-    const targetSystem = await resolveStationSystem(ctx, step);
-    if (!targetSystem) continue;
-    
     if (bot.system?.toLowerCase() !== targetSystem.toLowerCase() || 
         bot.poi !== poiId || !bot.docked) {
-      ctx.log("mission", `Verifying ${stepId}: navigating to ${poiId}...`);
+      ctx.log("mission", `Checking ${step.id}: navigating to ${poiId}...`);
       const docked = await navigateToStation(ctx, step);
-      if (!docked) continue;
+      if (!docked) {
+        firstIncompleteIndex = i;
+        break;
+      }
     }
     
-    // Try to accept the mission
-    const acceptResult = await acceptMission(ctx, stepId);
-    if (!acceptResult.success) {
-      // Check the specific error
-      if (acceptResult.error?.includes("already completed")) {
-        ctx.log("mission", `Verified ${stepId}: already completed (server confirmed)`);
-      } else if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
-        // "This mission is only available at X" or "not available at this station" 
-        // means we're at the WRONG STATION, NOT that it's completed!
-        // User confirmed: this error = NOT completed, WRONG STATION
-        ctx.log("mission", `Verification found ${stepId} was NOT completed (wrong station: ${acceptResult.error}), re-adding to queue`);
-        completedSteps.delete(stepId);
-        saveProgress(bot.username, chainName, completedSteps);
-      } else if (acceptResult.error?.includes("not available")) {
-        // Generic "not available" - could be various reasons, check active missions
-        await ctx.sleep(1000);
-        const activeMissions = await getActiveMissions(ctx);
-        const stillNotActive = !activeMissions.some(m => m.id === stepId);
-        if (stillNotActive) {
-          // Not in active missions, but we can't be sure why - don't assume completed
-          ctx.log("mission", `Verification unclear for ${stepId}: accept failed (${acceptResult.error}) and not in active missions. Assuming NOT completed for safety.`);
-          completedSteps.delete(stepId);
-          saveProgress(bot.username, chainName, completedSteps);
-        } else {
-          ctx.log("mission", `Verification found ${stepId} was NOT completed, re-adding to queue`);
-          completedSteps.delete(stepId);
-          saveProgress(bot.username, chainName, completedSteps);
-        }
-      } else {
-        // Some other error - don't assume completed
-        ctx.log("mission", `Verification found ${stepId} was NOT completed (error: ${acceptResult.error}), re-adding to queue`);
-        completedSteps.delete(stepId);
-        saveProgress(bot.username, chainName, completedSteps);
-      }
-    } else {
-      // Mission was accepted - it wasn't completed, so remove from completed
-      ctx.log("mission", `Verification found ${stepId} was NOT completed (just accepted it), re-adding to queue`);
-      completedSteps.delete(stepId);
-      saveProgress(bot.username, chainName, completedSteps);
+    const acceptResult = await acceptMission(ctx, step.id);
+    if (acceptResult.success) {
+      // Accepted! This is our next mission to do
+      firstIncompleteIndex = i;
+      ctx.log("mission", `Next mission to do: ${step.id} (just accepted it)`);
+      break;
     }
+    
+    // Check error
+    if (acceptResult.error?.includes("already completed")) {
+      // Already done - mark and continue
+      ctx.log("mission", `Already completed: ${step.id}, moving to next`);
+      completedSteps.add(step.id);
+      saveProgress(bot.username, chainName, completedSteps);
+      await ctx.sleep(500);
+      continue;
+    }
+    
+    if (acceptResult.error?.includes("already have an active instance")) {
+      // Mission already active - check active missions to confirm
+      const activeMissions = await getActiveMissions(ctx);
+      const hasMission = activeMissions.some(m => m.id === step.id);
+      if (hasMission) {
+        // It's already active - this is our next step
+        firstIncompleteIndex = i;
+        ctx.log("mission", `Mission ${step.id} already active, this is our next step`);
+        break;
+      }
+      // Not in active missions but got this error - weird, treat as not completed
+      firstIncompleteIndex = i;
+      break;
+    }
+    
+    if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
+      // Wrong station - we're already at the resolved station, so this is weird
+      // But the error tells us the mission is NOT completed
+      ctx.log("mission", `Mission ${step.id} not completed (wrong station error), this is our next step`);
+      firstIncompleteIndex = i;
+      break;
+    }
+    
+    // Other error - stop for investigation
+    ctx.log("error", `Mission ${step.id} accept failed: ${acceptResult.error} — stopping for investigation`);
+    return;
     
     await ctx.sleep(500);
+  }
+  
+  // If we went through all steps without finding incomplete, we're done
+  if (firstIncompleteIndex === -1 && completedSteps.size >= chain.steps.filter(s => s.id && s.type === "dock").length) {
+    ctx.log("mission", "All mission steps appear completed!");
   }
 
   const autoAccept = settings.autoAccept !== false;
@@ -1197,14 +1263,27 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
             await ctx.sleep(2000);
             continue;
           }
-          // "only available at X" or "not available at this station" = wrong station, NOT completed
-          if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
-            ctx.log("error", `Mission ${nextStep.id} not available here (${acceptResult.error}) — we're at the wrong station! Stopping.`);
-            return; // Stop the routine
+          // Mission already active but not in our check? Re-check
+          if (acceptResult.error?.includes("already have an active instance")) {
+            const recheckMissions = await getActiveMissions(ctx);
+            const recheckHasMission = recheckMissions.some(m => m.id === nextStep.id);
+            if (recheckHasMission) {
+              ctx.log("mission", `Mission ${nextStep.id} already active (confirmed), proceeding`);
+              // Continue with the step
+            } else {
+              ctx.log("error", `Mission ${nextStep.id} accept failed: ${acceptResult.error} — stopping for investigation`);
+              return;
+            }
+          } else {
+            // "only available at X" or "not available at this station" = wrong station, NOT completed
+            if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
+              ctx.log("error", `Mission ${nextStep.id} not available here (${acceptResult.error}) — we're at the wrong station! Stopping.`);
+              return; // Stop the routine
+            }
+            // Other errors - don't assume completed, stop for investigation
+            ctx.log("error", `Mission ${nextStep.id} accept failed: ${acceptResult.error} — stopping for investigation`);
+            return;
           }
-          // Other errors - don't assume completed, stop for investigation
-          ctx.log("error", `Mission ${nextStep.id} accept failed: ${acceptResult.error} — stopping for investigation`);
-          return;
         }
         await ctx.sleep(2000);
       }

@@ -1067,7 +1067,7 @@ async function detectChainPositionFromGameState(ctx: RoutineContext, chain: Miss
     const activeMission = activeMissions.find(m => missionMatchesStep(m, step));
     if (activeMission) {
       const objectives = (activeMission?.objectives as Array<Record<string, unknown>>) || [];
-      const allComplete = objectives.every((obj) => obj.completed === true || obj.progress === obj.quantity);
+      const allComplete = objectives.every((obj) => obj.completed === true || obj.current === obj.required || obj.progress === obj.quantity);
       if (allComplete) {
         completed.add(step.id);
         ctx.log("mission", `Verified completed from active mission: ${step.id}`);
@@ -1416,11 +1416,17 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     if (autoComplete && nextStep.type === "dock" && nextStep.id) {
       await ctx.sleep(2000);
       const activeMissions = await getActiveMissions(ctx);
-      const hasMission = activeMissions.some(m => missionMatchesStep(m, nextStep));
-      if (hasMission) {
-        const mission = activeMissions.find(m => missionMatchesStep(m, nextStep));
+      // Find the active mission: direct match, or parent mission for sub-requirements
+      let mission = activeMissions.find(m => missionMatchesStep(m, nextStep));
+      if (!mission && nextStep.completeAfter) {
+        for (const parent of nextStep.completeAfter) {
+          mission = activeMissions.find(m => missionMatchesStep(m, { id: parent, name: parent }));
+          if (mission) break;
+        }
+      }
+      if (mission) {
         const objectives = (mission?.objectives as Array<Record<string, unknown>>) || [];
-        const allComplete = objectives.every((obj) => obj.completed === true || obj.progress === obj.quantity);
+        const allComplete = objectives.length > 0 && objectives.every((obj) => obj.completed === true || obj.current === obj.required || obj.progress === obj.quantity);
          if (allComplete) {
            await completeMission(ctx, (mission as { uuid?: string })?.uuid || nextStep.id);
            await ctx.sleep(2000);
@@ -1430,7 +1436,13 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Mark step completed if its objective is done, even if the mission has more objectives
     const postActiveMissions = await getActiveMissions(ctx);
-    const mission = postActiveMissions.find(m => missionMatchesStep(m, nextStep));
+    let mission = postActiveMissions.find(m => missionMatchesStep(m, nextStep));
+    if (!mission && nextStep.completeAfter) {
+      for (const parent of nextStep.completeAfter) {
+        mission = postActiveMissions.find(m => missionMatchesStep(m, { id: parent, name: parent }));
+        if (mission) break;
+      }
+    }
     let stepDone = true;
     if (mission) {
       const objs = (mission.objectives as Array<Record<string, unknown>>) || [];

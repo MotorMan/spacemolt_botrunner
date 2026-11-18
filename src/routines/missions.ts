@@ -1,4 +1,4 @@
-import type { Bot, Routine, RoutineContext } from "../bot.js";
+﻿import type { Bot, Routine, RoutineContext } from "../bot.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -913,7 +913,7 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
         return false;
       }
       
-      ctx.log("travel", `⚠️ PATHFINDER JUMP: bearing ${step.bearing}, distance ${step.distance}...`);
+      ctx.log("travel", `âš ï¸ PATHFINDER JUMP: bearing ${step.bearing}, distance ${step.distance}...`);
       const jumpResp = await bot.exec("jump", { bearing: step.bearing, distance: step.distance, use_pathfinder: true });
       if (jumpResp.error) {
         ctx.log("error", `Pathfinder jump failed: ${jumpResp.error.message}`);
@@ -952,6 +952,81 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
     }
     case "deliver": {
       if (step.items) {
+        // Navigate to the delivery station first
+        if (step.station) {
+          const targetSystem = await resolveStationSystem(ctx, step);
+          if (targetSystem) {
+            const navigated = await navigateToSystem(ctx, targetSystem);
+            if (!navigated) {
+              ctx.log("error", `Failed to reach delivery station for ${step.id}`);
+              return false;
+            }
+            const poiId = step.isMobileStation && step.mobileStationPoiId ? step.mobileStationPoiId : step.station;
+            const { pois } = await getSystemInfo(ctx);
+            const st = pois.find(p => p.id === poiId && isStationPoi(p));
+            if (st) {
+              if (bot.poi !== st.id) {
+                const tr = await bot.exec("travel", { target_poi: st.id });
+                if (tr.error && !tr.error.message.includes("already")) ctx.log("error", `Travel failed: ${tr.error.message}`);
+                bot.poi = st.id;
+                await bot.refreshLocation();
+              }
+              const dr = await bot.exec("dock");
+              if (!dr.error || dr.error.message.includes("already")) bot.docked = true;
+              await tryRefuel(ctx);
+            }
+          }
+        }
+        // Ensure items in cargo, going home if needed
+        let have = await ensureItemsInCargo(ctx, step.items);
+        if (!have) {
+          const settings = getMissionSettings(bot);
+          const homeSystem = getHomeSystem(settings);
+          if (homeSystem && homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
+            ctx.log("mission", `Insufficient items; traveling home to ${homeSystem} for supplies...`);
+            const nav = await navigateToSystem(ctx, homeSystem);
+            if (nav) {
+              const { pois } = await getSystemInfo(ctx);
+              const hst = pois.find(p => isStationPoi(p));
+              if (hst) {
+                if (bot.poi !== hst.id) {
+                  const tr = await bot.exec("travel", { target_poi: hst.id });
+                  if (tr.error && !tr.error.message.includes("already")) ctx.log("error", `Travel failed: ${tr.error.message}`);
+                  bot.poi = hst.id;
+                  await bot.refreshLocation();
+                }
+                const dr = await bot.exec("dock");
+                if (!dr.error || dr.error.message.includes("already")) bot.docked = true;
+                await tryRefuel(ctx);
+                have = await ensureItemsInCargo(ctx, step.items);
+              }
+              // Return to delivery station
+              if (step.station) {
+                const targetSystem = await resolveStationSystem(ctx, step);
+                if (targetSystem) {
+                  await navigateToSystem(ctx, targetSystem);
+                  const poiId = step.isMobileStation && step.mobileStationPoiId ? step.mobileStationPoiId : step.station;
+                  const { pois: pois2 } = await getSystemInfo(ctx);
+                  const st2 = pois2.find(p => p.id === poiId && isStationPoi(p));
+                  if (st2) {
+                    if (bot.poi !== st2.id) {
+                      await bot.exec("travel", { target_poi: st2.id });
+                      bot.poi = st2.id;
+                      await bot.refreshLocation();
+                    }
+                    const dr2 = await bot.exec("dock");
+                    if (!dr2.error || dr2.error.message.includes("already")) bot.docked = true;
+                    await tryRefuel(ctx);
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (!have) {
+          ctx.log("error", `Cannot acquire required items for ${step.id}`);
+          return false;
+        }
         return await deliverItems(ctx, step.items);
       }
       return true;
@@ -995,7 +1070,7 @@ function findNextStep(completedSteps: Set<string>, chain: MissionChain): Mission
   return null;
 }
 
-// ── Progress Persistence ────────────────────────────────────────────
+// â”€â”€ Progress Persistence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const DATA_DIR = join(process.cwd(), "data");
 const MISSIONS_PROGRESS_DIR = join(DATA_DIR, "missions_progress");
@@ -1198,11 +1273,11 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
   // === Smart Chain Position Detection (NO TRAVEL) ===
   // Stay at current location, try to accept missions in order
-  // - "already completed" → mark done, continue to next
-  // - "only available at X" → that's our next mission, go to X
-  // - accepted successfully → that's our next mission
-  // - "already have an active instance" → that's our next mission
-  // - other error → stop for investigation
+  // - "already completed" â†’ mark done, continue to next
+  // - "only available at X" â†’ that's our next mission, go to X
+  // - accepted successfully â†’ that's our next mission
+  // - "already have an active instance" â†’ that's our next mission
+  // - other error â†’ stop for investigation
   ctx.log("mission", "Detecting current position in mission chain (no travel)...");
   let firstIncompleteIndex = -1;
   
@@ -1302,7 +1377,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
         const verifyMissions = await getActiveMissions(ctx);
         const verifyHasMission = verifyMissions.some(m => missionMatchesStep(m, step));
         if (!verifyHasMission) {
-          ctx.log("error", `Mission ${step.id} accept reported success but NOT in active missions — stopping for investigation`);
+          ctx.log("error", `Mission ${step.id} accept reported success but NOT in active missions â€” stopping for investigation`);
           return;
         }
         firstIncompleteIndex = i;
@@ -1339,7 +1414,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       const verifyMissions = await getActiveMissions(ctx);
       const verifyHasMission = verifyMissions.some(m => missionMatchesStep(m, step));
       if (!verifyHasMission) {
-        ctx.log("error", `Mission ${step.id} accept reported success but NOT in active missions — stopping for investigation`);
+        ctx.log("error", `Mission ${step.id} accept reported success but NOT in active missions â€” stopping for investigation`);
         return;
       }
       firstIncompleteIndex = i;
@@ -1387,7 +1462,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // Other error - stop for investigation
-    ctx.log("error", `Mission ${step.id} accept failed: ${acceptResult.error} — stopping for investigation`);
+    ctx.log("error", `Mission ${step.id} accept failed: ${acceptResult.error} â€” stopping for investigation`);
     return;
     
     await ctx.sleep(200);
@@ -1431,7 +1506,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("mission", `Executing step: ${nextStep.name} (${nextStep.id})`);
 
     // For dock-type steps with a mission ID, accept the mission (handling accept-station mismatches)
-    if (autoAccept && nextStep.type === "dock" && nextStep.id) {
+    if (autoAccept && (nextStep.type === "dock" || nextStep.type === "deliver") && nextStep.id) {
       const activeMissions = await getActiveMissions(ctx);
       const hasMission = activeMissions.some(m => missionMatchesStep(m, nextStep));
 
@@ -1506,11 +1581,11 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
             ctx.log("mission", `Not docked; skipping accept for ${nextStep.id}, proceeding to execute`);
           } else if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
             // Could not resolve accept station; stop for investigation
-            ctx.log("error", `Mission ${nextStep.id} not available here (${acceptResult.error}) — stopping.`);
+            ctx.log("error", `Mission ${nextStep.id} not available here (${acceptResult.error}) â€” stopping.`);
             return;
           } else {
             // Other errors - stop for investigation
-            ctx.log("error", `Mission ${nextStep.id} accept failed: ${acceptResult.error} — stopping for investigation`);
+            ctx.log("error", `Mission ${nextStep.id} accept failed: ${acceptResult.error} â€” stopping for investigation`);
             return;
           }
         } else {
@@ -1519,7 +1594,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           const verifyMissions = await getActiveMissions(ctx);
           const verifyHasMission = verifyMissions.some(m => missionMatchesStep(m, nextStep));
           if (!verifyHasMission) {
-            ctx.log("error", `Mission ${nextStep.id} accept reported success but NOT in active missions — stopping for investigation`);
+            ctx.log("error", `Mission ${nextStep.id} accept reported success but NOT in active missions â€” stopping for investigation`);
             return;
           }
           ctx.log("mission", `Mission ${nextStep.id} accepted and verified in active missions`);
@@ -1533,7 +1608,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
     const success = await executeMissionStep(ctx, nextStep);
     if (!success) {
-      ctx.log("error", `Step ${nextStep.id} failed — stopping routine for investigation. Fix the issue and restart to resume from this step.`);
+      ctx.log("error", `Step ${nextStep.id} failed â€” stopping routine for investigation. Fix the issue and restart to resume from this step.`);
       return; // Stop the routine instead of retrying
     }
 
@@ -1597,7 +1672,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("mission", `Step ${nextStep.id} completed (${completedSteps.size}/${chain.steps.length})`);
     } else {
       recordStepResult(bot.username, chainName, nextStep, mission as any, "failed", "Objective not confirmed complete after docking");
-      ctx.log("error", `Step ${nextStep.id} objective not confirmed complete after docking — stopping for investigation`);
+      ctx.log("error", `Step ${nextStep.id} objective not confirmed complete after docking â€” stopping for investigation`);
       return;
     }
     

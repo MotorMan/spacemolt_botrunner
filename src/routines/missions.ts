@@ -962,6 +962,59 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
     }
     case "dock": {
       if (step.station) {
+        // If this dock step fulfills delivery objectives of an active mission,
+        // acquire those items from home faction storage BEFORE traveling.
+        const activeMissions = await getActiveMissions(ctx);
+        let mission = activeMissions.find(m => missionMatchesStep(m, step));
+        if (!mission && step.completeAfter) {
+          for (const pid of step.completeAfter) {
+            mission = activeMissions.find(m => missionMatchesStep(m, { id: pid, name: pid }));
+            if (mission) break;
+          }
+        }
+        if (mission) {
+          const objs = (mission.objectives as Array<Record<string, unknown>>) || [];
+          const targetStation = (step.isMobileStation ? step.mobileStationId : step.station) || step.station;
+          const deliverObjs = objs.filter(o => {
+            if (o.completed === true) return false;
+            if (o.type !== "deliver_item") return false;
+            const tb = String(o.target_base || o.target_base_id || "").toLowerCase();
+            const ts = String(targetStation || "").toLowerCase();
+            return !!tb && (tb === ts || tb.includes(ts) || ts.includes(tb));
+          });
+          if (deliverObjs.length > 0) {
+            const items = deliverObjs.map(o => ({
+              itemId: String(o.item_id || o.itemId || ""),
+              quantity: Math.max(0, ((o.required as number) || 0) - ((o.current as number) || 0)),
+            })).filter(it => it.itemId && it.quantity > 0);
+            if (items.length > 0) {
+              ctx.log("mission", `Dock step requires delivery items: ${items.map(i => `${i.quantity}x ${i.itemId}`).join(", ")}`);
+              await bot.refreshCargo();
+              const hasAll = () => items.every(it => (bot.inventory.find(i => i.itemId === it.itemId)?.quantity || 0) >= it.quantity);
+              let have = hasAll();
+              if (!have && bot.docked) {
+                have = await ensureItemsInCargo(ctx, items);
+                await bot.refreshCargo();
+                have = hasAll();
+              }
+              if (!have) {
+                ctx.log("mission", "Traveling HOME to acquire delivery items from faction storage...");
+                const docked = await goHomeAndDock(ctx);
+                if (!docked) {
+                  ctx.log("error", `Cannot reach home station for ${step.id}`);
+                  return false;
+                }
+                have = await ensureItemsInCargo(ctx, items);
+                await bot.refreshCargo();
+                have = hasAll();
+                if (!have) {
+                  ctx.log("error", `Cannot acquire delivery items for ${step.id}`);
+                  return false;
+                }
+              }
+            }
+          }
+        }
         return await navigateToStation(ctx, step);
       }
       return true;
@@ -1682,7 +1735,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
      // the game says is still active.
      const activeNow = await getActiveMissions(ctx);
      const activeIdx = chain.steps.findIndex(s => !!s.id && activeNow.some(m => missionMatchesStep(m, s)));
-     if (activeIdx !== -1) {
+     if (activeIdx !== -1 && !completedSteps.has(chain.steps[activeIdx].id)) {
        if (!nextStep) break;
        const nextIdx = chain.steps.findIndex(s => s.id === nextStep!.id);
        if (activeIdx < nextIdx) {

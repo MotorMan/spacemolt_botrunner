@@ -262,7 +262,6 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "processing_the_data",
-        isMission: false,
         name: "Processing The Data",
         description: "Return to First Step Memorial Station",
         type: "dock",
@@ -1597,9 +1596,24 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   if (firstIncompleteIndex === -1) {
+  // Only verify (via accept) missions within the last 2 steps of saved progress;
+  // trust saved progress for anything further back to avoid re-accepting every mission.
+  let progressStart = 0;
+  for (let k = 0; k < chain.steps.length; k++) {
+    const s = chain.steps[k];
+    if (s.id && !completedSteps.has(s.id)) { progressStart = k; break; }
+  }
+  if (progressStart === 0 && completedSteps.size >= chain.steps.length) progressStart = chain.steps.length;
+  const verifyFromIndex = Math.max(0, progressStart - 2);
+
   for (let i = 0; i < chain.steps.length; i++) {
     const step = chain.steps[i];
     if (!step.id) continue;
+
+    // Trust saved progress for missions further than 2 steps behind current position
+    if (completedSteps.has(step.id) && i < verifyFromIndex) {
+      continue;
+    }
     
     // Check if already active FIRST - no need to try accept
     if (activeMissions.some(m => missionMatchesStep(m, step))) {
@@ -1761,8 +1775,24 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       break;
     }
 
+    if (acceptResult.error?.includes("requires completing mission") || acceptResult.error?.includes("prerequisite")) {
+      const m = acceptResult.error.match(/\[([^\]]+)\]/);
+      const prereqId = m ? m[1] : null;
+      const prereqStep = prereqId ? chain.steps.find(s => s.id === prereqId) : undefined;
+      if (prereqStep) {
+        const idx = chain.steps.indexOf(prereqStep);
+        for (let j = idx; j < chain.steps.length; j++) {
+          if (chain.steps[j].id) completedSteps.delete(chain.steps[j].id);
+        }
+        saveProgress(bot.username, chainName, completedSteps);
+        firstIncompleteIndex = idx;
+        ctx.log("mission", `Accept blocked by prerequisite ${prereqId}; switching to that mission first (detection)`);
+        break;
+      }
+    }
+
     // Other error - stop for investigation
-    ctx.log("error", `Mission ${step.id} accept failed: ${acceptResult.error} â€” stopping for investigation`);
+    ctx.log("error", `Mission ${step.id} accept failed: ${acceptResult.error} — stopping for investigation`);
     return;
     
     await ctx.sleep(200);

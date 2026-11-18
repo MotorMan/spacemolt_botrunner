@@ -48,10 +48,11 @@ const MISSION_CHAINS: MissionChain[] = [
       {
         id: "the_memorial",
         name: "The Memorial",
-        description: "Travel to First Step system and dock at Memorial Station",
+        description: "Accept at Frontier Station (mobile station)",
         type: "dock",
-        system: "first_step",
-        station: "first_step_memorial_station",
+        station: "frontier_station",
+        isMobileStation: true,
+        mobileStationId: "frontier_station",
       },
       {
         id: "the_expeditionary_mandate",

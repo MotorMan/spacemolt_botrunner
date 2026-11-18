@@ -618,6 +618,17 @@ async function navigateToStation(ctx: RoutineContext, step: MissionStep): Promis
     station = findStation(pois) || pois.find(p => isStationPoi(p));
   }
   if (!station) {
+    // No station in this system. If the active mission only requires visiting
+    // the system (visit_system), docking is unnecessary — treat as complete.
+    const activeMissions = await getActiveMissions(ctx);
+    const visitOnly = activeMissions.some(m => {
+      const objs = (m.objectives as Array<Record<string, unknown>>) || [];
+      return objs.some(o => o.type === "visit_system" && String(o.system_id || "").toLowerCase() === targetSystem.toLowerCase() && o.completed !== true);
+    });
+    if (visitOnly) {
+      ctx.log("mission", `No station in ${targetSystem}; visit_system objective satisfied by arrival`);
+      return true;
+    }
     ctx.log("error", `Station ${poiId} not found in ${targetSystem}`);
     return false;
   }
@@ -1726,6 +1737,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
    while (bot.state === "running") {
      // Complete any missions that are already fully done before picking the next step
+     await ctx.sleep(1500);
      const readyMissions = await getActiveMissions(ctx);
      for (const m of readyMissions) {
        const objs = (m.objectives as Array<Record<string, unknown>>) || [];
@@ -1839,7 +1851,32 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           } else if (acceptResult.error?.includes("not_docked") || acceptResult.error?.includes("not docked")) {
             // Not docked; skip accept, proceed to execute (will dock)
             ctx.log("mission", `Not docked; skipping accept for ${nextStep.id}, proceeding to execute`);
-          } else if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
+          } else if (acceptResult.error?.includes("requires completing mission") || acceptResult.error?.includes("prerequisite")) {
+            // A prerequisite mission isn't completed yet — complete it, then retry accept
+            const m = acceptResult.error.match(/\[([^\]]+)\]/);
+            const prereqId = m ? m[1] : null;
+            ctx.log("mission", `Accept blocked by prerequisite ${prereqId}; attempting to complete it...`);
+            const activeMissions = await getActiveMissions(ctx);
+            let prereqMission = prereqId ? activeMissions.find(m => (m.templateId || m.id) === prereqId || m.id === prereqId) : null;
+            if (!prereqMission && prereqId) {
+              // Fall back to any fully-complete active mission
+              prereqMission = activeMissions.find(m => {
+                const objs = (m.objectives as Array<Record<string, unknown>>) || [];
+                return objs.length > 0 && objs.every(o => o.completed === true || (o.current !== undefined && o.current === o.required));
+              });
+            }
+            if (prereqMission) {
+              const mid = (prereqMission as { uuid?: string; mission_id?: string; id?: string }).uuid || (prereqMission as { mission_id?: string }).mission_id || (prereqMission as { id?: string }).id;
+              if (mid) {
+                await completeMission(ctx, mid);
+                await ctx.sleep(2000);
+                acceptResult = await acceptMission(ctx, nextStep.id);
+              }
+            }
+            if (!acceptResult.success && !(acceptResult.error?.includes("already completed") || acceptResult.error?.includes("already have an active"))) {
+              ctx.log("error", `Mission ${nextStep.id} accept failed after prerequisite attempt: ${acceptResult.error} — stopping.`);
+              return;
+            }
             // Could not resolve accept station; stop for investigation
             ctx.log("error", `Mission ${nextStep.id} not available here (${acceptResult.error}) â€” stopping.`);
             return;
@@ -1883,6 +1920,19 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           if (mission) break;
         }
       }
+      if (!mission) {
+        // Fallback: find an active mission whose objectives target this step's station/system
+        const ts = String(nextStep.station || "").toLowerCase();
+        const sy = String(nextStep.system || "").toLowerCase();
+        mission = activeMissions.find(m => {
+          const objs = (m.objectives as Array<Record<string, unknown>>) || [];
+          return objs.some(o => {
+            const tb = String(o.target_base || o.target_base_id || "").toLowerCase();
+            const sid = String(o.system_id || "").toLowerCase();
+            return (ts && (tb === ts || tb.includes(ts) || ts.includes(tb))) || (sy && sid === sy);
+          });
+        });
+      }
       if (mission) {
         const objectives = (mission?.objectives as Array<Record<string, unknown>>) || [];
         const allComplete = objectives.length > 0 && objectives.every((obj) => obj.completed === true || (obj.current !== undefined && obj.current === obj.required) || (obj.progress !== undefined && obj.progress === obj.quantity));
@@ -1917,8 +1967,15 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
         if (matchingObj) {
           stepDone = matchingObj.completed === true || (matchingObj.current !== undefined && matchingObj.current === matchingObj.required);
         } else if (!allComplete) {
-          // Active mission not fully done and no matching objective for this step
-          stepDone = false;
+          // If the step's objective is a visit_system (no dock required), consider
+          // it done since navigation to the system succeeded.
+          const visitObj = objs.find(o => o.type === "visit_system" && String(o.system_id || "").toLowerCase() === String(nextStep.system || "").toLowerCase());
+          if (visitObj) {
+            stepDone = true;
+          } else {
+            // Active mission not fully done and no matching objective for this step
+            stepDone = false;
+          }
         }
       }
     }

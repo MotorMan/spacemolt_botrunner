@@ -1136,7 +1136,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
   
   for (let i = 0; i < chain.steps.length; i++) {
     const step = chain.steps[i];
-    if (!step.id || step.type !== "dock" || !step.station) continue;
+    if (!step.id) continue;
     
     // Check if already active FIRST - no need to try accept
     if (activeMissions.some(m => missionMatchesStep(m, step))) {
@@ -1288,6 +1288,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("mission", "Pre-gathering all required items for the chain...");
     const allItems = new Map<string, number>();
     for (const step of chain.steps) {
+      if (completedSteps.has(step.id)) continue; // skip completed missions
       if (step.items) {
         for (const item of step.items) {
           const current = allItems.get(item.itemId) || 0;
@@ -1427,15 +1428,32 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // Only mark step completed if its mission is no longer active (completed) or it's not a mission step
+    // Mark step completed if its objective is done, even if the mission has more objectives
     const postActiveMissions = await getActiveMissions(ctx);
-    const missionStillActive = nextStep.type === "dock" && !!nextStep.id && postActiveMissions.some(m => missionMatchesStep(m, nextStep));
-    if (!missionStillActive) {
+    const mission = postActiveMissions.find(m => missionMatchesStep(m, nextStep));
+    let stepDone = true;
+    if (mission) {
+      const objs = (mission.objectives as Array<Record<string, unknown>>) || [];
+      if (objs.length > 0) {
+        const targetStation = nextStep.isMobileStation ? nextStep.mobileStationId : nextStep.station;
+        const matchingObj = objs.find(o => {
+          const tb = (o.target_base as string) || (o.target_base_id as string) || "";
+          return !!targetStation && (tb === targetStation || tb === nextStep.station);
+        });
+        if (matchingObj) {
+          stepDone = matchingObj.completed === true || matchingObj.current === matchingObj.required;
+        }
+      }
+    }
+    // For non-dock steps or steps without a matching mission, consider done if executed successfully
+    if (nextStep.type !== "dock") stepDone = true;
+
+    if (stepDone) {
       completedSteps.add(nextStep.id);
       saveProgress(bot.username, chainName, completedSteps);
       ctx.log("mission", `Step ${nextStep.id} completed (${completedSteps.size}/${chain.steps.length})`);
     } else {
-      ctx.log("mission", `Step ${nextStep.id} executed but mission still active — not marking completed`);
+      ctx.log("mission", `Step ${nextStep.id} executed but objective not confirmed — not marking completed`);
     }
     
     await ctx.sleep(5000);

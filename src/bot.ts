@@ -1461,8 +1461,10 @@ docked = false;
     }
 
     if (command === "jump") {
-      const t = (payload as Record<string, unknown> | undefined)?.target_system;
-      if (typeof t === "number") {
+      const payloadRec = (payload as Record<string, unknown> | undefined);
+      const t = payloadRec?.target_system ?? payloadRec?.target ?? payloadRec?.id;
+      const bearing = typeof t === "number" ? t : (typeof t === "string" && t.trim() !== "" && !isNaN(Number(t)) ? Number(t) : null);
+      if (bearing !== null) {
         if (!this.hasPathfinderDrive) {
           await this.refreshShipMods();
         }
@@ -1479,16 +1481,28 @@ docked = false;
       // logic below runs on the normalized ApiResponse libExec returns.
       let resp: ApiResponse;
       if (command === "jump") {
-        const target = (payload as Record<string, unknown> | undefined)?.target_system;
+        const payloadRec = (payload as Record<string, unknown> | undefined);
+        const rawTarget = payloadRec?.target_system ?? payloadRec?.target ?? payloadRec?.id;
+        const bearing = typeof rawTarget === "number"
+          ? rawTarget
+          : (typeof rawTarget === "string" && rawTarget.trim() !== "" && !isNaN(Number(rawTarget)) ? Number(rawTarget) : null);
+        // Normalize pathfinder bearing to target_system so downstream dispatch matches
+        // the existing internal pathfinder-jump code path.
+        const normalizedPayload = payload ? { ...payload } : undefined;
+        if (bearing !== null && normalizedPayload) {
+          normalizedPayload.target_system = bearing;
+          delete normalizedPayload.target;
+          delete normalizedPayload.id;
+        }
         // Pathfinder jumps (target_system = bearing number) return pathfinder_redirect
         // immediately and NEVER produce action_result. libExec/account.send waits for
         // action_result which never arrives — causing a 10-minute hang. Worse: when
         // stop() aborts the routine, the pending libExec promise is still in flight
         // and eventually resolves, firing the jump long after the routine stopped.
         // Fire-and-forget: send the command and return immediately.
-        if (typeof target === "number") {
-          const { tool, action, body } = buildLibDispatch(command, payload);
-          debugLogForBot(this.username, "bot:exec", `${this.username} > pathfinder jump bearing=${target} payload=${JSON.stringify(body)}`);
+        if (bearing !== null) {
+          const { tool, action, body } = buildLibDispatch(command, normalizedPayload);
+          debugLogForBot(this.username, "bot:exec", `${this.username} > pathfinder jump bearing=${bearing} payload=${JSON.stringify(body)}`);
           const rawSend = this.liveRawSend();
           if (!rawSend) {
             return {
@@ -1506,7 +1520,7 @@ docked = false;
             await rawSend(tool, action, body);
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            this.log("error", `Pathfinder jump at bearing ${target} failed to send: ${message}`);
+            this.log("error", `Pathfinder jump at bearing ${bearing} failed to send: ${message}`);
             return {
               error: { code: "send_failed", message },
               result: undefined,
@@ -1519,7 +1533,7 @@ docked = false;
             notifications: [],
           };
         } else {
-          resp = await this.libExec(command, payload);
+          resp = await this.libExec(command, normalizedPayload || payload);
         }
       } else {
         resp = await this.libExec(command, payload);

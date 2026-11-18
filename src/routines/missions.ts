@@ -931,24 +931,34 @@ async function deliverItems(ctx: RoutineContext, items: Array<{ itemId: string; 
     }
     ctx.log("mission", `Delivering ${item.quantity}x ${item.itemId}...`);
     const storageBefore = bot.storage?.find(i => i.itemId === item.itemId)?.quantity || 0;
+    const cargoBefore = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
     const depResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
     if (depResp.error) {
       ctx.log("error", `Deposit failed: ${depResp.error.message}`);
       return false;
     }
-    // Verify the deposit actually landed in station storage
+    // Verify the deposit actually happened. Some missions consume the items
+    // immediately on deposit (station storage unchanged), others keep them in
+    // station storage until mission completion. Treat either signal as success:
+    // items leaving cargo OR station storage increasing.
     let verified = 0;
     for (let attempt = 1; attempt <= 3; attempt++) {
       await ctx.sleep(1000);
       await bot.refreshStorage();
+      await bot.refreshCargo();
       const storageAfter = bot.storage?.find(i => i.itemId === item.itemId)?.quantity || 0;
-      verified = Math.max(0, storageAfter - storageBefore);
-      if (verified > 0) break;
-      ctx.log("warn", `Station storage unchanged after deposit (attempt ${attempt}/3) for ${item.itemId}`);
+      const cargoAfter = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
+      const storageGain = Math.max(0, storageAfter - storageBefore);
+      const cargoLoss = Math.max(0, cargoBefore - cargoAfter);
+      if (storageGain > 0 || cargoLoss > 0) {
+        verified = storageGain > 0 ? storageGain : cargoLoss;
+        break;
+      }
+      ctx.log("warn", `Station storage/cargo unchanged after deposit (attempt ${attempt}/3) for ${item.itemId}`);
     }
     await bot.refreshCargo();
     if (verified <= 0) {
-      ctx.log("error", `Deposit reported success but station storage unchanged for ${item.itemId}`);
+      ctx.log("error", `Deposit reported success but neither cargo nor station storage changed for ${item.itemId}`);
       return false;
     }
     ctx.log("mission", `Deposited ${item.quantity}x ${item.itemId} (verified ${verified})`);

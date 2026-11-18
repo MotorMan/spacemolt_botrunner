@@ -400,6 +400,12 @@
         </div>
 
         <div class="cmd-group">
+          <label>Pathfinder Jump (All Bots)</label>
+          <input type="number" id="ca-pf-degree" min="0" max="360" value="0" style="width:80px;font-size:12px;padding:4px 8px">
+          <button class="primary sm" onclick="caExec('jump',{target:Math.max(0,Math.min(360,intVal('ca-pf-degree')))})">Jump</button>
+        </div>
+
+        <div class="cmd-group">
           <button class="sm" onclick="caExec('dock')">Dock All</button>
           <button class="sm" onclick="caExec('undock')">Undock All</button>
         </div>

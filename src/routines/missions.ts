@@ -472,6 +472,87 @@ function getHomeSystem(settings: Record<string, unknown>): string | undefined {
   return (settings.general as Record<string, unknown>)?.homeSystem as string | undefined;
 }
 
+function resolveHomeStation(settings: Record<string, unknown>, bot: Bot): { system?: string; station?: string } {
+  const m = ((settings.missions as Record<string, unknown>) || {}) as Record<string, unknown>;
+  const g = ((settings.general as Record<string, unknown>) || {}) as Record<string, unknown>;
+  const r = ((settings.return_home as Record<string, unknown>) || {}) as Record<string, unknown>;
+  const perBot = bot.username ? ((settings[bot.username] as Record<string, unknown>) || {}) as Record<string, unknown> : {};
+  const perBotM = ((perBot.missions as Record<string, unknown>) || {}) as Record<string, unknown>;
+  const perBotR = ((perBot.return_home as Record<string, unknown>) || {}) as Record<string, unknown>;
+  const perBotG = ((perBot.general as Record<string, unknown>) || {}) as Record<string, unknown>;
+
+  const stationCandidates = [
+    m.homeStation, perBotM.homeStation, g.factionStorageStation, r.homeStation, perBotR.homeStation, g.homeStation, perBotG.homeStation,
+  ].filter((v): v is string => typeof v === "string" && v.length > 0);
+
+  const systemCandidates = [
+    g.factionStorageSystem, getHomeSystem(settings), r.homeSystem, perBotR.homeSystem, perBotG.homeSystem,
+  ].filter((v): v is string => typeof v === "string" && v.length > 0);
+
+  let system: string | undefined;
+  let station: string | undefined;
+  for (const c of stationCandidates) {
+    if (c.includes("|")) {
+      const [sys, st] = c.split("|");
+      if (!system && sys) system = sys;
+      if (!station && st) station = st;
+    } else if (!station) {
+      station = c;
+    }
+  }
+  if (!system) system = systemCandidates[0];
+  return { system, station };
+}
+
+async function goHomeAndDock(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const allSettings = loadSettings() as Record<string, unknown>;
+  const { system: homeSystem, station: homeStation } = resolveHomeStation(allSettings, bot);
+
+  if (!homeSystem) {
+    ctx.log("error", "No home/faction-storage system configured");
+    return false;
+  }
+
+  const navigated = await navigateToSystem(ctx, homeSystem);
+  if (!navigated) {
+    ctx.log("error", `Failed to navigate home to ${homeSystem}`);
+    return false;
+  }
+
+  const { pois } = await getSystemInfo(ctx);
+  let stationPoi = homeStation ? pois.find(p => p.id === homeStation && isStationPoi(p)) : null;
+  if (!stationPoi) {
+    stationPoi = findStation(pois) || pois.find(p => isStationPoi(p)) || null;
+  }
+  if (!stationPoi) {
+    ctx.log("error", `No station found in home system ${homeSystem}`);
+    return false;
+  }
+
+  if (bot.poi !== stationPoi.id) {
+    ctx.log("travel", `Traveling to ${stationPoi.name}...`);
+    const travelResp = await bot.exec("travel", { target_poi: stationPoi.id });
+    if (travelResp.error && !travelResp.error.message.includes("already")) {
+      ctx.log("error", `Travel to home station failed: ${travelResp.error.message}`);
+      return false;
+    }
+    bot.poi = stationPoi.id;
+    await bot.refreshLocation();
+  }
+
+  ctx.log("system", "Docking at home station...");
+  const dockResp = await bot.exec("dock");
+  if (dockResp.error && !dockResp.error.message.includes("already")) {
+    ctx.log("error", `Dock at home station failed: ${dockResp.error.message}`);
+    return false;
+  }
+  bot.docked = true;
+  await tryRefuel(ctx);
+  ctx.log("mission", `Docked at home station ${stationPoi.id} in ${homeSystem}`);
+  return true;
+}
+
 async function resolveStationSystem(ctx: RoutineContext, step: MissionStep): Promise<string | null> {
   if (step.isMobileStation && step.mobileStationId) {
     // For mobile stations, use the tracked location from mapStore
@@ -694,57 +775,70 @@ function missionMatchesStep(m: { id?: string; name?: string; templateId?: string
 async function ensureItemsInCargo(ctx: RoutineContext, items: Array<{ itemId: string; quantity: number }>): Promise<boolean> {
   const { bot } = ctx;
   await bot.refreshCargo();
-  
+
+  if (!bot.docked) {
+    ctx.log("mission", "Not docked - cannot check storage; items must be acquired at a station");
+    return false;
+  }
+
   for (const item of items) {
     const have = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
     if (have >= item.quantity) continue;
 
     const needed = item.quantity - have;
     ctx.log("mission", `Need ${needed}x ${item.itemId}, checking storage...`);
-    
+
     const storageResp = await bot.exec("view_storage");
-    if (!storageResp.result) continue;
-    const storage = storageResp.result as Record<string, unknown>;
-    const storedItems = (storage.items as Array<Record<string, unknown>>) || [];
-    const stored = storedItems.find(i => (i.item_id as string) === item.itemId || (i.id as string) === item.itemId);
-    const storedQty = stored ? ((stored.quantity as number) || 0) : 0;
-    
-    if (storedQty > 0) {
-      const withdraw = Math.min(needed, storedQty);
-      const wResp = await bot.exec("storage", { 
-        action: "withdraw", 
-        item_id: item.itemId, 
-        quantity: withdraw, 
-        target: "self", 
-        source: "storage" 
-      });
-      if (!wResp.error) {
-        ctx.log("mission", `Withdrew ${withdraw}x ${item.itemId} from station storage`);
+    if (storageResp.result) {
+      const storage = storageResp.result as Record<string, unknown>;
+      const storedItems = (storage.items as Array<Record<string, unknown>>) || [];
+      const stored = storedItems.find(i => (i.item_id as string) === item.itemId || (i.id as string) === item.itemId);
+      const storedQty = stored ? ((stored.quantity as number) || 0) : 0;
+
+      if (storedQty > 0) {
+        const withdraw = Math.min(needed, storedQty);
+        const before = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
+        const wResp = await bot.exec("storage", {
+          action: "withdraw",
+          item_id: item.itemId,
+          quantity: withdraw,
+          target: "self",
+          source: "storage",
+        });
         await bot.refreshCargo();
-        continue;
+        const after = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
+        if (!wResp.error && after > before) {
+          ctx.log("mission", `Withdrew ${withdraw}x ${item.itemId} from station storage`);
+          continue;
+        }
+        ctx.log("warn", `Station storage withdraw did not increase cargo for ${item.itemId}`);
       }
     }
 
     const factionResp = await bot.exec("view_storage", { target: "faction" });
-    if (!factionResp.result) continue;
-    const faction = factionResp.result as Record<string, unknown>;
-    const factionItems = (faction.items as Array<Record<string, unknown>>) || [];
-    const factionStored = factionItems.find(i => (i.item_id as string) === item.itemId || (i.id as string) === item.itemId);
-    const factionQty = factionStored ? ((factionStored.quantity as number) || 0) : 0;
-    
-    if (factionQty > 0) {
-      const withdraw = Math.min(needed, factionQty);
-      const wResp = await bot.exec("storage", { 
-        action: "withdraw", 
-        item_id: item.itemId, 
-        quantity: withdraw, 
-        target: "self", 
-        source: "faction" 
-      });
-      if (!wResp.error) {
-        ctx.log("mission", `Withdrew ${withdraw}x ${item.itemId} from faction storage`);
+    if (factionResp.result) {
+      const faction = factionResp.result as Record<string, unknown>;
+      const factionItems = (faction.items as Array<Record<string, unknown>>) || [];
+      const factionStored = factionItems.find(i => (i.item_id as string) === item.itemId || (i.id as string) === item.itemId);
+      const factionQty = factionStored ? ((factionStored.quantity as number) || 0) : 0;
+
+      if (factionQty > 0) {
+        const withdraw = Math.min(needed, factionQty);
+        const before = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
+        const wResp = await bot.exec("storage", {
+          action: "withdraw",
+          item_id: item.itemId,
+          quantity: withdraw,
+          target: "self",
+          source: "faction",
+        });
         await bot.refreshCargo();
-        continue;
+        const after = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
+        if (!wResp.error && after > before) {
+          ctx.log("mission", `Withdrew ${withdraw}x ${item.itemId} from faction storage`);
+          continue;
+        }
+        ctx.log("warn", `Faction storage withdraw did not increase cargo for ${item.itemId}`);
       }
     }
 
@@ -789,16 +883,22 @@ async function deliverItems(ctx: RoutineContext, items: Array<{ itemId: string; 
       return false;
     }
     ctx.log("mission", `Delivering ${item.quantity}x ${item.itemId}...`);
-    const depResp = await bot.exec("storage", { 
-      action: "deposit", 
-      item_id: item.itemId, 
-      quantity: item.quantity, 
-      target: "storage", 
-      source: "self" 
+    const before = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
+    const depResp = await bot.exec("storage", {
+      action: "deposit",
+      item_id: item.itemId,
+      quantity: item.quantity,
+      target: "storage",
+      source: "self",
     });
     if (depResp.error) {
       ctx.log("error", `Deposit failed: ${depResp.error.message}`);
       return false;
+    }
+    await bot.refreshCargo();
+    const after = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
+    if (after > before - item.quantity) {
+      ctx.log("warn", `Deposit verification: cargo only decreased from ${before} to ${after} (expected ${before - item.quantity}); continuing`);
     }
     ctx.log("mission", `Deposited ${item.quantity}x ${item.itemId}`);
   }
@@ -952,36 +1052,45 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
     }
     case "deliver": {
       if (step.items) {
-        // First, ensure we have the items (going home if needed) BEFORE traveling to delivery station
-        let have = await ensureItemsInCargo(ctx, step.items);
+        // Verify cargo first
+        await bot.refreshCargo();
+        const hasAll = () => step.items!.every(it => (bot.inventory.find(i => i.itemId === it.itemId)?.quantity || 0) >= it.quantity);
+
+        let have = hasAll();
+        if (!have && bot.docked) {
+          have = await ensureItemsInCargo(ctx, step.items);
+          await bot.refreshCargo();
+          have = hasAll();
+        }
+
+        // If still missing, go HOME to grab from home base's faction storage (do NOT travel to destination empty)
         if (!have) {
-          const allSettings = loadSettings();
-          const homeSystem = getHomeSystem(allSettings as Record<string, unknown>);
-          if (homeSystem && homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
-            ctx.log("mission", `Insufficient items; traveling home to ${homeSystem} for supplies first...`);
-            const nav = await navigateToSystem(ctx, homeSystem);
-            if (nav) {
-              const { pois } = await getSystemInfo(ctx);
-              const hst = pois.find(p => isStationPoi(p));
-              if (hst) {
-                if (bot.poi !== hst.id) {
-                  const tr = await bot.exec("travel", { target_poi: hst.id });
-                  if (tr.error && !tr.error.message.includes("already")) ctx.log("error", `Travel failed: ${tr.error.message}`);
-                  bot.poi = hst.id;
-                  await bot.refreshLocation();
-                }
-                const dr = await bot.exec("dock");
-                if (!dr.error || dr.error.message.includes("already")) bot.docked = true;
-                await tryRefuel(ctx);
-                have = await ensureItemsInCargo(ctx, step.items);
-              }
-            }
+          ctx.log("mission", `Insufficient items in cargo; traveling HOME to grab required items from faction storage...`);
+          const docked = await goHomeAndDock(ctx);
+          if (!docked) {
+            ctx.log("error", `Cannot reach home station to acquire items for ${step.id}`);
+            return false;
+          }
+          have = await ensureItemsInCargo(ctx, step.items);
+          await bot.refreshCargo();
+          have = hasAll();
+          if (!have) {
+            ctx.log("error", `Cannot acquire required items for ${step.id} from home faction storage`);
+            return false;
           }
         }
-        if (!have) {
-          ctx.log("error", `Cannot acquire required items for ${step.id}`);
-          return false;
+
+        // Final verification before leaving home
+        await bot.refreshCargo();
+        for (const it of step.items) {
+          const q = bot.inventory.find(i => i.itemId === it.itemId)?.quantity || 0;
+          if (q < it.quantity) {
+            ctx.log("error", `Item check failed before departure: have ${q}x ${it.itemId}, need ${it.quantity}`);
+            return false;
+          }
         }
+        ctx.log("mission", `Cargo verified: ${step.items.map(it => `${it.quantity}x ${it.itemId}`).join(", ")}`);
+
         // Now navigate to the delivery station
         if (step.station) {
           const targetSystem = await resolveStationSystem(ctx, step);
@@ -996,17 +1105,47 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
             const st = pois.find(p => p.id === poiId && isStationPoi(p));
             if (st) {
               if (bot.poi !== st.id) {
+                ctx.log("travel", `Traveling to ${st.name}...`);
                 const tr = await bot.exec("travel", { target_poi: st.id });
-                if (tr.error && !tr.error.message.includes("already")) ctx.log("error", `Travel failed: ${tr.error.message}`);
+                if (tr.error && !tr.error.message.includes("already")) {
+                  ctx.log("error", `Travel failed: ${tr.error.message}`);
+                  return false;
+                }
                 bot.poi = st.id;
                 await bot.refreshLocation();
               }
               const dr = await bot.exec("dock");
-              if (!dr.error || dr.error.message.includes("already")) bot.docked = true;
+              if (dr.error && !dr.error.message.includes("already")) {
+                ctx.log("error", `Dock at delivery station failed: ${dr.error.message}`);
+                return false;
+              }
+              bot.docked = true;
               await tryRefuel(ctx);
+            } else {
+              ctx.log("error", `Delivery station ${poiId} not found in ${targetSystem}`);
+              return false;
             }
+          } else {
+            ctx.log("error", `Cannot resolve delivery system for ${step.id}`);
+            return false;
           }
         }
+
+        if (!bot.docked) {
+          ctx.log("error", `Not docked at delivery station for ${step.id}`);
+          return false;
+        }
+
+        // Verify items still in cargo before delivering
+        await bot.refreshCargo();
+        for (const it of step.items) {
+          const q = bot.inventory.find(i => i.itemId === it.itemId)?.quantity || 0;
+          if (q < it.quantity) {
+            ctx.log("error", `Items missing at delivery station: have ${q}x ${it.itemId}, need ${it.quantity}`);
+            return false;
+          }
+        }
+
         return await deliverItems(ctx, step.items);
       }
       return true;

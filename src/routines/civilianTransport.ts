@@ -674,6 +674,8 @@ interface IsolatedRouteStep {
   degree: number | null;
   station: string;
   dock: boolean;
+  pickup: boolean;
+  waitForPassengers: boolean;
 }
 
 type CivilianTransportMode = "normal" | "lounge_transport" | "achievement" | "isolated_transport";
@@ -759,6 +761,8 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
         degree: Number((botOverrides.isolatedDegree as number) ?? (t.isolatedDegree as number) ?? 0) || null,
         station: (botOverrides.isolatedStation as string) || (t.isolatedStation as string) || "",
         dock: (botOverrides.isolatedDockAtStation as boolean) ?? (t.isolatedDockAtStation as boolean) ?? false,
+        pickup: true,
+        waitForPassengers: false,
       }] : []),
     isolatedSystem: (botOverrides.isolatedSystem as string) || (t.isolatedSystem as string) || "",
     isolatedDegree: Number((botOverrides.isolatedDegree as number) ?? (t.isolatedDegree as number) ?? 0),
@@ -2228,6 +2232,7 @@ function hasUndeliveredLoungeCandidates(botUsername: string): boolean {
 // ── Main routine ─────────────────────────────────────────────
 
 async function executeIsolatedRoute(ctx: RoutineContext, bot: Bot, settings: CivilianTransportSettings, route: IsolatedRouteStep[]): Promise<boolean> {
+  const hasPickup = route.some((s) => s.pickup);
   for (const step of route) {
     if (step.system && (!bot.system || bot.system.toLowerCase() !== step.system.toLowerCase())) {
       ctx.log("transport", `Isolated route: navigating to system ${step.system}...`);
@@ -2246,8 +2251,30 @@ async function executeIsolatedRoute(ctx: RoutineContext, bot: Bot, settings: Civ
         await bot.refreshStatus(true);
       }
       await ensureDocked(ctx);
+      if (step.waitForPassengers) {
+        while (bot.state === "running") {
+          const lookup = await fetchStationPassengers(ctx, bot.system || "", bot.poi || "");
+          if (lookup && lookup.count > 0) break;
+          ctx.log("transport", `Isolated route: no passengers at ${bot.poi}, waiting 60s...`);
+          await ctx.sleep(60000);
+        }
+      }
+      if (step.pickup || !hasPickup) {
+        return true;
+      }
     } else if (step.dock) {
       await ensureDocked(ctx);
+      if (step.waitForPassengers) {
+        while (bot.state === "running") {
+          const lookup = await fetchStationPassengers(ctx, bot.system || "", bot.poi || "");
+          if (lookup && lookup.count > 0) break;
+          ctx.log("transport", `Isolated route: no passengers at ${bot.poi}, waiting 60s...`);
+          await ctx.sleep(60000);
+        }
+      }
+      if (step.pickup || !hasPickup) {
+        return true;
+      }
     }
     if (step.degree !== null && step.degree !== undefined) {
       const originPos = mapStore.getSystem(bot.system)?.position;
@@ -2263,8 +2290,18 @@ async function executeIsolatedRoute(ctx: RoutineContext, bot: Bot, settings: Civ
 
 async function executeIsolatedReturn(ctx: RoutineContext, bot: Bot, settings: CivilianTransportSettings): Promise<boolean> {
   const route = settings.isolatedRoute || [];
-  const jumps = route.filter((s) => s.degree !== null && s.degree !== undefined).reverse();
-  for (const j of jumps) {
+  const jumps: IsolatedRouteStep[] = [];
+  for (const s of route) {
+    if (s.station || s.dock) break;
+    if (s.degree !== null && s.degree !== undefined) jumps.push(s);
+  }
+  // If no break occurred (no dock step), include all degree steps
+  if (jumps.length === 0) {
+    for (const s of route) {
+      if (s.degree !== null && s.degree !== undefined) jumps.push(s);
+    }
+  }
+  for (const j of jumps.reverse()) {
     const originPos = mapStore.getSystem(bot.system)?.position;
     const bearing = (j.degree as number) + 180;
     ctx.log("transport", `Isolated return: pathfinder jump at ${bearing}° from ${bot.system}...`);

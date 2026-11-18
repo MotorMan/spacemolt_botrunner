@@ -1077,31 +1077,33 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check the specific error
       if (acceptResult.error?.includes("already completed")) {
         ctx.log("mission", `Verified ${stepId}: already completed (server confirmed)`);
-      } else if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available")) {
-        // Wrong station - but we already verified we're at the right station
-        // This could mean the mission was completed and is no longer available
+      } else if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
+        // "This mission is only available at X" or "not available at this station" 
+        // means we're at the WRONG STATION, NOT that it's completed!
+        // User confirmed: this error = NOT completed, WRONG STATION
+        ctx.log("mission", `Verification found ${stepId} was NOT completed (wrong station: ${acceptResult.error}), re-adding to queue`);
+        completedSteps.delete(stepId);
+        saveProgress(bot.username, chainName, completedSteps);
+      } else if (acceptResult.error?.includes("not available")) {
+        // Generic "not available" - could be various reasons, check active missions
         await ctx.sleep(1000);
         const activeMissions = await getActiveMissions(ctx);
         const stillNotActive = !activeMissions.some(m => m.id === stepId);
         if (stillNotActive) {
-          ctx.log("mission", `Verified ${stepId}: accept failed (not available) but not in active missions, likely already completed`);
+          // Not in active missions, but we can't be sure why - don't assume completed
+          ctx.log("mission", `Verification unclear for ${stepId}: accept failed (${acceptResult.error}) and not in active missions. Assuming NOT completed for safety.`);
+          completedSteps.delete(stepId);
+          saveProgress(bot.username, chainName, completedSteps);
         } else {
           ctx.log("mission", `Verification found ${stepId} was NOT completed, re-adding to queue`);
           completedSteps.delete(stepId);
           saveProgress(bot.username, chainName, completedSteps);
         }
       } else {
-        // Some other error - check active missions
-        await ctx.sleep(1000);
-        const activeMissions = await getActiveMissions(ctx);
-        const stillNotActive = !activeMissions.some(m => m.id === stepId);
-        if (stillNotActive) {
-          ctx.log("mission", `Verified ${stepId}: accept failed (${acceptResult.error}) but not in active missions, likely already completed`);
-        } else {
-          ctx.log("mission", `Verification found ${stepId} was NOT completed, re-adding to queue`);
-          completedSteps.delete(stepId);
-          saveProgress(bot.username, chainName, completedSteps);
-        }
+        // Some other error - don't assume completed
+        ctx.log("mission", `Verification found ${stepId} was NOT completed (error: ${acceptResult.error}), re-adding to queue`);
+        completedSteps.delete(stepId);
+        saveProgress(bot.username, chainName, completedSteps);
       }
     } else {
       // Mission was accepted - it wasn't completed, so remove from completed
@@ -1170,7 +1172,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       if (!hasMission) {
         const acceptResult = await acceptMission(ctx, nextStep.id);
         if (!acceptResult.success) {
-          // Check if error was "already completed" - if so, mark as done and continue
+          // Only mark as done if server explicitly says "already completed"
           if (acceptResult.error?.includes("already completed")) {
             ctx.log("mission", `Mission ${nextStep.id} already completed (server confirmed), marking step as done`);
             completedSteps.add(nextStep.id);
@@ -1178,17 +1180,14 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
             await ctx.sleep(2000);
             continue;
           }
-          // Other error - check active missions again
-          await ctx.sleep(1000);
-          const recheckMissions = await getActiveMissions(ctx);
-          const stillNotActive = !recheckMissions.some(m => m.id === nextStep.id);
-          if (stillNotActive) {
-            ctx.log("mission", `Mission ${nextStep.id} not accepted (${acceptResult.error}) but not in active missions, marking step as done`);
-            completedSteps.add(nextStep.id);
-            saveProgress(bot.username, chainName, completedSteps);
-            await ctx.sleep(2000);
-            continue;
+          // "only available at X" or "not available at this station" = wrong station, NOT completed
+          if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
+            ctx.log("error", `Mission ${nextStep.id} not available here (${acceptResult.error}) — we're at the wrong station! Stopping.`);
+            return; // Stop the routine
           }
+          // Other errors - don't assume completed, stop for investigation
+          ctx.log("error", `Mission ${nextStep.id} accept failed: ${acceptResult.error} — stopping for investigation`);
+          return;
         }
         await ctx.sleep(2000);
       }

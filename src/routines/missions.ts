@@ -1837,8 +1837,18 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
      ctx.log("mission", `Executing step: ${nextStep.name} (${nextStep.id})`);
 
-    // For dock-type steps with a mission ID, accept the mission (handling accept-station mismatches)
-    if (autoAccept && (nextStep.type === "dock" || nextStep.type === "deliver") && nextStep.id) {
+     // For dock-type steps with a mission ID, accept the mission (handling accept-station mismatches)
+     // Ensure docked first so accept can be attempted; never travel to the destination while undocked.
+     if (!bot.docked) {
+       ctx.log("mission", "Not docked — docking before accept attempt...");
+       const d = await ensureDocked(ctx);
+       if (!d) {
+         ctx.log("error", "Could not dock — stopping routine");
+         return;
+       }
+       await bot.refreshLocation();
+     }
+     if (autoAccept && (nextStep.type === "dock" || nextStep.type === "deliver" || nextStep.type === "goto") && nextStep.id) {
       const activeMissions = await getActiveMissions(ctx);
       const hasMission = activeMissions.some(m => missionMatchesStep(m, nextStep));
 
@@ -1960,6 +1970,17 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       } else if (nextStep.isMission === false) {
         ctx.log("mission", `Step ${nextStep.id} is a sub-requirement (not a mission), skipping accept`);
         recordStepResult(bot.username, chainName, nextStep, null, "skipped", "Sub-requirement (not an accept-able mission)");
+      }
+    }
+
+    // Hard guard: never execute a mission step unless the mission is active (or was
+    // just accepted). Sub-requirements (isMission === false) are exempt.
+    if (nextStep.isMission !== false) {
+      const nowMissions = await getActiveMissions(ctx);
+      const isActive = nowMissions.some(m => missionMatchesStep(m, nextStep));
+      if (!isActive) {
+        ctx.log("error", `Mission ${nextStep.id} is not active and could not be accepted — stopping to avoid wasted travel.`);
+        return;
       }
     }
 

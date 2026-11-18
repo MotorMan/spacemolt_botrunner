@@ -1147,8 +1147,12 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     
     // Skip if already verified as completed
     if (completedSteps.has(step.id)) {
-      // Non-mission steps (sub-requirements) are not accept-able; just skip
+      // Sub-requirements are not accept-able; ensure completed if parent done
       if (step.isMission === false) {
+        if (!completedSteps.has(step.id)) {
+          const parentsDone = !step.completeAfter || step.completeAfter.every(id => completedSteps.has(id));
+          if (parentsDone) completedSteps.add(step.id);
+        }
         await ctx.sleep(200);
         continue;
       }
@@ -1199,10 +1203,19 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
     
-    // Non-mission steps (sub-requirements) are not accept-able; just proceed to execute
+    // Sub-requirement steps: skip accept; auto-complete if parent mission done
     if (step.isMission === false) {
+      const parentsDone = !step.completeAfter || step.completeAfter.every(id => completedSteps.has(id));
+      if (parentsDone) {
+        completedSteps.add(step.id);
+        saveProgress(bot.username, chainName, completedSteps);
+        ctx.log("mission", `Sub-requirement ${step.id} skipped (parent mission completed)`);
+        await ctx.sleep(200);
+        continue;
+      }
+      // Parent mission still in progress - this is our next objective
       firstIncompleteIndex = i;
-      ctx.log("mission", `Step ${step.id} is a sub-requirement (not a mission), proceeding`);
+      ctx.log("mission", `Sub-requirement ${step.id} is next objective of in-progress mission`);
       break;
     }
     
@@ -1297,36 +1310,55 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
     ctx.log("mission", `Executing step: ${nextStep.name} (${nextStep.id})`);
 
-    // For dock-type steps with a mission ID, we need to be at the right station
+    // For dock-type steps with a mission ID, accept the mission (handling accept-station mismatches)
     if (autoAccept && nextStep.type === "dock" && nextStep.id) {
-      // First, ensure we're at the correct station for this mission
-      if (nextStep.station) {
-        // Check if already at the correct station (resolving mobile station system)
-        const targetSystem = await resolveStationSystem(ctx, nextStep);
-        // Determine the POI ID to use (for mobile stations, use mobileStationPoiId)
-        const poiId = nextStep.isMobileStation && nextStep.mobileStationPoiId 
-          ? nextStep.mobileStationPoiId 
-          : nextStep.station;
-        const atCorrectStation = targetSystem && 
-                                bot.system?.toLowerCase() === targetSystem.toLowerCase() && 
-                                bot.poi === poiId && bot.docked;
-        
-        if (!atCorrectStation) {
-          ctx.log("mission", `Navigating to ${poiId} for mission ${nextStep.id}...`);
-          const docked = await navigateToStation(ctx, nextStep);
-          if (!docked) {
-            ctx.log("error", `Failed to dock at ${poiId} for mission ${nextStep.id} — stopping routine for investigation. Fix the issue and restart to resume from this step.`);
-            return; // Stop the routine instead of retrying
-          }
-        }
-      }
-
-      // Now try to accept the mission
       const activeMissions = await getActiveMissions(ctx);
       const hasMission = activeMissions.some(m => missionMatchesStep(m, nextStep));
-      
-      if (!hasMission && nextStep.isMission !== false) {
-        const acceptResult = await acceptMission(ctx, nextStep.id);
+
+      if (nextStep.isMission !== false && !hasMission) {
+        // Try accept at current location first
+        let acceptResult = await acceptMission(ctx, nextStep.id);
+
+        // If the mission is only available at a different station, travel there and accept
+        if (!acceptResult.success && (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station"))) {
+          const m = acceptResult.error?.match(/available at (.+?)(?:\.|$)/i);
+          const stationName = m ? m[1].trim() : null;
+          if (stationName) {
+            ctx.log("mission", `Mission ${nextStep.id} only available at ${stationName}; traveling there to accept...`);
+            // Resolve station id from display name (normalize spaces -> underscores)
+            let ident = mapStore.resolveStationIdentity(stationName);
+            if (!ident.matched) {
+              ident = mapStore.resolveStationIdentity(stationName.toLowerCase().replace(/\s+/g, "_"));
+            }
+            let sysId = ident.systemId;
+            let poiId = ident.poiId || ident.poiName || null;
+            // Mobile capital (frontier station) handling
+            if (!sysId && (stationName.toLowerCase().includes("frontier") || (poiId && poiId.toLowerCase().includes("frontier")))) {
+              sysId = getMobileCapitolSystem();
+              poiId = poiId || "frontier_station";
+            }
+            if (sysId && poiId) {
+              const navigated = await navigateToSystem(ctx, sysId);
+              if (navigated) {
+                const { pois } = await getSystemInfo(ctx);
+                const station = pois.find(p => isStationPoi(p) && (p.id === poiId || p.name?.toLowerCase() === stationName.toLowerCase()));
+                if (station) {
+                  if (bot.poi !== station.id) {
+                    const tr = await bot.exec("travel", { target_poi: station.id });
+                    if (tr.error && !tr.error.message.includes("already")) ctx.log("error", `Travel failed: ${tr.error.message}`);
+                    bot.poi = station.id;
+                    await bot.refreshLocation();
+                  }
+                  const dr = await bot.exec("dock");
+                  if (!dr.error || dr.error.message.includes("already")) bot.docked = true;
+                  await tryRefuel(ctx);
+                }
+                acceptResult = await acceptMission(ctx, nextStep.id);
+              }
+            }
+          }
+        }
+
         if (!acceptResult.success) {
           // Only mark as done if server explicitly says "already completed"
           if (acceptResult.error?.includes("already completed")) {
@@ -1339,22 +1371,21 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           // Mission already active but not in our check? Re-check
           if (acceptResult.error?.includes("already have an active")) {
             const recheckMissions = await getActiveMissions(ctx);
-             const recheckHasMission = recheckMissions.some(m => missionMatchesStep(m, nextStep));
-             if (recheckHasMission) {
-               ctx.log("mission", `Mission ${nextStep.id} already active (confirmed), proceeding`);
-             } else {
-               ctx.log("mission", `Mission ${nextStep.id} reported already active by server; proceeding`);
-             }
+            const recheckHasMission = recheckMissions.some(m => missionMatchesStep(m, nextStep));
+            if (recheckHasMission) {
+              ctx.log("mission", `Mission ${nextStep.id} already active (confirmed), proceeding`);
+            } else {
+              ctx.log("mission", `Mission ${nextStep.id} reported already active by server; proceeding`);
+            }
           } else if (acceptResult.error?.includes("not found") || acceptResult.error?.includes("mission_not_found")) {
             // Sub-requirement step, not an accept-able mission; proceed to execute
             ctx.log("mission", `Step ${nextStep.id} is not an accept-able mission (sub-requirement), proceeding`);
+          } else if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
+            // Could not resolve accept station; stop for investigation
+            ctx.log("error", `Mission ${nextStep.id} not available here (${acceptResult.error}) — stopping.`);
+            return;
           } else {
-            // "only available at X" or "not available at this station" = wrong station, NOT completed
-            if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
-              ctx.log("error", `Mission ${nextStep.id} not available here (${acceptResult.error}) — we're at the wrong station! Stopping.`);
-              return; // Stop the routine
-            }
-            // Other errors - don't assume completed, stop for investigation
+            // Other errors - stop for investigation
             ctx.log("error", `Mission ${nextStep.id} accept failed: ${acceptResult.error} — stopping for investigation`);
             return;
           }

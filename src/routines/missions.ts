@@ -962,6 +962,35 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
   const settings = getMissionSettings(bot);
   const disablePathfinder = settings.disablePathfinderJumps === true;
   const minFuelPct = (settings.minFuelForPathfinder as number) ?? 80;
+
+  // Ensure any incomplete visit_system objectives of the active mission are
+  // satisfied before executing this step.
+  try {
+    const activeMissions = await getActiveMissions(ctx);
+    const mission = activeMissions.find(m => missionMatchesStep(m, step)) || activeMissions.find(m => {
+      const objs = (m.objectives as Array<Record<string, unknown>>) || [];
+      return objs.some(o => {
+        const tb = String(o.target_base || o.target_base_id || "").toLowerCase();
+        const ts = String(step.station || "").toLowerCase();
+        const sid = String(o.system_id || "").toLowerCase();
+        const ss = String(step.system || "").toLowerCase();
+        if (o.type === "visit_system") return sid !== "" && sid === ss;
+        return ts !== "" && (tb === ts || tb.includes(ts) || ts.includes(tb));
+      });
+    });
+    if (mission) {
+      const objs = (mission.objectives as Array<Record<string, unknown>>) || [];
+      const incompleteVisits = objs.filter(o => o.type === "visit_system" && o.completed !== true && o.system_id);
+      for (const vo of incompleteVisits) {
+        const sid = String(vo.system_id);
+        ctx.log("mission", `Visiting incomplete objective system: ${sid}...`);
+        await navigateToSystem(ctx, sid);
+        await ctx.sleep(1500);
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
   
   switch (step.type) {
     case "accept": {
@@ -2068,7 +2097,9 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           return !!targetStation && (tb === ts || tb === ss || tb.includes(ts) || ts.includes(tb) || tb.includes(ss) || ss.includes(tb));
         });
         if (matchingObj) {
-          stepDone = matchingObj.completed === true || (matchingObj.current !== undefined && matchingObj.current === matchingObj.required);
+          // Only consider the step done when ALL objectives of the mission are complete.
+          // A dock step whose matching objective is done but others remain must retry.
+          stepDone = allComplete;
         } else if (!allComplete) {
           // If the step's objective is a visit_system (no dock required), consider
           // it done since navigation to the system succeeded.

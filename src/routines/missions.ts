@@ -33,6 +33,7 @@ interface MissionStep {
   completeAfter?: string[];
   isMobileStation?: boolean;
   mobileStationId?: string;
+  mobileStationPoiId?: string;
 }
 
 interface MissionChain {
@@ -53,6 +54,7 @@ const MISSION_CHAINS: MissionChain[] = [
         station: "frontier_station",
         isMobileStation: true,
         mobileStationId: "frontier_station",
+        mobileStationPoiId: "mobile_capital",
       },
       {
         id: "the_expeditionary_mandate",
@@ -480,9 +482,14 @@ async function navigateToStation(ctx: RoutineContext, step: MissionStep): Promis
     return false;
   }
   
+  // Determine the POI ID to use (for mobile stations, use mobileStationPoiId)
+  const poiId = step.isMobileStation && step.mobileStationPoiId 
+    ? step.mobileStationPoiId 
+    : step.station;
+  
   // Check if already at the correct station
   if (bot.system?.toLowerCase() === targetSystem.toLowerCase() && 
-      bot.poi === step.station && bot.docked) {
+      bot.poi === poiId && bot.docked) {
     return true;
   }
   
@@ -492,9 +499,9 @@ async function navigateToStation(ctx: RoutineContext, step: MissionStep): Promis
   
   // Find and travel to the station
   const { pois } = await getSystemInfo(ctx);
-  const station = pois.find(p => p.id === step.station && isStationPoi(p));
+  const station = pois.find(p => p.id === poiId && isStationPoi(p));
   if (!station) {
-    ctx.log("error", `Station ${step.station} not found in ${targetSystem}`);
+    ctx.log("error", `Station ${poiId} not found in ${targetSystem}`);
     return false;
   }
   
@@ -1061,13 +1068,18 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     const step = chain.steps.find(s => s.id === stepId);
     if (!step || step.type !== "dock" || !step.station) continue;
     
+    // Determine the POI ID to use (for mobile stations, use mobileStationPoiId)
+    const poiId = step.isMobileStation && step.mobileStationPoiId 
+      ? step.mobileStationPoiId 
+      : step.station;
+    
     // Navigate to the mission's station
     const targetSystem = await resolveStationSystem(ctx, step);
     if (!targetSystem) continue;
     
     if (bot.system?.toLowerCase() !== targetSystem.toLowerCase() || 
-        bot.poi !== step.station || !bot.docked) {
-      ctx.log("mission", `Verifying ${stepId}: navigating to ${step.station}...`);
+        bot.poi !== poiId || !bot.docked) {
+      ctx.log("mission", `Verifying ${stepId}: navigating to ${poiId}...`);
       const docked = await navigateToStation(ctx, step);
       if (!docked) continue;
     }
@@ -1152,15 +1164,19 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       if (nextStep.station) {
         // Check if already at the correct station (resolving mobile station system)
         const targetSystem = await resolveStationSystem(ctx, nextStep);
+        // Determine the POI ID to use (for mobile stations, use mobileStationPoiId)
+        const poiId = nextStep.isMobileStation && nextStep.mobileStationPoiId 
+          ? nextStep.mobileStationPoiId 
+          : nextStep.station;
         const atCorrectStation = targetSystem && 
                                 bot.system?.toLowerCase() === targetSystem.toLowerCase() && 
-                                bot.poi === nextStep.station && bot.docked;
+                                bot.poi === poiId && bot.docked;
         
         if (!atCorrectStation) {
-          ctx.log("mission", `Navigating to ${nextStep.station} for mission ${nextStep.id}...`);
+          ctx.log("mission", `Navigating to ${poiId} for mission ${nextStep.id}...`);
           const docked = await navigateToStation(ctx, nextStep);
           if (!docked) {
-            ctx.log("error", `Failed to dock at ${nextStep.station} for mission ${nextStep.id} — stopping routine for investigation. Fix the issue and restart to resume from this step.`);
+            ctx.log("error", `Failed to dock at ${poiId} for mission ${nextStep.id} — stopping routine for investigation. Fix the issue and restart to resume from this step.`);
             return; // Stop the routine instead of retrying
           }
         }

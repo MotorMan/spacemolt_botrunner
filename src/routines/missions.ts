@@ -1845,6 +1845,30 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
        saveProgress(bot.username, chainName, completedSteps, chain);
      }
 
+     // Mark any step as completed if its corresponding objective is already done
+     // in any active mission, regardless of position detection.
+     const allActiveForCompletion = await getActiveMissions(ctx);
+     for (const st of chain.steps) {
+       if (!st.id) continue;
+       if (completedSteps.has(st.id)) continue;
+       for (const m of allActiveForCompletion) {
+         const objs = (m.objectives as Array<Record<string, unknown>>) || [];
+         const matchingObj = objs.find(o => {
+           const tb = String(o.target_base || o.target_base_id || "").toLowerCase();
+           const ts = String(st.station || "").toLowerCase();
+           const sid = String(o.system_id || "").toLowerCase();
+           const ss = String(st.system || "").toLowerCase();
+           if (o.type === "visit_system") return sid !== "" && sid === ss;
+           return ts !== "" && (tb === ts || tb.includes(ts) || ts.includes(tb));
+         });
+         if (matchingObj && (matchingObj.completed === true || (matchingObj.current !== undefined && matchingObj.current === matchingObj.required))) {
+           completedSteps.add(st.id);
+           break;
+         }
+       }
+     }
+     saveProgress(bot.username, chainName, completedSteps, chain);
+
      // If any active mission has incomplete visit_system objectives, visit those
      // systems first instead of advancing to the next chain step.
      const activeForVisits = await getActiveMissions(ctx);
@@ -1949,29 +1973,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           if (acceptResult.error?.includes("already completed")) {
             ctx.log("mission", `Mission ${nextStep.id} already completed (server confirmed), marking step as done`);
             completedSteps.add(nextStep.id);
-     // Additionally, mark any step as completed if its corresponding objective is
-     // already done in any active mission, regardless of position detection.
-     const allActive = await getActiveMissions(ctx);
-     for (const st of chain.steps) {
-       if (!st.id) continue;
-       if (completedSteps.has(st.id)) continue;
-       for (const m of allActive) {
-         const objs = (m.objectives as Array<Record<string, unknown>>) || [];
-         const matchingObj = objs.find(o => {
-           const tb = String(o.target_base || o.target_base_id || "").toLowerCase();
-           const ts = String(st.station || "").toLowerCase();
-           const sid = String(o.system_id || "").toLowerCase();
-           const ss = String(st.system || "").toLowerCase();
-           if (o.type === "visit_system") return sid !== "" && sid === ss;
-           return ts !== "" && (tb === ts || tb.includes(ts) || ts.includes(tb));
-         });
-         if (matchingObj && (matchingObj.completed === true || (matchingObj.current !== undefined && matchingObj.current === matchingObj.required))) {
-           completedSteps.add(st.id);
-           break;
-         }
-       }
-     }
-     saveProgress(bot.username, chainName, completedSteps, chain);
+            saveProgress(bot.username, chainName, completedSteps, chain);
             recordStepResult(bot.username, chainName, nextStep, null, "completed", "Accept returned already completed");
             await ctx.sleep(2000);
             continue;

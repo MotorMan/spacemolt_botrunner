@@ -1725,6 +1725,21 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
    while (bot.state === "running") {
+     // Complete any missions that are already fully done before picking the next step
+     const readyMissions = await getActiveMissions(ctx);
+     for (const m of readyMissions) {
+       const objs = (m.objectives as Array<Record<string, unknown>>) || [];
+       const allDone = objs.length > 0 && objs.every(o => o.completed === true || (o.current !== undefined && o.current === o.required) || (o.progress !== undefined && o.progress === o.quantity));
+       if (allDone) {
+         const missionId = (m as { uuid?: string; mission_id?: string; id?: string }).uuid || (m as { mission_id?: string }).mission_id || (m as { id?: string }).id;
+         if (missionId) {
+           ctx.log("mission", `Mission ${(m as { name?: string; title?: string }).title || (m as { name?: string }).name} is complete — turning it in...`);
+           await completeMission(ctx, missionId);
+           await ctx.sleep(1500);
+         }
+       }
+     }
+
      let nextStep = findNextStep(completedSteps, chain);
      if (!nextStep) {
        ctx.log("mission", "All mission steps completed!");
@@ -1857,7 +1872,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       return; // Stop the routine instead of retrying
     }
 
-    if (autoComplete && nextStep.type === "dock" && nextStep.id) {
+    if (autoComplete && (nextStep.type === "dock" || nextStep.type === "deliver") && nextStep.id) {
       await ctx.sleep(2000);
       const activeMissions = await getActiveMissions(ctx);
       // Find the active mission: direct match, or parent mission for sub-requirements

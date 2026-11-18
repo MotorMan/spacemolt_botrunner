@@ -1845,6 +1845,25 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
        saveProgress(bot.username, chainName, completedSteps, chain);
      }
 
+     // If any active mission has incomplete visit_system objectives, visit those
+     // systems first instead of advancing to the next chain step.
+     const activeForVisits = await getActiveMissions(ctx);
+     let visitedAny = false;
+     for (const m of activeForVisits) {
+       const objs = (m.objectives as Array<Record<string, unknown>>) || [];
+       const incompleteVisits = objs.filter(o => o.type === "visit_system" && o.completed !== true && o.system_id);
+       for (const vo of incompleteVisits) {
+         ctx.log("mission", `Incomplete visit objective: ${vo.system_name || vo.system_id}; traveling there to complete it...`);
+         await navigateToSystem(ctx, String(vo.system_id));
+         await ctx.sleep(2000);
+         visitedAny = true;
+       }
+     }
+     if (visitedAny) {
+       // Re-check after travel; loop again to complete the mission / advance
+       continue;
+     }
+
      let nextStep = findNextStep(completedSteps, chain);
      if (!nextStep) {
        ctx.log("mission", "All mission steps completed!");

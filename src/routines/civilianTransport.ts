@@ -26,6 +26,7 @@ import {
   getCargoFuelCells,
 } from "./common.js";
 import { logTransportProfit } from "./transportProfitDebug.js";
+import { executePathfinderJumpToBearing } from "./pathfinder.js";
 import { getEffectiveSystemBlacklist, getStationBlacklist } from "../web/server.js";
 import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
@@ -668,7 +669,7 @@ interface ListPassengersResponse {
   berths_used: { economy: number; business: number; first: number };
 }
 
-type CivilianTransportMode = "normal" | "lounge_transport" | "achievement";
+type CivilianTransportMode = "normal" | "lounge_transport" | "achievement" | "isolated_transport";
 
 interface CivilianTransportSettings {
   maxJumps: number;
@@ -698,6 +699,11 @@ interface CivilianTransportSettings {
   buyFuelCells: boolean;
   minFuelCellsToDepart: number;
   mode: CivilianTransportMode;
+  // Isolated transport settings (pathfinder jump to an isolated station)
+  isolatedSystem: string;
+  isolatedDegree: number;
+  isolatedStation: string;
+  isolatedDockAtStation: boolean;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -736,6 +742,10 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     buyFuelCells: (t.buyFuelCells as boolean) ?? false,
     minFuelCellsToDepart: Number((t.minFuelCellsToDepart as number) ?? 6),
     mode: (botOverrides.mode as CivilianTransportMode) || (t.mode as CivilianTransportMode) || "normal",
+    isolatedSystem: (botOverrides.isolatedSystem as string) || (t.isolatedSystem as string) || "",
+    isolatedDegree: Number((botOverrides.isolatedDegree as number) ?? (t.isolatedDegree as number) ?? 0),
+    isolatedStation: (botOverrides.isolatedStation as string) || (t.isolatedStation as string) || "",
+    isolatedDockAtStation: (botOverrides.isolatedDockAtStation as boolean) ?? (t.isolatedDockAtStation as boolean) ?? false,
   };
 }
 
@@ -2280,6 +2290,9 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
   if (settings.mode === "achievement") {
     ctx.log("transport", `★ ACHIEVEMENT MODE ★ Only picking up civilians ${bot.username} has not delivered yet, to transport every civilian once for this bot.`);
   }
+  if (settings.mode === "isolated_transport") {
+    ctx.log("transport", `★ ISOLATED TRANSPORT MODE ★ Pathfinder jump from ${settings.isolatedSystem} at ${settings.isolatedDegree}° to isolated station; returning passengers to Transit Lounge at home base.`);
+  }
 
   // Enable cloaking if configured and module is available
   if (settings.enableCloak) {
@@ -2532,7 +2545,46 @@ if (state && state.status !== "idle") {
         return;
       }
 
-      // ── Achievement mode: primary source is the home Transit Lounge ──
+       // ── Isolated transport: pathfinder jump from home to the isolated station ──
+       if (settings.mode === "isolated_transport" && isAtHomeBase(ctx, settings) && state.onboardPassengers.length === 0) {
+         const originSystem = settings.isolatedSystem || bot.system || "";
+         if (originSystem && bot.system && bot.system.toLowerCase() !== originSystem.toLowerCase()) {
+           ctx.log("transport", `Isolated transport: navigating to pathfinder origin ${originSystem}...`);
+           const ok = await navigateToSystem(ctx, originSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+           if (!ok) { await ctx.sleep(30000); continue; }
+           await bot.refreshLocation();
+         }
+         // Dock at the configured station in the origin system (if any)
+         if (settings.isolatedStation) {
+           const stId = settings.isolatedStation.includes("|") ? settings.isolatedStation.split("|")[1] : settings.isolatedStation;
+           if (bot.poi && bot.poi.toLowerCase() !== stId.toLowerCase()) {
+             const tr = await bot.exec("travel", { target_poi: stId });
+             if (tr.error) {
+               ctx.log("transport", `Isolated transport: travel to origin station failed: ${tr.error.message}`);
+               await ctx.sleep(30000); continue;
+             }
+             await bot.refreshStatus(true);
+           }
+           await ensureDocked(ctx);
+         } else if (settings.isolatedDockAtStation) {
+           await ensureDocked(ctx);
+         }
+         const originPos = mapStore.getSystem(bot.system)?.position;
+         ctx.log("transport", `Isolated transport: pathfinder jump at ${settings.isolatedDegree}° from ${bot.system}...`);
+         const res = await executePathfinderJumpToBearing(ctx, settings.isolatedDegree ?? 0, originPos ? { x: originPos.x, y: originPos.y } : null);
+         if (!res.success) { await ctx.sleep(30000); continue; }
+         await bot.refreshLocation();
+         // Dock at the first station available in the isolated system
+         await ensureDocked(ctx);
+         state.pickupStation = bot.poi || state.pickupStation;
+         state.pickupSystem = bot.system;
+         state.needsTravel = false;
+         state.roundsWithoutPassengers = 0;
+         state.awayPickupAttempts = 0;
+         saveTransportState(state);
+         await ctx.sleep(2000);
+         continue;
+       }
       // Other CT bots park passengers here. Deliver any not-yet-transported
       // expired lounge passenger first; only fall back to remote station
       // pickup when the lounge has nothing new to deliver.
@@ -2736,8 +2788,18 @@ if (state && state.status !== "idle") {
          if (state.pickupSystem !== bot.system) {
            try { await bot.refreshStatus(true); } catch { /* ignore */ }
            await bot.refreshLocation();
-           if (state.pickupSystem !== bot.system) {
-             const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+            if (state.pickupSystem !== bot.system) {
+              if (settings.mode === "isolated_transport" && bot.system && settings.isolatedSystem && bot.system.toLowerCase() === (settings.homeSystem || "").toLowerCase() && state.pickupSystem && state.pickupSystem.toLowerCase() !== bot.system.toLowerCase()) {
+                const originPos = mapStore.getSystem(bot.system)?.position;
+                const res = await executePathfinderJumpToBearing(ctx, settings.isolatedDegree ?? 0, originPos ? { x: originPos.x, y: originPos.y } : null);
+                if (!res.success) { state.status = "idle"; saveTransportState(state); await ctx.sleep(30000); continue; }
+                await bot.refreshLocation();
+                state.pickupSystem = bot.system;
+                state.pickupStation = bot.poi || state.pickupStation;
+                saveTransportState(state);
+                continue;
+              }
+              const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
              if (!ok) {
                state.status = "idle";
                saveTransportState(state);
@@ -2858,7 +2920,7 @@ if (state && state.status !== "idle") {
           // bound for blacklisted destinations to park them in the Transit Lounge
           // instead of skipping them entirely. Delivery to blacklisted destinations
           // remains blocked by the delivery blacklist check below.
-          if (!(settings.mode === "lounge_transport" && settings.allowParkInLounge)) {
+          if (!(settings.mode === "lounge_transport" || settings.mode === "isolated_transport" && settings.allowParkInLounge)) {
             ctx.log("transport", `Skipping passenger to blacklisted station: ${p.name} -> ${p.destination_name}`);
             skipped.push({ name: p.name, reason: `blacklisted station ${p.destination_name}` });
             continue;
@@ -2987,11 +3049,11 @@ if (state && state.status !== "idle") {
         classOrder.business = 2;
       }
 
-      const loungeFull = settings.mode === "lounge_transport" && passengersLounge.getAvailableSlots() <= 0;
+      const loungeFull = settings.mode === "lounge_transport" || settings.mode === "isolated_transport" && passengersLounge.getAvailableSlots() <= 0;
       if (loungeFull) {
         ctx.log("transport", `Transit Lounge is full (150/150) — doing normal passenger deliveries instead of lounge pickup`);
       }
-      if (settings.mode === "lounge_transport" && !loungeFull) {
+      if (settings.mode === "lounge_transport" || settings.mode === "isolated_transport" && !loungeFull) {
         ctx.log("transport", `Lounge transport mode: loading all ${waiting.length} passengers at ${bot.poi} for transport to Transit Lounge`);
 
         // load_passenger loads by destination station id, so group waiting
@@ -3510,7 +3572,7 @@ if (state && state.status !== "idle") {
       }
 
       // Handle lounge_transport mode: instead of delivering to destinations, return to home base
-      if (settings.mode === "lounge_transport") {
+      if (settings.mode === "lounge_transport" || settings.mode === "isolated_transport") {
          if ((!settings.homeSystem && !systemForStation(settings.homeStation)) || !settings.homeStation) {
           ctx.log("error", "Lounge transport mode requires homeSystem and homeStation to be configured");
           state.status = "idle";
@@ -3560,10 +3622,19 @@ if (state && state.status !== "idle") {
        try { await bot.refreshStatus(true); } catch { /* ignore */ }
        await bot.refreshLocation();
 
-       // Navigate to home system if not there
-       if (bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
-         ctx.log("transport", `Lounge transport: navigating to home system ${homeSystem}`);
-         const ok = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+         // Navigate to home system if not there
+        if (bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
+          if (settings.mode === "isolated_transport" && settings.isolatedSystem && bot.system.toLowerCase() !== settings.isolatedSystem.toLowerCase()) {
+            // isolated island: reverse pathfinder jump back toward origin system
+            const originPos = mapStore.getSystem(bot.system)?.position;
+            ctx.log("transport", `Isolated transport: reverse pathfinder jump (${(settings.isolatedDegree ?? 0) + 180}°) from ${bot.system}...`);
+            const res = await executePathfinderJumpToBearing(ctx, (settings.isolatedDegree ?? 0) + 180, originPos ? { x: originPos.x, y: originPos.y } : null);
+            if (!res.success) { await ctx.sleep(30000); continue; }
+            await bot.refreshLocation();
+            continue;
+          }
+          ctx.log("transport", `Lounge transport: navigating to home system ${homeSystem}`);
+          const ok = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
          if (!ok) {
            ctx.log("transport", `Failed to navigate to home system ${homeSystem}`);
            await ctx.sleep(30000);
@@ -3724,7 +3795,7 @@ if (state && state.status !== "idle") {
     // ── Lounge Delivery ──
     // Deliver expired Transit Lounge passengers to their destinations.
     // (In achievement mode this runs first as the primary source, above.)
-    if (settings.mode === "lounge_transport") {
+    if (settings.mode === "lounge_transport" || settings.mode === "isolated_transport") {
       const loungeActed = await tryDeliverExpiredLoungePassenger(ctx, bot, state, settings, null);
       if (loungeActed) continue;
     }

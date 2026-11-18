@@ -5926,9 +5926,10 @@
            actions += `
          <span class="profile-ore-label" style="margin-left:8px">Mode:</span>
          <select id="profile-civilianTransportMode" onchange="saveProfileCivilianTransportMode()">
-           <option value="normal"${botMode === "normal" ? " selected" : ""}>Normal (deliver to destinations)</option>
-           <option value="lounge_transport"${botMode === "lounge_transport" ? " selected" : ""}>Lounge Transport (drop at Transit Lounge)</option>
-           <option value="achievement"${botMode === "achievement" ? " selected" : ""}>Achievement (transport every civilian once)</option>
+<option value="normal"${botMode === "normal" ? " selected" : ""}>Normal (deliver to destinations)</option>
+<option value="lounge_transport"${botMode === "lounge_transport" ? " selected" : ""}>Lounge Transport (drop at Transit Lounge)</option>
+<option value="achievement"${botMode === "achievement" ? " selected" : ""}>Achievement (transport every civilian once)</option>
+<option value="isolated_transport"${botMode === "isolated_transport" ? " selected" : ""}>Isolated Transport (pathfinder to isolated station)</option>
          </select>
          <label style="display:inline-flex;align-items:center;gap:4px;margin-left:8px;font-size:11px;cursor:pointer">
            <input type="checkbox" id="profile-civilianTransportAllowRepeat" onchange="saveProfileCivilianTransportAllowRepeat()"${botAllowRepeat ? " checked" : ""}>
@@ -38897,10 +38898,24 @@ ignoreBlacklist: document.getElementById(
         stationList.sort((a, b) =>
           (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
         );
-        for (const { val, label, sysName } of stationList) {
-          const sel = val === homeSystem + "|" + homeStation ? " selected" : "";
-          homeStationOpts += `<option value="${esc(val)}"${sel}>${label} (${esc(sysName)})</option>`;
-        }
+         for (const { val, label, sysName } of stationList) {
+           const sel = val === homeSystem + "|" + homeStation ? " selected" : "";
+           homeStationOpts += `<option value="${esc(val)}"${sel}>${label} (${esc(sysName)})</option>`;
+         }
+
+         // Isolated transport options
+         let isolatedSystemOpts = '<option value="">(none)</option>';
+         for (const sysId of Object.keys(mapData).sort()) {
+           const sys = mapData[sysId];
+           const sysName = sys.name || sysId;
+           const sel = sysId === (ct.isolatedSystem || "") ? " selected" : "";
+           isolatedSystemOpts += `<option value="${esc(sysId)}"${sel}>${esc(sysName)} (${esc(sysId)})</option>`;
+         }
+         let isolatedStationOpts = '<option value="">(none)</option>';
+         for (const { val, label, sysName } of stationList) {
+           const sel = val === (ct.isolatedStation || "") ? " selected" : "";
+           isolatedStationOpts += `<option value="${esc(val)}"${sel}>${label} (${esc(sysName)})</option>`;
+         }
 
         panel.innerHTML = `
     <h3>Civilian Transport Settings</h3>
@@ -38960,9 +38975,10 @@ ignoreBlacklist: document.getElementById(
         <div class="setting-hint">Normal: delivers passengers to their destinations. Lounge Transport: picks up passengers and drops them at the faction Transit Lounge at home base. Achievement: only picks up civilians no bot has ever delivered, to transport every civilian once.</div>
       </div>
       <select id="set-civilian_transport-mode">
-        <option value="normal" ${ct.mode === "normal" || !ct.mode ? "selected" : ""}>Normal (deliver to destinations)</option>
-        <option value="lounge_transport" ${ct.mode === "lounge_transport" ? "selected" : ""}>Lounge Transport (drop at Transit Lounge)</option>
-        <option value="achievement" ${ct.mode === "achievement" ? "selected" : ""}>Achievement (transport every civilian once)</option>
+<option value="normal" ${ct.mode === "normal" || !ct.mode ? "selected" : ""}>Normal (deliver to destinations)</option>
+<option value="lounge_transport" ${ct.mode === "lounge_transport" ? "selected" : ""}>Lounge Transport (drop at Transit Lounge)</option>
+<option value="achievement" ${ct.mode === "achievement" ? "selected" : ""}>Achievement (transport every civilian once)</option>
+<option value="isolated_transport" ${ct.mode === "isolated_transport" ? "selected" : ""}>Isolated Transport (pathfinder to isolated station)</option>
       </select>
     </div>
 
@@ -39089,6 +39105,35 @@ ignoreBlacklist: document.getElementById(
       <input type="number" id="set-civilian_transport-minFuelCellsToDepart" min="0" max="200" value="${esc(String(ct.minFuelCellsToDepart ?? 6))}">
     </div>
 
+    <div style="margin-top:18px;padding:10px;border:1px solid #3a5a5a;border-radius:6px;background:#1d2a2a">
+      <div class="setting-label" style="color:#9be7ff">Isolated Transport (pathfinder to isolated station)</div>
+      <div class="setting-desc" style="margin-bottom:8px">Special mode: pathfinder-jumps from a main-network system to an isolated station, picks up all passengers there, and returns them to the faction Transit Lounge at home base. Configure the jump below.</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Origin system (pathfinder jump from)</div>
+          <div class="setting-hint">Main-network system the bot jumps from toward the isolated island.</div>
+        </div>
+        <select id="set-civilian_transport-isolatedSystem">${isolatedSystemOpts}</select>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Pathfinder jump angle (degrees)</div>
+          <div class="setting-hint">Compass bearing (0-360) for the pathfinder jump. Leave 0 if not used.</div>
+        </div>
+        <input type="number" id="set-civilian_transport-isolatedDegree" min="0" max="360" step="0.01" value="${esc(String(ct.isolatedDegree ?? 0))}">
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Origin station (optional)</div>
+          <div class="setting-hint">Station to dock at in the origin system before jumping. Or check "dock at station here".</div>
+        </div>
+        <select id="set-civilian_transport-isolatedStation">${isolatedStationOpts}</select>
+      </div>
+      <div style="margin-top:8px">
+        <label><input type="checkbox" id="set-civilian_transport-isolatedDockAtStation" ${ct.isolatedDockAtStation ? "checked" : ""}> Dock at the station here (origin system)</label>
+      </div>
+    </div>
+
     <div style="margin-top:18px">
       <button class="primary" onclick="saveCivilianTransportSettings()">Save Settings</button>
     </div>
@@ -39183,11 +39228,21 @@ ignoreBlacklist: document.getElementById(
           document.getElementById("set-civilian_transport-minFuelCellsToDepart")
             ?.value || 6,
         );
-         const mode =
-           document.getElementById("set-civilian_transport-mode")?.value || "normal";
-         const allowRepeatPassengers =
-           document.getElementById("set-civilian_transport-allowRepeatPassengers")
-             ?.checked ?? false;
+          const mode =
+            document.getElementById("set-civilian_transport-mode")?.value || "normal";
+          const allowRepeatPassengers =
+            document.getElementById("set-civilian_transport-allowRepeatPassengers")
+              ?.checked ?? false;
+          const isolatedSystem =
+            document.getElementById("set-civilian_transport-isolatedSystem")?.value || "";
+          const isolatedDegree = Number(
+            document.getElementById("set-civilian_transport-isolatedDegree")?.value || 0,
+          );
+          const isolatedStation =
+            document.getElementById("set-civilian_transport-isolatedStation")?.value || "";
+          const isolatedDockAtStation =
+            document.getElementById("set-civilian_transport-isolatedDockAtStation")
+              ?.checked ?? false;
 
 
         const s = {};
@@ -39221,7 +39276,11 @@ ignoreBlacklist: document.getElementById(
         s.buyFuelCells = buyFuelCells;
         s.minFuelCellsToDepart = minFuelCellsToDepart;
          s.mode = mode;
-         s.allowRepeatPassengers = allowRepeatPassengers;
+          s.allowRepeatPassengers = allowRepeatPassengers;
+          s.isolatedSystem = isolatedSystem;
+          s.isolatedDegree = isolatedDegree;
+          s.isolatedStation = isolatedStation;
+          s.isolatedDockAtStation = isolatedDockAtStation;
 
 
         send({

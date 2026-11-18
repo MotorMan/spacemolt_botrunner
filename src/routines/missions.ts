@@ -1010,9 +1010,29 @@ function getProgressFile(botUsername: string): string {
   return join(MISSIONS_PROGRESS_DIR, `${botUsername}.json`);
 }
 
+interface StepProgressDetail {
+  stepId: string;
+  stepName: string;
+  stepDescription?: string;
+  stepType?: string;
+  system?: string;
+  station?: string;
+  status: "completed" | "in_progress" | "skipped" | "failed";
+  completedAt?: number;
+  missionTitle?: string;
+  missionDescription?: string;
+  missionTemplateId?: string;
+  missionUuid?: string;
+  percentComplete?: number;
+  objectives?: Array<{ description?: string; type?: string; completed?: boolean; current?: number; required?: number; targetBase?: string; targetBaseName?: string; systemName?: string }>;
+  notes?: string;
+}
+
 interface MissionProgress {
   chainName: string;
+  chainSteps?: Array<{ id: string; name: string; description: string; type: string; system?: string; station?: string }>;
   completedSteps: string[];
+  stepDetails: Record<string, StepProgressDetail>;
   lastUpdated: number;
 }
 
@@ -1032,15 +1052,66 @@ function loadProgress(botUsername: string, chainName: string): Set<string> {
   return new Set<string>();
 }
 
-function saveProgress(botUsername: string, chainName: string, completedSteps: Set<string>): void {
+function saveProgress(botUsername: string, chainName: string, completedSteps: Set<string>, chain?: MissionChain): void {
   try {
     ensureProgressDir();
     const file = getProgressFile(botUsername);
+    let existing: MissionProgress | null = null;
+    if (existsSync(file)) {
+      try { existing = JSON.parse(readFileSync(file, "utf-8")) as MissionProgress; } catch (e) { existing = null; }
+    }
     const data: MissionProgress = {
       chainName,
+      chainSteps: chain ? chain.steps.map(st => ({ id: st.id, name: st.name, description: st.description, type: st.type, system: st.system, station: st.station })) : (existing?.chainSteps),
       completedSteps: Array.from(completedSteps),
+      stepDetails: existing?.stepDetails || {},
       lastUpdated: Date.now(),
     };
+    writeFileSync(file, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  } catch (e) {
+    // Ignore write errors
+  }
+}
+
+function recordStepResult(botUsername: string, chainName: string, step: MissionStep, mission: { title?: string; description?: string; template_id?: string; mission_id?: string; uuid?: string; percent_complete?: number; objectives?: Array<Record<string, unknown>> } | null, status: "completed" | "in_progress" | "skipped" | "failed", notes?: string): void {
+  try {
+    ensureProgressDir();
+    const file = getProgressFile(botUsername);
+    let data: MissionProgress | null = null;
+    if (existsSync(file)) {
+      try { data = JSON.parse(readFileSync(file, "utf-8")) as MissionProgress; } catch (e) { data = null; }
+    }
+    if (!data || data.chainName !== chainName) {
+      data = { chainName, completedSteps: [], stepDetails: {}, lastUpdated: Date.now() };
+    }
+    if (!data.stepDetails) data.stepDetails = {};
+    data.stepDetails[step.id] = {
+      stepId: step.id,
+      stepName: step.name,
+      stepDescription: step.description,
+      stepType: step.type,
+      system: step.system,
+      station: step.station,
+      status,
+      completedAt: status === "completed" ? Date.now() : undefined,
+      missionTitle: mission?.title,
+      missionDescription: mission?.description,
+      missionTemplateId: mission?.template_id,
+      missionUuid: mission?.mission_id || mission?.uuid,
+      percentComplete: mission?.percent_complete,
+      objectives: (mission?.objectives || []).map(o => ({
+        description: o.description as string,
+        type: o.type as string,
+        completed: o.completed as boolean,
+        current: o.current as number,
+        required: o.required as number,
+        targetBase: (o.target_base || o.target_base_id) as string,
+        targetBaseName: (o.target_base_name) as string,
+        systemName: (o.system_name) as string,
+      })),
+      notes,
+    };
+    data.lastUpdated = Date.now();
     writeFileSync(file, JSON.stringify(data, null, 2) + "\n", "utf-8");
   } catch (e) {
     // Ignore write errors
@@ -1144,6 +1215,22 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("mission", `Mission ${step.id} already active (from get_active_missions), this is our next step`);
       break;
     }
+
+    // Not docked: can't accept missions. Trust saved progress + active missions.
+    if (!bot.docked) {
+      if (step.isMission === false) {
+        const parentsDone = !step.completeAfter || step.completeAfter.every(id => completedSteps.has(id));
+        if (parentsDone) {
+          completedSteps.add(step.id);
+          saveProgress(bot.username, chainName, completedSteps, chain);
+          continue;
+        }
+      }
+      if (completedSteps.has(step.id)) continue;
+      firstIncompleteIndex = i;
+      ctx.log("mission", `Not docked; resuming from step ${step.id} (index ${i})`);
+      break;
+    }
     
     // Skip if already verified as completed
     if (completedSteps.has(step.id)) {
@@ -1161,6 +1248,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       if (!acceptResult.success) {
         if (acceptResult.error?.includes("already completed")) {
           ctx.log("mission", `Verified ${step.id}: already completed (server confirmed)`);
+          recordStepResult(bot.username, chainName, step, null, "completed", "Verified already completed via accept");
           await ctx.sleep(200);
           continue;
         }
@@ -1174,6 +1262,11 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
         }
         if (acceptResult.error?.includes("not found") || acceptResult.error?.includes("mission_not_found")) {
           // Not a real mission (sub-requirement); treat as completed
+          await ctx.sleep(200);
+          continue;
+        }
+        if (acceptResult.error?.includes("not_docked") || acceptResult.error?.includes("not docked")) {
+          // Not docked; can't verify. Trust progress.
           await ctx.sleep(200);
           continue;
         }
@@ -1210,6 +1303,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
         completedSteps.add(step.id);
         saveProgress(bot.username, chainName, completedSteps);
         ctx.log("mission", `Sub-requirement ${step.id} skipped (parent mission completed)`);
+        recordStepResult(bot.username, chainName, step, null, "skipped", "Parent mission completed");
         await ctx.sleep(200);
         continue;
       }
@@ -1242,6 +1336,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("mission", `Already completed: ${step.id}, moving to next`);
       completedSteps.add(step.id);
       saveProgress(bot.username, chainName, completedSteps);
+      recordStepResult(bot.username, chainName, step, null, "completed", "Accept returned already completed");
       await ctx.sleep(200);
       continue;
     }
@@ -1268,6 +1363,12 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       break;
     }
     
+    if (acceptResult.error?.includes("not_docked") || acceptResult.error?.includes("not docked")) {
+      firstIncompleteIndex = i;
+      ctx.log("mission", `Not docked; resuming from step ${step.id}`);
+      break;
+    }
+
     // Other error - stop for investigation
     ctx.log("error", `Mission ${step.id} accept failed: ${acceptResult.error} — stopping for investigation`);
     return;
@@ -1365,7 +1466,8 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           if (acceptResult.error?.includes("already completed")) {
             ctx.log("mission", `Mission ${nextStep.id} already completed (server confirmed), marking step as done`);
             completedSteps.add(nextStep.id);
-            saveProgress(bot.username, chainName, completedSteps);
+            saveProgress(bot.username, chainName, completedSteps, chain);
+            recordStepResult(bot.username, chainName, nextStep, null, "completed", "Accept returned already completed");
             await ctx.sleep(2000);
             continue;
           }
@@ -1404,6 +1506,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
         await ctx.sleep(2000);
       } else if (nextStep.isMission === false) {
         ctx.log("mission", `Step ${nextStep.id} is a sub-requirement (not a mission), skipping accept`);
+        recordStepResult(bot.username, chainName, nextStep, null, "skipped", "Sub-requirement (not an accept-able mission)");
       }
     }
 
@@ -1466,9 +1569,11 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (stepDone) {
       completedSteps.add(nextStep.id);
-      saveProgress(bot.username, chainName, completedSteps);
+      saveProgress(bot.username, chainName, completedSteps, chain);
+      recordStepResult(bot.username, chainName, nextStep, mission as any, "completed");
       ctx.log("mission", `Step ${nextStep.id} completed (${completedSteps.size}/${chain.steps.length})`);
     } else {
+      recordStepResult(bot.username, chainName, nextStep, mission as any, "failed", "Objective not confirmed complete after docking");
       ctx.log("error", `Step ${nextStep.id} objective not confirmed complete after docking — stopping for investigation`);
       return;
     }

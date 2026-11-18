@@ -624,20 +624,52 @@ async function completeMission(ctx: RoutineContext, missionId: string): Promise<
   return true;
 }
 
-async function getActiveMissions(ctx: RoutineContext): Promise<Array<{ id: string; objectives: unknown[] }>> {
+async function getActiveMissions(ctx: RoutineContext): Promise<Array<{ id: string; uuid: string; name: string; templateId: string; objectives: unknown[] }>> {
   const { bot } = ctx;
   const resp = await bot.exec("get_active_missions");
   if (resp.error || !resp.result) return [];
   const result = resp.result as Record<string, unknown>;
-  // API can return array directly or object with missions property
-  const missions = (
-    Array.isArray(result) ? result :
-    Array.isArray(result.missions) ? result.missions : []
-  ) as Array<Record<string, unknown>>;
-  return missions.map(m => ({
-    id: (m.mission_id as string) || (m.id as string) || "",
-    objectives: (m.objectives as unknown[]) || [],
-  }));
+  // API can return various shapes: { missions: { active: [...] } }, { missions: [...] }, [...], etc.
+  let raw: Array<Record<string, unknown>> = [];
+  if (Array.isArray(result)) {
+    raw = result as Array<Record<string, unknown>>;
+  } else if (result.missions && typeof result.missions === "object" && !Array.isArray(result.missions)) {
+    const m = result.missions as Record<string, unknown>;
+    if (Array.isArray(m.active)) raw = m.active as Array<Record<string, unknown>>;
+    else if (Array.isArray(m.missions)) raw = m.missions as Array<Record<string, unknown>>;
+    else if (Array.isArray(m)) raw = m as unknown as Array<Record<string, unknown>>;
+    else if (m.mission_id || m.id || m.mission_template_id || m.title || m.name) raw = [m];
+  } else if (Array.isArray(result.missions)) {
+    raw = result.missions as Array<Record<string, unknown>>;
+  } else if (Array.isArray(result.active)) {
+    raw = result.active as Array<Record<string, unknown>>;
+  } else if (result.mission_id || result.id || result.mission_template_id || result.title || result.name) {
+    raw = [result];
+  }
+  if (raw.length === 0 && (result.mission_id || result.id || result.mission_template_id || result.title || result.name)) {
+    raw = [result];
+  }
+  return raw.map(m => {
+    const templateId = (m.mission_template_id as string) || "";
+    const title = (m.title as string) || (m.name as string) || "";
+    const uuid = (m.mission_id as string) || (m.id as string) || "";
+    // Best key for matching chain steps: prefer template id, then title/name, then uuid
+    const id = templateId || title || uuid;
+    return {
+      id,
+      uuid,
+      name: title,
+      templateId,
+      objectives: (m.objectives as unknown[]) || [],
+    };
+  });
+}
+
+function missionMatchesStep(m: { id?: string; name?: string; templateId?: string }, step: { id?: string; name?: string }): boolean {
+  const norm = (v: unknown) => String(v ?? "").toLowerCase().replace(/\s+/g, "_").trim();
+  const mVals = [m.id, m.templateId, m.name].filter(Boolean).map(norm);
+  const sVals = [step.id, step.name].filter(Boolean).map(norm);
+  return mVals.some(mv => mv !== "" && sVals.includes(mv));
 }
 
 async function ensureItemsInCargo(ctx: RoutineContext, items: Array<{ itemId: string; quantity: number }>): Promise<boolean> {
@@ -1002,7 +1034,6 @@ async function detectChainPositionFromGameState(ctx: RoutineContext, chain: Miss
   
   // Get all active missions from the game
   const activeMissions = await getActiveMissions(ctx);
-  const activeMissionIds = new Set(activeMissions.map(m => m.id));
   
   // ONLY verify completion for missions that are currently active
   // If a mission is active AND its objectives are complete, it's done
@@ -1014,8 +1045,8 @@ async function detectChainPositionFromGameState(ctx: RoutineContext, chain: Miss
     if (completed.has(step.id)) continue;
     
     // If mission is currently active, check if objectives are complete
-    if (activeMissionIds.has(step.id)) {
-      const activeMission = activeMissions.find(m => m.id === step.id);
+    const activeMission = activeMissions.find(m => missionMatchesStep(m, step));
+    if (activeMission) {
       const objectives = (activeMission?.objectives as Array<Record<string, unknown>>) || [];
       const allComplete = objectives.every((obj) => obj.completed === true || obj.progress === obj.quantity);
       if (allComplete) {
@@ -1057,6 +1088,16 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
   const reconciled = await detectChainPositionFromGameState(ctx, chain, completedSteps);
   for (const id of reconciled) completedSteps.add(id);
   
+  // Reconcile: if a mission is currently active, its step is NOT completed
+  const currentActive = await getActiveMissions(ctx);
+  for (const m of currentActive) {
+    const step = chain.steps.find(s => missionMatchesStep(m, s));
+    if (step?.id) {
+      completedSteps.delete(step.id);
+    }
+  }
+  saveProgress(bot.username, chainName, completedSteps);
+  
   if (completedSteps.size > 0) {
     ctx.log("mission", `Resuming from step ${completedSteps.size + 1}/${chain.steps.length} (${completedSteps.size} steps already completed)`);
   }
@@ -1073,14 +1114,13 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
   
   // Get active missions ONCE at start
   const activeMissions = await getActiveMissions(ctx);
-  const activeMissionIds = new Set(activeMissions.map(m => m.id));
   
   for (let i = 0; i < chain.steps.length; i++) {
     const step = chain.steps[i];
     if (!step.id || step.type !== "dock" || !step.station) continue;
     
     // Check if already active FIRST - no need to try accept
-    if (activeMissionIds.has(step.id)) {
+    if (activeMissions.some(m => missionMatchesStep(m, step))) {
       firstIncompleteIndex = i;
       ctx.log("mission", `Mission ${step.id} already active (from get_active_missions), this is our next step`);
       break;
@@ -1096,7 +1136,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           await ctx.sleep(200);
           continue;
         }
-        if (acceptResult.error?.includes("already have an active instance")) {
+        if (acceptResult.error?.includes("already have an active")) {
           // Mission already active - it's our next step
           completedSteps.delete(step.id);
           saveProgress(bot.username, chainName, completedSteps);
@@ -1117,7 +1157,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
         // Verify it's now in active missions
         await ctx.sleep(500);
         const verifyMissions = await getActiveMissions(ctx);
-        const verifyHasMission = verifyMissions.some(m => m.id === step.id);
+        const verifyHasMission = verifyMissions.some(m => missionMatchesStep(m, step));
         if (!verifyHasMission) {
           ctx.log("error", `Mission ${step.id} accept reported success but NOT in active missions — stopping for investigation`);
           return;
@@ -1157,7 +1197,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
     
-    if (acceptResult.error?.includes("already have an active instance")) {
+    if (acceptResult.error?.includes("already have an active")) {
       // Mission already active - it's our next step
       firstIncompleteIndex = i;
       ctx.log("mission", `Mission ${step.id} already active, this is our next step`);
@@ -1240,7 +1280,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Now try to accept the mission
       const activeMissions = await getActiveMissions(ctx);
-      const hasMission = activeMissions.some(m => m.id === nextStep.id);
+      const hasMission = activeMissions.some(m => missionMatchesStep(m, nextStep));
       
       if (!hasMission) {
         const acceptResult = await acceptMission(ctx, nextStep.id);
@@ -1254,16 +1294,14 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
             continue;
           }
           // Mission already active but not in our check? Re-check
-          if (acceptResult.error?.includes("already have an active instance")) {
+          if (acceptResult.error?.includes("already have an active")) {
             const recheckMissions = await getActiveMissions(ctx);
-            const recheckHasMission = recheckMissions.some(m => m.id === nextStep.id);
-            if (recheckHasMission) {
-              ctx.log("mission", `Mission ${nextStep.id} already active (confirmed), proceeding`);
-              // Continue with the step
-            } else {
-              ctx.log("error", `Mission ${nextStep.id} accept failed: ${acceptResult.error} — stopping for investigation`);
-              return;
-            }
+             const recheckHasMission = recheckMissions.some(m => missionMatchesStep(m, nextStep));
+             if (recheckHasMission) {
+               ctx.log("mission", `Mission ${nextStep.id} already active (confirmed), proceeding`);
+             } else {
+               ctx.log("mission", `Mission ${nextStep.id} reported already active by server; proceeding`);
+             }
           } else {
             // "only available at X" or "not available at this station" = wrong station, NOT completed
             if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
@@ -1278,7 +1316,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           // Accept succeeded - VERIFY it's now in active missions
           await ctx.sleep(500);
           const verifyMissions = await getActiveMissions(ctx);
-          const verifyHasMission = verifyMissions.some(m => m.id === nextStep.id);
+          const verifyHasMission = verifyMissions.some(m => missionMatchesStep(m, nextStep));
           if (!verifyHasMission) {
             ctx.log("error", `Mission ${nextStep.id} accept reported success but NOT in active missions — stopping for investigation`);
             return;
@@ -1298,21 +1336,28 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     if (autoComplete && nextStep.type === "dock" && nextStep.id) {
       await ctx.sleep(2000);
       const activeMissions = await getActiveMissions(ctx);
-      const hasMission = activeMissions.some(m => m.id === nextStep.id);
+      const hasMission = activeMissions.some(m => missionMatchesStep(m, nextStep));
       if (hasMission) {
-        const mission = activeMissions.find(m => m.id === nextStep.id);
+        const mission = activeMissions.find(m => missionMatchesStep(m, nextStep));
         const objectives = (mission?.objectives as Array<Record<string, unknown>>) || [];
         const allComplete = objectives.every((obj) => obj.completed === true || obj.progress === obj.quantity);
-        if (allComplete) {
-          await completeMission(ctx, nextStep.id);
-          await ctx.sleep(2000);
-        }
+         if (allComplete) {
+           await completeMission(ctx, (mission as { uuid?: string })?.uuid || nextStep.id);
+           await ctx.sleep(2000);
+         }
       }
     }
 
-    completedSteps.add(nextStep.id);
-    saveProgress(bot.username, chainName, completedSteps);
-    ctx.log("mission", `Step ${nextStep.id} completed (${completedSteps.size}/${chain.steps.length})`);
+    // Only mark step completed if its mission is no longer active (completed) or it's not a mission step
+    const postActiveMissions = await getActiveMissions(ctx);
+    const missionStillActive = nextStep.type === "dock" && !!nextStep.id && postActiveMissions.some(m => missionMatchesStep(m, nextStep));
+    if (!missionStillActive) {
+      completedSteps.add(nextStep.id);
+      saveProgress(bot.username, chainName, completedSteps);
+      ctx.log("mission", `Step ${nextStep.id} completed (${completedSteps.size}/${chain.steps.length})`);
+    } else {
+      ctx.log("mission", `Step ${nextStep.id} executed but mission still active — not marking completed`);
+    }
     
     await ctx.sleep(5000);
   }

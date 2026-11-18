@@ -1067,7 +1067,7 @@ async function detectChainPositionFromGameState(ctx: RoutineContext, chain: Miss
     const activeMission = activeMissions.find(m => missionMatchesStep(m, step));
     if (activeMission) {
       const objectives = (activeMission?.objectives as Array<Record<string, unknown>>) || [];
-      const allComplete = objectives.every((obj) => obj.completed === true || obj.current === obj.required || obj.progress === obj.quantity);
+      const allComplete = objectives.every((obj) => obj.completed === true || (obj.current !== undefined && obj.current === obj.required) || (obj.progress !== undefined && obj.progress === obj.quantity));
       if (allComplete) {
         completed.add(step.id);
         ctx.log("mission", `Verified completed from active mission: ${step.id}`);
@@ -1426,7 +1426,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       if (mission) {
         const objectives = (mission?.objectives as Array<Record<string, unknown>>) || [];
-        const allComplete = objectives.length > 0 && objectives.every((obj) => obj.completed === true || obj.current === obj.required || obj.progress === obj.quantity);
+        const allComplete = objectives.length > 0 && objectives.every((obj) => obj.completed === true || (obj.current !== undefined && obj.current === obj.required) || (obj.progress !== undefined && obj.progress === obj.quantity));
          if (allComplete) {
            await completeMission(ctx, (mission as { uuid?: string })?.uuid || nextStep.id);
            await ctx.sleep(2000);
@@ -1446,6 +1446,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     let stepDone = true;
     if (mission) {
       const objs = (mission.objectives as Array<Record<string, unknown>>) || [];
+      const allComplete = objs.length > 0 && objs.every((o) => o.completed === true || (o.current !== undefined && o.current === o.required) || (o.progress !== undefined && o.progress === o.quantity));
       if (objs.length > 0) {
         const targetStation = nextStep.isMobileStation ? nextStep.mobileStationId : nextStep.station;
         const matchingObj = objs.find(o => {
@@ -1453,7 +1454,10 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           return !!targetStation && (tb === targetStation || tb === nextStep.station);
         });
         if (matchingObj) {
-          stepDone = matchingObj.completed === true || matchingObj.current === matchingObj.required;
+          stepDone = matchingObj.completed === true || (matchingObj.current !== undefined && matchingObj.current === matchingObj.required);
+        } else if (!allComplete) {
+          // Active mission not fully done and no matching objective for this step
+          stepDone = false;
         }
       }
     }
@@ -1465,7 +1469,8 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       saveProgress(bot.username, chainName, completedSteps);
       ctx.log("mission", `Step ${nextStep.id} completed (${completedSteps.size}/${chain.steps.length})`);
     } else {
-      ctx.log("mission", `Step ${nextStep.id} executed but objective not confirmed — not marking completed`);
+      ctx.log("error", `Step ${nextStep.id} objective not confirmed complete after docking — stopping for investigation`);
+      return;
     }
     
     await ctx.sleep(5000);

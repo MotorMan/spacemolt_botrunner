@@ -1170,6 +1170,10 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
   ctx.log("mission", `Starting mission chain: ${chain.name} (${chain.steps.length} steps)`);
 
+  // Refresh actual location/docked state (may be stale after a restart mid-travel)
+  await bot.refreshLocation();
+  ctx.log("mission", `Current location: system=${bot.system}, poi=${bot.poi}, docked=${bot.docked}`);
+
   // Load saved progress
   const completedSteps = loadProgress(bot.username, chainName);
   
@@ -1204,7 +1208,20 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
   
   // Get active missions ONCE at start
   const activeMissions = await getActiveMissions(ctx);
-  
+
+  // Fast path: if an active mission matches a chain step, jump straight to it
+  // without iterating/accepting from the start.
+  const activeMatchIndex = chain.steps.findIndex(step => !!step.id && activeMissions.some(m => missionMatchesStep(m, step)));
+  if (activeMatchIndex !== -1) {
+    for (let j = 0; j < activeMatchIndex; j++) {
+      if (chain.steps[j].id) completedSteps.add(chain.steps[j].id);
+    }
+    saveProgress(bot.username, chainName, completedSteps, chain);
+    firstIncompleteIndex = activeMatchIndex;
+    ctx.log("mission", `Active mission found at step ${chain.steps[activeMatchIndex].id} (index ${activeMatchIndex}); marked ${activeMatchIndex} prior steps completed`);
+  }
+
+  if (firstIncompleteIndex === -1) {
   for (let i = 0; i < chain.steps.length; i++) {
     const step = chain.steps[i];
     if (!step.id) continue;
@@ -1375,7 +1392,8 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     
     await ctx.sleep(200);
   }
-  
+  }
+
   // If we went through all steps without finding incomplete, we're done
   if (firstIncompleteIndex === -1 && completedSteps.size >= chain.steps.filter(s => s.id && s.type === "dock").length) {
     ctx.log("mission", "All mission steps appear completed!");
@@ -1417,7 +1435,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       const activeMissions = await getActiveMissions(ctx);
       const hasMission = activeMissions.some(m => missionMatchesStep(m, nextStep));
 
-      if (nextStep.isMission !== false && !hasMission) {
+      if (nextStep.isMission !== false && !hasMission && bot.docked) {
         // Try accept at current location first
         let acceptResult = await acceptMission(ctx, nextStep.id);
 
@@ -1483,6 +1501,9 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           } else if (acceptResult.error?.includes("not found") || acceptResult.error?.includes("mission_not_found")) {
             // Sub-requirement step, not an accept-able mission; proceed to execute
             ctx.log("mission", `Step ${nextStep.id} is not an accept-able mission (sub-requirement), proceeding`);
+          } else if (acceptResult.error?.includes("not_docked") || acceptResult.error?.includes("not docked")) {
+            // Not docked; skip accept, proceed to execute (will dock)
+            ctx.log("mission", `Not docked; skipping accept for ${nextStep.id}, proceeding to execute`);
           } else if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
             // Could not resolve accept station; stop for investigation
             ctx.log("error", `Mission ${nextStep.id} not available here (${acceptResult.error}) — stopping.`);
@@ -1553,8 +1574,10 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       if (objs.length > 0) {
         const targetStation = nextStep.isMobileStation ? nextStep.mobileStationId : nextStep.station;
         const matchingObj = objs.find(o => {
-          const tb = (o.target_base as string) || (o.target_base_id as string) || "";
-          return !!targetStation && (tb === targetStation || tb === nextStep.station);
+          const tb = ((o.target_base as string) || (o.target_base_id as string) || "").toLowerCase();
+          const ts = (targetStation || "").toLowerCase();
+          const ss = (nextStep.station || "").toLowerCase();
+          return !!targetStation && (tb === ts || tb === ss || tb.includes(ts) || ts.includes(tb) || tb.includes(ss) || ss.includes(tb));
         });
         if (matchingObj) {
           stepDone = matchingObj.completed === true || (matchingObj.current !== undefined && matchingObj.current === matchingObj.required);

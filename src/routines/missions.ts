@@ -1071,9 +1071,20 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
   ctx.log("mission", "Detecting current position in mission chain (no travel)...");
   let firstIncompleteIndex = -1;
   
+  // Get active missions ONCE at start
+  const activeMissions = await getActiveMissions(ctx);
+  const activeMissionIds = new Set(activeMissions.map(m => m.id));
+  
   for (let i = 0; i < chain.steps.length; i++) {
     const step = chain.steps[i];
     if (!step.id || step.type !== "dock" || !step.station) continue;
+    
+    // Check if already active FIRST - no need to try accept
+    if (activeMissionIds.has(step.id)) {
+      firstIncompleteIndex = i;
+      ctx.log("mission", `Mission ${step.id} already active (from get_active_missions), this is our next step`);
+      break;
+    }
     
     // Skip if already verified as completed
     if (completedSteps.has(step.id)) {
@@ -1103,6 +1114,14 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
         // Wasn't actually completed
         completedSteps.delete(step.id);
         saveProgress(bot.username, chainName, completedSteps);
+        // Verify it's now in active missions
+        await ctx.sleep(500);
+        const verifyMissions = await getActiveMissions(ctx);
+        const verifyHasMission = verifyMissions.some(m => m.id === step.id);
+        if (!verifyHasMission) {
+          ctx.log("error", `Mission ${step.id} accept reported success but NOT in active missions — stopping for investigation`);
+          return;
+        }
         firstIncompleteIndex = i;
         ctx.log("mission", `Found incomplete step (just accepted at current location): ${step.id} (index ${i})`);
         break;
@@ -1115,6 +1134,14 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     const acceptResult = await acceptMission(ctx, step.id);
     if (acceptResult.success) {
       // Accepted! This is our next mission to do
+      // Verify it's now in active missions
+      await ctx.sleep(500);
+      const verifyMissions = await getActiveMissions(ctx);
+      const verifyHasMission = verifyMissions.some(m => m.id === step.id);
+      if (!verifyHasMission) {
+        ctx.log("error", `Mission ${step.id} accept reported success but NOT in active missions — stopping for investigation`);
+        return;
+      }
       firstIncompleteIndex = i;
       ctx.log("mission", `Next mission to do: ${step.id} (just accepted it at current location)`);
       break;
@@ -1247,6 +1274,16 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
             ctx.log("error", `Mission ${nextStep.id} accept failed: ${acceptResult.error} — stopping for investigation`);
             return;
           }
+        } else {
+          // Accept succeeded - VERIFY it's now in active missions
+          await ctx.sleep(500);
+          const verifyMissions = await getActiveMissions(ctx);
+          const verifyHasMission = verifyMissions.some(m => m.id === nextStep.id);
+          if (!verifyHasMission) {
+            ctx.log("error", `Mission ${nextStep.id} accept reported success but NOT in active missions — stopping for investigation`);
+            return;
+          }
+          ctx.log("mission", `Mission ${nextStep.id} accepted and verified in active missions`);
         }
         await ctx.sleep(2000);
       }

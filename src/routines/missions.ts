@@ -1442,12 +1442,27 @@ async function detectChainPositionFromGameState(ctx: RoutineContext, chain: Miss
         completed.add(step.id);
       } else {
         completed.delete(step.id);
-        // Clear all subsequent steps too — they cannot be done if this mission isn't
+        // Only clear subsequent steps whose objectives are not yet done
         const idx = chain.steps.indexOf(step);
+        const objs = (activeMission?.objectives as Array<Record<string, unknown>>) || [];
         for (let k = idx; k < chain.steps.length; k++) {
-          if (chain.steps[k].id) completed.delete(chain.steps[k].id);
+          const st = chain.steps[k];
+          if (!st.id) continue;
+          const matchingObj = objs.find(o => {
+            const tb = String(o.target_base || o.target_base_id || "").toLowerCase();
+            const ts = String(st.station || "").toLowerCase();
+            const sid = String(o.system_id || "").toLowerCase();
+            const ss = String(st.system || "").toLowerCase();
+            if (o.type === "visit_system") return sid !== "" && sid === ss;
+            return ts !== "" && (tb === ts || tb.includes(ts) || ts.includes(tb));
+          });
+          if (matchingObj) {
+            const done = matchingObj.completed === true || (matchingObj.current !== undefined && matchingObj.current === matchingObj.required);
+            if (done) completed.add(st.id);
+            else completed.delete(st.id);
+          }
         }
-        ctx.log("mission", `Active mission ${step.id} still in progress — removed from completed`);
+        ctx.log("mission", `Active mission ${step.id} still in progress — reconciled completed steps`);
       }
       continue;
     }
@@ -1484,9 +1499,21 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
   ctx.log("mission", `Starting mission chain: ${chain.name} (${chain.steps.length} steps)`);
 
-  // Refresh actual location/docked state (may be stale after a restart mid-travel)
-  await bot.refreshLocation();
-  ctx.log("mission", `Current location: system=${bot.system}, poi=${bot.poi}, docked=${bot.docked}`);
+   // Refresh actual location/docked state (may be stale after a restart mid-travel)
+   await bot.refreshLocation();
+   ctx.log("mission", `Current location: system=${bot.system}, poi=${bot.poi}, docked=${bot.docked}`);
+
+   // Ensure docked before doing anything else; do not travel to mission destinations
+   // while undocked.
+   if (!bot.docked) {
+     ctx.log("mission", "Not docked at startup — docking before proceeding...");
+     const docked = await ensureDocked(ctx);
+     if (!docked) {
+       ctx.log("error", "Could not dock at startup — stopping routine");
+       return;
+     }
+     await bot.refreshLocation();
+   }
 
   // Load saved progress
   const completedSteps = loadProgress(bot.username, chainName);
@@ -1757,13 +1784,34 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
        }
      }
 
-     // Source of truth: get_active_missions. Clear any completed entries at/after
-     // the active mission so we never skip ahead past it.
+     // Source of truth: get_active_missions. Remove completed entries only for steps
+     // whose corresponding objective is NOT yet done, so finished sub-steps stay
+     // completed while the mission remains active.
      const activeNow2 = await getActiveMissions(ctx);
      const activeIdx2 = chain.steps.findIndex(s => !!s.id && activeNow2.some(m => missionMatchesStep(m, s)));
      if (activeIdx2 !== -1) {
+       const mission = activeNow2.find(m => missionMatchesStep(m, chain.steps[activeIdx2]));
+       const objs = (mission?.objectives as Array<Record<string, unknown>>) || [];
        for (let j = activeIdx2; j < chain.steps.length; j++) {
-         if (chain.steps[j].id) completedSteps.delete(chain.steps[j].id);
+         const st = chain.steps[j];
+         if (!st.id) continue;
+         // Find a matching objective for this step
+         const matchingObj = objs.find(o => {
+           const tb = String(o.target_base || o.target_base_id || "").toLowerCase();
+           const ts = String(st.station || "").toLowerCase();
+           const sid = String(o.system_id || "").toLowerCase();
+           const ss = String(st.system || "").toLowerCase();
+           if (o.type === "visit_system") return sid !== "" && sid === ss;
+           return ts !== "" && (tb === ts || tb.includes(ts) || ts.includes(tb));
+         });
+         if (matchingObj) {
+           const done = matchingObj.completed === true || (matchingObj.current !== undefined && matchingObj.current === matchingObj.required);
+           if (done) {
+             completedSteps.add(st.id);
+           } else {
+             completedSteps.delete(st.id);
+           }
+         }
        }
        saveProgress(bot.username, chainName, completedSteps, chain);
      }
@@ -1782,10 +1830,6 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
        if (!nextStep) break;
        const nextIdx = chain.steps.findIndex(s => s.id === nextStep!.id);
        if (activeIdx < nextIdx) {
-         for (let j = activeIdx; j < chain.steps.length; j++) {
-           if (chain.steps[j].id) completedSteps.delete(chain.steps[j].id);
-         }
-         saveProgress(bot.username, chainName, completedSteps, chain);
          nextStep = chain.steps[activeIdx];
          ctx.log("mission", `Active mission override: executing ${nextStep.id} instead of skipping ahead`);
        }

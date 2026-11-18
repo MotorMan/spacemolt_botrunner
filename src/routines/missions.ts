@@ -34,6 +34,7 @@ interface MissionStep {
   isMobileStation?: boolean;
   mobileStationId?: string;
   mobileStationPoiId?: string;
+  isMission?: boolean;
 }
 
 interface MissionChain {
@@ -67,6 +68,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "the_expeditionary_mandate_sol",
+        isMission: false,
         name: "The Expeditionary Mandate (Sol)",
         description: "Dock at Sol Central",
         type: "dock",
@@ -85,6 +87,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "the_other_side_ironhearth",
+        isMission: false,
         name: "The Other Side (Ironhearth)",
         description: "Dock at Ironhearth Station",
         type: "dock",
@@ -114,6 +117,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "survey_equipment_return",
+        isMission: false,
         name: "Survey Equipment Return",
         description: "Return to First Step Memorial Station",
         type: "dock",
@@ -132,6 +136,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "environmental_sampling_void_gate",
+        isMission: false,
         name: "Environmental Sampling (Void Gate)",
         description: "Visit Void Gate Outpost",
         type: "dock",
@@ -141,6 +146,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "environmental_sampling_last_light",
+        isMission: false,
         name: "Environmental Sampling (Last Light)",
         description: "Visit Last Light",
         type: "dock",
@@ -150,6 +156,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "environmental_sampling_fsms",
+        isMission: false,
         name: "Environmental Sampling (FSMS)",
         description: "Return to First Step Memorial Station",
         type: "dock",
@@ -178,6 +185,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "observation_points_timberline",
+        isMission: false,
         name: "Observation Points (Timberline)",
         description: "Dock at Timberline",
         type: "dock",
@@ -187,6 +195,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "observation_points_fsms",
+        isMission: false,
         name: "Observation Points (FSMS)",
         description: "Return to First Step Memorial Station",
         type: "dock",
@@ -205,6 +214,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "parallel_installations_trappist",
+        isMission: false,
         name: "Parallel Installations (TRAPPIST-1)",
         description: "Dock at TRAPPIST-1",
         type: "dock",
@@ -214,6 +224,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "parallel_installations_fsms",
+        isMission: false,
         name: "Parallel Installations (FSMS)",
         description: "Return to First Step Memorial Station",
         type: "dock",
@@ -232,6 +243,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "the_third_signature_fsms",
+        isMission: false,
         name: "The Third Signature (FSMS)",
         description: "Return to First Step Memorial Station",
         type: "dock",
@@ -250,6 +262,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "processing_the_data",
+        isMission: false,
         name: "Processing The Data",
         description: "Return to First Step Memorial Station",
         type: "dock",
@@ -268,6 +281,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "joining_the_investigators_fsms",
+        isMission: false,
         name: "Joining The Investigators (FSMS)",
         description: "Return to First Step Memorial Station",
         type: "dock",
@@ -286,6 +300,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "the_allocation_pattern_beta",
+        isMission: false,
         name: "The Allocation Pattern (Node Beta)",
         description: "Pass through Node Beta",
         type: "goto",
@@ -295,6 +310,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "the_allocation_pattern_gamma",
+        isMission: false,
         name: "The Allocation Pattern (Node Gamma)",
         description: "Pass through Node Gamma",
         type: "goto",
@@ -304,6 +320,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "the_allocation_pattern_fsms",
+        isMission: false,
         name: "The Allocation Pattern (FSMS)",
         description: "Return to First Step Memorial Station",
         type: "dock",
@@ -322,6 +339,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "the_frequency_gap_fsms",
+        isMission: false,
         name: "The Frequency Gap (FSMS)",
         description: "Return to First Step Memorial Station",
         type: "dock",
@@ -340,6 +358,7 @@ const MISSION_CHAINS: MissionChain[] = [
       },
       {
         id: "the_cover_story_fsms",
+        isMission: false,
         name: "The Cover Story (FSMS)",
         description: "Return to First Step Memorial Station",
         type: "dock",
@@ -1128,6 +1147,11 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     
     // Skip if already verified as completed
     if (completedSteps.has(step.id)) {
+      // Non-mission steps (sub-requirements) are not accept-able; just skip
+      if (step.isMission === false) {
+        await ctx.sleep(200);
+        continue;
+      }
       // Just try accept at CURRENT location
       const acceptResult = await acceptMission(ctx, step.id);
       if (!acceptResult.success) {
@@ -1143,6 +1167,11 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           firstIncompleteIndex = i;
           ctx.log("mission", `Mission ${step.id} already active, this is our next step`);
           break;
+        }
+        if (acceptResult.error?.includes("not found") || acceptResult.error?.includes("mission_not_found")) {
+          // Not a real mission (sub-requirement); treat as completed
+          await ctx.sleep(200);
+          continue;
         }
         // Any other error at current location = not completed, this is where we are
         completedSteps.delete(step.id);
@@ -1170,6 +1199,13 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
     
+    // Non-mission steps (sub-requirements) are not accept-able; just proceed to execute
+    if (step.isMission === false) {
+      firstIncompleteIndex = i;
+      ctx.log("mission", `Step ${step.id} is a sub-requirement (not a mission), proceeding`);
+      break;
+    }
+    
     // This step is not in completed - try to accept at CURRENT location
     const acceptResult = await acceptMission(ctx, step.id);
     if (acceptResult.success) {
@@ -1177,7 +1213,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       // Verify it's now in active missions
       await ctx.sleep(500);
       const verifyMissions = await getActiveMissions(ctx);
-      const verifyHasMission = verifyMissions.some(m => m.id === step.id);
+      const verifyHasMission = verifyMissions.some(m => missionMatchesStep(m, step));
       if (!verifyHasMission) {
         ctx.log("error", `Mission ${step.id} accept reported success but NOT in active missions — stopping for investigation`);
         return;
@@ -1201,6 +1237,13 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       // Mission already active - it's our next step
       firstIncompleteIndex = i;
       ctx.log("mission", `Mission ${step.id} already active, this is our next step`);
+      break;
+    }
+    
+    if (acceptResult.error?.includes("not found") || acceptResult.error?.includes("mission_not_found")) {
+      // Not a real mission (sub-requirement); proceed to execute
+      firstIncompleteIndex = i;
+      ctx.log("mission", `Step ${step.id} is not an accept-able mission (sub-requirement), proceeding`);
       break;
     }
     
@@ -1282,7 +1325,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       const activeMissions = await getActiveMissions(ctx);
       const hasMission = activeMissions.some(m => missionMatchesStep(m, nextStep));
       
-      if (!hasMission) {
+      if (!hasMission && nextStep.isMission !== false) {
         const acceptResult = await acceptMission(ctx, nextStep.id);
         if (!acceptResult.success) {
           // Only mark as done if server explicitly says "already completed"
@@ -1302,6 +1345,9 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
              } else {
                ctx.log("mission", `Mission ${nextStep.id} reported already active by server; proceeding`);
              }
+          } else if (acceptResult.error?.includes("not found") || acceptResult.error?.includes("mission_not_found")) {
+            // Sub-requirement step, not an accept-able mission; proceed to execute
+            ctx.log("mission", `Step ${nextStep.id} is not an accept-able mission (sub-requirement), proceeding`);
           } else {
             // "only available at X" or "not available at this station" = wrong station, NOT completed
             if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available at this station")) {
@@ -1324,6 +1370,8 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log("mission", `Mission ${nextStep.id} accepted and verified in active missions`);
         }
         await ctx.sleep(2000);
+      } else if (nextStep.isMission === false) {
+        ctx.log("mission", `Step ${nextStep.id} is a sub-requirement (not a mission), skipping accept`);
       }
     }
 

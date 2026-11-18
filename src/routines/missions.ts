@@ -955,8 +955,8 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
         // First, ensure we have the items (going home if needed) BEFORE traveling to delivery station
         let have = await ensureItemsInCargo(ctx, step.items);
         if (!have) {
-          const settings = getMissionSettings(bot);
-          const homeSystem = getHomeSystem(settings);
+          const allSettings = loadSettings();
+          const homeSystem = getHomeSystem(allSettings as Record<string, unknown>);
           if (homeSystem && homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
             ctx.log("mission", `Insufficient items; traveling home to ${homeSystem} for supplies first...`);
             const nav = await navigateToSystem(ctx, homeSystem);

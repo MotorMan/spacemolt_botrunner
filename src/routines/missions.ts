@@ -1840,6 +1840,10 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
            } else {
              completedSteps.delete(st.id);
            }
+         } else {
+           // Step belongs to a different mission than the active one; do not
+           // trust saved progress for it — force re-evaluation.
+           completedSteps.delete(st.id);
          }
        }
        saveProgress(bot.username, chainName, completedSteps, chain);

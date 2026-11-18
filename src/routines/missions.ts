@@ -594,15 +594,15 @@ async function dockAtStation(ctx: RoutineContext, systemId: string, stationId: s
   return false;
 }
 
-async function acceptMission(ctx: RoutineContext, missionId: string): Promise<boolean> {
+async function acceptMission(ctx: RoutineContext, missionId: string): Promise<{ success: boolean; error?: string }> {
   const { bot } = ctx;
   ctx.log("mission", `Accepting mission: ${missionId}`);
   const resp = await bot.exec("accept_mission", { mission_id: missionId });
   if (resp.error) {
     ctx.log("error", `Accept mission failed: ${resp.error.message}`);
-    return false;
+    return { success: false, error: resp.error.message };
   }
-  return true;
+  return { success: true };
 }
 
 async function completeMission(ctx: RoutineContext, missionId: string): Promise<boolean> {
@@ -755,7 +755,8 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
   switch (step.type) {
     case "accept": {
       if (step.id) {
-        return await acceptMission(ctx, step.id);
+        const result = await acceptMission(ctx, step.id);
+        return result.success;
       }
       return true;
     }
@@ -1052,6 +1053,66 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("mission", `Resuming from step ${completedSteps.size + 1}/${chain.steps.length} (${completedSteps.size} steps already completed)`);
   }
 
+  // Verify each completed step by attempting to accept the mission
+  // This catches cases where the progress file is wrong (e.g., marked done but mission failed)
+  ctx.log("mission", "Verifying completed steps...");
+  for (const stepId of completedSteps) {
+    const step = chain.steps.find(s => s.id === stepId);
+    if (!step || step.type !== "dock" || !step.station) continue;
+    
+    // Navigate to the mission's station
+    const targetSystem = await resolveStationSystem(ctx, step);
+    if (!targetSystem) continue;
+    
+    if (bot.system?.toLowerCase() !== targetSystem.toLowerCase() || 
+        bot.poi !== step.station || !bot.docked) {
+      ctx.log("mission", `Verifying ${stepId}: navigating to ${step.station}...`);
+      const docked = await navigateToStation(ctx, step);
+      if (!docked) continue;
+    }
+    
+    // Try to accept the mission
+    const acceptResult = await acceptMission(ctx, stepId);
+    if (!acceptResult.success) {
+      // Check the specific error
+      if (acceptResult.error?.includes("already completed")) {
+        ctx.log("mission", `Verified ${stepId}: already completed (server confirmed)`);
+      } else if (acceptResult.error?.includes("only available at") || acceptResult.error?.includes("not available")) {
+        // Wrong station - but we already verified we're at the right station
+        // This could mean the mission was completed and is no longer available
+        await ctx.sleep(1000);
+        const activeMissions = await getActiveMissions(ctx);
+        const stillNotActive = !activeMissions.some(m => m.id === stepId);
+        if (stillNotActive) {
+          ctx.log("mission", `Verified ${stepId}: accept failed (not available) but not in active missions, likely already completed`);
+        } else {
+          ctx.log("mission", `Verification found ${stepId} was NOT completed, re-adding to queue`);
+          completedSteps.delete(stepId);
+          saveProgress(bot.username, chainName, completedSteps);
+        }
+      } else {
+        // Some other error - check active missions
+        await ctx.sleep(1000);
+        const activeMissions = await getActiveMissions(ctx);
+        const stillNotActive = !activeMissions.some(m => m.id === stepId);
+        if (stillNotActive) {
+          ctx.log("mission", `Verified ${stepId}: accept failed (${acceptResult.error}) but not in active missions, likely already completed`);
+        } else {
+          ctx.log("mission", `Verification found ${stepId} was NOT completed, re-adding to queue`);
+          completedSteps.delete(stepId);
+          saveProgress(bot.username, chainName, completedSteps);
+        }
+      }
+    } else {
+      // Mission was accepted - it wasn't completed, so remove from completed
+      ctx.log("mission", `Verification found ${stepId} was NOT completed (just accepted it), re-adding to queue`);
+      completedSteps.delete(stepId);
+      saveProgress(bot.username, chainName, completedSteps);
+    }
+    
+    await ctx.sleep(500);
+  }
+
   const autoAccept = settings.autoAccept !== false;
   const autoComplete = settings.autoComplete !== false;
   const preGrabItems = settings.preGrabItems !== false;
@@ -1108,15 +1169,21 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       
       if (!hasMission) {
         const acceptResult = await acceptMission(ctx, nextStep.id);
-        if (!acceptResult) {
+        if (!acceptResult.success) {
           // Check if error was "already completed" - if so, mark as done and continue
-          // The acceptMission function logs the error, so we check the active missions again
+          if (acceptResult.error?.includes("already completed")) {
+            ctx.log("mission", `Mission ${nextStep.id} already completed (server confirmed), marking step as done`);
+            completedSteps.add(nextStep.id);
+            saveProgress(bot.username, chainName, completedSteps);
+            await ctx.sleep(2000);
+            continue;
+          }
+          // Other error - check active missions again
           await ctx.sleep(1000);
           const recheckMissions = await getActiveMissions(ctx);
           const stillNotActive = !recheckMissions.some(m => m.id === nextStep.id);
           if (stillNotActive) {
-            // Mission might already be completed - check if we can complete it or if it's done
-            ctx.log("mission", `Mission ${nextStep.id} not accepted (already completed or unavailable), marking step as done`);
+            ctx.log("mission", `Mission ${nextStep.id} not accepted (${acceptResult.error}) but not in active missions, marking step as done`);
             completedSteps.add(nextStep.id);
             saveProgress(bot.username, chainName, completedSteps);
             await ctx.sleep(2000);

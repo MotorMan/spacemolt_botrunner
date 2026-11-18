@@ -1824,6 +1824,17 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
        for (let j = activeIdx2; j < chain.steps.length; j++) {
          const st = chain.steps[j];
          if (!st.id) continue;
+         // Only reconcile steps that belong to the active mission; other missions'
+         // steps must not inherit this mission's objective completion.
+         const activeTemplate = String(mission?.templateId || activeNow2.find(m => missionMatchesStep(m, chain.steps[activeIdx2]))?.templateId || "").toLowerCase();
+         const stepMission = st.id.split("_")[0] + "_" + (st.id.split("_")[1] || "");
+         // Simpler: step belongs to active mission if its id starts with the active template id
+         const belongsToActive = activeTemplate !== "" && st.id.toLowerCase().startsWith(activeTemplate);
+         if (!belongsToActive) {
+           // Don't trust saved progress for steps of other missions
+           completedSteps.delete(st.id);
+           continue;
+         }
          // Find a matching objective for this step
          const matchingObj = objs.find(o => {
            const tb = String(o.target_base || o.target_base_id || "").toLowerCase();
@@ -1856,6 +1867,9 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
        if (!st.id) continue;
        if (completedSteps.has(st.id)) continue;
        for (const m of allActiveForCompletion) {
+         const activeTemplate = String(m.templateId || "").toLowerCase();
+         // Only mark steps that belong to this active mission
+         if (activeTemplate && !st.id.toLowerCase().startsWith(activeTemplate)) continue;
          const objs = (m.objectives as Array<Record<string, unknown>>) || [];
          const matchingObj = objs.find(o => {
            const tb = String(o.target_base || o.target_base_id || "").toLowerCase();

@@ -952,7 +952,37 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
     }
     case "deliver": {
       if (step.items) {
-        // Navigate to the delivery station first
+        // First, ensure we have the items (going home if needed) BEFORE traveling to delivery station
+        let have = await ensureItemsInCargo(ctx, step.items);
+        if (!have) {
+          const settings = getMissionSettings(bot);
+          const homeSystem = getHomeSystem(settings);
+          if (homeSystem && homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
+            ctx.log("mission", `Insufficient items; traveling home to ${homeSystem} for supplies first...`);
+            const nav = await navigateToSystem(ctx, homeSystem);
+            if (nav) {
+              const { pois } = await getSystemInfo(ctx);
+              const hst = pois.find(p => isStationPoi(p));
+              if (hst) {
+                if (bot.poi !== hst.id) {
+                  const tr = await bot.exec("travel", { target_poi: hst.id });
+                  if (tr.error && !tr.error.message.includes("already")) ctx.log("error", `Travel failed: ${tr.error.message}`);
+                  bot.poi = hst.id;
+                  await bot.refreshLocation();
+                }
+                const dr = await bot.exec("dock");
+                if (!dr.error || dr.error.message.includes("already")) bot.docked = true;
+                await tryRefuel(ctx);
+                have = await ensureItemsInCargo(ctx, step.items);
+              }
+            }
+          }
+        }
+        if (!have) {
+          ctx.log("error", `Cannot acquire required items for ${step.id}`);
+          return false;
+        }
+        // Now navigate to the delivery station
         if (step.station) {
           const targetSystem = await resolveStationSystem(ctx, step);
           if (targetSystem) {
@@ -976,56 +1006,6 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
               await tryRefuel(ctx);
             }
           }
-        }
-        // Ensure items in cargo, going home if needed
-        let have = await ensureItemsInCargo(ctx, step.items);
-        if (!have) {
-          const settings = getMissionSettings(bot);
-          const homeSystem = getHomeSystem(settings);
-          if (homeSystem && homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
-            ctx.log("mission", `Insufficient items; traveling home to ${homeSystem} for supplies...`);
-            const nav = await navigateToSystem(ctx, homeSystem);
-            if (nav) {
-              const { pois } = await getSystemInfo(ctx);
-              const hst = pois.find(p => isStationPoi(p));
-              if (hst) {
-                if (bot.poi !== hst.id) {
-                  const tr = await bot.exec("travel", { target_poi: hst.id });
-                  if (tr.error && !tr.error.message.includes("already")) ctx.log("error", `Travel failed: ${tr.error.message}`);
-                  bot.poi = hst.id;
-                  await bot.refreshLocation();
-                }
-                const dr = await bot.exec("dock");
-                if (!dr.error || dr.error.message.includes("already")) bot.docked = true;
-                await tryRefuel(ctx);
-                have = await ensureItemsInCargo(ctx, step.items);
-              }
-              // Return to delivery station
-              if (step.station) {
-                const targetSystem = await resolveStationSystem(ctx, step);
-                if (targetSystem) {
-                  await navigateToSystem(ctx, targetSystem);
-                  const poiId = step.isMobileStation && step.mobileStationPoiId ? step.mobileStationPoiId : step.station;
-                  const { pois: pois2 } = await getSystemInfo(ctx);
-                  const st2 = pois2.find(p => p.id === poiId && isStationPoi(p));
-                  if (st2) {
-                    if (bot.poi !== st2.id) {
-                      await bot.exec("travel", { target_poi: st2.id });
-                      bot.poi = st2.id;
-                      await bot.refreshLocation();
-                    }
-                    const dr2 = await bot.exec("dock");
-                    if (!dr2.error || dr2.error.message.includes("already")) bot.docked = true;
-                    await tryRefuel(ctx);
-                  }
-                }
-              }
-            }
-          }
-        }
-        if (!have) {
-          ctx.log("error", `Cannot acquire required items for ${step.id}`);
-          return false;
         }
         return await deliverItems(ctx, step.items);
       }

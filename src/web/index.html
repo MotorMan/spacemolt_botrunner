@@ -39307,7 +39307,7 @@ ignoreBlacklist: document.getElementById(
         s.minFuelCellsToDepart = minFuelCellsToDepart;
          s.mode = mode;
           s.allowRepeatPassengers = allowRepeatPassengers;
-          s.isolatedRoute = isolatedRoute;
+          s.isolatedRoute = (settings.civilian_transport && Array.isArray(settings.civilian_transport.isolatedRoute)) ? settings.civilian_transport.isolatedRoute : [];
 
 
         send({

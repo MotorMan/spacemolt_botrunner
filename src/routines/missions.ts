@@ -586,6 +586,10 @@ async function navigateToStation(ctx: RoutineContext, step: MissionStep): Promis
   const poiId = step.isMobileStation && step.mobileStationPoiId 
     ? step.mobileStationPoiId 
     : step.station;
+  if (!poiId) {
+    ctx.log("error", `No station POI configured for step ${step.id}`);
+    return false;
+  }
   
   // Check if already at the correct station
   if (bot.system?.toLowerCase() === targetSystem.toLowerCase() && 
@@ -599,7 +603,20 @@ async function navigateToStation(ctx: RoutineContext, step: MissionStep): Promis
   
   // Find and travel to the station
   const { pois } = await getSystemInfo(ctx);
-  const station = pois.find(p => p.id === poiId && isStationPoi(p));
+  let station = pois.find(p => p.id === poiId && isStationPoi(p));
+  if (!station) {
+    // Station ids in mission data often don't match the actual POI id; fall back
+    // to a name/substring match, then to the first usable station in the system.
+    const norm = (s: string) => s.toLowerCase().replace(/[_\s]+/g, "");
+    station = pois.find(p => isStationPoi(p) && norm(p.name || p.id) === norm(poiId));
+  }
+  if (!station) {
+    const sub = poiId.toLowerCase().replace(/_station$/i, "");
+    station = pois.find(p => isStationPoi(p) && (p.id.toLowerCase().includes(sub) || (p.name || "").toLowerCase().includes(sub)));
+  }
+  if (!station) {
+    station = findStation(pois) || pois.find(p => isStationPoi(p));
+  }
   if (!station) {
     ctx.log("error", `Station ${poiId} not found in ${targetSystem}`);
     return false;
@@ -788,6 +805,7 @@ async function ensureItemsInCargo(ctx: RoutineContext, items: Array<{ itemId: st
     const needed = item.quantity - have;
     ctx.log("mission", `Need ${needed}x ${item.itemId}, checking storage...`);
 
+    // 1. Personal (station) storage -> cargo via withdraw_items
     const storageResp = await bot.exec("view_storage");
     if (storageResp.result) {
       const storage = storageResp.result as Record<string, unknown>;
@@ -798,23 +816,18 @@ async function ensureItemsInCargo(ctx: RoutineContext, items: Array<{ itemId: st
       if (storedQty > 0) {
         const withdraw = Math.min(needed, storedQty);
         const before = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
-        const wResp = await bot.exec("storage", {
-          action: "withdraw",
-          item_id: item.itemId,
-          quantity: withdraw,
-          target: "self",
-          source: "storage",
-        });
+        const wResp = await bot.exec("withdraw_items", { item_id: item.itemId, quantity: withdraw });
         await bot.refreshCargo();
         const after = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
         if (!wResp.error && after > before) {
           ctx.log("mission", `Withdrew ${withdraw}x ${item.itemId} from station storage`);
           continue;
         }
-        ctx.log("warn", `Station storage withdraw did not increase cargo for ${item.itemId}`);
+        ctx.log("warn", `Station storage withdraw did not increase cargo for ${item.itemId}: ${wResp.error?.message || ""}`);
       }
     }
 
+    // 2. Faction storage -> station storage -> cargo (two-step; no direct faction->cargo command)
     const factionResp = await bot.exec("view_storage", { target: "faction" });
     if (factionResp.result) {
       const faction = factionResp.result as Record<string, unknown>;
@@ -824,24 +837,48 @@ async function ensureItemsInCargo(ctx: RoutineContext, items: Array<{ itemId: st
 
       if (factionQty > 0) {
         const withdraw = Math.min(needed, factionQty);
-        const before = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
-        const wResp = await bot.exec("storage", {
-          action: "withdraw",
-          item_id: item.itemId,
-          quantity: withdraw,
+        let actualQty = withdraw;
+        // Step A: move faction -> station (personal) storage
+        let depResp = await bot.exec("storage", {
+          action: "deposit",
           target: "self",
+          item_id: item.itemId,
+          quantity: actualQty,
           source: "faction",
         });
-        await bot.refreshCargo();
-        const after = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
-        if (!wResp.error && after > before) {
-          ctx.log("mission", `Withdrew ${withdraw}x ${item.itemId} from faction storage`);
-          continue;
+        if (depResp.error) {
+          const msg = String(depResp.error.message || "").toLowerCase();
+          if (msg.includes("invalid_quantity") || msg.includes("must be transferred with quantity")) {
+            ctx.log("warn", `Faction transfer requires quantity 1 for ${item.itemId} — retrying single-unit`);
+            depResp = await bot.exec("storage", {
+              action: "deposit",
+              target: "self",
+              item_id: item.itemId,
+              quantity: 1,
+              source: "faction",
+            });
+            actualQty = 1;
+          }
         }
-        ctx.log("warn", `Faction storage withdraw did not increase cargo for ${item.itemId}`);
+        if (depResp.error) {
+          ctx.log("warn", `Faction->station transfer failed for ${item.itemId}: ${depResp.error.message}`);
+        } else {
+          await bot.refreshStorage();
+          // Step B: station -> cargo
+          const before = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
+          const wResp = await bot.exec("withdraw_items", { item_id: item.itemId, quantity: actualQty });
+          await bot.refreshCargo();
+          const after = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
+          if (!wResp.error && after > before) {
+            ctx.log("mission", `Withdrew ${actualQty}x ${item.itemId} from faction storage`);
+            continue;
+          }
+          ctx.log("warn", `Station->cargo withdraw did not increase cargo for ${item.itemId}: ${wResp.error?.message || ""}`);
+        }
       }
     }
 
+    // 3. Market fallback
     if (bot.docked) {
       const marketResp = await bot.exec("view_market");
       if (marketResp.result) {
@@ -883,24 +920,28 @@ async function deliverItems(ctx: RoutineContext, items: Array<{ itemId: string; 
       return false;
     }
     ctx.log("mission", `Delivering ${item.quantity}x ${item.itemId}...`);
-    const before = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
-    const depResp = await bot.exec("storage", {
-      action: "deposit",
-      item_id: item.itemId,
-      quantity: item.quantity,
-      target: "storage",
-      source: "self",
-    });
+    const storageBefore = bot.storage?.find(i => i.itemId === item.itemId)?.quantity || 0;
+    const depResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
     if (depResp.error) {
       ctx.log("error", `Deposit failed: ${depResp.error.message}`);
       return false;
     }
-    await bot.refreshCargo();
-    const after = bot.inventory.find(i => i.itemId === item.itemId)?.quantity || 0;
-    if (after > before - item.quantity) {
-      ctx.log("warn", `Deposit verification: cargo only decreased from ${before} to ${after} (expected ${before - item.quantity}); continuing`);
+    // Verify the deposit actually landed in station storage
+    let verified = 0;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await ctx.sleep(1000);
+      await bot.refreshStorage();
+      const storageAfter = bot.storage?.find(i => i.itemId === item.itemId)?.quantity || 0;
+      verified = Math.max(0, storageAfter - storageBefore);
+      if (verified > 0) break;
+      ctx.log("warn", `Station storage unchanged after deposit (attempt ${attempt}/3) for ${item.itemId}`);
     }
-    ctx.log("mission", `Deposited ${item.quantity}x ${item.itemId}`);
+    await bot.refreshCargo();
+    if (verified <= 0) {
+      ctx.log("error", `Deposit reported success but station storage unchanged for ${item.itemId}`);
+      return false;
+    }
+    ctx.log("mission", `Deposited ${item.quantity}x ${item.itemId} (verified ${verified})`);
   }
   return true;
 }
@@ -1102,7 +1143,8 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
             }
             const poiId = step.isMobileStation && step.mobileStationPoiId ? step.mobileStationPoiId : step.station;
             const { pois } = await getSystemInfo(ctx);
-            const st = pois.find(p => p.id === poiId && isStationPoi(p));
+            const st0 = pois.find(p => p.id === poiId && isStationPoi(p));
+            const st = st0 || pois.find(p => isStationPoi(p) && (p.id.toLowerCase().includes(String(poiId).toLowerCase().replace(/_station$/i, "")) || (p.name || "").toLowerCase().includes(String(poiId).toLowerCase().replace(/_station$/i, "")))) || findStation(pois) || pois.find(p => isStationPoi(p)) || null;
             if (st) {
               if (bot.poi !== st.id) {
                 ctx.log("travel", `Traveling to ${st.name}...`);
@@ -1324,25 +1366,34 @@ async function detectChainPositionFromGameState(ctx: RoutineContext, chain: Miss
   // We do NOT infer completion from prerequisites or location
   for (const step of chain.steps) {
     if (!step.id) continue;
-    
-    // If already in saved completed, keep it
-    if (completed.has(step.id)) continue;
-    
-    // If mission is currently active, check if objectives are complete
+
     const activeMission = activeMissions.find(m => missionMatchesStep(m, step));
+
+    // If this mission is currently active, its completion status is dictated by
+    // its objectives — NOT by saved progress. Remove from completed if incomplete.
     if (activeMission) {
       const objectives = (activeMission?.objectives as Array<Record<string, unknown>>) || [];
-      const allComplete = objectives.every((obj) => obj.completed === true || (obj.current !== undefined && obj.current === obj.required) || (obj.progress !== undefined && obj.progress === obj.quantity));
+      const allComplete = objectives.length > 0 && objectives.every((obj) => obj.completed === true || (obj.current !== undefined && obj.current === obj.required) || (obj.progress !== undefined && obj.progress === obj.quantity));
       if (allComplete) {
         completed.add(step.id);
-        ctx.log("mission", `Verified completed from active mission: ${step.id}`);
+      } else {
+        completed.delete(step.id);
+        ctx.log("mission", `Active mission ${step.id} still in progress — removed from completed`);
       }
       continue;
     }
-    
-    // Mission is not active - we CANNOT determine if it's completed or not started
-    // Do NOT infer from prerequisites or location
-    // The progress file is the source of truth
+
+    // Sub-requirement steps whose parent mission is still active with incomplete
+    // objectives must NOT be considered completed.
+    if (step.isMission === false && step.completeAfter) {
+      const parentActive = step.completeAfter.some(pid => activeMissions.some(m => missionMatchesStep(m, { id: pid, name: pid })));
+      if (parentActive) {
+        completed.delete(step.id);
+        continue;
+      }
+    }
+
+    // For missions not currently active, trust saved progress (no change).
   }
   
   // Do NOT detect based on current location - that's unreliable
@@ -1409,6 +1460,11 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
   if (activeMatchIndex !== -1) {
     for (let j = 0; j < activeMatchIndex; j++) {
       if (chain.steps[j].id) completedSteps.add(chain.steps[j].id);
+    }
+    // Clear any stale completed entries at/after the active step so the routine
+    // never skips ahead past the mission the game says is still active.
+    for (let j = activeMatchIndex; j < chain.steps.length; j++) {
+      if (chain.steps[j].id) completedSteps.delete(chain.steps[j].id);
     }
     saveProgress(bot.username, chainName, completedSteps, chain);
     firstIncompleteIndex = activeMatchIndex;
@@ -1615,14 +1671,31 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     }
   }
 
-  while (bot.state === "running") {
-    const nextStep = findNextStep(completedSteps, chain);
-    if (!nextStep) {
-      ctx.log("mission", "All mission steps completed!");
-      break;
-    }
+   while (bot.state === "running") {
+     let nextStep = findNextStep(completedSteps, chain);
+     if (!nextStep) {
+       ctx.log("mission", "All mission steps completed!");
+       break;
+     }
 
-    ctx.log("mission", `Executing step: ${nextStep.name} (${nextStep.id})`);
+     // Source of truth: get_active_missions. Never skip ahead past the mission
+     // the game says is still active.
+     const activeNow = await getActiveMissions(ctx);
+     const activeIdx = chain.steps.findIndex(s => !!s.id && activeNow.some(m => missionMatchesStep(m, s)));
+     if (activeIdx !== -1) {
+       if (!nextStep) break;
+       const nextIdx = chain.steps.findIndex(s => s.id === nextStep!.id);
+       if (activeIdx < nextIdx) {
+         for (let j = activeIdx; j < chain.steps.length; j++) {
+           if (chain.steps[j].id) completedSteps.delete(chain.steps[j].id);
+         }
+         saveProgress(bot.username, chainName, completedSteps, chain);
+         nextStep = chain.steps[activeIdx];
+         ctx.log("mission", `Active mission override: executing ${nextStep.id} instead of skipping ahead`);
+       }
+     }
+
+     ctx.log("mission", `Executing step: ${nextStep.name} (${nextStep.id})`);
 
     // For dock-type steps with a mission ID, accept the mission (handling accept-station mismatches)
     if (autoAccept && (nextStep.type === "dock" || nextStep.type === "deliver") && nextStep.id) {

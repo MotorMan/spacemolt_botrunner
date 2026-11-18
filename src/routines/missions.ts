@@ -1442,6 +1442,11 @@ async function detectChainPositionFromGameState(ctx: RoutineContext, chain: Miss
         completed.add(step.id);
       } else {
         completed.delete(step.id);
+        // Clear all subsequent steps too — they cannot be done if this mission isn't
+        const idx = chain.steps.indexOf(step);
+        for (let k = idx; k < chain.steps.length; k++) {
+          if (chain.steps[k].id) completed.delete(chain.steps[k].id);
+        }
         ctx.log("mission", `Active mission ${step.id} still in progress — removed from completed`);
       }
       continue;
@@ -1743,13 +1748,24 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
        const objs = (m.objectives as Array<Record<string, unknown>>) || [];
        const allDone = objs.length > 0 && objs.every(o => o.completed === true || (o.current !== undefined && o.current === o.required) || (o.progress !== undefined && o.progress === o.quantity));
        if (allDone) {
-         const missionId = (m as { uuid?: string; mission_id?: string; id?: string }).uuid || (m as { mission_id?: string }).mission_id || (m as { id?: string }).id;
-         if (missionId) {
-           ctx.log("mission", `Mission ${(m as { name?: string; title?: string }).title || (m as { name?: string }).name} is complete — turning it in...`);
-           await completeMission(ctx, missionId);
+         const mid = (m as { uuid?: string; mission_id?: string; id?: string }).uuid || (m as { mission_id?: string }).mission_id || (m as { id?: string }).id;
+         if (mid) {
+           ctx.log("mission", `Mission ${(m as { title?: string; name?: string }).title || (m as { name?: string }).name} is complete — turning it in...`);
+           await completeMission(ctx, mid);
            await ctx.sleep(1500);
          }
        }
+     }
+
+     // Source of truth: get_active_missions. Clear any completed entries at/after
+     // the active mission so we never skip ahead past it.
+     const activeNow2 = await getActiveMissions(ctx);
+     const activeIdx2 = chain.steps.findIndex(s => !!s.id && activeNow2.some(m => missionMatchesStep(m, s)));
+     if (activeIdx2 !== -1) {
+       for (let j = activeIdx2; j < chain.steps.length; j++) {
+         if (chain.steps[j].id) completedSteps.delete(chain.steps[j].id);
+       }
+       saveProgress(bot.username, chainName, completedSteps, chain);
      }
 
      let nextStep = findNextStep(completedSteps, chain);

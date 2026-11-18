@@ -1898,7 +1898,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
      }
      if (autoAccept && (nextStep.type === "dock" || nextStep.type === "deliver" || nextStep.type === "goto") && nextStep.id) {
       const activeMissions = await getActiveMissions(ctx);
-      const hasMission = activeMissions.some(m => missionMatchesStep(m, nextStep));
+      const hasMission = activeMissions.some(m => missionMatchesStep(m, nextStep as any));
 
       if (nextStep.isMission !== false && !hasMission && bot.docked) {
         // Try accept at current location first
@@ -1979,7 +1979,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           // Mission already active but not in our check? Re-check
           if (acceptResult.error?.includes("already have an active")) {
             const recheckMissions = await getActiveMissions(ctx);
-            const recheckHasMission = recheckMissions.some(m => missionMatchesStep(m, nextStep));
+            const recheckHasMission = recheckMissions.some(m => missionMatchesStep(m, nextStep as any));
             if (recheckHasMission) {
               ctx.log("mission", `Mission ${nextStep.id} already active (confirmed), proceeding`);
             } else {
@@ -1992,19 +1992,26 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
             // Not docked; skip accept, proceed to execute (will dock)
             ctx.log("mission", `Not docked; skipping accept for ${nextStep.id}, proceeding to execute`);
           } else if (acceptResult.error?.includes("requires completing mission") || acceptResult.error?.includes("prerequisite")) {
-            // A prerequisite mission isn't completed yet — complete it, then retry accept
+            // A prerequisite mission isn't completed yet — go do it first instead of
+            // trying to complete it in place.
             const m = acceptResult.error.match(/\[([^\]]+)\]/);
             const prereqId = m ? m[1] : null;
-            ctx.log("mission", `Accept blocked by prerequisite ${prereqId}; attempting to complete it...`);
-            const activeMissions = await getActiveMissions(ctx);
-            let prereqMission = prereqId ? activeMissions.find(m => (m.templateId || m.id) === prereqId || m.id === prereqId) : null;
-            if (!prereqMission && prereqId) {
-              // Fall back to any fully-complete active mission
-              prereqMission = activeMissions.find(m => {
-                const objs = (m.objectives as Array<Record<string, unknown>>) || [];
-                return objs.length > 0 && objs.every(o => o.completed === true || (o.current !== undefined && o.current === o.required));
-              });
+            ctx.log("mission", `Accept blocked by prerequisite ${prereqId}; switching to that mission first...`);
+            const prereqStep = prereqId ? chain.steps.find(s => s.id === prereqId) : undefined;
+            if (prereqStep) {
+              // Clear completed entries from the prereq step onward so it actually runs
+              const idx = chain.steps.indexOf(prereqStep);
+              for (let j = idx; j < chain.steps.length; j++) {
+                if (chain.steps[j].id) completedSteps.delete(chain.steps[j].id);
+              }
+              saveProgress(bot.username, chainName, completedSteps, chain);
+              nextStep = prereqStep;
+              ctx.log("mission", `Switching to prerequisite step ${prereqStep.id}`);
+              continue;
             }
+            // Fallback: try to complete it in place
+            const activeMissions = await getActiveMissions(ctx);
+            const prereqMission = prereqId ? activeMissions.find(m => (m.templateId || m.id) === prereqId || m.id === prereqId) : null;
             if (prereqMission) {
               const mid = (prereqMission as { uuid?: string; mission_id?: string; id?: string }).uuid || (prereqMission as { mission_id?: string }).mission_id || (prereqMission as { id?: string }).id;
               if (mid) {
@@ -2029,7 +2036,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
           // Accept succeeded - VERIFY it's now in active missions
           await ctx.sleep(500);
           const verifyMissions = await getActiveMissions(ctx);
-          const verifyHasMission = verifyMissions.some(m => missionMatchesStep(m, nextStep));
+          const verifyHasMission = verifyMissions.some(m => missionMatchesStep(m, nextStep as any));
           if (!verifyHasMission) {
             ctx.log("error", `Mission ${nextStep.id} accept reported success but NOT in active missions â€” stopping for investigation`);
             return;
@@ -2047,7 +2054,7 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
     // just accepted). Sub-requirements (isMission === false) are exempt.
     if (nextStep.isMission !== false) {
       const nowMissions = await getActiveMissions(ctx);
-      const isActive = nowMissions.some(m => missionMatchesStep(m, nextStep));
+      const isActive = nowMissions.some(m => missionMatchesStep(m, nextStep as any));
       if (!isActive) {
         ctx.log("error", `Mission ${nextStep.id} is not active and could not be accepted — stopping to avoid wasted travel.`);
         return;
@@ -2064,10 +2071,10 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
       await ctx.sleep(2000);
       const activeMissions = await getActiveMissions(ctx);
       // Find the active mission: direct match, or parent mission for sub-requirements
-      let mission = activeMissions.find(m => missionMatchesStep(m, nextStep));
+      let mission = activeMissions.find(m => missionMatchesStep(m, nextStep as any));
       if (!mission && nextStep.completeAfter) {
         for (const parent of nextStep.completeAfter) {
-          mission = activeMissions.find(m => missionMatchesStep(m, { id: parent, name: parent }));
+          mission = activeMissions.find(m => missionMatchesStep(m, { id: parent, name: parent } as any));
           if (mission) break;
         }
       }
@@ -2096,10 +2103,10 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Mark step completed if its objective is done, even if the mission has more objectives
     const postActiveMissions = await getActiveMissions(ctx);
-    let mission = postActiveMissions.find(m => missionMatchesStep(m, nextStep));
+    let mission = postActiveMissions.find(m => missionMatchesStep(m, nextStep as any));
     if (!mission && nextStep.completeAfter) {
       for (const parent of nextStep.completeAfter) {
-        mission = postActiveMissions.find(m => missionMatchesStep(m, { id: parent, name: parent }));
+        mission = postActiveMissions.find(m => missionMatchesStep(m, { id: parent, name: parent } as any));
         if (mission) break;
       }
     }

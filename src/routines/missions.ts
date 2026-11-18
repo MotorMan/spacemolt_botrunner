@@ -995,69 +995,34 @@ async function detectChainPositionFromGameState(ctx: RoutineContext, chain: Miss
   const activeMissions = await getActiveMissions(ctx);
   const activeMissionIds = new Set(activeMissions.map(m => m.id));
   
-  // Get all missions from the chain that have IDs
-  const chainMissionIds = chain.steps
-    .filter(s => s.id)
-    .map(s => s.id!);
-  
-  // For each mission in the chain, check its status
+  // ONLY verify completion for missions that are currently active
+  // If a mission is active AND its objectives are complete, it's done
+  // We do NOT infer completion from prerequisites or location
   for (const step of chain.steps) {
     if (!step.id) continue;
     
     // If already in saved completed, keep it
     if (completed.has(step.id)) continue;
     
-    // If mission is currently active, it's not completed yet
+    // If mission is currently active, check if objectives are complete
     if (activeMissionIds.has(step.id)) {
-      // Check if objectives are complete
       const activeMission = activeMissions.find(m => m.id === step.id);
       const objectives = (activeMission?.objectives as Array<Record<string, unknown>>) || [];
       const allComplete = objectives.every((obj) => obj.completed === true || obj.progress === obj.quantity);
       if (allComplete) {
         completed.add(step.id);
+        ctx.log("mission", `Verified completed from active mission: ${step.id}`);
       }
       continue;
     }
     
-    // Mission is not active - could be completed or not started
-    // If all its prerequisites are in completed, and it's not active, it's likely completed
-    if (step.completeAfter) {
-      const prereqsMet = step.completeAfter.every(id => completed.has(id));
-      if (prereqsMet) {
-        // All prerequisites done, mission not active = likely completed
-        completed.add(step.id);
-        ctx.log("mission", `Detected completed mission from game state: ${step.id}`);
-      }
-    }
+    // Mission is not active - we CANNOT determine if it's completed or not started
+    // Do NOT infer from prerequisites or location
+    // The progress file is the source of truth
   }
   
-  // Also detect based on current location for steps without mission IDs
-  // (e.g., "goto" steps that just require being in a system)
-  for (const step of chain.steps) {
-    if (completed.has(step.id)) continue;
-    if (!step.id) continue;
-    
-    // For dock steps, if we're already at the target station docked, the step is likely done
-    if (step.type === "dock" && step.system && step.station) {
-      if (bot.system?.toLowerCase() === step.system.toLowerCase() && 
-          bot.poi === step.station && bot.docked) {
-        completed.add(step.id);
-        ctx.log("mission", `Detected completed step from current location: ${step.id}`);
-      }
-    }
-    
-    // For goto steps, if we're at the target system/poi
-    if (step.type === "goto" && step.system) {
-      if (bot.system?.toLowerCase() === step.system.toLowerCase()) {
-        if (!step.station || bot.poi === step.station) {
-          if (!step.poi || bot.poi === step.poi) {
-            completed.add(step.id);
-            ctx.log("mission", `Detected completed step from current location: ${step.id}`);
-          }
-        }
-      }
-    }
-  }
+  // Do NOT detect based on current location - that's unreliable
+  // (being in a system doesn't mean the mission step was done)
   
   return completed;
 }

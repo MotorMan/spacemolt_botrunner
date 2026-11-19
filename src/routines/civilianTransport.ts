@@ -2348,10 +2348,25 @@ if (state && state.status !== "idle") {
           status: "boarded",
           ticksRemaining: p.ticks_remaining,
         }));
-        state.route = planned;
-        state.currentRouteIndex = 0;
-        state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
-        state.status = "in_transit";
+        // In lounge transport mode, passengers aboard must be returned to the
+        // home base Transit Lounge — never delivered to their final destination.
+        // This overrides the destination-based route rebuild below so a restart
+        // mid-run cannot resume delivering passengers to their final stop.
+        if (settings.mode === "lounge_transport") {
+          const homeSys = systemForStation(settings.homeStation) || settings.homeSystem;
+          ctx.log("transport", `Lounge transport mode: ${state.onboardPassengers.length} passenger(s) aboard after restart — returning to home base ${settings.homeStation || "unconfigured"} for Transit Lounge unload`);
+          state.route = settings.homeStation && homeSys
+            ? [{ system: homeSys, poi: settings.homeStation, poiName: settings.homeStation }]
+            : [];
+          state.currentRouteIndex = 0;
+          state.currentDestination = settings.homeStation || null;
+          state.status = "returning_to_lounge";
+        } else {
+          state.route = planned;
+          state.currentRouteIndex = 0;
+          state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
+          state.status = "in_transit";
+        }
         const recoveredBerths = vParsed!.berths;
         const recoveredBerthsUsed = vParsed!.berths_used;
         const hasRecoveredBerths = (recoveredBerths.economy + recoveredBerths.business + recoveredBerths.first) > 0;
@@ -2395,10 +2410,23 @@ if (state && state.status !== "idle") {
           status: "boarded",
           ticksRemaining: p.ticks_remaining,
         }));
-        state.route = planned;
-        state.currentRouteIndex = 0;
-        state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
-        state.status = "in_transit";
+        // In lounge transport mode, passengers aboard must be returned to the
+        // home base Transit Lounge, never delivered to their final destination.
+        if (settings.mode === "lounge_transport") {
+          const homeSys = systemForStation(settings.homeStation) || settings.homeSystem;
+          ctx.log("transport", `Lounge transport mode: ${state.onboardPassengers.length} passenger(s) aboard after restart — returning to home base ${settings.homeStation || "unconfigured"} for Transit Lounge unload`);
+          state.route = settings.homeStation && homeSys
+            ? [{ system: homeSys, poi: settings.homeStation, poiName: settings.homeStation }]
+            : [];
+          state.currentRouteIndex = 0;
+          state.currentDestination = settings.homeStation || null;
+          state.status = "returning_to_lounge";
+        } else {
+          state.route = planned;
+          state.currentRouteIndex = 0;
+          state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
+          state.status = "in_transit";
+        }
         saveTransportState(state);
       }
     }
@@ -2519,6 +2547,33 @@ if (state && state.status !== "idle") {
         ctx.log("transport", `Low on fuel cells (${fuelCellCount} <= ${settings.minFuelCellsToDepart}) and tank low away from home — returning to base to restock`);
         await returnHomeForFuelCells(ctx, settings);
         await ctx.sleep(2000);
+        continue;
+      }
+    }
+
+    // ── Lounge transport guard ─────────────────────────────────────────
+    // In lounge_transport mode, passengers picked up from remote stations
+    // (fromLounge !== true) must be returned to the home base Transit Lounge,
+    // never delivered to their final destination. This catches restarts that
+    // reload a saved in_transit/traveling_to_ship route pointing at a
+    // passenger's destination, and any other stray state. Passengers already
+    // being delivered FROM the lounge (fromLounge === true) are left to the
+    // normal delivery path.
+    if (settings.mode === "lounge_transport" && state.status !== "returning_to_lounge") {
+      const remoteAboard = state.onboardPassengers.filter(
+        (p) => p.status === "boarded" && p.fromLounge !== true,
+      );
+      if (remoteAboard.length > 0) {
+        const homeSys = systemForStation(settings.homeStation) || settings.homeSystem;
+        ctx.log("transport", `Lounge transport mode: ${remoteAboard.length} passenger(s) aboard bound for remote destinations — returning to home base ${settings.homeStation || "unconfigured"} to unload into the Transit Lounge`);
+        state.route = settings.homeStation && homeSys
+          ? [{ system: homeSys, poi: settings.homeStation, poiName: settings.homeStation }]
+          : [];
+        state.currentRouteIndex = 0;
+        state.currentDestination = settings.homeStation || null;
+        state.status = "returning_to_lounge";
+        state.routeRebuildAttempts = 0;
+        saveTransportState(state);
         continue;
       }
     }

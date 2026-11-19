@@ -244,6 +244,26 @@ export function isDeepCoreOre(resourceId: string): boolean {
 }
 
 /**
+ * Radioactive ores that require deep core equipment (currently polonium).
+ * Basic radioactive miners may mine uranium, thorium and radium in ordinary
+ * or hidden POIs; only polonium needs a deep core extractor.
+ */
+function isDeepCoreRadioactiveOre(resourceId: string): boolean {
+  const lower = resourceId.toLowerCase();
+  return lower === "polonium_ore" || lower === "polonium";
+}
+
+/**
+ * Frontier systems (appended after the original 506) are only reachable via
+ * temporary wormholes that can expire and strand a ship. Radioactive miners
+ * must not target them. This check is intentionally limited to radioactive
+ * mining so regular miners keep their existing behavior.
+ */
+function isForbiddenRadioactiveSystem(systemId: string): boolean {
+  return mapStore.isFrontierSystem(systemId);
+}
+
+/**
  * Deep core deposits no longer obey standard power limits.
  * Returns true when the standard mining power / supported_power checks
  * should be skipped for the given ore.
@@ -1599,6 +1619,8 @@ export function pickTargetFromQuotas(
       if (jettisonSet.has(resourceId.toLowerCase())) continue;
       const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
+        // Radioactive miners must not target Frontier systems (wormhole stranding risk).
+        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId)) return false;
         if (shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
           return false;
         }
@@ -1619,6 +1641,7 @@ export function pickTargetFromQuotas(
       if (jettisonSet.has(resourceId.toLowerCase())) continue;
       const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
+        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId)) return false;
         if (shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
           return false;
         }
@@ -1789,6 +1812,8 @@ function getReachableOreLocations(
 
     // POI type / hidden-access checks
     if (miningType === "radioactive") {
+      // Frontier systems are wormhole-only and can strand the miner.
+      if (isForbiddenRadioactiveSystem(loc.systemId)) continue;
       if (poi.hidden === true && !canMineHiddenRadioactive) continue;
     } else if (miningType === "ice") {
       if (poi.hidden === true && !canMineHiddenIce) continue;
@@ -1912,6 +1937,7 @@ function pickTargetFromQuotasOrClosest(
 
     const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
+        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId)) return false;
         const hasScanData = loc.minutesSinceScan !== Infinity;
         const isLowRemainingWithUnknownPower = shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
         if (isLowRemainingWithUnknownPower) {
@@ -2402,8 +2428,9 @@ async function ensureFuelCellsStocked(ctx: RoutineContext): Promise<void> {
 // ── Deep core mining efficiency helpers ───────────────────────────────────
 
 /**
- * Find the best hidden POI for a given deep core ore.
+ * Find the best hidden POI for a given ore.
  * Prioritizes hidden POIs with high richness.
+ * Radioactive ores ignore the richness floor and always exclude Frontier systems.
  * Returns null if no suitable hidden POI found.
  */
 function findBestHiddenPoiForOre(
@@ -2415,10 +2442,20 @@ function findBestHiddenPoiForOre(
   depletionTimeoutMs: number,
   minRichness: number = 50, // Only consider POIs with richness >= this
   blacklist: string[] = [], // Systems to exclude (can be empty for cloaked miners)
+  excludeFrontier: boolean = false, // Radioactive miners must skip Frontier systems
 ): { poiId: string; poiName: string; systemId: string; systemName: string; richness: number; remaining: number; jumps: number; isHidden: boolean; supportedPower: number } | null {
+  // Radioactive ores are different from deep-core ores: any richness is viable
+  // and Frontier systems are always off-limits (wormhole stranding risk).
+  const radioactiveOre = isRadioactiveOre(oreId);
+  const effectiveExcludeFrontier = excludeFrontier || radioactiveOre;
+  const effectiveMinRichness = radioactiveOre ? 0 : minRichness;
+
   const locations = mapStore.findOreLocations(oreId, blacklist, blacklist.length === 0).filter(loc => {
     // Skip current POI
     if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
+
+    // Frontier systems are wormhole-only and can strand the miner.
+    if (effectiveExcludeFrontier && isForbiddenRadioactiveSystem(loc.systemId)) return false;
     
     // Must be a hidden POI
     const sys = mapStore.getSystem(loc.systemId);
@@ -2438,8 +2475,8 @@ function findBestHiddenPoiForOre(
     if (!oreEntry?.depleted) return true;
     return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
   }).filter(loc => {
-    // Only consider high richness POIs
-    return loc.richness >= minRichness;
+    // Only consider high richness POIs (radioactive ores: any richness)
+    return loc.richness >= effectiveMinRichness;
   });
 
   if (locations.length === 0) return null;
@@ -2492,6 +2529,9 @@ function areAllHiddenPoisDepleted(
   const allHiddenLocations = mapStore.findOreLocations(oreId, undefined, true).filter(loc => {
     // Skip current POI
     if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
+
+    // Radioactive miners must not count Frontier systems as available.
+    if (isRadioactiveOre(oreId) && isForbiddenRadioactiveSystem(loc.systemId)) return false;
     
     // Must be a hidden POI
     const sys = mapStore.getSystem(loc.systemId);
@@ -3126,16 +3166,30 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     const radioactiveCap = getRadioactiveCapabilityCached(cachedModules || []);
     const canMineBasicRadioactive = miningType === "radioactive" && radioactiveCap.canMineBasicRadioactive;
     const canMineDeepCoreRadioactive = miningType === "radioactive" && radioactiveCap.canMineDeepCoreRadioactive;
-    let canMineHiddenRadioactive = miningType === "radioactive" && radioactiveCap.canMineHiddenRadioactive;
 
-    // For radioactive mining, allow hidden POIs with basic equipment + deep core survey scanner
+    // A radioactive miner with basic gear (rad harvester + lead-lined cargo) can
+    // travel to any hidden POI that is already revealed. Only the deep-core
+    // radioactive ore (polonium) requires a deep core extractor, which is
+    // enforced separately below. This is intentionally NOT gated on deep core
+    // equipment: the old "hidden == deep core" assumption predates Frontier
+    // systems, where ordinary radioactive ores now spawn in hidden POIs.
+    let canMineHiddenRadioactive = canMineBasicRadioactive;
+
     const moduleStr = cachedModules ? cachedModules.map(m => {
       const obj = typeof m === "object" && m !== null ? m as Record<string, unknown> : {};
       return `${obj.id || ""} ${obj.name || ""} ${obj.type || ""} ${obj.special || ""}`.toLowerCase();
     }).join(" ") : "";
-    const hasDeepCoreSurveyScannerCached = moduleStr.includes("deep_core_survey_scanner") || moduleStr.includes("deep core survey scanner") || moduleStr.includes("deep_core_detection");
-    if (miningType === "radioactive" && radioactiveCap.canMineBasicRadioactive && hasDeepCoreSurveyScannerCached) {
-      canMineHiddenRadioactive = true;
+    const hasAnySurveyScanner = moduleStr.includes("survey_scanner") ||
+      moduleStr.includes("survey scanner") ||
+      moduleStr.includes("deep_core_survey_scanner") ||
+      moduleStr.includes("deep core survey scanner") ||
+      moduleStr.includes("deep_core_detection");
+    // Surveying discovers NEW hidden POIs; only attempt it when a scanner is fitted.
+    const canSurveyHiddenRadioactive = miningType === "radioactive" && canMineBasicRadioactive && hasAnySurveyScanner;
+
+    // Debug: log the capability check for troubleshooting
+    if (miningType === "radioactive") {
+      ctx.log("debug", `Radioactive capability: basic=${radioactiveCap.canMineBasicRadioactive}, deepCore=${radioactiveCap.canMineDeepCoreRadioactive}, hiddenPOI=${canMineHiddenRadioactive}, survey=${canSurveyHiddenRadioactive}`);
     }
 
     // Debug: log the capability check for troubleshooting
@@ -3171,6 +3225,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       // gas
       targetResource = isAutoDetected ? settings.targetGas : (settings.targetGas || settings.targetOre || settings.targetIce);
       resourceLabel = (targetResource === settings.targetOre && targetResource !== "") ? "ore" : (targetResource === settings.targetIce && targetResource !== "" ? "ice" : "gas");
+    }
+
+    // Polonium is the deep-core radioactive ore. A radioactive miner without a
+    // deep core extractor must not target it; clear it so quota rotation picks
+    // uranium, thorium or radium instead.
+    if (miningType === "radioactive" && targetResource && isDeepCoreRadioactiveOre(targetResource) && !canMineDeepCoreRadioactive) {
+      ctx.log("mining", `Radioactive target ${targetResource} requires a deep core extractor — clearing target`);
+      targetResource = "";
     }
 
     // CRITICAL FIX: If this global target was already rejected this cycle,
@@ -3221,18 +3283,19 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // Radioactive miner restriction: basic radioactive miners can only mine uranium/thorium (common radioactive ores)
-    // Rare radioactive ores like polonium/radium require hidden POI access
-    if (miningType === "radioactive" && !canMineHiddenRadioactive) {
-      const allowedRadioactiveOres = new Set(["uranium_ore", "thorium_ore"]);
+    // Radioactive miner restriction: only polonium is a deep-core radioactive
+    // ore. Basic rad miners can mine uranium, thorium and radium in both visible
+    // and hidden POIs, so only polonium is withheld when no deep core extractor
+    // is fitted.
+    if (miningType === "radioactive" && !canMineDeepCoreRadioactive) {
       const filteredQuotas: Record<string, number> = {};
       for (const [ore, quota] of Object.entries(quotas)) {
-        if (allowedRadioactiveOres.has(ore)) {
+        if (!isDeepCoreRadioactiveOre(ore)) {
           filteredQuotas[ore] = quota;
         }
       }
       quotas = filteredQuotas;
-      ctx.log("debug", `Basic radioactive miner - restricted to common radioactive ores: ${JSON.stringify(quotas)}`);
+      ctx.log("debug", `Radioactive miner without deep core extractor - excluding polonium: ${JSON.stringify(quotas)}`);
     }
 
     if (useDeepCore) {
@@ -3448,6 +3511,20 @@ if (shouldAbandon) {
         priorityTarget = freshTarget;
         ctx.log("mining", `Fresh quota target selected after rejection: "${effectiveTarget}"`);
       }
+    }
+
+    // Polonium is a deep-core radioactive ore. A radioactive miner without a
+    // deep core extractor must never keep it (e.g. from a recovered session or
+    // an old saved target). Drop it so quota rotation picks a mineable ore.
+    if (miningType === "radioactive" && effectiveTarget && isDeepCoreRadioactiveOre(effectiveTarget) && !canMineDeepCoreRadioactive) {
+      ctx.log("mining", `Target ${effectiveTarget} requires a deep core extractor — clearing target`);
+      if (recoveredSession) {
+        await failMiningSession(bot.username, "Deep core radioactive ore — missing extractor");
+        recoveredSession = null;
+      }
+      effectiveTarget = "";
+      targetResource = "";
+      quotaTargetResource = "";
     }
 
     // CRITICAL FIX: If session is in returning_home state, return home instead of mining
@@ -3729,6 +3806,8 @@ const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system,
         if (miningType !== "radioactive") {
           ctx.log("error", `Flock target ${flockTargetResource} is a radioactive ore — skipping (not in radioactive mode)`);
           // Don't override effectiveTarget — continue with solo mining instead
+        } else if (isDeepCoreRadioactiveOre(flockTargetResource) && !canMineDeepCoreRadioactive) {
+          ctx.log("error", `Flock target ${flockTargetResource} requires a deep core extractor — skipping`);
         } else {
           effectiveTarget = flockTargetResource;
           ctx.log("mining", `Flock radioactive target validated: ${flockTargetResource}`);
@@ -3812,14 +3891,21 @@ const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system,
       configuredSystem = settings.systemGas || settings.systemOre || settings.systemIce || "";
     }
 
+    // Radioactive miners must never be sent into a Frontier system, even when
+    // one is configured, because the wormhole can expire and strand the ship.
+    if (miningType === "radioactive" && configuredSystem && isForbiddenRadioactiveSystem(configuredSystem)) {
+      ctx.log("warn", `Configured radioactive system ${configuredSystem} is a Frontier system — ignoring (wormhole stranding risk)`);
+      configuredSystem = "";
+    }
+
 if (configuredSystem) {
       ctx.log("mining", `Configured harvesting system for ${miningType}: ${configuredSystem}`);
     }
 
     if (effectiveTarget) {
       const { pois: currentPois } = await getSystemInfo(ctx);
-      // Survey system for hidden POIs if radioactive mining with hidden capability
-      if (miningType === "radioactive" && canMineHiddenRadioactive) {
+      // Survey system for hidden POIs if radioactive mining with a survey scanner
+      if (miningType === "radioactive" && canSurveyHiddenRadioactive) {
         await surveySystemForHiddenPois(ctx);
       }
 const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
@@ -3835,6 +3921,8 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           return true;
         }
         if (miningType === "radioactive") {
+          // Frontier systems are wormhole-only and can strand the miner.
+          if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
           if (poi.hidden === true && !canMineHiddenRadioactive) return false;
           return true;
         }
@@ -3891,14 +3979,15 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
            if (poi.hidden === true && !canMineHiddenPois) return false;
            return true;
          }
-         if (miningType === "radioactive") {
-           if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-           return true;
-         }
-         if (miningType === "gas") {
-           if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-           return true;
-         }
+          if (miningType === "radioactive") {
+            if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
+            if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+            return true;
+          }
+          if (miningType === "gas") {
+            if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+            return true;
+          }
          if (miningType === "ice") {
            if (poi.hidden === true && !canMineHiddenIce) return false;
            return true;
@@ -4006,6 +4095,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                   return true;
                 }
                 if (miningType === "radioactive") {
+                  if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
                   if (poi.hidden === true && !canMineHiddenRadioactive) return false;
                   return true;
                 }
@@ -4261,6 +4351,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                 return true;
               }
               if (miningType === "radioactive") {
+                if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
                 if (poi.hidden === true && !canMineHiddenRadioactive) return false;
                 return true;
               }
@@ -4366,7 +4457,13 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
             // Local mining is acceptable only when every quota ore is at/above quota.
             ctx.log("warn", `No quota targets have available locations within ${maxJumps} jumps — mining locally (all quotas full)`);
             targetSystemId = bot.system;
-            const localPoi = findMiningPoi(currentPois, miningType, effectiveTarget, canMineHiddenPois, depletionTimeoutMs);
+            const localPoi = findMiningPoi(
+              currentPois,
+              miningType,
+              effectiveTarget,
+              miningType === "radioactive" ? canMineHiddenRadioactive : canMineHiddenPois,
+              depletionTimeoutMs,
+            );
             if (localPoi) {
               targetPoiId = localPoi.id;
               targetPoiName = localPoi.name;
@@ -4799,8 +4896,8 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           : settings.jettisonOres;
 
     // ── Find mining POI and station in current system ──
-    // Survey for hidden POIs if radioactive mining with capability
-    if (miningType === "radioactive" && canMineHiddenRadioactive) {
+    // Survey for hidden POIs if radioactive mining with a survey scanner
+    if (miningType === "radioactive" && canSurveyHiddenRadioactive) {
       await surveySystemForHiddenPois(ctx);
     }
     yield (miningType === "ice" ? "find_ice_field" : (miningType === "ore" || miningType === "radioactive" ? "find_ore_belt" : "find_gas_cloud"));
@@ -5018,6 +5115,8 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
              return true;
            }
           if (miningType === "radioactive") {
+            // Frontier systems are wormhole-only and can strand the miner.
+            if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
             const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                               (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
                                                loc.poiName.toLowerCase().includes('mineral field') ||
@@ -5211,7 +5310,9 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             if (miningType === "ore") {
               isValid = !chosenPoi.hidden || canMineHiddenPois;
             } else if (miningType === "radioactive") {
-              isValid = canMineBasicRadioactive && (!chosenPoi.hidden || canMineHiddenRadioactive);
+              isValid = canMineBasicRadioactive &&
+                !isForbiddenRadioactiveSystem(chosen.systemId) &&
+                (!chosenPoi.hidden || canMineHiddenRadioactive);
             } else if (miningType === "gas") {
               isValid = true;
             } else if (miningType === "ice") {
@@ -5973,7 +6074,8 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             const sys = mapStore.getSystem(loc.systemId);
             const poi = sys?.pois.find(p => p.id === loc.poiId);
             if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-              if (miningType === "radioactive") return canMineBasicRadioactive && (
+              if (miningType === "radioactive") return canMineBasicRadioactive &&
+                !isForbiddenRadioactiveSystem(loc.systemId) && (
                 isOreBeltPoi(poi?.type || "") ||
                 (!poi?.hidden && canMineDeepCoreRadioactive) ||
                 (poi?.hidden && canMineHiddenRadioactive)
@@ -7380,6 +7482,11 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
               oresToSearch = Array.from(RADIOACTIVE_ORES);
             }
 
+            // Only deep-core-capable miners may search for polonium.
+            if (!canMineDeepCoreRadioactive) {
+              oresToSearch = oresToSearch.filter(ore => !isDeepCoreRadioactiveOre(ore));
+            }
+
             for (const radioactiveOre of oresToSearch) {
               const hiddenPoiResult = findBestHiddenPoiForOre(
                 radioactiveOre,
@@ -7388,8 +7495,9 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                 maxJumps,
                 settings.ignoreDepletion,
                 depletionTimeoutMs,
-                canMineHiddenRadioactive ? 50 : 0,
-                blacklist
+                0, // radioactive ores are viable at any richness
+                blacklist,
+                true // never target Frontier systems
               );
 
               if (hiddenPoiResult) {
@@ -7417,17 +7525,18 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-                      if (miningType === "radioactive") {
-                        const isOreBelt = isOreBeltPoi(poi?.type || "") ||
-                                          (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
-                                                           loc.poiName.toLowerCase().includes('mineral field') ||
-                                                           loc.poiName.toLowerCase().includes('asteroid')));
-                        return canMineBasicRadioactive && (
-                          isOreBelt ||
-                          (!poi?.hidden && canMineDeepCoreRadioactive) ||
-                          (poi?.hidden && canMineHiddenRadioactive)
-                        );
-                      }
+              if (miningType === "radioactive") {
+                if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
+                const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                                  (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                                   loc.poiName.toLowerCase().includes('mineral field') ||
+                                                   loc.poiName.toLowerCase().includes('asteroid')));
+                return canMineBasicRadioactive && (
+                  isOreBelt ||
+                  (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                  (poi?.hidden && canMineHiddenRadioactive)
+                );
+              }
               if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
               return true;
@@ -7482,6 +7591,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
                 if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               if (miningType === "radioactive") {
+                if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
                 const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                                   (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
                                                    loc.poiName.toLowerCase().includes('mineral field') ||
@@ -7561,7 +7671,8 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                                 (p.name && (p.name.toLowerCase().includes('belt') ||
                                             p.name.toLowerCase().includes('mineral field') ||
                                             p.name.toLowerCase().includes('asteroid')));
-                              return canMineBasicRadioactive && (
+                              return canMineBasicRadioactive &&
+                                !isForbiddenRadioactiveSystem(bot.system) && (
                                 isOreBelt ||
                                 (!p.hidden && canMineDeepCoreRadioactive) ||
                                 (p.hidden && canMineHiddenRadioactive)
@@ -7619,6 +7730,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                     if (poi.hidden) continue; // Hidden POIs need special handling
                   }
                   if (miningType === "radioactive") {
+                    if (isForbiddenRadioactiveSystem(loc.systemId)) continue;
                     if (poi.hidden && !canMineHiddenRadioactive) continue;
                   }
                   if (miningType === "gas") {
@@ -7627,7 +7739,8 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                   if (miningType === "ice") {
                     if (poi.hidden && !canMineHiddenIce) continue;
                   }
-                  if (miningType === "radioactive" && !(canMineBasicRadioactive && (
+                  if (miningType === "radioactive" && !(canMineBasicRadioactive &&
+                    !isForbiddenRadioactiveSystem(loc.systemId) && (
                     isOreBeltPoi(poi.type) ||
                     (!poi.hidden && canMineDeepCoreRadioactive) ||
                     (poi.hidden && canMineHiddenRadioactive)

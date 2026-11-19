@@ -75,6 +75,14 @@ export interface ResourceRecord {
 /** Depletion timeout in milliseconds - POIs can be re-checked after this long. */
 export const DEPLETION_TIMEOUT_MS = 3 * 60 * 60 * 1000; // 3 hours
 
+/**
+ * The 506th and final system of the original map. Every system after it in
+ * map.json insertion order was appended later and is a Frontier system.
+ * Frontier systems are reached through temporary wormholes that can expire,
+ * so routines that cannot afford to be stranded must not target them.
+ */
+const LAST_ORIGINAL_SYSTEM_ID = "bnki";
+
 /** Check if an ore depletion has expired (can be re-mined). */
 export function isDepletionExpired(depletedAt: string | undefined, timeoutMs: number = DEPLETION_TIMEOUT_MS): boolean {
   if (!depletedAt) return true;
@@ -359,6 +367,9 @@ class MapStore {
   // id/name → id lookup, rebuilt whenever mapGeneration changes.
   private systemLookupIndex: Map<string, string> | null = null;
   private systemLookupIndexGeneration = -1;
+  // Frontier-system lookup, rebuilt whenever mapGeneration changes.
+  private frontierSystemIds: Set<string> | null = null;
+  private frontierSystemGeneration = -1;
 
   constructor() {
     this.data = this.load();
@@ -2959,6 +2970,47 @@ const locations = this.findOreLocations(oreId, blacklist);
   }
 
   /**
+   * Compute the set of Frontier system keys (loose form) from map insertion
+   * order. The original 506 systems come first in map.json and the 506th is
+   * "bnki"; everything after it is a Frontier system. If "bnki" is absent
+   * (older/seed map), fall back to the main connected component.
+   */
+  private computeFrontierSystemIds(): Set<string> {
+    const ids = Object.keys(this.data.systems);
+    let cutoff = ids.findIndex(id => looseSystemKey(id) === looseSystemKey(LAST_ORIGINAL_SYSTEM_ID));
+    if (cutoff < 0) {
+      // bnki is missing (older/seed map). Fall back to the main connected
+      // component: anything not connected to home is a Frontier system.
+      const main = this.getMainNetworkSystems();
+      const mainLoose = new Set(Array.from(main).map(looseSystemKey));
+      const frontier = new Set<string>();
+      for (const id of ids) {
+        if (!mainLoose.has(looseSystemKey(id))) frontier.add(looseSystemKey(id));
+      }
+      return frontier;
+    }
+    const frontier = new Set<string>();
+    for (let i = cutoff + 1; i < ids.length; i++) {
+      frontier.add(looseSystemKey(ids[i]));
+    }
+    return frontier;
+  }
+
+  /**
+   * Whether a system is a Frontier system (appended after the original 506).
+   * Frontier systems are only reachable via temporary wormholes, which can
+   * expire and strand a ship, so mining routines must avoid them.
+   */
+  isFrontierSystem(systemId: string): boolean {
+    if (!systemId) return false;
+    if (this.frontierSystemGeneration !== this.mapGeneration || !this.frontierSystemIds) {
+      this.frontierSystemIds = this.computeFrontierSystemIds();
+      this.frontierSystemGeneration = this.mapGeneration;
+    }
+    return this.frontierSystemIds.has(looseSystemKey(systemId));
+  }
+
+  /**
    * Get the set of system IDs in the main connected component (the original ~506 systems).
    * Uses the same logic as buildFixedRouteGraph in explorer.ts to identify the main network.
    * Returns a Set of lowercase system IDs.
@@ -3082,4 +3134,9 @@ export const mapStore = new MapStore();
 /** Get the set of system IDs in the main connected component (original ~506 systems). */
 export function getMainNetworkSystems(): Set<string> {
   return mapStore.getMainNetworkSystems();
+}
+
+/** Whether a system is a Frontier system (appended after the original 506). */
+export function isFrontierSystem(systemId: string): boolean {
+  return mapStore.isFrontierSystem(systemId);
 }

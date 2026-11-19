@@ -2724,8 +2724,8 @@ if (state && state.status !== "idle") {
           continue;
         }
         // Isolated transport in the wild: never scan the galaxy; return home instead.
-        if (settings.mode === "isolated_transport" && !isAtHomeBase(ctx, settings)) {
-          ctx.log("transport", "Isolated transport: away from home base — returning home instead of scanning");
+        if (settings.mode === "isolated_transport" && !isAtHomeBase(ctx, settings) && !(settings.isolatedStation && bot.poi && bot.poi.toLowerCase() === settings.isolatedStation.toLowerCase())) {
+          ctx.log("transport", "Isolated transport: away from home base and isolated station — returning home instead of scanning");
           state.pickupStation = settings.homeStation || null;
           state.pickupSystem = settings.homeSystem || null;
           state.needsTravel = true;
@@ -3197,7 +3197,7 @@ if (state && state.status !== "idle") {
         classOrder.business = 2;
       }
 
-       const loungeFull = settings.mode === "lounge_transport" && passengersLounge.getAvailableSlots() <= 0;
+       const loungeFull = false;
       if (loungeFull) {
         ctx.log("transport", `Transit Lounge is full (150/150) — doing normal passenger deliveries instead of lounge pickup`);
       }
@@ -3281,16 +3281,6 @@ if (state && state.status !== "idle") {
           }
          } else {
          // Isolated transport never delivers passengers to their destinations; if the
-         // Transit Lounge is full we cannot check anyone in, so skip loading entirely
-         // rather than falling back to normal (route-checking) delivery.
-         if (settings.mode === "lounge_transport" && passengersLounge.getAvailableSlots() <= 0) {
-           ctx.log("transport", "Transit Lounge full — skipping pickup at isolated station");
-           state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
-           state.status = "idle";
-           saveTransportState(state);
-           await ctx.sleep(30000);
-           continue;
-         }
          // Normal mode: load by destination groups
         for (const leg of plannedRoute) {
         const legPoiLower = leg.poi.toLowerCase();

@@ -14,6 +14,7 @@ import {
   resolveStationId,
 } from "./common.js";
 import { mapStore } from "../mapstore.js";
+import { executePathfinderJumpToBearing } from "./pathfinder.js";
 import { catalogStore } from "../catalogstore.js";
 import { loadSettings } from "../web/server.js";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
@@ -969,8 +970,7 @@ async function deliverItems(ctx: RoutineContext, items: Array<{ itemId: string; 
 async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promise<boolean> {
   const { bot } = ctx;
   const settings = getMissionSettings(bot);
-  const disablePathfinder = settings.disablePathfinderJumps === true;
-  const minFuelPct = (settings.minFuelForPathfinder as number) ?? 80;
+  // removed unused top-level vars; defined in cases where needed
 
   // Ensure any incomplete visit_system objectives of the active mission are
   // satisfied before executing this step.
@@ -1096,34 +1096,96 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
       if (step.system) {
         await navigateToSystem(ctx, step.system);
       }
-      if (step.bearing !== undefined && step.distance !== undefined) {
-        ctx.log("travel", `Jumping bearing ${step.bearing}, distance ${step.distance}...`);
-        const jumpResp = await bot.exec("jump", { bearing: step.bearing, distance: step.distance });
+      if (step.bearing !== undefined) {
+        await ensureUndocked(ctx);
+        ctx.log("travel", `Jumping bearing ${step.bearing}...`);
+        const jumpResp = await bot.exec("jump", { target_system: step.bearing });
         if (jumpResp.error) {
           ctx.log("error", `Bearing jump failed: ${jumpResp.error.message}`);
           return false;
         }
+        // Wait for transit to start
+        let inTransit = false;
+        for (let i = 0; i < 60 && bot.state === "running" && !inTransit; i++) {
+          await ctx.sleep(1000);
+          const poiResp = await bot.exec("get_poi");
+          if (poiResp.result && typeof poiResp.result === "object") {
+            inTransit = (poiResp.result as Record<string, unknown>).in_transit === true;
+          }
+        }
+        if (!inTransit) {
+          ctx.log("error", `Bearing jump ${step.bearing} — transit never started`);
+          return false;
+        }
+        // If a distance is given, turn around after traveling that far.
+        if (step.distance && step.distance > 0) {
+          const targetTicks = Math.ceil(step.distance / 10);
+          const startTick = await bot.pollCurrentTick();
+          let redirected = false;
+          while (bot.state === "running" && inTransit) {
+            await ctx.sleep(2000);
+            const poiResp = await bot.exec("get_poi");
+            if (poiResp.result && typeof poiResp.result === "object") {
+              inTransit = (poiResp.result as Record<string, unknown>).in_transit === true;
+            }
+            if (!redirected && startTick !== null && inTransit) {
+              const nowTick = await bot.pollCurrentTick();
+              if (nowTick !== null && nowTick - startTick >= targetTicks) {
+                const newBearing = (step.bearing + 180) % 360;
+                ctx.log("travel", `Turn-around: redirecting to bearing ${newBearing}...`);
+                const rResp = await bot.exec("jump", { target_system: newBearing });
+                if (rResp.error) {
+                  ctx.log("error", `Redirect failed: ${rResp.error.message}`);
+                  return false;
+                }
+                redirected = true;
+              }
+            }
+          }
+        } else {
+          while (bot.state === "running" && inTransit) {
+            await ctx.sleep(2000);
+            const poiResp = await bot.exec("get_poi");
+            if (poiResp.result && typeof poiResp.result === "object") {
+              inTransit = (poiResp.result as Record<string, unknown>).in_transit === true;
+            }
+          }
+        }
         await bot.refreshLocation();
       }
       if (step.poi) {
-        await bot.exec("interact_poi", { poi_id: step.poi });
+        await ctx.sleep(2000);
+        const interactResp = await bot.exec("interact_poi", { poi_id: step.poi });
+        if (interactResp.error) {
+          ctx.log("error", `Interact POI failed: ${interactResp.error.message}`);
+          return false;
+        }
       }
       return true;
     }
     case "pathfinder_jump": {
-      // Safety checks for pathfinder jumps
+      // Navigate to launch system first
+      if (step.system) {
+        const navigated = await navigateToSystem(ctx, step.system);
+        if (!navigated) {
+          ctx.log("warn", `Could not reach launch system ${step.system}; jumping from current location ${bot.system}`);
+        }
+      }
+      await ensureUndocked(ctx);
+
+      const disablePathfinder = settings.disablePathfinderJumps === true;
       if (disablePathfinder) {
         ctx.log("error", `Pathfinder jump required for step "${step.name}" but pathfinder jumps are DISABLED in settings.`);
-        ctx.log("error", `Please enable "Allow Pathfinder Jumps" in Missions settings, or manually execute: jump bearing ${step.bearing}, distance ${step.distance}`);
-        return false; // This will cause the routine to retry and log repeatedly
+        ctx.log("error", `Please enable "Allow Pathfinder Jumps" in Missions settings.`);
+        return false;
       }
-      
+
       // Check fuel level
+      const minFuelPct = (settings.minFuelForPathfinder as number) ?? 80;
       await bot.refreshShip();
       const fuelPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 100;
       if (fuelPct < minFuelPct) {
         ctx.log("error", `Pathfinder jump requires ${minFuelPct}% fuel, current: ${fuelPct.toFixed(1)}%. Refueling first...`);
-        // Try to refuel
         await ensureDocked(ctx);
         const refuelResp = await bot.exec("refuel");
         if (refuelResp.error) {
@@ -1136,41 +1198,49 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
           return false;
         }
       }
-      
-      // Validate bearing (0-360)
+
       if (step.bearing === undefined || step.bearing < 0 || step.bearing > 360) {
         ctx.log("error", `Invalid bearing for pathfinder jump: ${step.bearing}. Must be 0-360 degrees.`);
         return false;
       }
-      
-      // Validate distance (must be positive)
-      if (step.distance === undefined || step.distance <= 0) {
-        ctx.log("error", `Invalid distance for pathfinder jump: ${step.distance}. Must be positive.`);
-        return false;
-      }
-      
-      // Check if we have a pathfinder drive equipped
+
       await bot.refreshShip();
+      if (!bot.hasPathfinderDrive) {
+        await bot.refreshShipMods();
+      }
       if (!bot.hasPathfinderDrive) {
         ctx.log("error", `No Pathfinder Drive equipped! Cannot execute pathfinder jump.`);
         return false;
       }
-      
-      ctx.log("travel", `âš ï¸ PATHFINDER JUMP: bearing ${step.bearing}, distance ${step.distance}...`);
-      const jumpResp = await bot.exec("jump", { bearing: step.bearing, distance: step.distance, use_pathfinder: true });
-      if (jumpResp.error) {
-        ctx.log("error", `Pathfinder jump failed: ${jumpResp.error.message}`);
+
+      const currentSys = mapStore.getSystem(bot.system);
+      const originPos = currentSys?.position ? { x: currentSys.position.x, y: currentSys.position.y } : null;
+
+      ctx.log("travel", `⚠️ PATHFINDER JUMP: bearing ${step.bearing}...`);
+      const result = await executePathfinderJumpToBearing(ctx, step.bearing, originPos, { waitForCompletion: true });
+      if (!result.success) {
+        ctx.log("error", `Pathfinder jump failed`);
         return false;
       }
       await bot.refreshLocation();
-      
-      // If there's a POI to interact with after the jump
+
       if (step.poi) {
         await ctx.sleep(2000);
         const interactResp = await bot.exec("interact_poi", { poi_id: step.poi });
         if (interactResp.error) {
           ctx.log("error", `Interact POI after pathfinder jump failed: ${interactResp.error.message}`);
           return false;
+        }
+      }
+
+      // Optional return-to-station after the jump (e.g. back to FSMS)
+      if (step.station) {
+        const targetSystem = step.system && step.system !== "first_step" ? step.system : undefined;
+        // Resolve via navigateToStation using a synthetic step-like approach
+        const navStep = { ...step } as MissionStep;
+        const ok = await navigateToStation(ctx, navStep);
+        if (!ok) {
+          ctx.log("warn", `Post-jump navigation to station ${step.station} failed; continuing`);
         }
       }
       return true;

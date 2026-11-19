@@ -425,6 +425,7 @@ const MISSION_CHAINS: MissionChain[] = [
         station: "frontier_station",
         isMobileStation: true,
         mobileStationId: "frontier_station",
+        mobileStationPoiId: "mobile_capital",
         completeAfter: ["no_lane"],
       },
       {
@@ -533,7 +534,7 @@ async function goHomeAndDock(ctx: RoutineContext): Promise<boolean> {
   if (bot.poi !== stationPoi.id) {
     ctx.log("travel", `Traveling to ${stationPoi.name}...`);
     const travelResp = await bot.exec("travel", { target_poi: stationPoi.id });
-    if (travelResp.error && !travelResp.error.message.includes("already")) {
+    if (travelResp.error && !travelResp.error.message.toLowerCase().includes("already")) {
       ctx.log("error", `Travel to home station failed: ${travelResp.error.message}`);
       return false;
     }
@@ -543,7 +544,7 @@ async function goHomeAndDock(ctx: RoutineContext): Promise<boolean> {
 
   ctx.log("system", "Docking at home station...");
   const dockResp = await bot.exec("dock");
-  if (dockResp.error && !dockResp.error.message.includes("already")) {
+  if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
     ctx.log("error", `Dock at home station failed: ${dockResp.error.message}`);
     return false;
   }
@@ -636,7 +637,7 @@ async function navigateToStation(ctx: RoutineContext, step: MissionStep): Promis
   if (bot.poi !== station.id) {
     ctx.log("travel", `Traveling to ${station.name}...`);
     const travelResp = await bot.exec("travel", { target_poi: station.id });
-    if (travelResp.error && !travelResp.error.message.includes("already")) {
+    if (travelResp.error && !travelResp.error.message.toLowerCase().includes("already")) {
       ctx.log("error", `Travel failed: ${travelResp.error.message}`);
       return false;
     }
@@ -646,7 +647,7 @@ async function navigateToStation(ctx: RoutineContext, step: MissionStep): Promis
   
   ctx.log("system", "Docking...");
   const dockResp = await bot.exec("dock");
-  if (!dockResp.error || dockResp.error.message.includes("already")) {
+  if (!dockResp.error || dockResp.error.message.toLowerCase().includes("already")) {
     bot.docked = true;
     
     // Refuel after docking if needed
@@ -706,7 +707,7 @@ async function dockAtStation(ctx: RoutineContext, systemId: string, stationId: s
   if (bot.poi !== station.id) {
     ctx.log("travel", `Traveling to ${station.name}...`);
     const travelResp = await bot.exec("travel", { target_poi: station.id });
-    if (travelResp.error && !travelResp.error.message.includes("already")) {
+    if (travelResp.error && !travelResp.error.message.toLowerCase().includes("already")) {
       ctx.log("error", `Travel failed: ${travelResp.error.message}`);
       return false;
     }
@@ -716,7 +717,7 @@ async function dockAtStation(ctx: RoutineContext, systemId: string, stationId: s
 
   ctx.log("system", "Docking...");
   const dockResp = await bot.exec("dock");
-  if (!dockResp.error || dockResp.error.message.includes("already")) {
+  if (!dockResp.error || dockResp.error.message.toLowerCase().includes("already")) {
     bot.docked = true;
     
     // Refuel after docking if needed
@@ -1082,7 +1083,7 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
           if (poi) {
             ctx.log("travel", `Traveling to ${poi.name}...`);
             const travelResp = await bot.exec("travel", { target_poi: poi.id });
-            if (travelResp.error && !travelResp.error.message.includes("already")) {
+            if (travelResp.error && !travelResp.error.message.toLowerCase().includes("already")) {
               ctx.log("error", `Travel failed: ${travelResp.error.message}`);
               return false;
             }
@@ -1381,7 +1382,7 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
               if (bot.poi !== st.id) {
                 ctx.log("travel", `Traveling to ${st.name}...`);
                 const tr = await bot.exec("travel", { target_poi: st.id });
-                if (tr.error && !tr.error.message.includes("already")) {
+                if (tr.error && !tr.error.message.toLowerCase().includes("already")) {
                   ctx.log("error", `Travel failed: ${tr.error.message}`);
                   return false;
                 }
@@ -1389,7 +1390,7 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
                 await bot.refreshLocation();
               }
               const dr = await bot.exec("dock");
-              if (dr.error && !dr.error.message.includes("already")) {
+              if (dr.error && !dr.error.message.toLowerCase().includes("already")) {
                 ctx.log("error", `Dock at delivery station failed: ${dr.error.message}`);
                 return false;
               }
@@ -2142,12 +2143,12 @@ export const missionsRoutine: Routine = async function* (ctx: RoutineContext) {
                 if (station) {
                   if (bot.poi !== station.id) {
                     const tr = await bot.exec("travel", { target_poi: station.id });
-                    if (tr.error && !tr.error.message.includes("already")) ctx.log("error", `Travel failed: ${tr.error.message}`);
+                    if (tr.error && !tr.error.message.toLowerCase().includes("already")) ctx.log("error", `Travel failed: ${tr.error.message}`);
                     bot.poi = station.id;
                     await bot.refreshLocation();
                   }
                   const dr = await bot.exec("dock");
-                  if (!dr.error || dr.error.message.includes("already")) bot.docked = true;
+                  if (!dr.error || dr.error.message.toLowerCase().includes("already")) bot.docked = true;
                   await tryRefuel(ctx);
                 }
                 acceptResult = await acceptMission(ctx, nextStep.id);

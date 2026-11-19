@@ -410,7 +410,7 @@ const MISSION_CHAINS: MissionChain[] = [
         name: "No Lane",
         description: "Install survey_scanner_ii, pathfinder jump to Sanctum, scan, visit hidden POI, return to FSMS",
         type: "pathfinder_jump",
-        system: "first_step",
+        system: "nexus_prime",
         station: "first_step_memorial_station",
         bearing: 144.2,
         distance: 590,
@@ -1183,14 +1183,48 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
       return true;
     }
     case "pathfinder_jump": {
-      // Navigate to launch system first
-      if (step.system) {
-        const navigated = await navigateToSystem(ctx, step.system);
-        if (!navigated) {
-          if (bot.state !== "running") return false;
-          ctx.log("error", `Failed to reach launch system ${step.system} for pathfinder jump`);
-          return false;
+      // Resolve the launch system from the active mission (source of truth) when
+      // possible, falling back to the configured step.system. This prevents
+      // pathfinder jumps from the wrong location.
+      let launchSystem = step.system;
+      try {
+        const activeMissions = await getActiveMissions(ctx);
+        const mission = activeMissions.find(m => missionMatchesStep(m, step));
+        if (mission) {
+          const objs = (mission.objectives as Array<Record<string, unknown>>) || [];
+          for (const o of objs) {
+            const sid = String(o.system_id || "").trim();
+            if (sid && mapStore.getSystem(sid)) {
+              launchSystem = sid;
+              break;
+            }
+          }
         }
+      } catch (e) {
+        // ignore; fall back to step.system
+      }
+      // Hardcoded safety for the Sanctum pathfinder missions: always launch from Nexus Prime.
+      if (step.id === "into_the_sanctum" || step.id === "no_lane") {
+        launchSystem = "nexus_prime";
+      }
+      if (!launchSystem) {
+        ctx.log("error", `Cannot determine launch system for pathfinder jump step ${step.id}`);
+        return false;
+      }
+      ctx.log("mission", `Pathfinder jump launch system resolved to ${launchSystem} (step.system=${step.system})`);
+
+      // Navigate to launch system first
+      const navigated = await navigateToSystem(ctx, launchSystem);
+      if (!navigated) {
+        if (bot.state !== "running") return false;
+        ctx.log("error", `Failed to reach launch system ${launchSystem} for pathfinder jump`);
+        return false;
+      }
+      await bot.refreshLocation();
+      // Hard block: abort if we are not actually at the resolved launch system.
+      if (bot.system?.toLowerCase() !== launchSystem.toLowerCase()) {
+        ctx.log("error", `Pathfinder jump aborted — not at launch system ${launchSystem} (actual: ${bot.system})`);
+        return false;
       }
       if (bot.state !== "running") return false;
       await ensureUndocked(ctx);

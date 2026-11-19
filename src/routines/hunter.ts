@@ -13,6 +13,10 @@
  *   - hunt_big_creatures: Hunt known large creatures (Cloudwhale, Molt Leviathan,
  *     Rainbow Leviathan) using explorer wildlife data. Targets the closest known
  *     big creature, falls back to random creature farm when none are known.
+ *   - repeater_hunter: Hunt repeater NPCs across a Hunter Patrol Profile's systems
+ *     (same ordered routing as the creature farm). When attacked without engaging
+ *     a local repeater, roams the system's POIs looting the repeater wrecks before
+ *     continuing the route.
  *   - fleet_arena: Stay in the current POI and do nothing until the fleet enters battle
  *   - pvp: Camp a single system POI (never move) and send an attack command every
  *          tick at a configured target player (hunter.targetPlayer / per-bot override)
@@ -131,6 +135,8 @@ import {
   isPirateTarget,
   isCreatureTarget,
   isCreatureName,
+  isRepeaterTarget,
+  isRepeaterName,
   ensureAmmoLoaded,
   engageTarget,
   analyzeExistingBattle,
@@ -386,6 +392,13 @@ function isWeakCreatureBattleAlreadyHandled(ctx: RoutineContext, battleStatus: {
   return allies.length > 0;
 }
 
+export interface UnexpectedBattleInfo {
+  /** True when this call actually joined/fought a battle. */
+  handled: boolean;
+  /** True when the battle roster included a repeater NPC. */
+  involvesRepeater: boolean;
+}
+
 async function handleUnexpectedBattle(
   ctx: RoutineContext,
   maxAttackTier: PirateTier,
@@ -399,6 +412,7 @@ async function handleUnexpectedBattle(
   boardingMarines: number = 0,
   shieldRechargePct: number = 80,
   cloakOnStart: boolean = false,
+  info?: UnexpectedBattleInfo,
 ): Promise<void> {
   const battleStatus = await getBattleStatus(ctx);
   if (!battleStatus) return;
@@ -421,15 +435,20 @@ async function handleUnexpectedBattle(
 
   ctx.log("combat", `âœ… Engaging unexpected battle on side ${analysis.sideId}: ${analysis.reason} â€” holding and fighting`);
 
+  if (info) {
+    info.handled = true;
+    info.involvesRepeater = battleStatus.participants.some(p => isRepeaterName(p.username || ""));
+  }
+
   const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
   const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
   const fakeTargetIsCreature = fakeTarget ? isCreatureName(fakeTarget.name) : false;
 
   if (boardingEnabled && fakeTarget) {
-    // NEVER attempt boarding on creatures - they are not capturable ships
+    // NEVER attempt boarding on creatures or repeaters - they are not capturable ships
     const boardingTargetName = fakeTarget.name || "";
-    if (isCreatureName(boardingTargetName)) {
-      ctx.log("combat", `âš ï¸ ${boardingTargetName} is a creature - cannot board, engaging with fire stance`);
+    if (isCreatureName(boardingTargetName) || isRepeaterName(boardingTargetName)) {
+      ctx.log("combat", `⚠️ ${boardingTargetName} is a creature/repeater - cannot board, engaging with fire stance`);
     } else {
       const canBoard = await checkBoardingCapability(ctx);
       if (canBoard) {
@@ -439,9 +458,9 @@ async function handleUnexpectedBattle(
           ctx.log("combat", `Boarding: insufficient fit marines (${fitMarines} aboard, need ${marineRequirement}) â€” cannot board`);
         } else {
           const boardingTarget = pickLowestShieldsEnemy(battleStatus, analysis.sideId) || fakeTarget;
-          // Double-check the actual target isn't a creature
-          if (isCreatureName(boardingTarget.name)) {
-            ctx.log("combat", `âš ï¸ ${boardingTarget.name} is a creature - cannot board, engaging with fire stance`);
+          // Double-check the actual target isn't a creature or repeater
+          if (isCreatureName(boardingTarget.name) || isRepeaterName(boardingTarget.name)) {
+            ctx.log("combat", `âš ï¸ ${boardingTarget.name} is a creature/repeater - cannot board, engaging with fire stance`);
           } else {
             ctx.log("combat", `ðŸ›¸ Boarding: engaging unexpected battle with ${boardingTarget.name} (shields â‰¤ ${boardingShieldThreshold}% â†’ board)`);
             broadcastHunterAssist(ctx, boardingTarget, isCreatureName(boardingTarget.name));
@@ -465,7 +484,7 @@ async function handleUnexpectedBattle(
   await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs, cloakOnStart, fakeTargetIsCreature);
 }
 
-async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
+async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, info?: UnexpectedBattleInfo): Promise<boolean> {
   // Process any incoming hunter-assist requests from allies in our POI first.
   // (No-op if disabled, docked, already busy, or no pending requests.)
   await checkHunterCoordRequests(ctx, settings);
@@ -477,7 +496,7 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
     apiChecked = true;
     if (battleStatus) {
       ctx.log("combat", `âš ï¸ Battle detected via API (ID: ${battleStatus.battle_id}) - engaging instead of navigating`);
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart, info);
       return true;
     }
     // API returned no battle - clear stale WebSocket state if present
@@ -498,7 +517,7 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
   // API failed, check WebSocket state as fallback
   if (ctx.bot.isInBattle()) {
     ctx.log("combat", `âš ï¸ WebSocket battle state detected (ID: ${ctx.bot.currentBattle.battleId}) - engaging instead of navigating`);
-     await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
+     await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart, info);
     return true;
   }
   
@@ -554,7 +573,7 @@ async function handleFuelCheckFailure(
 
 export type HunterCoordinationMode = "off" | "assist" | "avoid";
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "protect_here" | "creature_farm" | "creature_farm_random" | "hunt_big_creatures" | "fleet_arena" | "fleet" | "pvp" | "boarding";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "protect_here" | "creature_farm" | "creature_farm_random" | "hunt_big_creatures" | "repeater_hunter" | "fleet_arena" | "fleet" | "pvp" | "boarding";
 
 /**
  * A Creature Farm "route" is just a Hunter Patrol Profile (hunter.hunterPatrols).
@@ -1998,6 +2017,28 @@ function pickCreatureTargets(entities: NearbyEntity[], bot: Bot, huntCreatures: 
 }
 
 /**
+ * How many times a single system sweep may restart its POI loop after a repeater
+ * kill. A repeater's wreck can end up in any POI of the system, so the sweep
+ * restarts to visit every POI again and loot them all. The cap stops a system
+ * full of repeaters from trapping the hunter in an endless POI loop.
+ */
+const REPEATER_POI_SWEEP_RESET_LIMIT = 3;
+
+/**
+ * Pick the repeater NPCs a creature hunter should engage.
+ *
+ * Repeaters live in their own `get_nearby` section and behave like creatures in
+ * combat: they are attacked the same way (no boarding) and shoot back once one
+ * of them is destroyed. Sorted by hull so the biggest relay is dropped first.
+ */
+function pickRepeaterTargets(entities: NearbyEntity[], max: number): NearbyEntity[] {
+  return entities
+    .filter(e => isRepeaterTarget(e) && !isStationEntity(e))
+    .sort((a, b) => (b.maxHull || b.hull || 0) - (a.maxHull || a.hull || 0))
+    .slice(0, Math.max(0, max));
+}
+
+/**
  * Wrapper around engageTarget that broadcasts a hunter-assist request (so same-POI
  * allies can join) before fighting. Skips the broadcast when we are ourselves
  * responding to someone else's assist request, to avoid echo loops.
@@ -2517,6 +2558,11 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       return;
     }
 
+    if (initialSettings.mode === "repeater_hunter") {
+      yield* repeaterHunterRoutine(ctx);
+      return;
+    }
+
     if (initialSettings.mode === "hunt_big_creatures") {
       yield* huntBigCreaturesRoutine(ctx);
       return;
@@ -2889,8 +2935,13 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
       ctx.log("info", `Creature farm sweep ${sweeps}/${loopCap} â€” ${patrolPois.length} POI(s) in ${targetSystem}`);
       let sweepKills = 0;
+      // Set when a repeater dies: its wreck can surface in any POI of the system,
+      // so the POI loop restarts to visit every POI again and loot them all.
+      let repeaterKilledThisSweep = false;
+      let poiSweepRestarts = 0;
 
-      for (const poi of patrolPois) {
+      for (let poiIdx = 0; poiIdx < patrolPois.length; poiIdx++) {
+        const poi = patrolPois[poiIdx];
         if (bot.state !== "running") break;
 
         // Mid-loop safety checks
@@ -2953,18 +3004,21 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
           const entities = parseNearby(afterBattleData);
           const creatures = pickCreatureTargets(entities, bot, true, settings.maxCreaturesPerScan, settings.coordinationMode);
+          // Repeaters are their own get_nearby section but behave like creatures:
+          // engage them on sight (never board them).
+          const repeaters = pickRepeaterTargets(entities, settings.maxCreaturesPerScan);
           const pirates = settings.ignorePirates ? [] : entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-          let targets = [...creatures, ...pirates];
+          let targets = [...creatures, ...repeaters, ...pirates];
           targets = pickUnclaimedBoardingTarget(targets, bot.username);
 
           const targetsToEngage = sortTargetsByPriority(targets);
 
           if (targetsToEngage.length === 0) {
-            // POI currently clear â€” stop re-scanning this POI for now
+            // POI currently clear — stop re-scanning this POI for now
             break;
           }
 
-          ctx.log("combat", `Found ${pirates.length} pirate(s), ${creatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses})${settings.ignorePirates ? " â€” ignoring pirates" : ""}`);
+          ctx.log("combat", `Found ${pirates.length} pirate(s), ${creatures.length} creature(s), ${repeaters.length} repeater(s) at ${poi.name} (pass ${passes}/${maxPasses})${settings.ignorePirates ? " — ignoring pirates" : ""}`);
 
           for (const target of targetsToEngage) {
             if (bot.state !== "running") break;
@@ -3000,6 +3054,10 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
               totalKills++;
               sweepKills++;
               recordCreatureKill(bot, target);
+              if (isRepeaterTarget(target)) {
+                repeaterKilledThisSweep = true;
+                ctx.log("combat", `Repeater destroyed (${target.name}) — its wreck may surface in another POI of ${targetSystem}`);
+              }
               ctx.log("combat", `Kill #${totalKills} (${target.name}) â€” looting before next...`);
               if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
               const cset = getHunterSettings(bot.username);
@@ -3019,9 +3077,22 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
           await ctx.sleep(1500);
         }
         if (cargoFull) break;
-      }
 
-      // After a full sweep, loop again to catch respawns across the system
+        // Check this POI for wrecks even when it had no targets: a repeater
+        // killed in another POI of the system can leave loot here.
+        if (!settings.disableWreckSalvaging && bot.state === "running" && !bot.docked) {
+          await scavengeWrecks(ctx);
+        }
+
+        // A repeater's wreck can surface in any POI of the system — restart the
+        // POI sweep so every POI is visited again and all the wrecks are looted.
+        if (repeaterKilledThisSweep && poiSweepRestarts < REPEATER_POI_SWEEP_RESET_LIMIT && !cargoFull && !settings.disableWreckSalvaging) {
+          poiSweepRestarts++;
+          repeaterKilledThisSweep = false;
+          poiIdx = -1; // the for-loop increment lands back on the first POI
+          ctx.log("combat", `Repeater killed in ${targetSystem} — restarting POI sweep (${poiSweepRestarts}/${REPEATER_POI_SWEEP_RESET_LIMIT}) to loot wrecks across all POIs`);
+        }
+      }
       await bot.refreshCargo();
       const afterCargo = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
       if (afterCargo >= cargoFullPct) break; // top of loop routes home
@@ -3269,6 +3340,483 @@ async function shouldAbortForBigCreatureHunt(ctx: RoutineContext, settings: Retu
   return true;
 }
 
+/**
+ * True when the battle we just handled involved at least one repeater NPC.
+ * Checks both the live API status and the WebSocket battle state (the battle
+ * may already be over by the time the caller checks).
+ */
+async function recentBattleInvolvesRepeater(ctx: RoutineContext): Promise<boolean> {
+  const status = await getBattleStatus(ctx);
+  if (status?.participants?.some(p => isRepeaterName(p.username || ""))) return true;
+  // The API may already report no battle if the kill ended it. The WebSocket
+  // battle state keeps the last roster briefly — trust it only while it is fresh
+  // so a stale roster from an old fight cannot trigger a bogus wreck hunt.
+  const cb = ctx.bot.currentBattle;
+  if (cb && Array.isArray(cb.participants) && cb.lastUpdate > 0 && Date.now() - cb.lastUpdate < 60_000) {
+    for (const p of cb.participants) {
+      const name = ((p as Record<string, unknown>).username as string)
+        || ((p as Record<string, unknown>).name as string)
+        || "";
+      if (isRepeaterName(name)) return true;
+    }
+  }
+  return false;
+}
+
+type WreckRoamResult = "found" | "empty" | "interrupted";
+
+/**
+ * Roam every POI in the system (starting at `startIndex`, wrapping around),
+ * looting wrecks, until the repeater wrecks are recovered. Returns:
+ *   - "found"       — a wreck with loot was found and looted
+ *   - "empty"       — every POI was checked and nothing was looted
+ *   - "interrupted" — a battle/dock/shutdown interrupted the search
+ */
+async function roamPoisForRepeaterWrecks(
+  ctx: RoutineContext,
+  pois: Array<{ id: string; name: string }>,
+  startIndex: number,
+): Promise<WreckRoamResult> {
+  const { bot } = ctx;
+  if (pois.length === 0) return "empty";
+  const start = ((startIndex % pois.length) + pois.length) % pois.length;
+  const order = [...pois.slice(start), ...pois.slice(0, start)];
+
+  for (const poi of order) {
+    if (bot.state !== "running" || bot.docked) return "interrupted";
+    if (bot.isInBattle()) return "interrupted";
+
+    const travelResp = await bot.exec("travel", { target_poi: poi.id });
+    if (travelResp.error && !travelResp.error.message.includes("already")) {
+      ctx.log("error", `Repeater wreck hunt: travel to ${poi.name} failed: ${travelResp.error.message}`);
+      continue;
+    }
+    bot.poi = poi.id;
+    bot.clearObservationState();
+    await ctx.sleep(1000);
+    if (bot.state !== "running" || bot.docked) return "interrupted";
+    if (bot.isInBattle()) return "interrupted";
+
+    await bot.refreshCargo();
+    const looted = await sweepWrecksAtPoi(ctx);
+    if (looted > 0) {
+      ctx.log("combat", `Repeater wreck hunt: recovered ${looted} item(s) at ${poi.name}`);
+      return "found";
+    }
+  }
+  return "empty";
+}
+
+// ─── Repeater Hunter Routine ──────────────────────────────────
+//
+// Repeater-SPECIFIC hunter sub-routine. It focuses entirely on the repeater
+// NPCs from their own `get_nearby` section.
+//
+// Routing is identical to the creature farm: an ordered Hunter Patrol Profile
+// system list, `creatureFarmLoopsPerSystem` sweeps per system, then advance to
+// the next system and cycle back at the end. `singleLoop` returns home for
+// resupply after a full profile cycle.
+//
+// Repeater-specific behaviour:
+//   * Pirates are never engaged on purpose. If a pirate attacks, the hunter
+//     fights back but keeps hunting repeaters.
+//   * If the hunter is attacked WITHOUT having engaged a local repeater, the
+//     attacker was a repeater that was not in the POI we scanned (or one that
+//     shot first). Its wreck can be in any POI of the system, so the hunter
+//     roams every POI looting wrecks until it recovers the loot, and only then
+//     continues its route.
+//   * After a repeater kill the POI sweep restarts (like the creature farm) so
+//     wrecks that surfaced in other POIs are still looted.
+async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await ensureHunterCoordListener(bot.username);
+
+  await bot.refreshLocation();
+  let totalKills = 0;
+  let justResupplied = false;
+  let sysIndex = 0;
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+    const profile = getHunterPatrolProfile(bot.username);
+    if (!profile || profile.patrolSystems.length === 0) {
+      ctx.log("error", "repeater_hunter mode but no Hunter Patrol Profile assigned (set hunter.hunterPatrols + hunter.botHunterPatrolAssignments). Waiting 60s...");
+      await ctx.sleep(60000);
+      continue;
+    }
+
+    const effectiveSystems = profile.patrolSystems;
+    if (sysIndex >= effectiveSystems.length) sysIndex = 0;
+    const homeSystem = settings.homeSystem || "";
+    const homeStation = settings.homeStation || "";
+    const targetPois = profile.targetPois || [];
+    const targetSystem = effectiveSystems[sysIndex];
+
+    const loopsPerSystem = settings.creatureFarmLoopsPerSystem > 0 ? settings.creatureFarmLoopsPerSystem : 3;
+    const cargoFullPct = settings.creatureFarmCargoFullPct > 0 ? settings.creatureFarmCargoFullPct : 0.95;
+    const maxPasses = settings.creatureFarmMaxPassesPerPoi > 0 ? settings.creatureFarmMaxPassesPerPoi : 6;
+    const maxSweeps = settings.creatureFarmMaxSystemSweeps > 0 ? settings.creatureFarmMaxSystemSweeps : 40;
+    const loopCap = Math.min(loopsPerSystem, maxSweeps);
+    const disableWreckSalvaging = settings.disableWreckSalvaging === true;
+
+    const safetyOpts = {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
+      skipBlacklist: true,
+      isCombatBot: true,
+      joinBattles: true,
+    };
+
+    // ── Death recovery ──
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
+    // ── Status ──
+    yield "get_status";
+    await bot.refreshLocation();
+    logStatus(ctx);
+
+    // ── Fuel ──
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem, homeStation, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
+      continue;
+    }
+
+    // ── Hull ──
+    await bot.refreshShip();
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (hullPct <= settings.repairThreshold) {
+      ctx.log("system", `Hull at ${hullPct}% — returning home to repair`);
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
+      continue;
+    }
+
+    // ── Low fuel cells ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+      if (canMakeItHome) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
+        await returnToHomeAndResupply(ctx, settings);
+        justResupplied = true;
+        continue;
+      }
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home — proceeding anyway`);
+    }
+
+    // ── Cargo full? ──
+    await bot.refreshCargo();
+    const cargoPct0 = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+    if (cargoPct0 >= cargoFullPct) {
+      ctx.log("system", `Cargo ${Math.round(cargoPct0 * 100)}% — returning home to deposit loot + restock ammo`);
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
+      continue;
+    }
+
+    // ── Ammo ──
+    const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    if (!hasAmmo && !settings.meatShield) {
+      ctx.log("combat", "Out of ammo — returning home to restock");
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
+      continue;
+    }
+
+    // ── Field consumables ──
+    if (isLowOnFieldConsumables(bot.inventory, 1, 0) && !justResupplied) {
+      ctx.log("combat", "Low on repair kits — returning home to resupply");
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
+      continue;
+    }
+
+    // ── Navigate to target system ──
+    if (bot.system !== targetSystem) {
+      ctx.log("travel", `Repeater hunter: heading to target system ${targetSystem}...`);
+      const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
+      if (!arrived) {
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          await handleNavigationBattleInterrupt(ctx, settings);
+        } else {
+          ctx.log("error", `Could not reach ${targetSystem} — retrying next cycle`);
+          await ctx.sleep(5000);
+        }
+        continue;
+      }
+      await resubscribeObservationAfterMove(bot);
+    }
+
+    if (isLowOnFieldConsumables(bot.inventory, 1, 0)) {
+      justResupplied = true;
+    } else {
+      justResupplied = false;
+    }
+
+    // ── Sweep the system ──
+    let sweeps = 0;
+    let cargoFull = false;
+    while (bot.state === "running" && sweeps < loopCap && !cargoFull) {
+      sweeps++;
+      yield "scan_system";
+      const { pois } = await getSystemInfo(ctx);
+      let patrolPois = pois.filter(p => !isStationPoi(p));
+      if (targetPois.length > 0) {
+        patrolPois = patrolPois.filter(p => targetPois.includes(p.id) || targetPois.includes(p.name));
+      }
+      if (patrolPois.length === 0) {
+        ctx.log("info", "Repeater hunter: no non-station POIs in target system — waiting 30s");
+        await ctx.sleep(30000);
+        break;
+      }
+
+      ctx.log("info", `Repeater hunter sweep ${sweeps}/${loopCap} — ${patrolPois.length} POI(s) in ${targetSystem}`);
+      let sweepKills = 0;
+      let repeaterKilledThisSweep = false;
+      let poiSweepRestarts = 0;
+      // Set when a battle we did NOT start involved a repeater: the kill's wreck
+      // may be in another POI, so we roam the system for it before moving on.
+      let wreckHuntPending = false;
+      let wreckHuntsThisSweep = 0;
+      const WRECK_HUNTS_PER_SWEEP = 2;
+
+      for (let poiIdx = 0; poiIdx < patrolPois.length; poiIdx++) {
+        const poi = patrolPois[poiIdx];
+        if (bot.state !== "running") break;
+
+        // ── Mid-loop safety checks ──
+        await bot.refreshShip();
+        const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        if (midHull <= settings.repairThreshold) {
+          ctx.log("system", "Hull low — aborting sweep to return home");
+          break;
+        }
+        await bot.refreshCargo();
+        const midCargo = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+        if (midCargo >= cargoFullPct) { cargoFull = true; break; }
+        const midAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+        if (!midAmmo && !settings.meatShield) {
+          ctx.log("combat", "Out of ammo mid-hunt — aborting sweep to home");
+          break;
+        }
+
+        // A battle left over from the previous POI (e.g. a repeater that shot
+        // us while we were travelling) must be finished before we scan here.
+        const carriedInfo: UnexpectedBattleInfo = { handled: false, involvesRepeater: false };
+        await checkAndHandleExistingBattle(ctx, settings, carriedInfo);
+        if (carriedInfo.handled && carriedInfo.involvesRepeater && !repeaterKilledThisSweep) {
+          wreckHuntPending = true;
+        }
+
+        // ── Travel to POI ──
+        yield "travel_to_poi";
+        ctx.log("travel", `Repeater hunter: travelling to ${poi.name}...`);
+        const travelResp = await bot.exec("travel", { target_poi: poi.id });
+        if (travelResp.error && !travelResp.error.message.includes("already")) {
+          ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
+          continue;
+        }
+        bot.poi = poi.id;
+        bot.clearObservationState();
+        await ctx.sleep(1000);
+
+        let engagedRepeaterHere = false;
+        let passes = 0;
+        while (bot.state === "running" && passes < maxPasses && !cargoFull) {
+          passes++;
+          yield "scan_for_targets";
+          const obsResult = await getObservationOrNearby(bot);
+          const nearbyData = obsResult.result;
+          if (!nearbyData) {
+            ctx.log("error", `No nearby data at ${poi.name}`);
+            break;
+          }
+          bot.trackNearbyPlayers(nearbyData);
+          bot.trackWildlife(nearbyData); bot.trackRepeaters(nearbyData);
+
+          // Fight back if a pirate/repeater attacks, but never go looking for
+          // non-repeater targets on purpose. If the fight involves a repeater and
+          // we did not start it, the kill's wreck may be in another POI.
+          const battleBefore = await getBattleStatus(ctx);
+          if (battleBefore && !engagedRepeaterHere && await recentBattleInvolvesRepeater(ctx)) {
+            wreckHuntPending = true;
+          }
+          const battleInfo: UnexpectedBattleInfo = { handled: false, involvesRepeater: false };
+          await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart, battleInfo);
+          if (battleInfo.handled && battleInfo.involvesRepeater && !engagedRepeaterHere) {
+            wreckHuntPending = true;
+          }
+
+          // Re-fetch after potential battle — the old snapshot is now stale.
+          const afterBattleResp = await getObservationOrNearby(bot);
+          const afterBattleData = afterBattleResp.result;
+          if (!afterBattleData) {
+            ctx.log("error", `No nearby data at ${poi.name} after battle check`);
+            break;
+          }
+          bot.trackNearbyPlayers(afterBattleData);
+          bot.trackWildlife(afterBattleData); bot.trackRepeaters(afterBattleData);
+
+          const entities = parseNearby(afterBattleData);
+          const repeaters = pickRepeaterTargets(entities, settings.maxCreaturesPerScan);
+          if (repeaters.length === 0) {
+            break;
+          }
+
+          ctx.log("combat", `Found ${repeaters.length} repeater(s) at ${poi.name} (pass ${passes}/${maxPasses})`);
+
+          for (const target of repeaters) {
+            if (bot.state !== "running") break;
+
+            await bot.refreshShip();
+            const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+            if (preHull <= settings.repairThreshold) break;
+
+            await useRepairKits(ctx);
+            const ammo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+            if (!ammo && !settings.meatShield) {
+              ctx.log("combat", "Out of ammo mid-hunt — aborting");
+              break;
+            }
+
+            yield "engage";
+
+            const freshScanResp = await bot.exec("get_nearby");
+            let freshEntities: NearbyEntity[] = [];
+            if (!freshScanResp.error && freshScanResp.result) {
+              bot.trackNearbyPlayers(freshScanResp.result);
+              bot.trackWildlife(freshScanResp.result); bot.trackRepeaters(freshScanResp.result);
+              freshEntities = parseNearby(freshScanResp.result);
+            }
+            const stillPresent = freshEntities.find(e => e.id === target.id || e.name === target.name);
+            if (!stillPresent) {
+              ctx.log("combat", `${target.name} is no longer at this POI — skipping to next target`);
+              continue;
+            }
+
+            const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+            if (won) {
+              totalKills++;
+              sweepKills++;
+              engagedRepeaterHere = true;
+              repeaterKilledThisSweep = true;
+              ctx.log("combat", `Kill #${totalKills} (${target.name}) — looting before next...`);
+              if (!disableWreckSalvaging) await sweepWrecksAtPoi(ctx);
+              const cset = getHunterSettings(bot.username);
+              await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
+              await bot.refreshCargo();
+              if (isLowOnFieldConsumables(bot.inventory, 1, 0) && !justResupplied) {
+                ctx.log("combat", "Low on consumables — ending sweep to resupply");
+                break;
+              }
+              const cp = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+              if (cp >= cargoFullPct) { cargoFull = true; break; }
+            }
+          }
+          if (cargoFull) break;
+          await ctx.sleep(1500);
+        }
+        if (cargoFull) break;
+
+        // Check this POI for wrecks even when it had no repeaters: a repeater
+        // killed elsewhere in the system can leave loot here.
+        if (!disableWreckSalvaging && bot.state === "running" && !bot.docked) {
+          await sweepWrecksAtPoi(ctx);
+        }
+
+        // We were attacked without engaging a local repeater → roam every POI
+        // until the repeater wrecks are recovered, then resume the route.
+        if (wreckHuntPending && !disableWreckSalvaging && bot.state === "running" && !bot.docked) {
+          if (wreckHuntsThisSweep >= WRECK_HUNTS_PER_SWEEP) {
+            wreckHuntPending = false;
+            ctx.log("combat", `Wreck hunt limit (${WRECK_HUNTS_PER_SWEEP}) reached for this sweep — resuming route`);
+          } else {
+            wreckHuntPending = false;
+            wreckHuntsThisSweep++;
+            ctx.log("combat", `Attacked without engaging a local repeater — roaming ${patrolPois.length} POI(s) in ${targetSystem} for the repeater wrecks`);
+            const roam = await roamPoisForRepeaterWrecks(ctx, patrolPois, 0);
+            if (roam === "found") {
+              ctx.log("combat", "Repeater wrecks recovered — resuming route");
+            } else if (roam === "empty") {
+              ctx.log("combat", `No repeater wrecks found in ${targetSystem} — resuming route`);
+            }
+            // Restart the POI sweep from the first POI so the route is still
+            // fully covered after the roam (unless combat interrupted us).
+            if (roam !== "interrupted") {
+              poiIdx = -1;
+              continue;
+            }
+          }
+        }
+
+        // A repeater's wreck can surface in any POI — restart the POI sweep so
+        // every POI is visited again and all the wrecks are looted.
+        if (repeaterKilledThisSweep && poiSweepRestarts < REPEATER_POI_SWEEP_RESET_LIMIT && !cargoFull && !disableWreckSalvaging) {
+          poiSweepRestarts++;
+          repeaterKilledThisSweep = false;
+          poiIdx = -1;
+          ctx.log("combat", `Repeater killed in ${targetSystem} — restarting POI sweep (${poiSweepRestarts}/${REPEATER_POI_SWEEP_RESET_LIMIT}) to loot wrecks across all POIs`);
+        }
+      }
+
+      // Final safety net: a battle may have been detected after the last POI.
+      if (wreckHuntPending && !disableWreckSalvaging && bot.state === "running" && !bot.docked) {
+        wreckHuntPending = false;
+        if (wreckHuntsThisSweep < WRECK_HUNTS_PER_SWEEP) {
+          wreckHuntsThisSweep++;
+          ctx.log("combat", `Attacked without engaging a local repeater — final wreck roam across ${targetSystem}`);
+          const roam = await roamPoisForRepeaterWrecks(ctx, patrolPois, 0);
+          if (roam === "found") ctx.log("combat", "Repeater wrecks recovered — resuming route");
+          else if (roam === "empty") ctx.log("combat", `No repeater wrecks found in ${targetSystem} — resuming route`);
+        } else {
+          ctx.log("combat", `Wreck hunt limit (${WRECK_HUNTS_PER_SWEEP}) reached — resuming route`);
+        }
+      }
+
+      if (cargoFull) {
+        await bot.refreshCargo();
+        const cp = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+        break;
+      }
+      if (sweepKills === 0) {
+        ctx.log("info", "Sweep found no repeaters — waiting for respawns...");
+        await ctx.sleep(10000);
+      }
+    }
+
+    if (cargoFull) {
+      await bot.refreshCargo();
+      const cp = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+      ctx.log("system", `Cargo full (${Math.round(cp * 100)}%) — returning home to deposit loot + restock ammo`);
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+    }
+
+    // ── Routing: advance to the next profile system ──
+    const prevSystem = targetSystem;
+    const wasLastSystem = (sysIndex + 1) >= effectiveSystems.length;
+    sysIndex = (sysIndex + 1) % effectiveSystems.length;
+    const nextSystem = effectiveSystems[sysIndex];
+    if (nextSystem !== prevSystem) {
+      ctx.log("info", `Repeater hunter: completed ${loopsPerSystem} loop(s) in ${prevSystem} — routing to ${nextSystem} (${sysIndex + 1}/${effectiveSystems.length})`);
+    } else {
+      ctx.log("debug", `Repeater hunter: completed ${loopsPerSystem} loop(s) in ${prevSystem} (only system in profile)`);
+    }
+
+    if (settings.singleLoop && wasLastSystem) {
+      ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+    }
+  }
+}
+
 async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
@@ -3460,16 +4008,18 @@ async function poiHasLootableWrecks(ctx: RoutineContext): Promise<boolean> {
  * Wrecks can also appear a few seconds after the battle ends, so we re-check
  * briefly instead of doing a single loot pass and moving on.
  */
-async function sweepWrecksAtPoi(ctx: RoutineContext): Promise<void> {
+async function sweepWrecksAtPoi(ctx: RoutineContext): Promise<number> {
   const { bot } = ctx;
+  let totalLooted = 0;
   for (let attempt = 0; attempt < 3; attempt++) {
-    if (bot.state !== "running") return;
-    if (bot.docked) return;
-    if (bot.isInBattle()) return; // fight first — the caller sweeps again after combat
+    if (bot.state !== "running") return totalLooted;
+    if (bot.docked) return totalLooted;
+    if (bot.isInBattle()) return totalLooted; // fight first — the caller sweeps again after combat
     await bot.refreshCargo();
-    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) return;
+    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) return totalLooted;
 
     const looted = await scavengeWrecks(ctx);
+    totalLooted += looted;
     if (looted > 0) {
       // Grabbed something — a short pause, then confirm nothing else spawned.
       if (attempt < 2) await ctx.sleep(1500);
@@ -3478,11 +4028,12 @@ async function sweepWrecksAtPoi(ctx: RoutineContext): Promise<void> {
 
     // Nothing looted this pass: give late-spawning wrecks a moment, then bail
     // out if the POI really is empty.
-    if (attempt >= 1) return;
+    if (attempt >= 1) return totalLooted;
     await ctx.sleep(4000);
-    if (bot.state !== "running" || bot.docked || bot.isInBattle()) return;
-    if (!(await poiHasLootableWrecks(ctx))) return;
+    if (bot.state !== "running" || bot.docked || bot.isInBattle()) return totalLooted;
+    if (!(await poiHasLootableWrecks(ctx))) return totalLooted;
   }
+  return totalLooted;
 }
 
 async function farmSystemForBigCreature(
@@ -3507,7 +4058,10 @@ async function farmSystemForBigCreature(
     return aIsTarget - bIsTarget;
   });
 
-  for (const poi of patrolPois) {
+  let repeaterKilled = false;
+  let poiSweepRestarts = 0;
+  for (let poiIdx = 0; poiIdx < patrolPois.length; poiIdx++) {
+    const poi = patrolPois[poiIdx];
     if (bot.state !== "running") break;
     if (targetKilled) break;
     engagedAtPoi = false;
@@ -3565,16 +4119,18 @@ async function farmSystemForBigCreature(
       const bigCreatures = allCreatures.filter(e => isBigCreature(e.name));
       const otherCreatures = allCreatures.filter(e => !isBigCreature(e.name));
       const creatures = [...prioritizeBigCreatures(bigCreatures), ...prioritizeLeviathans(otherCreatures)].slice(0, settings.maxCreaturesPerScan);
+      // Repeaters are their own get_nearby section but behave like creatures.
+      const repeaters = pickRepeaterTargets(entities, settings.maxCreaturesPerScan);
       const pirates = settings.ignorePirates ? [] : entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-      let targets = [...creatures, ...pirates];
+      let targets = [...creatures, ...repeaters, ...pirates];
       targets = pickUnclaimedBoardingTarget(targets, bot.username);
       const targetsToEngage = sortTargetsByPriority(targets);
-      const prioritizedTargets = prioritizeBigCreatures(targetsToEngage.filter(t => isCreatureTarget(t, true) || (!settings.ignorePirates && isPirateTarget(t, settings.onlyNPCs, settings.maxAttackTier))));
+      const prioritizedTargets = prioritizeBigCreatures(targetsToEngage.filter(t => isCreatureTarget(t, true) || isRepeaterTarget(t) || (!settings.ignorePirates && isPirateTarget(t, settings.onlyNPCs, settings.maxAttackTier))));
 
       if (prioritizedTargets.length === 0) break;
 
       const bigCount = prioritizedTargets.filter(t => isBigCreature(t.name)).length;
-      ctx.log("combat", `Big creature hunt: ${pirates.length} pirate(s), ${allCreatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses}, ${bigCount} big target(s))${settings.ignorePirates ? " â€” ignoring pirates" : ""}`);
+      ctx.log("combat", `Big creature hunt: ${pirates.length} pirate(s), ${allCreatures.length} creature(s), ${repeaters.length} repeater(s) at ${poi.name} (pass ${passes}/${maxPasses}, ${bigCount} big target(s))${settings.ignorePirates ? " — ignoring pirates" : ""}`);
 
       for (const t of prioritizedTargets) {
         if (bot.state !== "running") break;
@@ -3612,7 +4168,8 @@ async function farmSystemForBigCreature(
           totalKills++;
           if (isCloudWhale(t.name)) cloudwhaleKills++;
           recordCreatureKill(bot, t);
-          ctx.log("combat", `Kill #${totalKills} (${t.name}) â€” looting...`);
+          if (isRepeaterTarget(t)) repeaterKilled = true;
+          ctx.log("combat", `Kill #${totalKills} (${t.name}) — looting...`);
           if (!settings.disableWreckSalvaging) {
             if (bot.isInBattle()) {
               ctx.log("combat", "Clearing stale battle state after big creature kill â€” looting immediately");
@@ -3654,6 +4211,21 @@ async function farmSystemForBigCreature(
         }
       }
       await ctx.sleep(1500);
+    }
+
+    // Check this POI for wrecks even when nothing was engaged here: a repeater
+    // killed in another POI of the system can leave loot behind.
+    if (!settings.disableWreckSalvaging && bot.state === "running" && !bot.docked) {
+      await sweepWrecksAtPoi(ctx);
+    }
+
+    // A repeater's wreck can surface in any POI of the system — restart the POI
+    // loop so every POI is visited again and all the wrecks are looted.
+    if (repeaterKilled && !targetKilled && poiSweepRestarts < REPEATER_POI_SWEEP_RESET_LIMIT && !settings.disableWreckSalvaging) {
+      poiSweepRestarts++;
+      repeaterKilled = false;
+      poiIdx = -1;
+      ctx.log("combat", `Repeater killed in ${target.system} — restarting POI sweep (${poiSweepRestarts}/${REPEATER_POI_SWEEP_RESET_LIMIT}) to loot wrecks across all POIs`);
     }
   }
 
@@ -3773,8 +4345,11 @@ async function creatureFarmRandomFallbackCycle(
     const patrolPois = pois.filter(p => !isStationPoi(p));
     if (patrolPois.length === 0) break;
 
-    ctx.log("info", `Fallback farm sweep ${sweeps}/${loopsPerSystem} â€” ${patrolPois.length} POI(s)`);
-    for (const poi of patrolPois) {
+    ctx.log("info", `Fallback farm sweep ${sweeps}/${loopsPerSystem} — ${patrolPois.length} POI(s)`);
+    let repeaterKilledThisSweep = false;
+    let poiSweepRestarts = 0;
+    for (let poiIdx = 0; poiIdx < patrolPois.length; poiIdx++) {
+      const poi = patrolPois[poiIdx];
       if (bot.state !== "running") break;
       await bot.refreshShip();
       const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
@@ -3805,9 +4380,11 @@ async function creatureFarmRandomFallbackCycle(
 
         const entities = parseNearby(afterBattleData);
         const creatures = pickCreatureTargets(entities, bot, true, settings.maxCreaturesPerScan, settings.coordinationMode);
-        if (creatures.length === 0) break;
+        const repeaters = pickRepeaterTargets(entities, settings.maxCreaturesPerScan);
+        const targets = [...creatures, ...repeaters];
+        if (targets.length === 0) break;
 
-        for (const t of creatures) {
+        for (const t of targets) {
           if (bot.state !== "running") break;
           await useRepairKits(ctx);
           const ammo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
@@ -3816,6 +4393,7 @@ async function creatureFarmRandomFallbackCycle(
           const won = await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
           if (won) {
             recordCreatureKill(bot, t);
+            if (isRepeaterTarget(t)) repeaterKilledThisSweep = true;
             if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
             const cset = getHunterSettings(bot.username);
             await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
@@ -3831,6 +4409,20 @@ async function creatureFarmRandomFallbackCycle(
           }
         }
         await ctx.sleep(1500);
+      }
+
+      // Check this POI for wrecks even when it had no targets: a repeater killed
+      // in another POI of the system can leave loot here.
+      if (!settings.disableWreckSalvaging && bot.state === "running" && !bot.docked) {
+        await scavengeWrecks(ctx);
+      }
+
+      // Repeater wreck may be in any POI — restart the POI loop to loot them all.
+      if (repeaterKilledThisSweep && poiSweepRestarts < REPEATER_POI_SWEEP_RESET_LIMIT && !settings.disableWreckSalvaging) {
+        poiSweepRestarts++;
+        repeaterKilledThisSweep = false;
+        poiIdx = -1;
+        ctx.log("combat", `Repeater killed in ${targetSystem} — restarting POI sweep (${poiSweepRestarts}/${REPEATER_POI_SWEEP_RESET_LIMIT}) to loot wrecks across all POIs`);
       }
     }
   }
@@ -9175,7 +9767,8 @@ async function* engageBoardingTargetsAtCurrentPoi(
       const canBoard = settings.boardingEnabled
         && settings.boardingShieldThreshold > 0
         && await checkBoardingCapability(ctx)
-        && !isCreatureTarget(target as any, true); // NEVER board creatures - they are not capturable
+        && !isCreatureTarget(target as any, true) // NEVER board creatures - they are not capturable
+        && !isRepeaterTarget(target as any); // NEVER board repeaters - they are NPC relays, not ships
 
       if (canBoard) {
         const fitMarines = await getFitMarineCount(ctx);
@@ -9523,7 +10116,8 @@ async function* boardingSystemPass(
       const canBoard = settings.boardingEnabled
         && settings.boardingShieldThreshold > 0
         && await checkBoardingCapability(ctx)
-        && !isCreatureTarget(target as any, true); // NEVER board creatures - they are not capturable
+        && !isCreatureTarget(target as any, true) // NEVER board creatures - they are not capturable
+        && !isRepeaterTarget(target as any); // NEVER board repeaters - they are NPC relays, not ships
 
       if (canBoard) {
         const fitMarines = await getFitMarineCount(ctx);

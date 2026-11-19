@@ -59,7 +59,11 @@ function isCreatureNameOrSpecies(entity: NearbyEntity | null | undefined): boole
 }
 
 function isCreatureFightTarget(target: NearbyEntity | null | undefined): boolean {
-  return !!target?.isCreature || target?.type === "creature" || target?.id?.startsWith("crt_") || isCreatureNameOrSpecies(target);
+  if (!target) return false;
+  // Repeaters are stationary NPC relays like creatures: closing to engaged and
+  // staying there is correct (moving between rings just wastes damage ticks).
+  if (target.isRepeater || target.type === "repeater" || isRepeaterName(target.name)) return true;
+  return !!target.isCreature || target.type === "creature" || target.id?.startsWith("crt_") || isCreatureNameOrSpecies(target);
 }
 
 // ── Types ─────────────────────────────────────────────
@@ -274,6 +278,12 @@ export interface NearbyEntity {
   branded?: boolean;
   brand_faction?: string;
   brand_ranch?: string;
+  /** Repeater NPCs are signal relays: they have their own `repeaters` section in
+   *  get_nearby, are attacked like creatures, and shoot back once one of them
+   *  dies. */
+  isRepeater?: boolean;
+  repeaterId?: string;
+  shipClass?: string;
 }
 
 export interface WeaponModule {
@@ -397,7 +407,41 @@ let rawEntities: Array<Record<string, unknown>> = [];
     }
   }
 
-  return entities.filter(e => e.id);
+  if (Array.isArray(r.repeaters)) {
+    const rawRepeaters = r.repeaters as Array<Record<string, unknown>>;
+    for (const rep of rawRepeaters) {
+      const repeaterId = (rep.repeater_id as string) || (rep.id as string) || "";
+      if (!repeaterId) continue;
+
+      const name = (rep.name as string) || (rep.ship_name as string) || "";
+      entities.push({
+        id: repeaterId,
+        name: name || repeaterId,
+        type: "repeater",
+        faction: (rep.faction as string) || "",
+        isNPC: true,
+        isPirate: false,
+        isRepeater: true,
+        repeaterId,
+        shipClass: (rep.ship_class as string) || "",
+        hull: rep.hull as number,
+        maxHull: rep.max_hull as number,
+        shield: rep.shield as number,
+        maxShield: rep.max_shield as number,
+        inCombat: rep.in_battle as boolean,
+      });
+    }
+  }
+
+  // De-duplicate by id, keeping the LAST entry: the dedicated pirate / creature /
+  // repeater blocks run after the generic pass and carry the richer data (tier,
+  // hull, repeater_id, ...).
+  const byId = new Map<string, NearbyEntity>();
+  for (const e of entities) {
+    if (!e.id) continue;
+    byId.set(e.id, e);
+  }
+  return [...byId.values()];
 }
 
 // ── Target Validation ─────────────────────────────────────────
@@ -418,6 +462,27 @@ export function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean, maxAttac
 export function isCreatureTarget(entity: NearbyEntity, huntCreatures: boolean): boolean {
   if (!huntCreatures) return false;
   return !!(entity.isCreature || entity.type === "creature" || (entity.id && entity.id.startsWith("crt_")) || isCreatureName(entity.name) || isCreatureName(entity.species));
+}
+
+/**
+ * True when a display name belongs to a repeater NPC ("Silver Repeater",
+ * "Spire Repeater", ...). Battle rosters only carry usernames, so the combat
+ * analysis uses this name check to classify repeaters as hostile NPCs.
+ */
+export function isRepeaterName(name: string | undefined): boolean {
+  if (!name) return false;
+  return /repeater/i.test(name);
+}
+
+/**
+ * True when an entity is a repeater NPC. Repeaters are parsed from their own
+ * `repeaters` section in get_nearby, but the name check keeps older/partial
+ * payloads (and battle rosters) working.
+ */
+export function isRepeaterTarget(entity: NearbyEntity): boolean {
+  if (!entity) return false;
+  if (entity.isRepeater || entity.type === "repeater" || entity.repeaterId) return true;
+  return entity.isNPC === true && isRepeaterName(entity.name);
 }
 
 // ── Weapon & Ammo Management ─────────────────────────────────
@@ -743,18 +808,23 @@ export async function analyzeExistingBattle(
     playerCount: number;
     pirateCount: number;
     creatureCount: number;
+    repeaterCount: number;
     pirateTiers: string[];
     playerNames: string[];
     pirateNames: string[];
     creatureNames: string[];
+    repeaterNames: string[];
   }
 
   const sideAnalysis: SideAnalysis[] = sides.map(side => {
     const sideParticipants = participants.filter(p => p.side_id === side.side_id);
 
-    // Classify each participant as pirate / creature / real player.
+    // Classify each participant as pirate / creature / repeater / real player.
+    const repeaters = sideParticipants.filter(p => isRepeaterName(p.username || ""));
+
     const pirates = sideParticipants.filter(p => {
       const username = p.username || "";
+      if (isRepeaterName(username)) return false;
       return username.toLowerCase().includes("pirate") ||
              username.toLowerCase().includes("drifter") ||
              username.toLowerCase().includes("executioner") ||
@@ -775,8 +845,9 @@ export async function analyzeExistingBattle(
 
     const players = sideParticipants.filter(p => {
       const username = p.username || "";
-      // Real players: not a pirate keyword and not a known creature.
+      // Real players: not a pirate keyword, not a known creature, not a repeater.
       if (isCreatureName(username)) return false;
+      if (isRepeaterName(username)) return false;
       return !pirates.some(pir => pir === p) && !p.username?.startsWith("[POLICE]");
     });
 
@@ -785,24 +856,26 @@ export async function analyzeExistingBattle(
       playerCount: players.length,
       pirateCount: pirates.length,
       creatureCount: creatures.length,
+      repeaterCount: repeaters.length,
       pirateTiers: pirates.map(p => "unknown"),
       playerNames: players.map(p => p.username || p.player_id),
       pirateNames: pirates.map(p => p.username || p.player_id),
       creatureNames: creatures.map(p => p.username || p.player_id),
+      repeaterNames: repeaters.map(p => p.username || p.player_id),
     };
   });
 
   ctx.log("combat", `   Side analysis: ${sideAnalysis.map(s =>
-    `Side ${s.sideId}: ${s.playerCount} player(s) [${s.playerNames.join(",")}] vs ${s.pirateCount} pirate(s) [${s.pirateNames.join(",")}] + ${s.creatureCount} creature(s) [${s.creatureNames.join(",")}]`
+    `Side ${s.sideId}: ${s.playerCount} player(s) [${s.playerNames.join(",")}] vs ${s.pirateCount} pirate(s) [${s.pirateNames.join(",")}] + ${s.creatureCount} creature(s) [${s.creatureNames.join(",")}] + ${s.repeaterCount} repeater(s) [${s.repeaterNames.join(",")}]`
   ).join(" | ")}`);
 
   // A "player side" is any side with real players; a "hostile side" is any side
-  // with pirates OR creatures. We join a player side that is fighting a hostile
-  // side (they may be on the same side, or on opposite sides — e.g. one player vs
-  // one creature). This lets allied hunters pull in to help a faction member who
-  // got attacked by a creature.
+  // with pirates, creatures OR repeaters. We join a player side that is fighting a
+  // hostile side (they may be on the same side, or on opposite sides — e.g. one
+  // player vs one creature). This lets allied hunters pull in to help a faction
+  // member who got attacked by a creature (or a repeater that shot back).
   const playerSides = sideAnalysis.filter(s => s.playerCount > 0);
-  const hostileSides = sideAnalysis.filter(s => s.pirateCount > 0 || s.creatureCount > 0);
+  const hostileSides = sideAnalysis.filter(s => s.pirateCount > 0 || s.creatureCount > 0 || s.repeaterCount > 0);
 
   if (playerSides.length === 0 || hostileSides.length === 0) {
     // If our bot (or our drones/faction) is in the battle, we are already fighting — do NOT re-engage
@@ -816,6 +889,7 @@ export async function analyzeExistingBattle(
     const allPlayers = participants.filter(p => {
       const username = p.username || "";
       if (isCreatureName(username)) return false;
+      if (isRepeaterName(username)) return false;
       return !username.startsWith("[POLICE]") &&
              !username.toLowerCase().includes("pirate") &&
              !username.toLowerCase().includes("drifter");
@@ -836,7 +910,8 @@ export async function analyzeExistingBattle(
   // This is intentional — they are combat bots designed to fight.
 
   const hostileDesc = `${hostileSide.pirateCount} pirate(s)` +
-    (hostileSide.creatureCount > 0 ? ` + ${hostileSide.creatureCount} creature(s)` : "");
+    (hostileSide.creatureCount > 0 ? ` + ${hostileSide.creatureCount} creature(s)` : "") +
+    (hostileSide.repeaterCount > 0 ? ` + ${hostileSide.repeaterCount} repeater(s)` : "");
   return {
     shouldJoin: true,
     sideId: sideToJoin.sideId,
@@ -1788,6 +1863,21 @@ async function acquireEnemyFromNearby(
     if (huntCreatures || (preferName && isCreatureName(preferName))) {
       return creatures[0];
     }
+  }
+  // Re-acquire repeaters too: like creatures, the battle roster's id is not the
+  // id the `attack` command accepts — only get_nearby's repeater_id is. Without
+  // this the hunter sits in the battle without ever being registered as engaged.
+  // Only take a repeater when it is the named enemy, otherwise a repeater that
+  // happens to share the POI would hijack a creature/pirate fight.
+  const repeaters = entities.filter(e => isRepeaterTarget(e));
+  if (repeaters.length > 0 && (!preferName || isRepeaterName(preferName))) {
+    if (preferName) {
+      const hit = repeaters.find(r =>
+        r.name === preferName || r.name.toLowerCase().includes(preferName.toLowerCase())
+      );
+      if (hit) return hit;
+    }
+    return repeaters[0];
   }
   return null;
 }

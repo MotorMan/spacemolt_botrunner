@@ -5518,6 +5518,7 @@
         <option value="creature_farm"${hunterMode === "creature_farm" ? " selected" : ""}>Creature Farm</option>
         <option value="creature_farm_random"${hunterMode === "creature_farm_random" ? " selected" : ""}>Creature Farm (Random Systems)</option>
         <option value="hunt_big_creatures"${hunterMode === "hunt_big_creatures" ? " selected" : ""}>Hunt Big Creatures (explorer data)</option>
+        <option value="repeater_hunter"${hunterMode === "repeater_hunter" ? " selected" : ""}>Repeater Hunter</option>
         <option value="fleet_arena"${hunterMode === "fleet_arena" ? " selected" : ""}>Fleet/Arena Mode (idle until battle)</option>
         <option value="pvp"${hunterMode === "pvp" ? " selected" : ""}>PVP (camp POI, attack player)</option>
         <option value="boarding"${hunterMode === "boarding" ? " selected" : ""}>Boarding (patrol + board eligible targets)</option>
@@ -34623,6 +34624,7 @@ ignoreBlacklist: document.getElementById(
           <option value="creature_farm">Creature Farm</option>
           <option value="creature_farm_random">Creature Farm (Random Systems)</option>
           <option value="hunt_big_creatures">Hunt Big Creatures (explorer data)</option>
+          <option value="repeater_hunter">Repeater Hunter</option>
           <option value="fleet_arena">Fleet/Arena Mode (idle until battle)</option>
           <option value="pvp">PVP (camp POI, attack player)</option>
           <option value="boarding">Boarding (patrol + board eligible targets)</option>
@@ -35165,7 +35167,7 @@ ignoreBlacklist: document.getElementById(
     <div class="setting-row">
       <div>
         <div class="setting-label">Creature Farm Loops / System</div>
-        <div class="setting-hint">When in creature_farm mode, farm this many full loops in each Hunter Patrol Profile system before routing to the next system (cycles). A loop = one farm pass until cargo is full or all sweeps are exhausted.</div>
+        <div class="setting-hint">When in creature_farm or repeater_hunter mode, farm this many full loops in each Hunter Patrol Profile system before routing to the next system (cycles). A loop = one farm pass until cargo is full or all sweeps are exhausted.</div>
       </div>
       <input type="number" id="set-hunter-creatureFarmLoopsPerSystem" min="1" max="100" value="${h.creatureFarmLoopsPerSystem ?? 3}">
     </div>

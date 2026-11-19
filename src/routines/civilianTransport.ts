@@ -165,7 +165,6 @@ async function depositExcessCredits(ctx: RoutineContext, settings: CivilianTrans
   }
 }
 
-const primedSystems = new Set<string>();
 let stationRefCache: StationRef | null = null;
 
 function loadStationRef(): StationRef {
@@ -2723,6 +2722,16 @@ if (state && state.status !== "idle") {
           saveTransportState(state);
           await ctx.sleep(2000);
           continue;
+        }
+        // Isolated transport in the wild: never scan the galaxy; return home instead.
+        if (settings.mode === "isolated_transport" && !isAtHomeBase(ctx, settings)) {
+          ctx.log("transport", "Isolated transport: away from home base — returning home instead of scanning");
+          state.pickupStation = settings.homeStation || null;
+          state.pickupSystem = settings.homeSystem || null;
+          state.needsTravel = true;
+          state.roundsWithoutPassengers = 0;
+          state.awayPickupAttempts = 0;
+          saveTransportState(state);
         }
       // Other CT bots park passengers here. Deliver any not-yet-transported
       // expired lounge passenger first; only fall back to remote station

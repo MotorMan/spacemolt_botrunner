@@ -3187,11 +3187,11 @@ if (state && state.status !== "idle") {
         classOrder.business = 2;
       }
 
-       const loungeFull = (settings.mode === "lounge_transport" || settings.mode === "isolated_transport") && passengersLounge.getAvailableSlots() <= 0;
+       const loungeFull = settings.mode === "lounge_transport" && passengersLounge.getAvailableSlots() <= 0;
       if (loungeFull) {
         ctx.log("transport", `Transit Lounge is full (150/150) — doing normal passenger deliveries instead of lounge pickup`);
       }
-       if ((settings.mode === "lounge_transport" || settings.mode === "isolated_transport") && !loungeFull) {
+       if ((settings.mode === "lounge_transport" && !loungeFull) || settings.mode === "isolated_transport") {
         ctx.log("transport", `Lounge transport mode: loading all ${waiting.length} passengers at ${bot.poi} for transport to Transit Lounge`);
 
         // load_passenger loads by destination station id, so group waiting
@@ -3273,7 +3273,7 @@ if (state && state.status !== "idle") {
          // Isolated transport never delivers passengers to their destinations; if the
          // Transit Lounge is full we cannot check anyone in, so skip loading entirely
          // rather than falling back to normal (route-checking) delivery.
-         if ((settings.mode === "lounge_transport" || settings.mode === "isolated_transport") && passengersLounge.getAvailableSlots() <= 0) {
+         if (settings.mode === "lounge_transport" && passengersLounge.getAvailableSlots() <= 0) {
            ctx.log("transport", "Transit Lounge full — skipping pickup at isolated station");
            state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
            state.status = "idle";
@@ -3884,46 +3884,57 @@ if (state && state.status !== "idle") {
         ticksRemaining: p.ticks_remaining,
       }));
       saveTransportState(state);
-      ctx.log("transport", `Lounge transport: unloading ${state.onboardPassengers.length} passengers to Transit Lounge at ${homeStation}`);
-      const unloadResp = await bot.exec("unload_passenger", { id: "all", target: "lounge" });
-      if (unloadResp.error) {
-        ctx.log("error", `Unload to lounge failed: ${unloadResp.error.message}`);
-        await ctx.sleep(30000);
-        continue;
-      }
+       const loungeHasSlots = passengersLounge.getAvailableSlots() > 0;
+       if (loungeHasSlots) {
+         ctx.log("transport", `Lounge transport: unloading ${state.onboardPassengers.length} passengers to Transit Lounge at ${homeStation}`);
+         const unloadResp = await bot.exec("unload_passenger", { id: "all", target: "lounge" });
+         if (unloadResp.error) {
+           ctx.log("error", `Unload to lounge failed: ${unloadResp.error.message}`);
+           await ctx.sleep(30000);
+           continue;
+         }
 
-      // Track each passenger in the lounge store for future delivery
-      for (const p of state.onboardPassengers) {
-        const loungeEntry = PassengersLoungeStore.createLoungePassenger({
-          citizenId: p.citizenId,
-          name: p.name,
-          accommodationClass: p.accommodationClass,
-          citizenship: p.citizenship || "",
-          destination: p.destination,
-          destinationName: p.destinationName,
-          destinationSystem: p.destinationSystem || "",
-          fare: p.fare || 0,
-          bio: p.bio || "",
-          loadedAt: p.loadedAt,
-        });
-        passengersLounge.addOrUpdatePassenger(loungeEntry);
-        civilianStore.addOrUpdate({
-          citizenId: p.citizenId,
-          name: p.name,
-          accommodationClass: p.accommodationClass,
-          citizenship: p.citizenship || "",
-          destination: p.destination,
-          destinationName: p.destinationName,
-          destinationSystem: p.destinationSystem,
-          fare: p.fare || 0,
-          bio: p.bio || "",
-          loadedAt: p.loadedAt,
-          status: "boarded",
-        }, bot.username);
-        ctx.log("transport", `Lounge transport: checked ${p.name} into Transit Lounge (expires ${loungeEntry.expiresAt})`);
-      }
-
-      ctx.log("transport", `Lounge transport: successfully unloaded ${state.onboardPassengers.length} passengers to Transit Lounge`);
+         // Track each passenger in the lounge store for future delivery
+         for (const p of state.onboardPassengers) {
+           const loungeEntry = PassengersLoungeStore.createLoungePassenger({
+             citizenId: p.citizenId,
+             name: p.name,
+             accommodationClass: p.accommodationClass,
+             citizenship: p.citizenship || "",
+             destination: p.destination,
+             destinationName: p.destinationName,
+             destinationSystem: p.destinationSystem || "",
+             fare: p.fare || 0,
+             bio: p.bio || "",
+             loadedAt: p.loadedAt,
+           });
+           passengersLounge.addOrUpdatePassenger(loungeEntry);
+           civilianStore.addOrUpdate({
+             citizenId: p.citizenId,
+             name: p.name,
+             accommodationClass: p.accommodationClass,
+             citizenship: p.citizenship || "",
+             destination: p.destination,
+             destinationName: p.destinationName,
+             destinationSystem: p.destinationSystem,
+             fare: p.fare || 0,
+             bio: p.bio || "",
+             loadedAt: p.loadedAt,
+             status: "boarded",
+           }, bot.username);
+           ctx.log("transport", `Lounge transport: checked ${p.name} into Transit Lounge (expires ${loungeEntry.expiresAt})`);
+         }
+         ctx.log("transport", `Lounge transport: successfully unloaded ${state.onboardPassengers.length} passengers to Transit Lounge`);
+       } else {
+         ctx.log("transport", `Transit Lounge full — dropping ${state.onboardPassengers.length} passengers into regular queue at ${homeStation}`);
+         const unloadResp = await bot.exec("unload_passenger", { id: "all" });
+         if (unloadResp.error) {
+           ctx.log("error", `Unload failed: ${unloadResp.error.message}`);
+           await ctx.sleep(30000);
+           continue;
+         }
+         ctx.log("transport", `Lounge transport: unloaded ${state.onboardPassengers.length} passengers to regular queue at ${homeStation}`);
+       }
       state.onboardPassengers = [];
       state.route = [];
       state.currentRouteIndex = 0;

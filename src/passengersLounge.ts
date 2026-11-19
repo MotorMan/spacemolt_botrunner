@@ -95,7 +95,10 @@ export class PassengersLoungeStore {
   }
 
   getAvailableSlots(): number {
-    return Math.max(0, LOUNGE_CAPACITY - this.passengers.size);
+    const occupied = Array.from(this.passengers.values()).filter(
+      (p) => p.status === "waiting" || p.status === "ready_for_delivery",
+    ).length;
+    return Math.max(0, LOUNGE_CAPACITY - occupied);
   }
 
   addPassenger(passenger: LoungePassenger): boolean {

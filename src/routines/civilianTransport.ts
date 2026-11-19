@@ -3212,8 +3212,29 @@ if (state && state.status !== "idle") {
           group.passengers.push(p);
         }
 
-        let loadedThisLeg = 0;
-        for (const group of loungeByDest.values()) {
+         // Isolated stations are disconnected from most destinations, so
+         // load_passenger by destination fails with no_route. Try loading all
+         // waiting passengers in one call first; fall back to per-destination
+         // loading for stations where the server can resolve routes.
+         let triedAll = false;
+         const allLoadResp = await bot.exec("load_passenger", { id: "all" });
+         if (!allLoadResp.error) {
+           // Verify it actually boarded someone; otherwise fall back
+           const verifyResp = await bot.exec("list_passengers");
+           const vParsed = verifyResp.error || !verifyResp.result ? null : parseListPassengers(verifyResp.result);
+           if (vParsed && vParsed.passengers.length > 0) {
+             triedAll = true;
+             ctx.log("transport", `Loaded ${vParsed.passengers.length} passengers via 'all' (lounge mode)`);
+           } else {
+             ctx.log("transport", `load_passenger 'all' returned success but boarded 0 — falling back to per-destination`);
+           }
+         } else {
+           ctx.log("transport", `load_passenger 'all' unavailable (${allLoadResp.error.message}) — falling back to per-destination`);
+         }
+
+         if (!triedAll) {
+         let loadedThisLeg = 0;
+         for (const group of loungeByDest.values()) {
           const totalLoaded = usedEconomy + usedBusiness + usedFirst;
           if (settings.maxPassengers > 0 && totalLoaded >= settings.maxPassengers) break;
 
@@ -3267,9 +3288,11 @@ if (state && state.status !== "idle") {
           } else {
             ctx.log("transport", `Loaded passengers for ${destId} (lounge mode)`);
           }
-          await ctx.sleep(11000);
-        }
-       } else {
+           await ctx.sleep(11000);
+         }
+         } // end if (!triedAll)
+         await ctx.sleep(11000);
+        } else {
          // Isolated transport never delivers passengers to their destinations; if the
          // Transit Lounge is full we cannot check anyone in, so skip loading entirely
          // rather than falling back to normal (route-checking) delivery.

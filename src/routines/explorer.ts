@@ -1220,6 +1220,26 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
+    // ── Check fuel cell depletion — return to home base if enabled and out of fuel cells ──
+    // This MUST run before the refuel gate below: once the last fuel cell is burned,
+    // ensureFueled() cannot refuel in the field and just loops ("could not refuel"),
+    // never reaching the end-of-loop check, so the bot stays stranded instead of
+    // returning home to restock.
+    const depletionSettings = getExplorerSettings(bot.username);
+    if (depletionSettings.returnToHomeOnFuelCellDepletion) {
+      const fuelCellCheck = await checkFuelCellInventory(ctx);
+      if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
+        yield "return_to_home_fuel_cells";
+        const returned = await returnToHomeBaseForFuelCells(ctx, true);
+        if (returned) {
+          await bot.refreshLocation();
+          ctx.log("info", `Returned to home base — continuing exploration`);
+          continue;
+        }
+      }
+    }
+
     // ── Ensure fueled before exploring ──
     yield "fuel_check";
     const fueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
@@ -1242,7 +1262,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Find station for emergency refueling
     const station = findStation(pois);
 
-    // ── Visit each POI ──
+// ── Visit each POI ──
     let wormholeJumped = false;
     for (const { poi, reason } of toVisit) {
       if (bot.state !== "running") break;
@@ -1449,23 +1469,6 @@ yield "deposit_cargo";
 
     // ── Re-get settings in case they changed ──
     const currentSettings = getExplorerSettings(bot.username);
-
-    // ── Check fuel cell depletion — return to home base if enabled and no fuel cells left ──
-    if (currentSettings.returnToHomeOnFuelCellDepletion) {
-      const fuelCellCheck = await checkFuelCellInventory(ctx);
-      // Only return if we previously had fuel cells (cargo was full with them) but now they're gone
-      // This prevents unnecessary trips when we never loaded fuel cells in the first place
-if (fuelCellCheck.totalFuelCells < 3) {
-        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
-        yield "return_to_home_fuel_cells";
-        const returned = await returnToHomeBaseForFuelCells(ctx, true);
-        if (returned) {
-          await bot.refreshLocation();
-          ctx.log("info", `Returned to home base — continuing exploration`);
-          continue;
-        }
-      }
-    }
 
     // ── Pick next system to explore ──
     yield "pick_next_system";
@@ -2399,6 +2402,22 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
     // ── Find hidden POIs that need scanning ──
     yield "find_hidden_pois";
+
+    // ── Check fuel cell depletion — return to home base if enabled and out of fuel cells ──
+    // Runs before the per-POI refuel gate so a stranded bot returns home instead of looping.
+    if (modeCheck.returnToHomeOnFuelCellDepletion) {
+      const fuelCellCheck = await checkFuelCellInventory(ctx);
+      if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
+        yield "return_to_home_fuel_cells";
+        const returned = await returnToHomeBaseForFuelCells(ctx);
+        if (returned) {
+          await bot.refreshLocation();
+          ctx.log("info", `Returned to home base — continuing deep core scan`);
+          continue;
+        }
+      }
+    }
     const hiddenPois = findHiddenPoisToScan(ctx);
 
     if (hiddenPois.length === 0) {
@@ -2573,22 +2592,6 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
           await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
         } else {
           ctx.log("info", `Cargo full with fuel cells (${fuelCellCount} fuel cells, ${bot.cargo}/${bot.cargoMax} cargo) — continuing exploration`);
-        }
-      }
-
-      // ── Check fuel cell depletion — return to home base if enabled and no fuel cells left ──
-      const deepScanSettings = getExplorerSettings(bot.username);
-      if (deepScanSettings.returnToHomeOnFuelCellDepletion) {
-        const fuelCellCheck = await checkFuelCellInventory(ctx);
-        if (fuelCellCheck.totalFuelCells === 0) {
-          ctx.log("system", `Fuel cells depleted (0 remaining) — returning to home base to reload`);
-          yield "return_to_home_fuel_cells";
-          const returned = await returnToHomeBaseForFuelCells(ctx);
-          if (returned) {
-            await bot.refreshLocation();
-            ctx.log("info", `Returned to home base — continuing deep core scan`);
-            break; // Break to restart the while loop
-          }
         }
       }
     }
@@ -2769,6 +2772,25 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // ── Build list of known systems with stations, sorted by stalest market data ──
     yield "plan_route";
+
+    // ── Check fuel cell depletion — return to home base if enabled and out of fuel cells ──
+    // Runs before the per-station ensureFueled() gate: once the cells are gone the
+    // refuel attempt fails in the field and the loop would never reach the old
+    // end-of-station check, leaving the bot stranded away from home.
+    const depletionSettings = getExplorerSettings(bot.username);
+    if (depletionSettings.returnToHomeOnFuelCellDepletion) {
+      const fuelCellCheck = await checkFuelCellInventory(ctx);
+      if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock military fuel cells`);
+        yield "return_to_home_fuel_cells";
+        const returned = await returnToHomeBaseForFuelCells(ctx);
+        if (returned) {
+          await bot.refreshLocation();
+          ctx.log("info", `Returned to home base — continuing exploration`);
+          continue;
+        }
+      }
+    }
     const allSystems = mapStore.getAllSystems();
     const stationSystems: Array<{ systemId: string; systemName: string; stationPoi: string; stationName: string; staleMins: number }> = [];
 
@@ -3123,23 +3145,6 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         }
       }
 
-      // ── Check fuel cell depletion — return to home base if enabled and no fuel cells left ──
-      const tradeFuelSettings = getExplorerSettings(bot.username);
-      if (tradeFuelSettings.returnToHomeOnFuelCellDepletion) {
-        const fuelCellCheck = await checkFuelCellInventory(ctx);
-        if (fuelCellCheck.totalFuelCells < 3) {
-          ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock military fuel cells`);
-          yield "return_to_home_fuel_cells";
-          const returned = await returnToHomeBaseForFuelCells(ctx);
-          if (returned) {
-            await bot.refreshLocation();
-            ctx.log("info", `Returned to home base — continuing exploration`);
-            continue;
-          }
-        }
-        
-      }
-
       // ── Check skills ──
       yield "check_skills";
       await bot.checkSkills();
@@ -3267,6 +3272,22 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
 
     // Refresh settings
     const settings = getExplorerSettings(bot.username);
+
+    // ── Check fuel cell depletion — return to home base if enabled and out of fuel cells ──
+    // Runs before any refuel gate so a stranded bot returns home instead of looping.
+    if (settings.returnToHomeOnFuelCellDepletion) {
+      const fuelCellCheck = await checkFuelCellInventory(ctx);
+      if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
+        yield "return_to_home_fuel_cells";
+        const returned = await returnToHomeBaseForFuelCells(ctx);
+        if (returned) {
+          await bot.refreshLocation();
+          ctx.log("info", `Returned to home base — continuing visit-all exploration`);
+          continue;
+        }
+      }
+    }
 
     await bot.refreshShip();
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
@@ -3593,6 +3614,22 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           ctx.log("info", "Cloak already active");
         } else {
           ctx.log("warn", `Cloak command failed: ${cloakResp.error.message}`);
+        }
+      }
+    }
+
+    // ── Check fuel cell depletion — return to home base if enabled and out of fuel cells ──
+    // Runs before any refuel gate so a stranded bot returns home instead of looping.
+    if (cloakSettings.returnToHomeOnFuelCellDepletion) {
+      const fuelCellCheck = await checkFuelCellInventory(ctx);
+      if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
+        yield "return_to_home_fuel_cells";
+        const returned = await returnToHomeBaseForFuelCells(ctx);
+        if (returned) {
+          await bot.refreshLocation();
+          ctx.log("info", `Returned to home base — continuing achievement exploration`);
+          continue;
         }
       }
     }
@@ -4585,6 +4622,22 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
       return;
     }
 
+    // ── Check fuel cell depletion — return to home base if enabled and out of fuel cells ──
+    // Runs before any refuel gate so a stranded bot returns home instead of looping.
+    if (modeCheck.returnToHomeOnFuelCellDepletion) {
+      const fuelCellCheck = await checkFuelCellInventory(ctx);
+      if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
+        yield "return_to_home_fuel_cells";
+        const returned = await returnToHomeBaseForFuelCells(ctx);
+        if (returned) {
+          await bot.refreshLocation();
+          ctx.log("info", `Returned to home base — continuing fixed route`);
+          continue;
+        }
+      }
+    }
+
     // ── Load / ensure route ──
     let fixed = explorerFixedPathStore.getFixedPath(bot.username);
     if (!fixed) {
@@ -5327,6 +5380,23 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
       }
     }
 
+    // ── Check fuel cell depletion — return to home base if enabled and out of fuel cells ──
+    // Runs before the refuel gate: once cells are gone ensureFueled() cannot refuel in
+    // the field and the loop would spin instead of returning home to restock.
+    if (settings.returnToHomeOnFuelCellDepletion) {
+      const fuelCellCheck = await checkFuelCellInventory(ctx);
+      if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
+        yield "return_to_home_fuel_cells";
+        const returned = await returnToHomeBaseForFuelCells(ctx, true);
+        if (returned) {
+          await bot.refreshLocation();
+          ctx.log("info", `Returned to home base — continuing frontier exploration`);
+          continue;
+        }
+      }
+    }
+
     // ── Ensure fueled before exploring ──
     yield "fuel_check";
     const fueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
@@ -5579,21 +5649,6 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
     // ── Check skills for level-ups ──
     yield "check_skills";
     await bot.checkSkills();
-
-    // ── Check fuel cell depletion — return to home base if enabled and no fuel cells left ──
-    if (settings.returnToHomeOnFuelCellDepletion) {
-      const fuelCellCheck = await checkFuelCellInventory(ctx);
-      if (fuelCellCheck.totalFuelCells < 3) {
-        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
-        yield "return_to_home_fuel_cells";
-        const returned = await returnToHomeBaseForFuelCells(ctx);
-        if (returned) {
-          await bot.refreshLocation();
-          ctx.log("info", `Returned to home base — continuing frontier exploration`);
-          continue;
-        }
-      }
-    }
 
     // ── Check if we should auto-return due to low fuel ──
     if (settings.frontierAutoReturn && fuelPct <= settings.frontierFuelThreshold) {
@@ -6296,6 +6351,23 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
       }
     }
 
+    // ── Check fuel cell depletion — return to home base if enabled and out of fuel cells ──
+    // Runs before the refuel gate: once cells are gone ensureFueled() cannot refuel in
+    // the field and the loop would spin instead of returning home to restock.
+    if (settings.returnToHomeOnFuelCellDepletion) {
+      const fuelCellCheck = await checkFuelCellInventory(ctx);
+      if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock`);
+        yield "return_to_home_fuel_cells";
+        const returned = await returnToHomeBaseForFuelCells(ctx, true);
+        if (returned) {
+          await bot.refreshLocation();
+          ctx.log("info", `Returned to home base — continuing frontier exploration`);
+          continue;
+        }
+      }
+    }
+
     // ── Ensure fueled before exploring ──
     yield "fuel_check";
     const fueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
@@ -6573,41 +6645,6 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
     // ── Check skills for level-ups ──
     yield "check_skills";
     await bot.checkSkills();
-
-    // ── Check fuel cell depletion — return to home base if enabled and no fuel cells left ──
-    if (settings.returnToHomeOnFuelCellDepletion) {
-      const fuelCellCheck = await checkFuelCellInventory(ctx);
-      if (fuelCellCheck.totalFuelCells < 3) {
-        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — attempting return to entry system ${entrySystemId}...`);
-        yield "return_to_home_fuel_cells";
-        // In frontier survey, try to return to entry system instead of global home base
-        let returned = false;
-        if (entrySystemId && systemId !== entrySystemId) {
-          ctx.log("travel", `Fuel cells low — attempting return to entry system ${entrySystemId} to reload...`);
-          const blacklist = getEffectiveSystemBlacklist(bot);
-          const arrived = await navigateToSystem(ctx, entrySystemId, { 
-            fuelThresholdPct: FUEL_SAFETY_PCT, 
-            hullThresholdPct: 30, 
-            skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked,
-            allowWormholes: true
-          });
-          if (arrived) {
-            returned = await returnToHomeBaseForFuelCells(ctx);
-          } else {
-            ctx.log("warn", `Could not reach entry system ${entrySystemId} for fuel cell reload — continuing survey`);
-          }
-        } else if (systemId === entrySystemId) {
-          returned = await returnToHomeBaseForFuelCells(ctx);
-        } else {
-          ctx.log("warn", `Fuel cells low but no entry system tracked — continuing survey`);
-        }
-        if (returned) {
-          await bot.refreshLocation();
-          ctx.log("info", `Returned to entry system — continuing frontier survey`);
-          continue;
-        }
-      }
-    }
 
     // ── Check if we should auto-return due to low fuel ──
     if (settings.frontierAutoReturn && fuelPct <= settings.frontierFuelThreshold) {

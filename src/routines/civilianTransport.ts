@@ -26,7 +26,6 @@ import {
   getCargoFuelCells,
 } from "./common.js";
 import { logTransportProfit } from "./transportProfitDebug.js";
-import { executePathfinderJumpToBearing } from "./pathfinder.js";
 import { getEffectiveSystemBlacklist, getStationBlacklist } from "../web/server.js";
 import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
@@ -669,16 +668,7 @@ interface ListPassengersResponse {
   berths_used: { economy: number; business: number; first: number };
 }
 
-interface IsolatedRouteStep {
-  system: string;
-  degree: number | null;
-  station: string;
-  dock: boolean;
-  pickup: boolean;
-  waitForPassengers: boolean;
-}
-
-type CivilianTransportMode = "normal" | "lounge_transport" | "achievement" | "isolated_transport";
+type CivilianTransportMode = "normal" | "lounge_transport" | "achievement";
 
 interface CivilianTransportSettings {
   maxJumps: number;
@@ -708,13 +698,6 @@ interface CivilianTransportSettings {
   buyFuelCells: boolean;
   minFuelCellsToDepart: number;
   mode: CivilianTransportMode;
-  // Isolated transport fixed route
-  isolatedRoute: IsolatedRouteStep[];
-  // legacy single-jump fields (optional)
-  isolatedSystem?: string;
-  isolatedDegree?: number;
-  isolatedStation?: string;
-  isolatedDockAtStation?: boolean;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -753,21 +736,6 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     buyFuelCells: (t.buyFuelCells as boolean) ?? false,
     minFuelCellsToDepart: Number((t.minFuelCellsToDepart as number) ?? 6),
     mode: (botOverrides.mode as CivilianTransportMode) || (t.mode as CivilianTransportMode) || "normal",
-    isolatedRoute: Array.isArray((botOverrides.isolatedRoute as any)) ? (botOverrides.isolatedRoute as IsolatedRouteStep[]) :
-      Array.isArray((t.isolatedRoute as any)) ? (t.isolatedRoute as IsolatedRouteStep[]) :
-      // legacy fallback
-      ((botOverrides.isolatedSystem || t.isolatedSystem) ? [{
-        system: (botOverrides.isolatedSystem as string) || (t.isolatedSystem as string) || "",
-        degree: Number((botOverrides.isolatedDegree as number) ?? (t.isolatedDegree as number) ?? 0) || null,
-        station: (botOverrides.isolatedStation as string) || (t.isolatedStation as string) || "",
-        dock: (botOverrides.isolatedDockAtStation as boolean) ?? (t.isolatedDockAtStation as boolean) ?? false,
-        pickup: true,
-        waitForPassengers: false,
-      }] : []),
-    isolatedSystem: (botOverrides.isolatedSystem as string) || (t.isolatedSystem as string) || "",
-    isolatedDegree: Number((botOverrides.isolatedDegree as number) ?? (t.isolatedDegree as number) ?? 0),
-    isolatedStation: (botOverrides.isolatedStation as string) || (t.isolatedStation as string) || "",
-    isolatedDockAtStation: (botOverrides.isolatedDockAtStation as boolean) ?? (t.isolatedDockAtStation as boolean) ?? false,
   };
 }
 
@@ -2231,88 +2199,6 @@ function hasUndeliveredLoungeCandidates(botUsername: string): boolean {
 
 // ── Main routine ─────────────────────────────────────────────
 
-async function executeIsolatedRoute(ctx: RoutineContext, bot: Bot, settings: CivilianTransportSettings, route: IsolatedRouteStep[]): Promise<boolean> {
-  const hasPickup = route.some((s) => s.pickup);
-  for (const step of route) {
-    if (step.system && (!bot.system || bot.system.toLowerCase() !== step.system.toLowerCase())) {
-      ctx.log("transport", `Isolated route: navigating to system ${step.system}...`);
-      const ok = await navigateToSystem(ctx, step.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
-      if (!ok) return false;
-      await bot.refreshLocation();
-    }
-    if (step.station) {
-      const stId = step.station.includes("|") ? step.station.split("|")[1] : step.station;
-      if (bot.poi && bot.poi.toLowerCase() !== stId.toLowerCase()) {
-        const tr = await bot.exec("travel", { target_poi: stId });
-        if (tr.error) {
-          ctx.log("transport", `Isolated route: travel to station failed: ${tr.error.message}`);
-          return false;
-        }
-        await bot.refreshStatus(true);
-      }
-      await ensureDocked(ctx);
-      if (step.waitForPassengers) {
-        while (bot.state === "running") {
-          const lookup = await fetchStationPassengers(ctx, bot.system || "", bot.poi || "");
-          if (lookup && lookup.count > 0) break;
-          ctx.log("transport", `Isolated route: no passengers at ${bot.poi}, waiting 60s...`);
-          await ctx.sleep(60000);
-        }
-      }
-      if (step.pickup || !hasPickup) {
-        return true;
-      }
-    } else if (step.dock) {
-      await ensureDocked(ctx);
-      if (step.waitForPassengers) {
-        while (bot.state === "running") {
-          const lookup = await fetchStationPassengers(ctx, bot.system || "", bot.poi || "");
-          if (lookup && lookup.count > 0) break;
-          ctx.log("transport", `Isolated route: no passengers at ${bot.poi}, waiting 60s...`);
-          await ctx.sleep(60000);
-        }
-      }
-      if (step.pickup || !hasPickup) {
-        return true;
-      }
-    }
-    if (step.degree !== null && step.degree !== undefined) {
-      const originPos = mapStore.getSystem(bot.system)?.position;
-      ctx.log("transport", `Isolated route: pathfinder jump at ${step.degree}° from ${bot.system}...`);
-      const res = await executePathfinderJumpToBearing(ctx, step.degree, originPos ? { x: originPos.x, y: originPos.y } : null);
-      if (!res.success) return false;
-      await bot.refreshLocation();
-      await ensureDocked(ctx);
-    }
-  }
-  return true;
-}
-
-async function executeIsolatedReturn(ctx: RoutineContext, bot: Bot, settings: CivilianTransportSettings): Promise<boolean> {
-  const route = settings.isolatedRoute || [];
-  const jumps: IsolatedRouteStep[] = [];
-  for (const s of route) {
-    if (s.station || s.dock) break;
-    if (s.degree !== null && s.degree !== undefined) jumps.push(s);
-  }
-  // If no break occurred (no dock step), include all degree steps
-  if (jumps.length === 0) {
-    for (const s of route) {
-      if (s.degree !== null && s.degree !== undefined) jumps.push(s);
-    }
-  }
-  for (const j of jumps.reverse()) {
-    const originPos = mapStore.getSystem(bot.system)?.position;
-    const bearing = (j.degree as number) + 180;
-    ctx.log("transport", `Isolated return: pathfinder jump at ${bearing}° from ${bot.system}...`);
-    const res = await executePathfinderJumpToBearing(ctx, bearing, originPos ? { x: originPos.x, y: originPos.y } : null);
-    if (!res.success) return false;
-    await bot.refreshLocation();
-    await ensureDocked(ctx);
-  }
-  return true;
-}
-
 export const civilianTransportRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
   const settings = getCivilianTransportSettings(bot.username);
@@ -2394,9 +2280,6 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
   if (settings.mode === "achievement") {
     ctx.log("transport", `★ ACHIEVEMENT MODE ★ Only picking up civilians ${bot.username} has not delivered yet, to transport every civilian once for this bot.`);
   }
-  if (settings.mode === "isolated_transport") {
-    ctx.log("transport", `★ ISOLATED TRANSPORT MODE ★ Pathfinder jump from ${settings.isolatedSystem} at ${settings.isolatedDegree}° to isolated station; returning passengers to Transit Lounge at home base.`);
-  }
 
   // Enable cloaking if configured and module is available
   if (settings.enableCloak) {
@@ -2437,140 +2320,87 @@ if (state && state.status !== "idle") {
         state.pickupStation = bot.docked && bot.poi ? bot.poi : settings.homeStation || null;
         state.pickupSystem = bot.docked && bot.poi ? bot.system : settings.homeSystem || null;
         saveTransportState(state);
-       } else if (settings.mode === "lounge_transport" || settings.mode === "isolated_transport") {
-         state.onboardPassengers = vParsed!.passengers.map(p => ({
-           citizenId: p.citizen_id || p.name,
-           name: p.name,
-           accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
-           citizenship: p.citizenship,
-           destination: p.destination,
-           destinationName: p.destination_name,
-           destinationSystem: (p as any).destinationSystem || p.destination_system,
-           fare: p.fare,
-           bio: p.bio,
-           routeData: p.route_data || null,
-           loadedAt: new Date().toISOString(),
-           status: "boarded",
-           ticksRemaining: p.ticks_remaining,
-         }));
-         const homeSystem = systemForStation(settings.homeStation) || settings.homeSystem;
-         state.route = (homeSystem && settings.homeStation) ? [{ system: homeSystem, poi: settings.homeStation, poiName: settings.homeStation }] : [];
-         state.currentRouteIndex = 0;
-         state.currentDestination = settings.homeStation || null;
-         state.status = "returning_to_lounge";
-         const recoveredBerths = vParsed!.berths;
-         const recoveredBerthsUsed = vParsed!.berths_used;
-         const hasRecoveredBerths = (recoveredBerths.economy + recoveredBerths.business + recoveredBerths.first) > 0;
-         if (hasRecoveredBerths) {
-           state.berths = recoveredBerths;
-           state.berths_used = recoveredBerthsUsed;
-         }
-         saveTransportState(state);
-       } else {
-         const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
-         for (const p of vParsed!.passengers) {
-           const existing = destMap.get(p.destination);
-           if (existing) {
-             existing.count++;
-             continue;
-           }
-           const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
-           destMap.set(p.destination, { system: resolved?.system || "", poi: resolved?.poi || p.destination, poiName: p.destination_name, count: 1 });
-         }
-         const routeDests = Array.from(destMap.values()).filter(d => d.system);
-         const planned = await planTourRoute(bot.system || "", routeDests, 6, bot);
-         state.onboardPassengers = vParsed!.passengers.map(p => ({
-           citizenId: p.citizen_id || p.name,
-           name: p.name,
-           accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
-           citizenship: p.citizenship,
-           destination: p.destination,
-           destinationName: p.destination_name,
-           destinationSystem: (p as any).destinationSystem || p.destination_system,
-           fare: p.fare,
-           bio: p.bio,
-           routeData: p.route_data || null,
-           loadedAt: new Date().toISOString(),
-           status: "boarded",
-           ticksRemaining: p.ticks_remaining,
-         }));
-         state.route = planned;
-         state.currentRouteIndex = 0;
-         state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
-         state.status = "in_transit";
-         const recoveredBerths = vParsed!.berths;
-         const recoveredBerthsUsed = vParsed!.berths_used;
-         const hasRecoveredBerths = (recoveredBerths.economy + recoveredBerths.business + recoveredBerths.first) > 0;
-         if (hasRecoveredBerths) {
-           state.berths = recoveredBerths;
-           state.berths_used = recoveredBerthsUsed;
-         }
-         saveTransportState(state);
-       }
+      } else {
+        const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
+        for (const p of vParsed!.passengers) {
+          const existing = destMap.get(p.destination);
+          if (existing) {
+            existing.count++;
+            continue;
+          }
+          const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
+          destMap.set(p.destination, { system: resolved?.system || "", poi: resolved?.poi || p.destination, poiName: p.destination_name, count: 1 });
+        }
+        const routeDests = Array.from(destMap.values()).filter(d => d.system);
+        const planned = await planTourRoute(bot.system || "", routeDests, 6, bot);
+        state.onboardPassengers = vParsed!.passengers.map(p => ({
+          citizenId: p.citizen_id || p.name,
+          name: p.name,
+          accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
+          citizenship: p.citizenship,
+          destination: p.destination,
+          destinationName: p.destination_name,
+          destinationSystem: (p as any).destinationSystem || p.destination_system,
+          fare: p.fare,
+          bio: p.bio,
+          routeData: p.route_data || null,
+          loadedAt: new Date().toISOString(),
+          status: "boarded",
+          ticksRemaining: p.ticks_remaining,
+        }));
+        state.route = planned;
+        state.currentRouteIndex = 0;
+        state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
+        state.status = "in_transit";
+        const recoveredBerths = vParsed!.berths;
+        const recoveredBerthsUsed = vParsed!.berths_used;
+        const hasRecoveredBerths = (recoveredBerths.economy + recoveredBerths.business + recoveredBerths.first) > 0;
+        if (hasRecoveredBerths) {
+          state.berths = recoveredBerths;
+          state.berths_used = recoveredBerthsUsed;
+        }
+        saveTransportState(state);
+      }
     }
   } else if (state && state.status === "idle") {
     const verifyResp = await bot.exec("list_passengers");
     if (!verifyResp.error && verifyResp.result) {
       const vParsed = parseListPassengers(verifyResp.result);
       const verifiedCount = vParsed ? vParsed.passengers.length : 0;
-       if (verifiedCount > 0) {
-         if (settings.mode === "lounge_transport" || settings.mode === "isolated_transport") {
-           state.onboardPassengers = vParsed!.passengers.map(p => ({
-             citizenId: p.citizen_id || p.name,
-             name: p.name,
-             accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
-             citizenship: p.citizenship,
-             destination: p.destination,
-             destinationName: p.destination_name,
-             destinationSystem: (p as any).destinationSystem || p.destination_system,
-             fare: p.fare,
-             bio: p.bio,
-             routeData: p.route_data || null,
-             loadedAt: new Date().toISOString(),
-             status: "boarded",
-             ticksRemaining: p.ticks_remaining,
-           }));
-           const homeSystem = systemForStation(settings.homeStation) || settings.homeSystem;
-           state.route = (homeSystem && settings.homeStation) ? [{ system: homeSystem, poi: settings.homeStation, poiName: settings.homeStation }] : [];
-           state.currentRouteIndex = 0;
-           state.currentDestination = settings.homeStation || null;
-           state.status = "returning_to_lounge";
-           saveTransportState(state);
-         } else {
-           const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
-           for (const p of vParsed!.passengers) {
-             const existing = destMap.get(p.destination);
-             if (existing) {
-               existing.count++;
-               continue;
-             }
-             const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
-             destMap.set(p.destination, { system: resolved?.system || "", poi: resolved?.poi || p.destination, poiName: p.destination_name, count: 1 });
-           }
-           const routeDests = Array.from(destMap.values()).filter(d => d.system);
-           const planned = await planTourRoute(bot.system || "", routeDests, 6, bot);
-           state.onboardPassengers = vParsed!.passengers.map(p => ({
-             citizenId: p.citizen_id || p.name,
-             name: p.name,
-             accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
-             citizenship: p.citizenship,
-             destination: p.destination,
-             destinationName: p.destination_name,
-             destinationSystem: (p as any).destinationSystem || p.destination_system,
-             fare: p.fare,
-             bio: p.bio,
-             routeData: p.route_data || null,
-             loadedAt: new Date().toISOString(),
-             status: "boarded",
-             ticksRemaining: p.ticks_remaining,
-           }));
-           state.route = planned;
-           state.currentRouteIndex = 0;
-           state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
-           state.status = "in_transit";
-           saveTransportState(state);
-         }
-       }
+      if (verifiedCount > 0) {
+        const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
+        for (const p of vParsed!.passengers) {
+          const existing = destMap.get(p.destination);
+          if (existing) {
+            existing.count++;
+            continue;
+          }
+          const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
+          destMap.set(p.destination, { system: resolved?.system || "", poi: resolved?.poi || p.destination, poiName: p.destination_name, count: 1 });
+        }
+        const routeDests = Array.from(destMap.values()).filter(d => d.system);
+        const planned = await planTourRoute(bot.system || "", routeDests, 6, bot);
+        state.onboardPassengers = vParsed!.passengers.map(p => ({
+          citizenId: p.citizen_id || p.name,
+          name: p.name,
+          accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
+          citizenship: p.citizenship,
+          destination: p.destination,
+          destinationName: p.destination_name,
+          destinationSystem: (p as any).destinationSystem || p.destination_system,
+          fare: p.fare,
+          bio: p.bio,
+          routeData: p.route_data || null,
+          loadedAt: new Date().toISOString(),
+          status: "boarded",
+          ticksRemaining: p.ticks_remaining,
+        }));
+        state.route = planned;
+        state.currentRouteIndex = 0;
+        state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
+        state.status = "in_transit";
+        saveTransportState(state);
+      }
     }
   }
 
@@ -2702,37 +2532,7 @@ if (state && state.status !== "idle") {
         return;
       }
 
-        // ── Isolated transport: execute fixed route to the isolated station ──
-        if (settings.mode === "isolated_transport" && isAtHomeBase(ctx, settings) && state.onboardPassengers.length === 0) {
-          const route = settings.isolatedRoute || [];
-          if (route.length === 0) {
-            ctx.log("transport", "Isolated transport: no route steps configured");
-            await ctx.sleep(30000); continue;
-          }
-          ctx.log("transport", `Isolated transport: executing ${route.length} route step(s)...`);
-          const ok = await executeIsolatedRoute(ctx, bot, settings, route);
-          if (!ok) { await ctx.sleep(30000); continue; }
-          await bot.refreshLocation();
-          await ensureDocked(ctx);
-          state.pickupStation = bot.poi || state.pickupStation;
-          state.pickupSystem = bot.system;
-          state.needsTravel = false;
-          state.roundsWithoutPassengers = 0;
-          state.awayPickupAttempts = 0;
-          saveTransportState(state);
-          await ctx.sleep(2000);
-          continue;
-        }
-        // Isolated transport in the wild: never scan the galaxy; return home instead.
-        if (settings.mode === "isolated_transport" && !isAtHomeBase(ctx, settings) && !(settings.isolatedStation && bot.poi && bot.poi.toLowerCase() === settings.isolatedStation.toLowerCase())) {
-          ctx.log("transport", "Isolated transport: away from home base and isolated station — returning home instead of scanning");
-          state.pickupStation = settings.homeStation || null;
-          state.pickupSystem = settings.homeSystem || null;
-          state.needsTravel = true;
-          state.roundsWithoutPassengers = 0;
-          state.awayPickupAttempts = 0;
-          saveTransportState(state);
-        }
+      // ── Achievement mode: primary source is the home Transit Lounge ──
       // Other CT bots park passengers here. Deliver any not-yet-transported
       // expired lounge passenger first; only fall back to remote station
       // pickup when the lounge has nothing new to deliver.
@@ -2791,9 +2591,9 @@ if (state && state.status !== "idle") {
            }
            // We already have a new pickup station set, proceed to travel
          } else {
-           // Collect fuel cells at any station when idle
-           await collectFuelCells(ctx, settings);
-           const lookup = await fetchStationPassengers(ctx, bot.system, bot.poi);
+          // Collect fuel cells at any station when idle
+          await collectFuelCells(ctx, settings);
+          const lookup = await fetchStationPassengers(ctx, bot.system, bot.poi);
           if (lookup && lookup.count > 0) {
             state.pickupStation = bot.poi;
             state.pickupSystem = bot.system;
@@ -2936,18 +2736,8 @@ if (state && state.status !== "idle") {
          if (state.pickupSystem !== bot.system) {
            try { await bot.refreshStatus(true); } catch { /* ignore */ }
            await bot.refreshLocation();
-            if (state.pickupSystem !== bot.system) {
-              if (settings.mode === "isolated_transport" && bot.system && settings.isolatedSystem && bot.system.toLowerCase() === (settings.homeSystem || "").toLowerCase() && state.pickupSystem && state.pickupSystem.toLowerCase() !== bot.system.toLowerCase()) {
-                const originPos = mapStore.getSystem(bot.system)?.position;
-                const res = await executePathfinderJumpToBearing(ctx, settings.isolatedDegree ?? 0, originPos ? { x: originPos.x, y: originPos.y } : null);
-                if (!res.success) { state.status = "idle"; saveTransportState(state); await ctx.sleep(30000); continue; }
-                await bot.refreshLocation();
-                state.pickupSystem = bot.system;
-                state.pickupStation = bot.poi || state.pickupStation;
-                saveTransportState(state);
-                continue;
-              }
-              const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+           if (state.pickupSystem !== bot.system) {
+             const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
              if (!ok) {
                state.status = "idle";
                saveTransportState(state);
@@ -3068,7 +2858,7 @@ if (state && state.status !== "idle") {
           // bound for blacklisted destinations to park them in the Transit Lounge
           // instead of skipping them entirely. Delivery to blacklisted destinations
           // remains blocked by the delivery blacklist check below.
-           if (!((settings.mode === "lounge_transport" || settings.mode === "isolated_transport") && settings.allowParkInLounge)) {
+          if (!(settings.mode === "lounge_transport" && settings.allowParkInLounge)) {
             ctx.log("transport", `Skipping passenger to blacklisted station: ${p.name} -> ${p.destination_name}`);
             skipped.push({ name: p.name, reason: `blacklisted station ${p.destination_name}` });
             continue;
@@ -3197,11 +2987,11 @@ if (state && state.status !== "idle") {
         classOrder.business = 2;
       }
 
-       const loungeFull = false;
+      const loungeFull = settings.mode === "lounge_transport" && passengersLounge.getAvailableSlots() <= 0;
       if (loungeFull) {
         ctx.log("transport", `Transit Lounge is full (150/150) — doing normal passenger deliveries instead of lounge pickup`);
       }
-       if ((settings.mode === "lounge_transport" && !loungeFull) || settings.mode === "isolated_transport") {
+      if (settings.mode === "lounge_transport" && !loungeFull) {
         ctx.log("transport", `Lounge transport mode: loading all ${waiting.length} passengers at ${bot.poi} for transport to Transit Lounge`);
 
         // load_passenger loads by destination station id, so group waiting
@@ -3222,9 +3012,9 @@ if (state && state.status !== "idle") {
           group.passengers.push(p);
         }
 
-         let loadedThisLeg = 0;
-         for (const group of loungeByDest.values()) {
-           const totalLoaded = usedEconomy + usedBusiness + usedFirst;
+        let loadedThisLeg = 0;
+        for (const group of loungeByDest.values()) {
+          const totalLoaded = usedEconomy + usedBusiness + usedFirst;
           if (settings.maxPassengers > 0 && totalLoaded >= settings.maxPassengers) break;
 
           const destId = group.id;
@@ -3277,11 +3067,10 @@ if (state && state.status !== "idle") {
           } else {
             ctx.log("transport", `Loaded passengers for ${destId} (lounge mode)`);
           }
-            await ctx.sleep(11000);
-          }
-         } else {
-         // Isolated transport never delivers passengers to their destinations; if the
-         // Normal mode: load by destination groups
+          await ctx.sleep(11000);
+        }
+      } else {
+        // Normal mode: load by destination groups
         for (const leg of plannedRoute) {
         const legPoiLower = leg.poi.toLowerCase();
         const legSysLower = leg.system.toLowerCase();
@@ -3721,7 +3510,7 @@ if (state && state.status !== "idle") {
       }
 
       // Handle lounge_transport mode: instead of delivering to destinations, return to home base
-      if (settings.mode === "lounge_transport" || settings.mode === "isolated_transport") {
+      if (settings.mode === "lounge_transport") {
          if ((!settings.homeSystem && !systemForStation(settings.homeStation)) || !settings.homeStation) {
           ctx.log("error", "Lounge transport mode requires homeSystem and homeStation to be configured");
           state.status = "idle";
@@ -3771,18 +3560,10 @@ if (state && state.status !== "idle") {
        try { await bot.refreshStatus(true); } catch { /* ignore */ }
        await bot.refreshLocation();
 
-         // Navigate to home system if not there
-        if (bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
-          if (settings.mode === "isolated_transport" && settings.isolatedRoute && settings.isolatedRoute.length > 0 && bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase() && !mapStore.getSystem(bot.system)) {
-            // isolated island (unknown system): execute reverse pathfinder jumps back toward the main network
-            ctx.log("transport", `Isolated transport: returning via reverse route...`);
-            const ok = await executeIsolatedReturn(ctx, bot, settings);
-            if (!ok) { await ctx.sleep(30000); continue; }
-            await bot.refreshLocation();
-            continue;
-          }
-          ctx.log("transport", `Lounge transport: navigating to home system ${homeSystem}`);
-          const ok = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+       // Navigate to home system if not there
+       if (bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
+         ctx.log("transport", `Lounge transport: navigating to home system ${homeSystem}`);
+         const ok = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
          if (!ok) {
            ctx.log("transport", `Failed to navigate to home system ${homeSystem}`);
            await ctx.sleep(30000);
@@ -3884,57 +3665,46 @@ if (state && state.status !== "idle") {
         ticksRemaining: p.ticks_remaining,
       }));
       saveTransportState(state);
-       const loungeHasSlots = passengersLounge.getAvailableSlots() > 0;
-       if (loungeHasSlots) {
-         ctx.log("transport", `Lounge transport: unloading ${state.onboardPassengers.length} passengers to Transit Lounge at ${homeStation}`);
-         const unloadResp = await bot.exec("unload_passenger", { id: "all", target: "lounge" });
-         if (unloadResp.error) {
-           ctx.log("error", `Unload to lounge failed: ${unloadResp.error.message}`);
-           await ctx.sleep(30000);
-           continue;
-         }
+      ctx.log("transport", `Lounge transport: unloading ${state.onboardPassengers.length} passengers to Transit Lounge at ${homeStation}`);
+      const unloadResp = await bot.exec("unload_passenger", { id: "all", target: "lounge" });
+      if (unloadResp.error) {
+        ctx.log("error", `Unload to lounge failed: ${unloadResp.error.message}`);
+        await ctx.sleep(30000);
+        continue;
+      }
 
-         // Track each passenger in the lounge store for future delivery
-         for (const p of state.onboardPassengers) {
-           const loungeEntry = PassengersLoungeStore.createLoungePassenger({
-             citizenId: p.citizenId,
-             name: p.name,
-             accommodationClass: p.accommodationClass,
-             citizenship: p.citizenship || "",
-             destination: p.destination,
-             destinationName: p.destinationName,
-             destinationSystem: p.destinationSystem || "",
-             fare: p.fare || 0,
-             bio: p.bio || "",
-             loadedAt: p.loadedAt,
-           });
-           passengersLounge.addOrUpdatePassenger(loungeEntry);
-           civilianStore.addOrUpdate({
-             citizenId: p.citizenId,
-             name: p.name,
-             accommodationClass: p.accommodationClass,
-             citizenship: p.citizenship || "",
-             destination: p.destination,
-             destinationName: p.destinationName,
-             destinationSystem: p.destinationSystem,
-             fare: p.fare || 0,
-             bio: p.bio || "",
-             loadedAt: p.loadedAt,
-             status: "boarded",
-           }, bot.username);
-           ctx.log("transport", `Lounge transport: checked ${p.name} into Transit Lounge (expires ${loungeEntry.expiresAt})`);
-         }
-         ctx.log("transport", `Lounge transport: successfully unloaded ${state.onboardPassengers.length} passengers to Transit Lounge`);
-       } else {
-         ctx.log("transport", `Transit Lounge full — dropping ${state.onboardPassengers.length} passengers into regular queue at ${homeStation}`);
-         const unloadResp = await bot.exec("unload_passenger", { id: "all" });
-         if (unloadResp.error) {
-           ctx.log("error", `Unload failed: ${unloadResp.error.message}`);
-           await ctx.sleep(30000);
-           continue;
-         }
-         ctx.log("transport", `Lounge transport: unloaded ${state.onboardPassengers.length} passengers to regular queue at ${homeStation}`);
-       }
+      // Track each passenger in the lounge store for future delivery
+      for (const p of state.onboardPassengers) {
+        const loungeEntry = PassengersLoungeStore.createLoungePassenger({
+          citizenId: p.citizenId,
+          name: p.name,
+          accommodationClass: p.accommodationClass,
+          citizenship: p.citizenship || "",
+          destination: p.destination,
+          destinationName: p.destinationName,
+          destinationSystem: p.destinationSystem || "",
+          fare: p.fare || 0,
+          bio: p.bio || "",
+          loadedAt: p.loadedAt,
+        });
+        passengersLounge.addOrUpdatePassenger(loungeEntry);
+        civilianStore.addOrUpdate({
+          citizenId: p.citizenId,
+          name: p.name,
+          accommodationClass: p.accommodationClass,
+          citizenship: p.citizenship || "",
+          destination: p.destination,
+          destinationName: p.destinationName,
+          destinationSystem: p.destinationSystem,
+          fare: p.fare || 0,
+          bio: p.bio || "",
+          loadedAt: p.loadedAt,
+          status: "boarded",
+        }, bot.username);
+        ctx.log("transport", `Lounge transport: checked ${p.name} into Transit Lounge (expires ${loungeEntry.expiresAt})`);
+      }
+
+      ctx.log("transport", `Lounge transport: successfully unloaded ${state.onboardPassengers.length} passengers to Transit Lounge`);
       state.onboardPassengers = [];
       state.route = [];
       state.currentRouteIndex = 0;
@@ -3954,7 +3724,7 @@ if (state && state.status !== "idle") {
     // ── Lounge Delivery ──
     // Deliver expired Transit Lounge passengers to their destinations.
     // (In achievement mode this runs first as the primary source, above.)
-    if (settings.mode === "lounge_transport" || settings.mode === "isolated_transport") {
+    if (settings.mode === "lounge_transport") {
       const loungeActed = await tryDeliverExpiredLoungePassenger(ctx, bot, state, settings, null);
       if (loungeActed) continue;
     }
@@ -4127,19 +3897,7 @@ if (state && state.status !== "idle") {
             await ctx.sleep(60000);
             continue;
           }
-          if (settings.mode === "lounge_transport" || settings.mode === "isolated_transport") {
-           // Lounge/isolated transport never delivers to passenger destinations;
-           // redirect home instead of rebuilding a destination route.
-           const homeSystem = systemForStation(settings.homeStation) || settings.homeSystem;
-           state.route = (homeSystem && settings.homeStation) ? [{ system: homeSystem, poi: settings.homeStation, poiName: settings.homeStation }] : [];
-           state.currentRouteIndex = 0;
-           state.currentDestination = settings.homeStation || null;
-           state.status = "returning_to_lounge";
-           state.routeRebuildAttempts = 0;
-           saveTransportState(state);
-           continue;
-         }
-         state.routeRebuildAttempts = retryCount;
+          state.routeRebuildAttempts = retryCount;
           const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
           for (const p of state.onboardPassengers) {
             ctx.log("transport", `resolveDestination for onboard passenger: ${p.destination} (system: ${p.destinationSystem || 'none'})`);

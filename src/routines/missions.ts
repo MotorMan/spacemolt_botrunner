@@ -969,6 +969,7 @@ async function deliverItems(ctx: RoutineContext, items: Array<{ itemId: string; 
 
 async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promise<boolean> {
   const { bot } = ctx;
+  if (bot.state !== "running") return false;
   const settings = getMissionSettings(bot);
   // removed unused top-level vars; defined in cases where needed
 
@@ -1093,12 +1094,21 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
       return true;
     }
     case "jump": {
+      if (bot.state !== "running") return false;
       if (step.system) {
-        await navigateToSystem(ctx, step.system);
+        const navigated = await navigateToSystem(ctx, step.system);
+        if (!navigated) {
+          if (bot.state !== "running") return false;
+          ctx.log("error", `Failed to reach launch system ${step.system}`);
+          return false;
+        }
       }
+      if (bot.state !== "running") return false;
       if (step.bearing !== undefined) {
         await ensureUndocked(ctx);
+        if (bot.state !== "running") return false;
         ctx.log("travel", `Jumping bearing ${step.bearing}...`);
+        if (bot.state !== "running") return false;
         const jumpResp = await bot.exec("jump", { target_system: step.bearing });
         if (jumpResp.error) {
           ctx.log("error", `Bearing jump failed: ${jumpResp.error.message}`);
@@ -1108,11 +1118,13 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
         let inTransit = false;
         for (let i = 0; i < 60 && bot.state === "running" && !inTransit; i++) {
           await ctx.sleep(1000);
+          if (bot.state !== "running") break;
           const poiResp = await bot.exec("get_poi");
           if (poiResp.result && typeof poiResp.result === "object") {
             inTransit = (poiResp.result as Record<string, unknown>).in_transit === true;
           }
         }
+        if (bot.state !== "running") return false;
         if (!inTransit) {
           ctx.log("error", `Bearing jump ${step.bearing} — transit never started`);
           return false;
@@ -1124,15 +1136,18 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
           let redirected = false;
           while (bot.state === "running" && inTransit) {
             await ctx.sleep(2000);
+            if (bot.state !== "running") break;
             const poiResp = await bot.exec("get_poi");
             if (poiResp.result && typeof poiResp.result === "object") {
               inTransit = (poiResp.result as Record<string, unknown>).in_transit === true;
             }
+            if (bot.state !== "running") break;
             if (!redirected && startTick !== null && inTransit) {
               const nowTick = await bot.pollCurrentTick();
               if (nowTick !== null && nowTick - startTick >= targetTicks) {
                 const newBearing = (step.bearing + 180) % 360;
                 ctx.log("travel", `Turn-around: redirecting to bearing ${newBearing}...`);
+                if (bot.state !== "running") break;
                 const rResp = await bot.exec("jump", { target_system: newBearing });
                 if (rResp.error) {
                   ctx.log("error", `Redirect failed: ${rResp.error.message}`);
@@ -1145,16 +1160,20 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
         } else {
           while (bot.state === "running" && inTransit) {
             await ctx.sleep(2000);
+            if (bot.state !== "running") break;
             const poiResp = await bot.exec("get_poi");
             if (poiResp.result && typeof poiResp.result === "object") {
               inTransit = (poiResp.result as Record<string, unknown>).in_transit === true;
             }
           }
         }
+        if (bot.state !== "running") return false;
         await bot.refreshLocation();
       }
+      if (bot.state !== "running") return false;
       if (step.poi) {
         await ctx.sleep(2000);
+        if (bot.state !== "running") return false;
         const interactResp = await bot.exec("interact_poi", { poi_id: step.poi });
         if (interactResp.error) {
           ctx.log("error", `Interact POI failed: ${interactResp.error.message}`);
@@ -1168,10 +1187,14 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
       if (step.system) {
         const navigated = await navigateToSystem(ctx, step.system);
         if (!navigated) {
-          ctx.log("warn", `Could not reach launch system ${step.system}; jumping from current location ${bot.system}`);
+          if (bot.state !== "running") return false;
+          ctx.log("error", `Failed to reach launch system ${step.system} for pathfinder jump`);
+          return false;
         }
       }
+      if (bot.state !== "running") return false;
       await ensureUndocked(ctx);
+      if (bot.state !== "running") return false;
 
       const disablePathfinder = settings.disablePathfinderJumps === true;
       if (disablePathfinder) {
@@ -1217,11 +1240,14 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
       const originPos = currentSys?.position ? { x: currentSys.position.x, y: currentSys.position.y } : null;
 
       ctx.log("travel", `⚠️ PATHFINDER JUMP: bearing ${step.bearing}...`);
+      if (bot.state !== "running") return false;
       const result = await executePathfinderJumpToBearing(ctx, step.bearing, originPos, { waitForCompletion: true });
       if (!result.success) {
+        if (bot.state !== "running") return false;
         ctx.log("error", `Pathfinder jump failed`);
         return false;
       }
+      if (bot.state !== "running") return false;
       await bot.refreshLocation();
 
       if (step.poi) {
@@ -1235,11 +1261,11 @@ async function executeMissionStep(ctx: RoutineContext, step: MissionStep): Promi
 
       // Optional return-to-station after the jump (e.g. back to FSMS)
       if (step.station) {
-        const targetSystem = step.system && step.system !== "first_step" ? step.system : undefined;
-        // Resolve via navigateToStation using a synthetic step-like approach
         const navStep = { ...step } as MissionStep;
+        if (bot.state !== "running") return false;
         const ok = await navigateToStation(ctx, navStep);
         if (!ok) {
+          if (bot.state !== "running") return false;
           ctx.log("warn", `Post-jump navigation to station ${step.station} failed; continuing`);
         }
       }

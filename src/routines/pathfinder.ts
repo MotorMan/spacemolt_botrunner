@@ -244,6 +244,9 @@ export async function executePathfinderJumpToBearing(
   options: { waitForCompletion?: boolean; midTransitWaitMs?: number } = {}
 ): Promise<{ success: boolean; landedSystem: string; arrivalPos: { x: number; y: number } | null; ticksTraveled: number }> {
   const { bot } = ctx;
+  if (bot.state !== "running") {
+    return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
+  }
   const { waitForCompletion = true, midTransitWaitMs = 0 } = options;
 
   if (!bot.hasPathfinderDrive) {
@@ -273,6 +276,11 @@ export async function executePathfinderJumpToBearing(
   const startTick = await bot.pollCurrentTick();
 
   ctx.log("travel", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° from ${originSystem} (returning to main network)`);
+
+  if (bot.state !== "running") {
+    if (wasCloaked) await bot.exec("cloak", { enable: true });
+    return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
+  }
 
   const jumpResp = await bot.exec("jump", { target_system: bearing });
   if (jumpResp.error) {
@@ -1129,6 +1137,11 @@ async function pathfinderJumpAtBearing(
   const startTick = await bot.pollCurrentTick();
 
   ctx.log("travel", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° from ${originSystem}`);
+
+  if (bot.state !== "running") {
+    if (wasCloaked) await bot.exec("cloak", { enable: true });
+    return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
+  }
 
   const jumpResp = await bot.exec("jump", { target_system: bearing });
   if (jumpResp.error) {

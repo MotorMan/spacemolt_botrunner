@@ -2446,41 +2446,48 @@ async function executeIsolatedStep(
     ctx.log("transport", `Isolated ${label}: landed in ${bot.system} after pathfinder jump`);
   }
 
-  // ── 3. Travel to step.station and dock if requested ────────────────────
-  if (step.station) {
-    if ((bot.poi || "") !== step.station) {
-      ctx.log("transport", `Isolated ${label}: traveling to station ${step.station}`);
-      const tr = await bot.exec("travel", { target_poi: step.station });
-      if (tr.error) {
-        const errMsg = tr.error.message || "";
-        // If the station is actually in another system, jump there first.
-        const m = errMsg.match(/in the [^()]* system \(([^)]+)\)/i);
-        const targetSys = m ? m[1].trim() : null;
-        const curM = errMsg.match(/you are in ([^.]+)\./i);
-        if (curM) invalidateCachedPosition(bot, curM[1].trim());
-        if (targetSys && (!bot.system || bot.system.toLowerCase() !== targetSys.toLowerCase())) {
-          ctx.log("transport", `Isolated ${label}: station is in ${targetSys}, navigating there first`);
-          const ok = await navigateToSystem(ctx, targetSys, {
-            fuelThresholdPct: settings.refuelThreshold,
-            hullThresholdPct: settings.repairThreshold,
-            skipBlacklist: true,
-          });
-          if (!ok) {
-            ctx.log("error", `Isolated ${label}: failed to navigate to ${targetSys}`);
-            return "stopped";
-          }
-          invalidateCachedPosition(bot, targetSys);
-          await bot.refreshStatus(true);
-          // Retry the travel on the next loop iteration.
-          return "advance";
+  // ── 3. Travel to step.station (if set) and dock if requested ───────────
+  // When step.station is empty but the step wants to dock and/or pick up
+  // passengers, we still need to be docked somewhere in the current system —
+  // ensureDocked() finds a suitable station in the current system.
+  if (step.station && (bot.poi || "") !== step.station) {
+    ctx.log("transport", `Isolated ${label}: traveling to station ${step.station}`);
+    const tr = await bot.exec("travel", { target_poi: step.station });
+    if (tr.error) {
+      const errMsg = tr.error.message || "";
+      // If the station is actually in another system, jump there first.
+      const m = errMsg.match(/in the [^()]* system \(([^)]+)\)/i);
+      const targetSys = m ? m[1].trim() : null;
+      const curM = errMsg.match(/you are in ([^.]+)\./i);
+      if (curM) invalidateCachedPosition(bot, curM[1].trim());
+      if (targetSys && (!bot.system || bot.system.toLowerCase() !== targetSys.toLowerCase())) {
+        ctx.log("transport", `Isolated ${label}: station is in ${targetSys}, navigating there first`);
+        const ok = await navigateToSystem(ctx, targetSys, {
+          fuelThresholdPct: settings.refuelThreshold,
+          hullThresholdPct: settings.repairThreshold,
+          skipBlacklist: true,
+        });
+        if (!ok) {
+          ctx.log("error", `Isolated ${label}: failed to navigate to ${targetSys}`);
+          return "stopped";
         }
-        ctx.log("error", `Isolated ${label}: travel to ${step.station} failed: ${errMsg}`);
-        return "stopped";
+        invalidateCachedPosition(bot, targetSys);
+        await bot.refreshStatus(true);
+        // Retry the travel on the next loop iteration.
+        return "advance";
       }
-      await bot.refreshStatus();
+      ctx.log("error", `Isolated ${label}: travel to ${step.station} failed: ${errMsg}`);
+      return "stopped";
     }
+    await bot.refreshStatus();
+  }
 
-    if (step.dock && !bot.docked) {
+  // Dock when requested, or when we need to pick up passengers (pickup requires
+  // being docked). With no explicit station, ensureDocked() picks one in the
+  // current system; with an explicit station we honor it.
+  const needsDock = (step.dock || step.pickup) && !bot.docked;
+  if (needsDock) {
+    if (step.station) {
       ctx.log("transport", `Isolated ${label}: docking at ${step.station}`);
       const dockResp = await bot.exec("dock");
       if (dockResp.error) {
@@ -2492,8 +2499,13 @@ async function executeIsolatedStep(
           markStationDenied(step.station);
           return "advance";
         } else {
-          ctx.log("error", `Isolated ${label}: dock failed: ${msg}`);
-          return "stopped";
+          // Fall back to ensureDocked so we can still pick up passengers.
+          ctx.log("warn", `Isolated ${label}: dock at ${step.station} failed (${msg}) — trying another station in system`);
+          const ok = await ensureDocked(ctx);
+          if (!ok) {
+            ctx.log("error", `Isolated ${label}: could not dock at any station in ${bot.system}`);
+            return "stopped";
+          }
         }
       }
       await bot.refreshStatus();
@@ -2502,36 +2514,42 @@ async function executeIsolatedStep(
         await ctx.sleep(5000);
         return "advance";
       }
+    } else {
+      // No explicit station: find and dock at a station in the current system.
+      ctx.log("transport", `Isolated ${label}: docking at a station in ${bot.system}`);
+      const ok = await ensureDocked(ctx);
+      if (!ok) {
+        ctx.log("error", `Isolated ${label}: could not dock at any station in ${bot.system}`);
+        return "stopped";
+      }
+      await bot.refreshStatus();
+    }
+  }
+
+  // ── 4. Pickup ────────────────────────────────────────────────────────
+  if (step.pickup) {
+    if (!bot.docked) {
+      // Pickup requires docking; try once more to dock at a local station.
+      ctx.log("transport", `Isolated ${label}: pickup requested but not docked — docking first`);
+      const ok = await ensureDocked(ctx);
+      if (!ok) {
+        ctx.log("error", `Isolated ${label}: dock failed before pickup`);
+        return "stopped";
+      }
+      await bot.refreshStatus();
     }
 
-    // ── 4. Pickup ────────────────────────────────────────────────────────
-    if (step.pickup) {
-      if (!bot.docked) {
-        ctx.log("transport", `Isolated ${label}: pickup requested but not docked — docking first`);
-        const dockResp = await bot.exec("dock");
-        if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
-          ctx.log("error", `Isolated ${label}: dock failed before pickup: ${dockResp.error.message}`);
-          return "stopped";
-        }
-        bot.docked = true;
-        await bot.refreshStatus();
+    if (step.waitForPassengers) {
+      const aboard = await isolatedWaitForAndLoadPassengers(ctx, state, settings);
+      if (bot.state !== "running") return "stopped";
+      if (aboard === 0) {
+        ctx.log("transport", `Isolated ${label}: waitForPassengers set but no passengers loaded before stop`);
+        return "stopped";
       }
-
-      if (step.waitForPassengers) {
-        const aboard = await isolatedWaitForAndLoadPassengers(ctx, state, settings);
-        if (bot.state !== "running") return "stopped";
-        if (aboard === 0) {
-          ctx.log("transport", `Isolated ${label}: waitForPassengers set but no passengers loaded before stop`);
-          return "stopped";
-        }
-      } else {
-        await isolatedLoadWaitingPassengers(ctx, state, settings);
-      }
-      saveTransportState(state);
+    } else {
+      await isolatedLoadWaitingPassengers(ctx, state, settings);
     }
-  } else if (step.pickup) {
-    // Pickup requested but no station specified — nothing to dock at.
-    ctx.log("warn", `Isolated ${label}: pickup requested but no station set — skipping pickup`);
+    saveTransportState(state);
   }
 
   return "advance";

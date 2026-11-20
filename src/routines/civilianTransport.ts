@@ -728,6 +728,17 @@ interface CivilianTransportSettings {
 
 // ── Settings ─────────────────────────────────────────────────
 
+/**
+ * The web UI stores station references as "system|poiId". Travel/dock commands
+ * only accept the POI id, so strip any "system|" prefix. A bare value is
+ * returned unchanged.
+ */
+function normalizeStationRef(value: string): string {
+  if (!value) return "";
+  const bar = value.lastIndexOf("|");
+  return bar >= 0 ? value.slice(bar + 1) : value;
+}
+
 function getCivilianTransportSettings(username?: string): CivilianTransportSettings {
   const all = readSettings();
   const t = (all as any).civilian_transport || {};
@@ -739,7 +750,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     refuelThreshold: Number((t.refuelThreshold as number) ?? 50),
     repairThreshold: Number((t.repairThreshold as number) ?? 40),
     homeSystem: (botOverrides.homeSystem as string) || (t.homeSystem as string) || "",
-    homeStation: (botOverrides.homeStation as string) || (t.homeStation as string) || "",
+    homeStation: normalizeStationRef((botOverrides.homeStation as string) || (t.homeStation as string) || ""),
     maxPassengers: Number((t.maxPassengers as number) ?? 0),
     maxEconomy: Number((t.maxEconomy as number) ?? 0),
     maxBusiness: Number((t.maxBusiness as number) ?? 0),
@@ -768,7 +779,9 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
           .map((s) => ({
             system: String((s.system as string) || ""),
             degree: typeof (s.degree as number) === "number" && !isNaN(s.degree as number) ? (s.degree as number) : null,
-            station: String((s.station as string) || ""),
+            // The web UI stores stations as "system|poiId"; travel only needs
+            // the POI id, so strip any "system|" prefix here.
+            station: normalizeStationRef(String((s.station as string) || "")),
             dock: (s.dock as boolean) === true,
             pickup: (s.pickup as boolean) === true,
             waitForPassengers: (s.waitForPassengers as boolean) === true,
@@ -2451,6 +2464,8 @@ async function executeIsolatedStep(
 ): Promise<"advance" | "stopped"> {
   const { bot } = ctx;
   const label = `step ${stepIndex + 1}`;
+  // Defensive: the station may be stored as "system|poiId" — travel needs POI.
+  const stationPoi = normalizeStationRef(step.station);
 
   // ── 1. Normal-jump to step.system (auto-routed) ────────────────────────
   if (step.system) {
@@ -2497,9 +2512,9 @@ async function executeIsolatedStep(
   // When step.station is empty but the step wants to dock and/or pick up
   // passengers, we still need to be docked somewhere in the current system —
   // ensureDocked() finds a suitable station in the current system.
-  if (step.station && (bot.poi || "") !== step.station) {
-    ctx.log("transport", `Isolated ${label}: traveling to station ${step.station}`);
-    const tr = await bot.exec("travel", { target_poi: step.station });
+  if (stationPoi && (bot.poi || "") !== stationPoi) {
+    ctx.log("transport", `Isolated ${label}: traveling to station ${stationPoi}`);
+    const tr = await bot.exec("travel", { target_poi: stationPoi });
     if (tr.error) {
       const errMsg = tr.error.message || "";
       // If the station is actually in another system, jump there first.
@@ -2523,7 +2538,7 @@ async function executeIsolatedStep(
         // Retry the travel on the next loop iteration.
         return "advance";
       }
-      ctx.log("error", `Isolated ${label}: travel to ${step.station} failed: ${errMsg}`);
+      ctx.log("error", `Isolated ${label}: travel to ${stationPoi} failed: ${errMsg}`);
       return "stopped";
     }
     await bot.refreshStatus();
@@ -2534,20 +2549,20 @@ async function executeIsolatedStep(
   // current system; with an explicit station we honor it.
   const needsDock = (step.dock || step.pickup) && !bot.docked;
   if (needsDock) {
-    if (step.station) {
-      ctx.log("transport", `Isolated ${label}: docking at ${step.station}`);
+    if (stationPoi) {
+      ctx.log("transport", `Isolated ${label}: docking at ${stationPoi}`);
       const dockResp = await bot.exec("dock");
       if (dockResp.error) {
         const msg = dockResp.error.message || "";
         if (msg.toLowerCase().includes("already")) {
           bot.docked = true;
         } else if (/access denied/i.test(msg)) {
-          ctx.log("error", `Isolated ${label}: dock denied at ${step.station} — marking restricted`);
-          markStationDenied(step.station);
+          ctx.log("error", `Isolated ${label}: dock denied at ${stationPoi} — marking restricted`);
+          markStationDenied(stationPoi);
           return "advance";
         } else {
           // Fall back to ensureDocked so we can still pick up passengers.
-          ctx.log("warn", `Isolated ${label}: dock at ${step.station} failed (${msg}) — trying another station in system`);
+          ctx.log("warn", `Isolated ${label}: dock at ${stationPoi} failed (${msg}) — trying another station in system`);
           const ok = await ensureDocked(ctx);
           if (!ok) {
             ctx.log("error", `Isolated ${label}: could not dock at any station in ${bot.system}`);

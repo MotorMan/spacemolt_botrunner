@@ -5687,6 +5687,22 @@
       </label>`;
         }
 
+        // Per-bot glass miner "Mine Only" toggle (visible when glass_miner is selected or running)
+        const isGlassMiner =
+          (bot.state === "running" && bot.routine === "glass_miner") ||
+          (bot.state !== "running" &&
+            bot.state !== "stopping" &&
+            getProfileSelectedRoutine() === "glass_miner");
+        if (isGlassMiner) {
+          const botSettings = settings[bot.username] || {};
+          const mineOnly = botSettings.mineOnly === true;
+          actions += `
+      <label class="profile-ore-label" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:8px" title="When enabled, never travel. If already inside a seam_glass POI, mine it and keep shields/hull topped up while the hazard zone drains them.">
+        <input type="checkbox" id="profile-glassminer-mineOnly" onchange="saveProfileGlassMinerMineOnly()"${mineOnly ? " checked" : ""}>
+        Mine Only (seam_glass)
+      </label>`;
+        }
+
         // Per-bot station priority + home system (visible for trader and faction_trader)
         const isTrader =
           (bot.state === "running" &&
@@ -6336,6 +6352,21 @@
         const acceptMissions = cb.checked;
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { acceptMissions });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfileGlassMinerMineOnly() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const cb = document.getElementById("profile-glassminer-mineOnly");
+        if (!cb) return;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { mineOnly: cb.checked });
         send({
           type: "saveSettings",
           routine: bot.username,
@@ -32640,6 +32671,7 @@ async function fetchPersonalFacilityTypes(username) {
         const maxRepeaterTierToEngage = g.maxRepeaterTierToEngage || "large";
         const fleeFromSpireMonolith = g.fleeFromSpireMonolith ?? true;
         const cloakOnStart = g.cloakOnStart ?? false;
+        const mineOnly = g.mineOnly ?? false;
 
         // Routing profiles
         const routeProfiles = g.routeProfiles || [];
@@ -33181,6 +33213,14 @@ async function fetchPersonalFacilityTypes(username) {
         </div>
         <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-cloakOnStart"${cloakOnStart ? " checked" : ""}> Enabled</label>
       </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Mine Only (seam_glass)</div>
+          <div class="setting-hint">Never travel. If already inside a seam_glass POI, mine it and keep shields/hull topped up while the hazard zone drains them. Otherwise holds position.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-glass_miner-mineOnly"${mineOnly ? " checked" : ""}> Enabled</label>
+      </div>
     </div>
 
     <div class="setting-section">
@@ -33492,6 +33532,7 @@ async function fetchPersonalFacilityTypes(username) {
             maxRepeaterTierToEngage: document.getElementById("set-glass_miner-maxRepeaterTierToEngage").value,
             fleeFromSpireMonolith: document.getElementById("set-glass_miner-fleeFromSpireMonolith").checked,
             cloakOnStart: document.getElementById("set-glass_miner-cloakOnStart").checked,
+            mineOnly: document.getElementById("set-glass_miner-mineOnly").checked,
             
             // Routing profiles
             routeProfiles: routeProfiles,

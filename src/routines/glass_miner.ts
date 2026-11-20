@@ -575,6 +575,8 @@ export interface GlassMinerSettings {
   maxRepeaterTierToEngage: PirateTier;
 fleeFromSpireMonolith: boolean;
   cloakOnStart: boolean;
+  // Mine current seam_glass POI without traveling; keep shields/hull topped up
+  mineOnly: boolean;
   // Routing profiles
   routeProfiles: GlassMinerRouteProfile[];
   activeRouteProfile: string;
@@ -715,6 +717,7 @@ async function getGlassMinerSettings(username?: string): Promise<GlassMinerSetti
     fleeFromSpireMonolith: (m.fleeFromSpireMonolith as boolean) ?? true,
     cloakOnStart: (m.cloakOnStart as boolean) ?? false,
     autoDetectMiningType: (m.miningType === "auto" || m.miningType === "Auto" || m.miningType === "AUTO"),
+    mineOnly: (botOverrides.mineOnly as boolean) ?? (m.mineOnly as boolean) ?? false,
     // Routing profiles
     routeProfiles: parseRouteProfiles(m.routeProfiles),
     activeRouteProfile: (botOverrides.activeRouteProfile as string) || (m.activeRouteProfile as string) || "",
@@ -1198,6 +1201,55 @@ function hasLocalMiningPoiOfType(
     }
   }
   return false;
+}
+
+// ── Mine-only (stationary) helpers ───────────────────────────
+
+/**
+ * When mine-only mode is enabled and the bot is already inside a seam_glass POI,
+ * build a mining target from the current POI instead of traveling.
+ */
+function getCurrentSeamGlassTarget(settings: GlassMinerSettings, bot: Bot): { systemId: string; poiId: string; resourceId: string; poiName: string } | null {
+  if (!settings.mineOnly) return null;
+  if (bot.docked) return null;
+
+  const sys = mapStore.getSystem(bot.system);
+  if (!sys) return null;
+
+  const poi = sys.pois.find(p => p.id === bot.poi);
+  if (!poi) return null;
+
+  const hasSeamGlass =
+    (poi.ores_found || []).some(e => e.item_id === "seam_glass") ||
+    (poi.resources || []).some(r => r.resource_id === "seam_glass");
+  if (!hasSeamGlass) return null;
+
+  return {
+    systemId: bot.system,
+    poiId: poi.id,
+    resourceId: "seam_glass",
+    poiName: poi.name || poi.id,
+  };
+}
+
+/** Build a mining target from the active route profile (if it defines one). */
+function getRouteProfileTarget(settings: GlassMinerSettings, bot: Bot): { systemId: string; poiId: string; resourceId: string; poiName: string } | null {
+  const activeRoute = getActiveRouteProfile(settings);
+  if (!activeRoute) return null;
+  if (!activeRoute.miningPoiId || !activeRoute.miningResourceId) return null;
+
+  const targetSystemId = activeRoute.pathfinderTargetSystem
+    ? resolveSystemId(activeRoute.pathfinderTargetSystem)
+    : bot.system;
+
+  if (!targetSystemId) return null;
+
+  return {
+    systemId: targetSystemId,
+    poiId: activeRoute.miningPoiId,
+    resourceId: activeRoute.miningResourceId,
+    poiName: activeRoute.miningPoiName || activeRoute.miningPoiId,
+  };
 }
 
 // ── Target selection ─────────────────────────────────────────
@@ -1797,7 +1849,7 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     // Fuel check
     const fuelPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 100;
-    if (fuelPct <= settings.refuelThreshold) {
+    if (fuelPct <= settings.refuelThreshold && !settings.mineOnly) {
       ctx.log("system", `Fuel at ${fuelPct.toFixed(1)}% ≤ ${settings.refuelThreshold}% — refueling`);
       yield "refuel";
       await tryRefuel(ctx, { skipApprovedCheck: true });
@@ -1903,6 +1955,22 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
       continue;
     }
 
+    // Mine-only mode: when enabled, skip all travel. If we are already inside a
+    // seam_glass POI, mine it and keep shields/hull topped up while the POI's
+    // hazard zone drains them. Never navigate, jump, or travel to a POI.
+    let target: { systemId: string; poiId: string; resourceId: string; poiName: string } | null = null;
+    if (settings.mineOnly) {
+      const mineOnlyTarget = getCurrentSeamGlassTarget(settings, bot);
+      if (!mineOnlyTarget) {
+        ctx.log("system", "Mine-only mode enabled — not in a seam_glass POI; holding position");
+        await fullTimeShieldMonitor(ctx, settings);
+        await ctx.sleep(15000);
+        continue;
+      }
+      ctx.log("mining", `Mine-only mode — mining ${mineOnlyTarget.resourceId} at ${mineOnlyTarget.poiName} (${mineOnlyTarget.systemId})`);
+      target = mineOnlyTarget;
+    }
+
     // Detect mining type
     const detectedMiningType = await detectMiningType(ctx, cachedModules);
     let miningType: MiningType;
@@ -1932,10 +2000,11 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
     const canMineHiddenIce = miningType === "ice" && deepCoreCap.hasExtractor;
 
     // Find mining target - use routing profile if active
-    let target: { systemId: string; poiId: string; resourceId: string; poiName: string } | null = null;
     const activeRoute = getActiveRouteProfile(settings);
-    
-    if (activeRoute) {
+
+    // Non-mine-only modes navigate along the route profile's outbound route and
+    // optional pathfinder jump before mining. Mine-only mode skips all travel.
+    if (activeRoute && !settings.mineOnly) {
       ctx.log("system", `Using routing profile: ${activeRoute.name}`);
       
       // Navigate outbound route systems
@@ -2015,22 +2084,14 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
       }
       
       // Set target from route profile
-      if (activeRoute.miningPoiId && activeRoute.miningResourceId) {
-        const targetSystemId = activeRoute.pathfinderTargetSystem 
-          ? resolveSystemId(activeRoute.pathfinderTargetSystem)
-          : bot.system;
-        
-        if (targetSystemId) {
-          target = {
-            systemId: targetSystemId,
-            poiId: activeRoute.miningPoiId,
-            resourceId: activeRoute.miningResourceId,
-            poiName: activeRoute.miningPoiName || activeRoute.miningPoiId,
-          };
+      if (!target) {
+        target = getRouteProfileTarget(settings, bot);
+        if (target) {
+          ctx.log("system", `Target from route profile: ${target.resourceId} at ${target.poiName} (${target.systemId})`);
         }
       }
     }
-    
+
     // Fallback to automatic target finding if no route profile or profile didn't set target
     if (!target) {
       target = await findBestMiningTarget(
@@ -2055,8 +2116,8 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     ctx.log("mining", `Target: ${target.resourceId} at ${target.poiName} (${target.systemId})`);
 
-    // Navigate to target system
-    if (bot.system !== target.systemId) {
+    // Navigate to target system (never travels in mine-only mode)
+    if (!settings.mineOnly && bot.system !== target.systemId) {
       yield "navigate";
       const safetyOpts = {
         fuelThresholdPct: settings.refuelThreshold,
@@ -2074,8 +2135,8 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
       }
     }
 
-    // Travel to POI
-    if (bot.poi !== target.poiId) {
+    // Travel to POI (never travels in mine-only mode)
+    if (!settings.mineOnly && bot.poi !== target.poiId) {
       yield "travel";
       const travelResp = await bot.exec("travel", { target_poi: target.poiId });
       if (travelResp.error && !travelResp.error.message.includes("already")) {

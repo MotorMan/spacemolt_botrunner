@@ -33,6 +33,7 @@ import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { onCivilianTransportUpdate } from "../client_sync_hooks.js";
 import { passengersLounge, LoungePassenger, PassengersLoungeStore } from "../passengersLounge.js";
 import { livePassengers } from "../livePassengers.js";
+import { executePathfinderJumpToBearing } from "./pathfinder.js";
 
 // HTML markup for log lines rendered in the web UI.
 const HTML_RESET = "</span>";
@@ -587,7 +588,7 @@ interface TransportPassenger {
 
 interface TransportState {
   botUsername: string;
-  status: "idle" | "traveling_to_ship" | "loading" | "in_transit" | "unloading" | "completed" | "returning_to_lounge" | "delivering_lounge_passenger";
+  status: "idle" | "traveling_to_ship" | "loading" | "in_transit" | "unloading" | "completed" | "returning_to_lounge" | "delivering_lounge_passenger" | "isolated_transit" | "isolated_unloading";
   shipId: string;
   shipName: string;
   customName?: string;
@@ -608,6 +609,10 @@ interface TransportState {
   awayPickupAttempts: number;
   needsTravel: boolean;
   recentlyVisitedStations: string[];
+  /** Isolated-transport only: current index into settings.isolatedRoute. */
+  isolatedStepIndex?: number;
+  /** Isolated-transport only: sub-phase within a step. */
+  isolatedPhase?: "transit" | "jump" | "to_station" | "docked" | "pickup" | "done";
 }
 
 interface FleetShip {
@@ -668,7 +673,27 @@ interface ListPassengersResponse {
   berths_used: { economy: number; business: number; first: number };
 }
 
-type CivilianTransportMode = "normal" | "lounge_transport" | "achievement";
+type CivilianTransportMode = "normal" | "lounge_transport" | "achievement" | "isolated_transport";
+
+/**
+ * One step of an isolated-transport fixed route.
+ *
+ * A step is executed as: normal-jump to `system` (auto-routed via find_route
+ * from wherever we currently are), then — if `degree` is set — perform a
+ * Pathfinder Drive jump at that absolute bearing FROM that system (the drift
+ * lands us in a new, usually uncharted system). Finally, if `station` is set
+ * we travel to that POI, docking when `dock` is true, and load passengers when
+ * `pickup` is true. When `waitForPassengers` is true and nobody is waiting we
+ * poll until at least one passenger appears (or the bot is stopped).
+ */
+interface IsolatedRouteStep {
+  system: string;
+  degree: number | null;
+  station: string;
+  dock: boolean;
+  pickup?: boolean;
+  waitForPassengers?: boolean;
+}
 
 interface CivilianTransportSettings {
   maxJumps: number;
@@ -698,6 +723,7 @@ interface CivilianTransportSettings {
   buyFuelCells: boolean;
   minFuelCellsToDepart: number;
   mode: CivilianTransportMode;
+  isolatedRoute: IsolatedRouteStep[];
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -736,6 +762,18 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     buyFuelCells: (t.buyFuelCells as boolean) ?? false,
     minFuelCellsToDepart: Number((t.minFuelCellsToDepart as number) ?? 6),
     mode: (botOverrides.mode as CivilianTransportMode) || (t.mode as CivilianTransportMode) || "normal",
+    isolatedRoute: Array.isArray((t.isolatedRoute as any))
+      ? (t.isolatedRoute as any[])
+          .filter((s) => s && typeof s === "object")
+          .map((s) => ({
+            system: String((s.system as string) || ""),
+            degree: typeof (s.degree as number) === "number" && !isNaN(s.degree as number) ? (s.degree as number) : null,
+            station: String((s.station as string) || ""),
+            dock: (s.dock as boolean) === true,
+            pickup: (s.pickup as boolean) === true,
+            waitForPassengers: (s.waitForPassengers as boolean) === true,
+          }))
+      : [],
   };
 }
 
@@ -788,7 +826,7 @@ function isValidTransportState(state: unknown): state is TransportState {
   if (typeof s.shipId !== "string" || s.shipId.length === 0) return false;
   const berths = s.berths as Record<string, number> | undefined;
   if (!berths || (berths.economy + berths.business + berths.first) <= 0) return false;
-  const validStatuses = new Set(["idle", "loading", "unloading", "in_transit", "traveling_to_ship", "returning_to_lounge", "delivering_lounge_passenger"]);
+  const validStatuses = new Set(["idle", "loading", "unloading", "in_transit", "traveling_to_ship", "returning_to_lounge", "delivering_lounge_passenger", "isolated_transit", "isolated_unloading"]);
   if (typeof s.status !== "string" || !validStatuses.has(s.status)) return false;
   return true;
 }
@@ -1923,6 +1961,8 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, customName: st
     awayPickupAttempts: 0,
     needsTravel: false,
     recentlyVisitedStations: [],
+    isolatedStepIndex: 0,
+    isolatedPhase: "transit",
   };
 }
 
@@ -2199,6 +2239,476 @@ function hasUndeliveredLoungeCandidates(botUsername: string): boolean {
 
 // ── Main routine ─────────────────────────────────────────────
 
+// ── Isolated Transport (fixed-route) engine ─────────────────────────────────
+//
+// Isolated transport is a 100% separate code path. It NEVER runs the normal
+// passenger-scanning / lounge-delivery / achievement logic. It simply walks the
+// ordered `isolatedRoute` array:
+//
+//   for each step:
+//     1. normal-jump to step.system (auto-routed via find_route)
+//     2. if step.degree != null: Pathfinder jump at that absolute bearing FROM
+//        step.system, then wait for the drift to land in a new system
+//     3. if step.station: travel to that POI, dock when step.dock
+//     4. if step.pickup: load passengers (optionally waiting for them first)
+//     5. advance to the next step
+//
+// When the last step is reached and we are docked at the home station, all
+// aboard passengers are checked into the faction Transit Lounge and the route
+// restarts from step 0. The route is assumed to be a complete round trip
+// (out AND back) as configured in the web UI.
+
+/** Returns true when the ship has at least one free passenger berth. */
+function hasFreeBerth(berthsUsed: { economy: number; business: number; first: number }, berths: { economy: number; business: number; first: number }): boolean {
+  return (berthsUsed.economy < berths.economy) || (berthsUsed.business < berths.business) || (berthsUsed.first < berths.first);
+}
+
+/** Refresh berth capacity + usage from the ship. Returns true on success. */
+async function refreshBerths(ctx: RoutineContext, state: TransportState): Promise<boolean> {
+  const { bot } = ctx;
+  const resp = await bot.exec("list_passengers");
+  if (resp.error || !resp.result) return false;
+  const parsed = parseListPassengers(resp.result);
+  if (!parsed) return false;
+  if (parsed.berths.economy + parsed.berths.business + parsed.berths.first > 0) {
+    state.berths = parsed.berths;
+  }
+  state.berths_used = parsed.berths_used;
+  return true;
+}
+
+/**
+ * Load all waiting passengers at the current docked station whose destination
+ * we can resolve. Returns the number of passengers actually aboard after the
+ * load attempt (verified via list_passengers).
+ */
+async function isolatedLoadWaitingPassengers(
+  ctx: RoutineContext,
+  state: TransportState,
+  settings: CivilianTransportSettings,
+): Promise<number> {
+  const { bot } = ctx;
+  if (!bot.docked) return 0;
+
+  // Reconcile berth capacity/usage from the ship first.
+  if (!await refreshBerths(ctx, state)) {
+    ctx.log("transport", "Isolated: could not read berths via list_passengers");
+  }
+
+  const stationResp = await bot.exec("list_station_passengers");
+  let waiting: StationPassenger[] = [];
+  if (!stationResp.error && stationResp.result) {
+    const parsed = parseStationPassengers(stationResp.result);
+    if (parsed) waiting = parsed.waiting;
+  }
+
+  if (waiting.length === 0) return 0;
+
+  // Group waiting passengers by destination (load_passenger loads by dest id).
+  const byDest = new Map<string, StationPassenger[]>();
+  for (const p of waiting) {
+    const cls = p.class.toLowerCase();
+    if (cls === "first" && !settings.allowFirstClass) continue;
+    if (cls === "business" && !settings.allowBusinessClass) continue;
+    if (cls === "economy" && !settings.allowEconomyClass) continue;
+    const arr = byDest.get(p.destination) || [];
+    arr.push(p);
+    byDest.set(p.destination, arr);
+  }
+
+  let loadedAny = false;
+  for (const [destId, ps] of byDest) {
+    // Stop loading once berths are full.
+    if (!hasFreeBerth(state.berths_used, state.berths)) {
+      ctx.log("transport", "Isolated: berths full — no more passengers to load");
+      break;
+    }
+    const loadResp = await bot.exec("load_passenger", { id: destId });
+    if (loadResp.error) {
+      ctx.log("error", `Isolated: load_passenger failed for ${destId}: ${loadResp.error.message}`);
+    } else {
+      loadedAny = true;
+      ctx.log("transport", `Isolated: loaded passengers for ${ps[0]?.destination_name || destId} (${ps.length} waiting)`);
+    }
+    // Rate-limit between destination loads.
+    await ctx.sleep(11000);
+    if (!await refreshBerths(ctx, state)) break;
+  }
+
+  if (!loadedAny) return 0;
+
+  // Verify what is actually aboard now.
+  const verifyResp = await bot.exec("list_passengers");
+  if (verifyResp.error || !verifyResp.result) return state.onboardPassengers.length;
+  const parsed = parseListPassengers(verifyResp.result);
+  if (!parsed) return state.onboardPassengers.length;
+
+  state.onboardPassengers = parsed.passengers.map(p => ({
+    citizenId: p.citizen_id || p.name,
+    name: p.name,
+    accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
+    citizenship: p.citizenship || "",
+    destination: p.destination,
+    destinationName: p.destination_name,
+    destinationSystem: (p as any).destinationSystem || p.destination_system,
+    fare: p.fare || 0,
+    bio: p.bio || "",
+    routeData: p.route_data || null,
+    loadedAt: new Date().toISOString(),
+    status: "boarded",
+    ticksRemaining: p.ticks_remaining,
+  }));
+
+  return state.onboardPassengers.length;
+}
+
+/**
+ * Wait (poll) until at least one passenger is waiting at the current docked
+ * station, loading them as soon as they appear. Honors bot stop. Returns the
+ * number of passengers aboard once at least one was loaded, or 0 if the bot was
+ * stopped while waiting.
+ */
+async function isolatedWaitForAndLoadPassengers(
+  ctx: RoutineContext,
+  state: TransportState,
+  settings: CivilianTransportSettings,
+): Promise<number> {
+  const { bot } = ctx;
+  const POLL_INTERVAL_MS = 30000;
+  ctx.log("transport", "Isolated: waiting for passengers to appear at this station...");
+
+  while (bot.state === "running") {
+    const aboard = await isolatedLoadWaitingPassengers(ctx, state, settings);
+    if (aboard > 0) {
+      ctx.log("transport", `Isolated: ${aboard} passenger(s) aboard after waiting`);
+      return aboard;
+    }
+    ctx.log("transport", "Isolated: still no passengers — polling again shortly");
+    await ctx.sleep(POLL_INTERVAL_MS);
+  }
+
+  return 0;
+}
+
+/**
+ * Execute a single isolated-route step. Returns:
+ *   "advance"  — step complete, move to the next one
+ *   "stopped"  — bot was stopped mid-step
+ */
+async function executeIsolatedStep(
+  ctx: RoutineContext,
+  state: TransportState,
+  settings: CivilianTransportSettings,
+  step: IsolatedRouteStep,
+  stepIndex: number,
+): Promise<"advance" | "stopped"> {
+  const { bot } = ctx;
+  const label = `step ${stepIndex + 1}`;
+
+  // ── 1. Normal-jump to step.system (auto-routed) ────────────────────────
+  if (step.system) {
+    await bot.refreshLocation();
+    await bot.refreshStatus();
+    const sysNow = (bot.system || "").toLowerCase();
+    const sysTarget = step.system.toLowerCase();
+    if (sysNow !== sysTarget) {
+      ctx.log("transport", `Isolated ${label}: navigating to ${step.system}`);
+      const ok = await navigateToSystem(ctx, step.system, {
+        fuelThresholdPct: settings.refuelThreshold,
+        hullThresholdPct: settings.repairThreshold,
+        skipBlacklist: true,
+      });
+      if (!ok) {
+        ctx.log("error", `Isolated ${label}: failed to navigate to ${step.system}`);
+        return "stopped";
+      }
+      await bot.refreshLocation();
+      await bot.refreshStatus();
+      if ((bot.system || "").toLowerCase() !== sysTarget) {
+        ctx.log("error", `Isolated ${label}: still not at ${step.system} (at ${bot.system}) — aborting`);
+        return "stopped";
+      }
+    }
+  }
+
+  // ── 2. Optional Pathfinder jump at the configured bearing ──────────────
+  if (step.degree !== null && step.degree !== undefined) {
+    ctx.log("transport", `Isolated ${label}: pathfinder jump at bearing ${step.degree}° from ${bot.system}`);
+    const originSys = mapStore.getSystem(bot.system || "");
+    const originPos = originSys?.position ? { x: originSys.position.x, y: originSys.position.y } : null;
+    const jump = await executePathfinderJumpToBearing(ctx, step.degree, originPos, { waitForCompletion: true });
+    if (!jump.success) {
+      ctx.log("error", `Isolated ${label}: pathfinder jump at ${step.degree}° failed`);
+      return "stopped";
+    }
+    await bot.refreshLocation();
+    await bot.refreshStatus();
+    ctx.log("transport", `Isolated ${label}: landed in ${bot.system} after pathfinder jump`);
+  }
+
+  // ── 3. Travel to step.station and dock if requested ────────────────────
+  if (step.station) {
+    if ((bot.poi || "") !== step.station) {
+      ctx.log("transport", `Isolated ${label}: traveling to station ${step.station}`);
+      const tr = await bot.exec("travel", { target_poi: step.station });
+      if (tr.error) {
+        const errMsg = tr.error.message || "";
+        // If the station is actually in another system, jump there first.
+        const m = errMsg.match(/in the [^()]* system \(([^)]+)\)/i);
+        const targetSys = m ? m[1].trim() : null;
+        const curM = errMsg.match(/you are in ([^.]+)\./i);
+        if (curM) invalidateCachedPosition(bot, curM[1].trim());
+        if (targetSys && (!bot.system || bot.system.toLowerCase() !== targetSys.toLowerCase())) {
+          ctx.log("transport", `Isolated ${label}: station is in ${targetSys}, navigating there first`);
+          const ok = await navigateToSystem(ctx, targetSys, {
+            fuelThresholdPct: settings.refuelThreshold,
+            hullThresholdPct: settings.repairThreshold,
+            skipBlacklist: true,
+          });
+          if (!ok) {
+            ctx.log("error", `Isolated ${label}: failed to navigate to ${targetSys}`);
+            return "stopped";
+          }
+          invalidateCachedPosition(bot, targetSys);
+          await bot.refreshStatus(true);
+          // Retry the travel on the next loop iteration.
+          return "advance";
+        }
+        ctx.log("error", `Isolated ${label}: travel to ${step.station} failed: ${errMsg}`);
+        return "stopped";
+      }
+      await bot.refreshStatus();
+    }
+
+    if (step.dock && !bot.docked) {
+      ctx.log("transport", `Isolated ${label}: docking at ${step.station}`);
+      const dockResp = await bot.exec("dock");
+      if (dockResp.error) {
+        const msg = dockResp.error.message || "";
+        if (msg.toLowerCase().includes("already")) {
+          bot.docked = true;
+        } else if (/access denied/i.test(msg)) {
+          ctx.log("error", `Isolated ${label}: dock denied at ${step.station} — marking restricted`);
+          markStationDenied(step.station);
+          return "advance";
+        } else {
+          ctx.log("error", `Isolated ${label}: dock failed: ${msg}`);
+          return "stopped";
+        }
+      }
+      await bot.refreshStatus();
+      if (!bot.docked) {
+        ctx.log("transport", `Isolated ${label}: dock issued but not yet docked — waiting`);
+        await ctx.sleep(5000);
+        return "advance";
+      }
+    }
+
+    // ── 4. Pickup ────────────────────────────────────────────────────────
+    if (step.pickup) {
+      if (!bot.docked) {
+        ctx.log("transport", `Isolated ${label}: pickup requested but not docked — docking first`);
+        const dockResp = await bot.exec("dock");
+        if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+          ctx.log("error", `Isolated ${label}: dock failed before pickup: ${dockResp.error.message}`);
+          return "stopped";
+        }
+        bot.docked = true;
+        await bot.refreshStatus();
+      }
+
+      if (step.waitForPassengers) {
+        const aboard = await isolatedWaitForAndLoadPassengers(ctx, state, settings);
+        if (bot.state !== "running") return "stopped";
+        if (aboard === 0) {
+          ctx.log("transport", `Isolated ${label}: waitForPassengers set but no passengers loaded before stop`);
+          return "stopped";
+        }
+      } else {
+        await isolatedLoadWaitingPassengers(ctx, state, settings);
+      }
+      saveTransportState(state);
+    }
+  } else if (step.pickup) {
+    // Pickup requested but no station specified — nothing to dock at.
+    ctx.log("warn", `Isolated ${label}: pickup requested but no station set — skipping pickup`);
+  }
+
+  return "advance";
+}
+
+/**
+ * Run the full isolated-transport route as a loop. Walks settings.isolatedRoute
+ * in order; after the final step (expected to be the home station) it unloads
+ * all passengers into the faction Transit Lounge, then restarts from step 0.
+ * This function never returns unless the bot is stopped.
+ */
+async function isolatedTransportLoop(
+  ctx: RoutineContext,
+  state: TransportState,
+  settings: CivilianTransportSettings,
+): Promise<void> {
+  const { bot } = ctx;
+  const route = settings.isolatedRoute;
+
+  if (route.length === 0) {
+    ctx.log("error", "Isolated transport mode: isolatedRoute is empty — nothing to do");
+    return;
+  }
+
+  const homeStation = settings.homeStation;
+  const homeSystem = systemForStation(homeStation) || settings.homeSystem;
+
+  ctx.log("transport", `Isolated transport started: ${route.length} step(s). Home lounge: ${homeStation || "(unconfigured)"}`);
+
+  // Validate we have a home lounge to unload into.
+  if (!homeStation) {
+    ctx.log("error", "Isolated transport mode requires homeStation to be configured (faction Transit Lounge)");
+    return;
+  }
+
+  state.isolatedStepIndex = state.isolatedStepIndex ?? 0;
+  state.isolatedPhase = state.isolatedPhase ?? "transit";
+
+  while (bot.state === "running") {
+    const stepIdx: number = state.isolatedStepIndex ?? 0;
+
+    // ── Route complete → unload to lounge and restart ──────────────────
+    if (stepIdx >= route.length) {
+      // Ensure we are docked at the home station to hand off to the lounge.
+      if (!homeSystem || (bot.system || "").toLowerCase() !== homeSystem.toLowerCase()) {
+        ctx.log("transport", `Isolated: route complete but not at home system ${homeSystem} — navigating home`);
+        const ok = await navigateToSystem(ctx, homeSystem, {
+          fuelThresholdPct: settings.refuelThreshold,
+          hullThresholdPct: settings.repairThreshold,
+          skipBlacklist: true,
+        });
+        if (!ok) {
+          ctx.log("error", `Isolated: failed to navigate home to ${homeSystem} — retrying`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshLocation();
+        await bot.refreshStatus();
+        continue;
+      }
+
+      if ((bot.poi || "") !== homeStation) {
+        ctx.log("transport", `Isolated: traveling to home station ${homeStation} for lounge unload`);
+        const tr = await bot.exec("travel", { target_poi: homeStation });
+        if (tr.error) {
+          ctx.log("error", `Isolated: travel to home station failed: ${tr.error.message}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        continue;
+      }
+
+      if (!bot.docked) {
+        ctx.log("transport", `Isolated: docking at home station ${homeStation}`);
+        const dockResp = await bot.exec("dock");
+        if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+          ctx.log("error", `Isolated: dock at home failed: ${dockResp.error.message}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        bot.docked = true;
+        await bot.refreshStatus();
+        if (!bot.docked) {
+          await ctx.sleep(5000);
+          continue;
+        }
+      }
+
+      // Unload all passengers into the faction Transit Lounge.
+      const verifyResp = await bot.exec("list_passengers");
+      const verified = verifyResp.error || !verifyResp.result ? null : parseListPassengers(verifyResp.result);
+      if (!verified || verified.passengers.length === 0) {
+        ctx.log("transport", "Isolated: no passengers aboard to check into the Transit Lounge — restarting route");
+      } else {
+        ctx.log("transport", `Isolated: unloading ${verified.passengers.length} passenger(s) into the Transit Lounge at ${homeStation}`);
+        const unloadResp = await bot.exec("unload_passenger", { id: "all", target: "lounge" });
+        if (unloadResp.error) {
+          ctx.log("error", `Isolated: unload to lounge failed: ${unloadResp.error.message}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+
+        // Track each checked-in passenger in the lounge store for onward delivery.
+        for (const p of verified.passengers) {
+          const loungeEntry = PassengersLoungeStore.createLoungePassenger({
+            citizenId: p.citizen_id || p.name,
+            name: p.name,
+            accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
+            citizenship: p.citizenship || "",
+            destination: p.destination,
+            destinationName: p.destination_name,
+            destinationSystem: (p as any).destinationSystem || p.destination_system || "",
+            fare: p.fare || 0,
+            bio: p.bio || "",
+            loadedAt: new Date().toISOString(),
+          });
+          passengersLounge.addOrUpdatePassenger(loungeEntry);
+          civilianStore.addOrUpdate({
+            citizenId: p.citizen_id || p.name,
+            name: p.name,
+            accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
+            citizenship: p.citizenship || "",
+            destination: p.destination,
+            destinationName: p.destination_name,
+            destinationSystem: (p as any).destinationSystem || p.destination_system,
+            fare: p.fare || 0,
+            bio: p.bio || "",
+            loadedAt: new Date().toISOString(),
+            status: "boarded",
+          }, bot.username);
+        }
+        ctx.log("transport", `Isolated: successfully checked ${verified.passengers.length} passenger(s) into the Transit Lounge`);
+      }
+
+      // Reset for the next round.
+      state.onboardPassengers = [];
+      state.berths_used = { economy: 0, business: 0, first: 0 };
+      state.isolatedStepIndex = 0;
+      state.isolatedPhase = "transit";
+      state.status = "isolated_transit";
+      saveTransportState(state);
+
+      // Collect fuel cells at home between rounds.
+      await collectFuelCells(ctx, settings);
+
+      ctx.log("transport", "Isolated: route complete — restarting from step 1");
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    const step = route[stepIdx];
+    ctx.log("transport", `Isolated: executing step ${stepIdx + 1}/${route.length} (system=${step.system || "—"}, degree=${step.degree ?? "—"}, station=${step.station || "—"}, dock=${step.dock}, pickup=${step.pickup === true})`);
+
+    state.status = "isolated_transit";
+    saveTransportState(state);
+
+    const result = await executeIsolatedStep(ctx, state, settings, step, stepIdx);
+    if (result === "stopped") {
+      // Bot was stopped, or a hard error occurred. If the bot is still running
+      // it was a recoverable error — back off and retry the same step.
+      if (bot.state !== "running") return;
+      ctx.log("warn", `Isolated: step ${stepIdx + 1} did not complete cleanly — retrying in 30s`);
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    // Advance to the next step.
+    state.isolatedStepIndex = stepIdx + 1;
+    state.isolatedPhase = "transit";
+    saveTransportState(state);
+    await ctx.sleep(2000);
+  }
+}
+
+// ── Main routine ─────────────────────────────────────────────
+
 export const civilianTransportRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
   const settings = getCivilianTransportSettings(bot.username);
@@ -2295,7 +2805,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
     ctx.log("transport", `Fuel after collection: ${Math.round(fuelPct)}%`);
   }
 
-if (state && state.status !== "idle") {
+if (state && state.status !== "idle" && settings.mode !== "isolated_transport") {
     const verifyResp = await bot.exec("list_passengers");
     if (verifyResp.error || !verifyResp.result) {
       state.status = "idle";
@@ -2377,7 +2887,7 @@ if (state && state.status !== "idle") {
         saveTransportState(state);
       }
     }
-  } else if (state && state.status === "idle") {
+  } else if (state && state.status === "idle" && settings.mode !== "isolated_transport") {
     const verifyResp = await bot.exec("list_passengers");
     if (!verifyResp.error && verifyResp.result) {
       const vParsed = parseListPassengers(verifyResp.result);
@@ -2495,6 +3005,17 @@ if (state && state.status !== "idle") {
         await bot.exec("battle", { action: "stance", stance: "flee" });
         battleState.lastFleeTime = now;
       }
+    }
+
+    // ── Isolated Transport mode (exclusive) ────────────────────────────────
+    // This mode NEVER runs the normal passenger-scanning / lounge-delivery /
+    // achievement logic. It walks the fixed isolatedRoute array (out and back)
+    // and only ever unloads into the faction Transit Lounge at the home station.
+    // The loop below does not return unless the bot is stopped.
+    if (settings.mode === "isolated_transport") {
+      await isolatedTransportLoop(ctx, state, settings);
+      // If the isolated loop returned, the bot was stopped.
+      return;
     }
 
     // Drop any aboard passengers whose destination was blacklisted (only

@@ -1337,17 +1337,32 @@ function parseListPassengers(result: unknown): ListPassengersResponse | null {
     return undefined;
   };
   const berthsRaw = inner.berths && typeof inner.berths === "object" ? (inner.berths as Record<string, unknown>) : null;
-  const extractBerthCount = (val: unknown): number => {
-    if (typeof val === "number") return val;
+  // Berths come back as either a plain number or an object like {total, free}.
+  // Extract both total and free so we can report how many are actually in use;
+  // without this the isolated loader cannot tell when the ship is full.
+  const extractBerth = (val: unknown): { total: number; free: number } => {
+    if (typeof val === "number") return { total: val, free: val };
     if (val && typeof val === "object") {
       const obj = val as Record<string, unknown>;
-      return num(obj.total) ?? num(obj.free) ?? 0;
+      const total = num(obj.total) ?? num(obj.free) ?? 0;
+      const free = num(obj.free) ?? total;
+      return { total, free };
     }
-    return 0;
+    return { total: 0, free: 0 };
   };
-  const economy = berthsRaw ? extractBerthCount(berthsRaw.economy) : 0;
-  const business = berthsRaw ? extractBerthCount(berthsRaw.business) : 0;
-  const first = berthsRaw ? extractBerthCount(berthsRaw.first) : 0;
+  const berthClass = (key: string): { total: number; free: number } =>
+    berthsRaw ? extractBerth(berthsRaw[key]) : { total: 0, free: 0 };
+  const eco = berthClass("economy");
+  const bus = berthClass("business");
+  const fst = berthClass("first");
+  const economy = eco.total;
+  const business = bus.total;
+  const first = fst.total;
+  const berths_used = {
+    economy: Math.max(0, eco.total - eco.free),
+    business: Math.max(0, bus.total - bus.free),
+    first: Math.max(0, fst.total - fst.free),
+  };
   for (let i = 0; i < passengers.length; i++) {
     const p = passengers[i];
     if (typeof p === "object" && p !== null) {
@@ -1363,7 +1378,7 @@ function parseListPassengers(result: unknown): ListPassengersResponse | null {
   return {
     passengers,
     berths: { economy, business, first },
-    berths_used: { economy: 0, business: 0, first: 0 },
+    berths_used,
   };
 }
 
@@ -2277,10 +2292,49 @@ async function refreshBerths(ctx: RoutineContext, state: TransportState): Promis
   return true;
 }
 
+/** Verify how many passengers are actually aboard and refresh local state. */
+async function verifyAboard(
+  ctx: RoutineContext,
+  state: TransportState,
+): Promise<{ count: number; full: boolean }> {
+  const { bot } = ctx;
+  const resp = await bot.exec("list_passengers");
+  if (resp.error || !resp.result) {
+    return { count: state.onboardPassengers.length, full: false };
+  }
+  const parsed = parseListPassengers(resp.result);
+  if (!parsed) {
+    return { count: state.onboardPassengers.length, full: false };
+  }
+  if (parsed.berths.economy + parsed.berths.business + parsed.berths.first > 0) {
+    state.berths = parsed.berths;
+  }
+  state.berths_used = parsed.berths_used;
+  state.onboardPassengers = parsed.passengers.map(p => ({
+    citizenId: p.citizen_id || p.name,
+    name: p.name,
+    accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
+    citizenship: p.citizenship || "",
+    destination: p.destination,
+    destinationName: p.destination_name,
+    destinationSystem: (p as any).destinationSystem || p.destination_system,
+    fare: p.fare || 0,
+    bio: p.bio || "",
+    routeData: p.route_data || null,
+    loadedAt: new Date().toISOString(),
+    status: "boarded",
+    ticksRemaining: p.ticks_remaining,
+  }));
+  return {
+    count: state.onboardPassengers.length,
+    full: !hasFreeBerth(state.berths_used, state.berths),
+  };
+}
+
 /**
- * Load all waiting passengers at the current docked station whose destination
- * we can resolve. Returns the number of passengers actually aboard after the
- * load attempt (verified via list_passengers).
+ * Load waiting passengers at the current docked station, grouped by
+ * destination, stopping as soon as the ship's berths are full. Returns the
+ * number of passengers actually aboard after the attempt.
  */
 async function isolatedLoadWaitingPassengers(
   ctx: RoutineContext,
@@ -2288,11 +2342,17 @@ async function isolatedLoadWaitingPassengers(
   settings: CivilianTransportSettings,
 ): Promise<number> {
   const { bot } = ctx;
-  if (!bot.docked) return 0;
+  if (!bot.docked) return state.onboardPassengers.length;
 
   // Reconcile berth capacity/usage from the ship first.
   if (!await refreshBerths(ctx, state)) {
     ctx.log("transport", "Isolated: could not read berths via list_passengers");
+  }
+
+  // Already full? Nothing to load.
+  if (!hasFreeBerth(state.berths_used, state.berths)) {
+    ctx.log("transport", "Isolated: berths already full — skipping passenger load");
+    return state.onboardPassengers.length;
   }
 
   const stationResp = await bot.exec("list_station_passengers");
@@ -2302,7 +2362,10 @@ async function isolatedLoadWaitingPassengers(
     if (parsed) waiting = parsed.waiting;
   }
 
-  if (waiting.length === 0) return 0;
+  if (waiting.length === 0) {
+    // No new passengers, but we may already be carrying some.
+    return state.onboardPassengers.length;
+  }
 
   // Group waiting passengers by destination (load_passenger loads by dest id).
   const byDest = new Map<string, StationPassenger[]>();
@@ -2333,40 +2396,24 @@ async function isolatedLoadWaitingPassengers(
     // Rate-limit between destination loads.
     await ctx.sleep(11000);
     if (!await refreshBerths(ctx, state)) break;
+    if (!hasFreeBerth(state.berths_used, state.berths)) {
+      ctx.log("transport", "Isolated: ship is now full — stopping passenger load");
+      break;
+    }
   }
 
-  if (!loadedAny) return 0;
-
-  // Verify what is actually aboard now.
-  const verifyResp = await bot.exec("list_passengers");
-  if (verifyResp.error || !verifyResp.result) return state.onboardPassengers.length;
-  const parsed = parseListPassengers(verifyResp.result);
-  if (!parsed) return state.onboardPassengers.length;
-
-  state.onboardPassengers = parsed.passengers.map(p => ({
-    citizenId: p.citizen_id || p.name,
-    name: p.name,
-    accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
-    citizenship: p.citizenship || "",
-    destination: p.destination,
-    destinationName: p.destination_name,
-    destinationSystem: (p as any).destinationSystem || p.destination_system,
-    fare: p.fare || 0,
-    bio: p.bio || "",
-    routeData: p.route_data || null,
-    loadedAt: new Date().toISOString(),
-    status: "boarded",
-    ticksRemaining: p.ticks_remaining,
-  }));
-
-  return state.onboardPassengers.length;
+  const { count } = await verifyAboard(ctx, state);
+  if (!loadedAny && count === 0) {
+    ctx.log("transport", "Isolated: no passengers were loaded at this station");
+  }
+  return count;
 }
 
 /**
- * Wait (poll) until at least one passenger is waiting at the current docked
- * station, loading them as soon as they appear. Honors bot stop. Returns the
- * number of passengers aboard once at least one was loaded, or 0 if the bot was
- * stopped while waiting.
+ * Wait (poll) until at least one passenger is aboard at the current docked
+ * station, loading them as soon as they appear. Returns as soon as the ship
+ * holds at least one passenger (either already aboard or freshly loaded), or
+ * when the bot is stopped.
  */
 async function isolatedWaitForAndLoadPassengers(
   ctx: RoutineContext,
@@ -2380,7 +2427,7 @@ async function isolatedWaitForAndLoadPassengers(
   while (bot.state === "running") {
     const aboard = await isolatedLoadWaitingPassengers(ctx, state, settings);
     if (aboard > 0) {
-      ctx.log("transport", `Isolated: ${aboard} passenger(s) aboard after waiting`);
+      ctx.log("transport", `Isolated: ${aboard} passenger(s) aboard`);
       return aboard;
     }
     ctx.log("transport", "Isolated: still no passengers — polling again shortly");

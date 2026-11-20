@@ -2454,6 +2454,39 @@ async function isolatedWaitForAndLoadPassengers(
 }
 
 /**
+ * Reconcile the persisted route index with the bot's actual location.
+ *
+ * A mid-route restart can leave `isolatedStepIndex` pointing at a step whose
+ * system we have already left (e.g. the bot restarted at mile_mark while the
+ * saved index still pointed at the tiaki jump origin). Trying to navigate back
+ * to that origin can be impossible (there is no direct route), so instead we
+ * resume at the step that matches where we actually are.
+ *
+ * Strategy: keep the current step if its system matches; otherwise search
+ * forward for the next step whose system matches, then backward.
+ */
+function resyncIsolatedStepIndex(
+  route: IsolatedRouteStep[],
+  currentSystem: string,
+  currentIndex: number,
+): number {
+  if (!currentSystem || route.length === 0) return currentIndex;
+  const cur = currentSystem.toLowerCase();
+  const stepSystem = (s: IsolatedRouteStep | undefined): string =>
+    (s?.system || "").toLowerCase();
+
+  if (stepSystem(route[currentIndex]) === cur) return currentIndex;
+
+  for (let i = currentIndex + 1; i < route.length; i++) {
+    if (stepSystem(route[i]) === cur) return i;
+  }
+  for (let i = currentIndex - 1; i >= 0; i--) {
+    if (stepSystem(route[i]) === cur) return i;
+  }
+  return currentIndex;
+}
+
+/**
  * Execute a single isolated-route step. Returns:
  *   "advance"  — step complete, move to the next one
  *   "stopped"  — bot was stopped mid-step
@@ -2693,6 +2726,24 @@ async function isolatedTransportLoop(
     ctx.log("transport", `Isolated: starting at home with fuel at ${startFuelPct}%`);
   }
 
+  // Reconcile the restored step index with our real position. A restart between
+  // systems can leave the saved index pointing at a step we have already passed.
+  {
+    await bot.refreshLocation();
+    const before = state.isolatedStepIndex ?? 0;
+    const after = resyncIsolatedStepIndex(route, bot.system || "", before);
+    if (after !== before) {
+      ctx.log("transport", `Isolated: resuming at step ${after + 1}/${route.length} (matched current system ${bot.system}); was step ${before + 1}`);
+      state.isolatedStepIndex = after;
+      saveTransportState(state);
+    }
+  }
+
+  // Consecutive failures for the current step (used to recover instead of
+  // retrying an unreachable step forever).
+  let failedStepIdx = -1;
+  let stepFailures = 0;
+
   while (bot.state === "running") {
     const stepIdx: number = state.isolatedStepIndex ?? 0;
 
@@ -2825,12 +2876,49 @@ async function isolatedTransportLoop(
     const result = await executeIsolatedStep(ctx, state, settings, step, stepIdx);
     if (result === "stopped") {
       // Bot was stopped, or a hard error occurred. If the bot is still running
-      // it was a recoverable error — back off and retry the same step.
+      // it was a recoverable error.
       if (bot.state !== "running") return;
-      ctx.log("warn", `Isolated: step ${stepIdx + 1} did not complete cleanly — retrying in 30s`);
+
+      if (failedStepIdx !== stepIdx) {
+        failedStepIdx = stepIdx;
+        stepFailures = 0;
+      }
+      stepFailures++;
+
+      if (stepFailures >= 3) {
+        // Repeatedly failing to reach/execute this step. Try to resync to where
+        // we actually are; if that fails, bail out to home and restart the route
+        // rather than looping forever.
+        await bot.refreshLocation();
+        const resynced = resyncIsolatedStepIndex(route, bot.system || "", stepIdx);
+        if (resynced !== stepIdx) {
+          ctx.log("warn", `Isolated: step ${stepIdx + 1} unreachable — resuming at step ${resynced + 1} (current system ${bot.system})`);
+          state.isolatedStepIndex = resynced;
+          state.isolatedPhase = "transit";
+          saveTransportState(state);
+          stepFailures = 0;
+          failedStepIdx = -1;
+          await ctx.sleep(5000);
+          continue;
+        }
+        ctx.log("error", `Isolated: step ${stepIdx + 1} failed ${stepFailures}x and cannot be resynced — returning home to restart the route`);
+        state.isolatedStepIndex = route.length;
+        state.isolatedPhase = "transit";
+        saveTransportState(state);
+        stepFailures = 0;
+        failedStepIdx = -1;
+        await ctx.sleep(5000);
+        continue;
+      }
+
+      ctx.log("warn", `Isolated: step ${stepIdx + 1} did not complete cleanly (${stepFailures}/3) — retrying in 30s`);
       await ctx.sleep(30000);
       continue;
     }
+
+    // Step succeeded — reset the failure tracker.
+    stepFailures = 0;
+    failedStepIdx = -1;
 
     // Advance to the next step.
     state.isolatedStepIndex = stepIdx + 1;

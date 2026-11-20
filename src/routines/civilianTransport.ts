@@ -682,15 +682,17 @@ type CivilianTransportMode = "normal" | "lounge_transport" | "achievement" | "is
  * from wherever we currently are), then — if `degree` is set — perform a
  * Pathfinder Drive jump at that absolute bearing FROM that system (the drift
  * lands us in a new, usually uncharted system). Finally, if `station` is set
- * we travel to that POI, docking when `dock` is true, and load passengers when
- * `pickup` is true. When `waitForPassengers` is true and nobody is waiting we
- * poll until at least one passenger appears (or the bot is stopped).
+ * we travel to that POI, docking when `dock` is true, refueling when `refuel`
+ * is true, and load passengers when `pickup` is true. When `waitForPassengers`
+ * is true and nobody is waiting we poll until at least one passenger appears
+ * (or the bot is stopped).
  */
 interface IsolatedRouteStep {
   system: string;
   degree: number | null;
   station: string;
   dock: boolean;
+  refuel?: boolean;
   pickup?: boolean;
   waitForPassengers?: boolean;
 }
@@ -783,6 +785,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
             // the POI id, so strip any "system|" prefix here.
             station: normalizeStationRef(String((s.station as string) || "")),
             dock: (s.dock as boolean) === true,
+            refuel: (s.refuel as boolean) === true,
             pickup: (s.pickup as boolean) === true,
             waitForPassengers: (s.waitForPassengers as boolean) === true,
           }))
@@ -2588,6 +2591,30 @@ async function executeIsolatedStep(
     }
   }
 
+  // ── 3b. Optional refuel at this stop ─────────────────────────────────
+  // A step can force a refuel (e.g. at a friendly station that produces fuel,
+  // or as a backup before a costly pathfinder leg). Requires being docked.
+  if (step.refuel) {
+    if (!bot.docked) {
+      ctx.log("transport", `Isolated ${label}: refuel requested but not docked — docking first`);
+      const docked = await ensureDocked(ctx);
+      if (!docked) {
+        ctx.log("warn", `Isolated ${label}: could not dock to refuel — skipping refuel`);
+      } else {
+        await bot.refreshStatus();
+      }
+    }
+    if (bot.docked) {
+      await bot.refreshShip();
+      const beforePct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
+      ctx.log("transport", `Isolated ${label}: refueling (fuel at ${beforePct}%)`);
+      await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+      await bot.refreshShip();
+      const afterPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
+      ctx.log("transport", `Isolated ${label}: fuel after refuel: ${afterPct}%`);
+    }
+  }
+
   // ── 4. Pickup ────────────────────────────────────────────────────────
   if (step.pickup) {
     if (!bot.docked) {
@@ -2649,6 +2676,22 @@ async function isolatedTransportLoop(
 
   state.isolatedStepIndex = state.isolatedStepIndex ?? 0;
   state.isolatedPhase = state.isolatedPhase ?? "transit";
+
+  // If we are starting (or resuming) docked at home, top up fuel cells and the
+  // tank before heading out — pathfinder jumps are expensive and we never want
+  // to begin a leg on a low tank.
+  try {
+    await bot.refreshStatus();
+    await bot.refreshLocation();
+  } catch { /* ignore */ }
+  if (bot.docked && homeStation && (bot.poi || "").toLowerCase() === homeStation.toLowerCase()) {
+    await collectFuelCells(ctx, settings);
+    await bot.refreshShip();
+    await tryRefuel(ctx, { homeSystem, skipApprovedCheck: true });
+    await bot.refreshShip();
+    const startFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
+    ctx.log("transport", `Isolated: starting at home with fuel at ${startFuelPct}%`);
+  }
 
   while (bot.state === "running") {
     const stepIdx: number = state.isolatedStepIndex ?? 0;
@@ -2755,8 +2798,18 @@ async function isolatedTransportLoop(
       state.status = "isolated_transit";
       saveTransportState(state);
 
-      // Collect fuel cells at home between rounds.
+      // Collect fuel cells at home between rounds, then top the tank up before
+      // departing. Pathfinder jumps burn ~5x a normal jump, so leaving home on a
+      // near-empty tank risks getting stranded mid-route.
       await collectFuelCells(ctx, settings);
+      await bot.refreshShip();
+      await bot.refreshCargo();
+      const homeFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
+      ctx.log("transport", `Isolated: at home with fuel at ${homeFuelPct}% — refueling before departure`);
+      await tryRefuel(ctx, { homeSystem, skipApprovedCheck: true });
+      await bot.refreshShip();
+      const afterFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
+      ctx.log("transport", `Isolated: fuel after refuel: ${afterFuelPct}%`);
 
       ctx.log("transport", "Isolated: route complete — restarting from step 1");
       await ctx.sleep(5000);
@@ -2764,7 +2817,7 @@ async function isolatedTransportLoop(
     }
 
     const step = route[stepIdx];
-    ctx.log("transport", `Isolated: executing step ${stepIdx + 1}/${route.length} (system=${step.system || "—"}, degree=${step.degree ?? "—"}, station=${step.station || "—"}, dock=${step.dock}, pickup=${step.pickup === true})`);
+    ctx.log("transport", `Isolated: executing step ${stepIdx + 1}/${route.length} (system=${step.system || "—"}, degree=${step.degree ?? "—"}, station=${step.station || "—"}, dock=${step.dock}, refuel=${step.refuel === true}, pickup=${step.pickup === true})`);
 
     state.status = "isolated_transit";
     saveTransportState(state);

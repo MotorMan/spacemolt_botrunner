@@ -33719,7 +33719,7 @@ ${generateMissionStepsHtml()}
        function addCivilianTransportIsolatedStep() {
          const ct = settings.civilian_transport || (settings.civilian_transport = {});
          if (!Array.isArray(ct.isolatedRoute)) ct.isolatedRoute = [];
-         ct.isolatedRoute.push({ system: "", degree: null, station: "", dock: false, pickup: false, waitForPassengers: false });
+          ct.isolatedRoute.push({ system: "", degree: null, station: "", dock: false, refuel: false, pickup: false, waitForPassengers: false });
          settings.civilian_transport = ct;
          renderCivilianTransportSettings(document.getElementById("settingsContent"));
        }
@@ -33733,13 +33733,15 @@ ${generateMissionStepsHtml()}
        function updateCivilianTransportIsolatedStep(index, field, value) {
          const ct = settings.civilian_transport || {};
          if (!Array.isArray(ct.isolatedRoute) || !ct.isolatedRoute[index]) return;
-         if (field === "degree") {
-           ct.isolatedRoute[index].degree = value === "" ? null : parseFloat(value);
-         } else if (field === "dock") {
-           ct.isolatedRoute[index].dock = Boolean(value);
-         } else {
-           ct.isolatedRoute[index][field] = value;
-         }
+          if (field === "degree") {
+            ct.isolatedRoute[index].degree = value === "" ? null : parseFloat(value);
+          } else if (field === "dock") {
+            ct.isolatedRoute[index].dock = Boolean(value);
+          } else if (field === "refuel") {
+            ct.isolatedRoute[index].refuel = Boolean(value);
+          } else {
+            ct.isolatedRoute[index][field] = value;
+          }
          settings.civilian_transport = ct;
        }
 
@@ -39172,6 +39174,7 @@ ignoreBlacklist: document.getElementById(
             '</div>' +
             '<div style="margin-top:6px">' +
               '<label><input type="checkbox"' + (step.dock ? " checked" : "") + ' onchange="updateCivilianTransportIsolatedStep(' + idx + ', \'dock\', this.checked)"> Dock at station here</label>' +
+              ' <label style="margin-left:12px"><input type="checkbox"' + (step.refuel ? " checked" : "") + ' onchange="updateCivilianTransportIsolatedStep(' + idx + ', \'refuel\', this.checked)"> Refuel here</label>' +
               ' <label style="margin-left:12px"><input type="checkbox"' + (step.pickup ? " checked" : "") + ' onchange="updateCivilianTransportIsolatedStep(' + idx + ', \'pickup\', this.checked)"> Grab passengers here</label>' +
               ' <label style="margin-left:12px"><input type="checkbox"' + (step.waitForPassengers ? " checked" : "") + ' onchange="updateCivilianTransportIsolatedStep(' + idx + ', \'waitForPassengers\', this.checked)"> Wait for passengers</label>' +
             '</div>' +

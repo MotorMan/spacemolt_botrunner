@@ -72,6 +72,10 @@
  *   fleetFightPlayers         â€” fight players too, since the fleet leader picked the
  *                               target (default: true; false = honour onlyNPCs and flee players)
  *   fleetUndockToFight        â€” undock when a battle starts while docked (default: true)
+ *   fleetRefuelThreshold      â€” fuel % at which a wingman tops itself up from cargo
+ *                               fuel cells while standing by (0 = use refuelThreshold;
+ *                               default: refuelThreshold). Stops a follower from
+ *                               stalling the whole fleet at the next jump.
  *   boardingEnabled          â€” when true, the hunter switches to boarding stance on eligible targets with low shields instead of killing them (default: false)
  *   boardingShieldThreshold   â€” shield % at or below which to attempt boarding (default: 5)
  *   boardingMarines           â€” marines to commit to the board stance (0 = all fit marines on board; default: 0)
@@ -687,8 +691,9 @@ export function getHunterSettings(username?: string): {
   creatureFarmMaxSystemSweeps: number;
    fleetIdlePollSeconds: number;
   fleetBattleConfirmSeconds: number;
-  fleetFightPlayers: boolean;
+   fleetFightPlayers: boolean;
   fleetUndockToFight: boolean;
+  fleetRefuelThreshold: number;
     boardingEnabled: boolean;
   boardingShieldThreshold: number;
   boardingMarines: number;
@@ -722,6 +727,15 @@ export function getHunterSettings(username?: string): {
 
   const rawMode = ((botOverrides.hunterMode as HunterMode) || (h.mode as HunterMode) || "roam_systems") as HunterMode;
   const mode = normalizeHunterMode(rawMode);
+
+  // Fleet mode refuel point: a dedicated threshold if set, otherwise reuse the
+  // normal hunter refuelThreshold so existing setups keep working unchanged.
+  const fleetRefuelThresholdRaw =
+    (botOverrides.fleetRefuelThreshold as number) ?? (h.fleetRefuelThreshold as number);
+  const fleetRefuelThreshold =
+    typeof fleetRefuelThresholdRaw === "number" && fleetRefuelThresholdRaw > 0
+      ? fleetRefuelThresholdRaw
+      : ((h.refuelThreshold as number) || 40);
 
   return {
     mode,
@@ -777,6 +791,7 @@ export function getHunterSettings(username?: string): {
     fleetBattleConfirmSeconds: (botOverrides.fleetBattleConfirmSeconds as number) ?? (h.fleetBattleConfirmSeconds as number) ?? 10,
     fleetFightPlayers: (botOverrides.fleetFightPlayers as boolean) ?? (h.fleetFightPlayers as boolean) ?? true,
     fleetUndockToFight: (botOverrides.fleetUndockToFight as boolean) ?? (h.fleetUndockToFight as boolean) ?? true,
+    fleetRefuelThreshold,
     boardingEnabled: (botOverrides.boardingEnabled as boolean) ?? (mode === "boarding"),
     boardingShieldThreshold: (botOverrides.boardingShieldThreshold as number) ?? (h.boardingShieldThreshold as number) ?? 5,
     boardingMarines: (botOverrides.boardingMarines as number) ?? (h.boardingMarines as number) ?? 0,
@@ -3734,14 +3749,19 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
 
         // Check this POI for wrecks even when it had no repeaters: a repeater
         // killed elsewhere in the system can leave loot here.
+        let lootedAtThisPoi = 0;
         if (!disableWreckSalvaging && bot.state === "running" && !bot.docked) {
-          await sweepWrecksAtPoi(ctx);
+          lootedAtThisPoi = await sweepWrecksAtPoi(ctx);
         }
 
         // Attacked without engaging a local repeater → the attacker was a repeater
         // that shot us on entry, so its wreck can be in any POI of the system. Roam
         // each POI ONCE, stopping as soon as the wrecks are recovered, then resume
         // the normal single-pass route. We never re-walk the system's POIs here.
+        // If we already looted wrecks at THIS POI, the hunt is done — don't roam.
+        if (lootedAtThisPoi > 0) {
+          wreckHuntPending = false;
+        }
         if (wreckHuntPending && !disableWreckSalvaging && bot.state === "running" && !bot.docked) {
           if (wreckHuntsThisSweep >= WRECK_HUNTS_PER_SWEEP) {
             wreckHuntPending = false;
@@ -3762,19 +3782,10 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
         }
       }
 
-      // Final safety net: a battle may have been detected after the last POI.
-      if (wreckHuntPending && !disableWreckSalvaging && bot.state === "running" && !bot.docked) {
-        wreckHuntPending = false;
-        if (wreckHuntsThisSweep < WRECK_HUNTS_PER_SWEEP) {
-          wreckHuntsThisSweep++;
-          ctx.log("combat", `Attacked without engaging a local repeater — final wreck roam across ${targetSystem}`);
-          const roam = await roamPoisForRepeaterWrecks(ctx, patrolPois, 0);
-          if (roam === "found") ctx.log("combat", "Repeater wrecks recovered — resuming route");
-          else if (roam === "empty") ctx.log("combat", `No repeater wrecks found in ${targetSystem} — resuming route`);
-        } else {
-          ctx.log("combat", `Wreck hunt limit (${WRECK_HUNTS_PER_SWEEP}) reached — resuming route`);
-        }
-      }
+      // Note: no post-loop wreck roam. The "attacked on entry" case is handled
+      // inside the POI loop above (gated on lootedAtThisPoi so it never fires when
+      // this POI already yielded wrecks). Re-walking every POI here would violate
+      // the "each POI visited at most once per system" rule.
 
       if (cargoFull) {
         await bot.refreshCargo();
@@ -4009,7 +4020,10 @@ async function sweepWrecksAtPoi(ctx: RoutineContext): Promise<number> {
   for (let attempt = 0; attempt < 3; attempt++) {
     if (bot.state !== "running") return totalLooted;
     if (bot.docked) return totalLooted;
-    if (bot.isInBattle()) return totalLooted; // fight first — the caller sweeps again after combat
+    // Do NOT bail on `bot.isInBattle()` here: the WebSocket battle flag can stay
+    // set after a won fight (no battle_end push), which would make us skip looting
+    // wrecks that are sitting right here. `scavengeWrecks` confirms against the API
+    // and clears stale state before looting, so defer that decision to it.
     await bot.refreshCargo();
     if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) return totalLooted;
 
@@ -4025,7 +4039,7 @@ async function sweepWrecksAtPoi(ctx: RoutineContext): Promise<number> {
     // out if the POI really is empty.
     if (attempt >= 1) return totalLooted;
     await ctx.sleep(4000);
-    if (bot.state !== "running" || bot.docked || bot.isInBattle()) return totalLooted;
+    if (bot.state !== "running" || bot.docked) return totalLooted;
     if (!(await poiHasLootableWrecks(ctx))) return totalLooted;
   }
   return totalLooted;
@@ -6521,6 +6535,88 @@ async function fleetModeFight(
   );
 }
 
+/** How often a standing-by wingman re-checks its fuel tank. */
+const FLEET_FUEL_CHECK_MS = 30 * 1000;
+
+/**
+ * Keep a fleet wingman fuelled without breaking formation.
+ *
+ * Fleet mode normally does nothing while standing by, but a low tank means the
+ * whole fleet stalls at the next jump. So — never in combat — we watch the tank
+ * and top it up from whatever is already aboard:
+ *
+ *   1. Docked   -> station fuel / storage / market via tryRefuel.
+ *   2. Undocked -> burn cargo fuel cells in place. `refuel` draws from cargo
+ *                  while undocked, so this never leaves the fleet's POI.
+ *
+ * If the tank still cannot reach the threshold with what is aboard we log a
+ * warning and keep formation rather than wandering off to a station mid-fleet.
+ */
+async function fleetModeRefuel(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+  const threshold = settings.fleetRefuelThreshold;
+
+  await bot.refreshShip();
+  let fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (fuelPct >= threshold) return;
+
+  // Fuel is not consumed in combat and the fleet needs our guns — top up later.
+  if (bot.isInBattle()) {
+    ctx.log("combat", `Fleet mode: fuel at ${fuelPct}% but a battle is live — will refuel after the fight`);
+    return;
+  }
+
+  ctx.log("system", `Fleet mode: fuel at ${fuelPct}% (threshold ${threshold}%) — topping up without leaving the fleet`);
+
+  if (bot.docked) {
+    await tryRefuel(ctx, { skipApprovedCheck: true, homeSystem: settings.homeSystem });
+    await bot.refreshShip();
+    fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelPct >= threshold) {
+      ctx.log("system", `Fleet mode: refuelled at dock — fuel now ${fuelPct}%`);
+      return;
+    }
+    // Still short and docked: pull cells from faction/station storage or market.
+    await acquireFuelCellsAndRefuel(ctx);
+    await bot.refreshShip();
+    fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  } else {
+    // Undocked: consume cargo fuel cells in place so we never leave the fleet's POI.
+    await bot.refreshCargo();
+    const cargoCellFuel = (bot.inventory || [])
+      .filter((i) => getFuelCellFuelValue(i.itemId) > 0)
+      .reduce((sum, i) => sum + getFuelCellFuelValue(i.itemId) * (i.quantity || 0), 0);
+    if (cargoCellFuel <= 0) {
+      ctx.log("warn", `Fleet mode: fuel at ${fuelPct}% and no fuel cells in cargo — cannot refuel without leaving the fleet`);
+      return;
+    }
+    for (let attempt = 0; attempt < 40 && bot.state === "running"; attempt++) {
+      const resp = await bot.exec("refuel");
+      if (resp.error) {
+        const msg = (resp.error.message || "").toLowerCase();
+        if (msg.includes("already full") || msg.includes("tank_full") || msg.includes("max")) break;
+        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("no fuel")) break;
+        ctx.log("error", `Fleet refuel error: ${resp.error.message}`);
+        break;
+      }
+      await bot.refreshShip();
+      fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (fuelPct >= 95) break;
+    }
+  }
+
+  await bot.refreshShip();
+  fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (fuelPct >= threshold) {
+    ctx.log("system", `Fleet mode: refuelled — fuel now ${fuelPct}%`);
+  } else {
+    ctx.log("warn", `Fleet mode: fuel still at ${fuelPct}% (threshold ${threshold}%) — no usable fuel source without leaving the fleet`);
+  }
+}
+
 async function* fleetArenaModeRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
@@ -6541,6 +6637,7 @@ async function* fleetArenaModeRoutine(ctx: RoutineContext): AsyncGenerator<strin
   let lastProbe = 0;
   let lastStatusRefresh = Date.now();
   let lastDeathCheck = Date.now();
+  let lastFuelCheck = 0;
   let standbyLogged = true;
   let ignoredBattleId = "";
   let consecutiveReengages = 0;
@@ -6605,6 +6702,13 @@ async function* fleetArenaModeRoutine(ctx: RoutineContext): AsyncGenerator<strin
         await bot.refreshStatus();
         logStatus(ctx);
       }
+      // Keep the wingman fuelled so a low tank never stalls the whole fleet at
+      // the next jump. Throttled so standby stays quiet on the wire, and skipped
+      // while a battle is live (handled after the fight).
+      if (Date.now() - lastFuelCheck >= FLEET_FUEL_CHECK_MS) {
+        lastFuelCheck = Date.now();
+        await fleetModeRefuel(ctx, settings);
+      }
       yield "waiting";
       await ctx.sleep(idleMs);
       continue;
@@ -6666,9 +6770,10 @@ async function* fleetArenaModeRoutine(ctx: RoutineContext): AsyncGenerator<strin
       settings.ammoReloadPercentThreshold,
     );
     await bot.refreshShip();
+    const standbyFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log(
       "info",
-      `Fleet mode: back on standby â€” hull ${bot.hull}/${bot.maxHull} | shields ${bot.shield}/${bot.maxShield} | ammo ${bot.ammo}`,
+      `Fleet mode: back on standby â€” hull ${bot.hull}/${bot.maxHull} | shields ${bot.shield}/${bot.maxShield} | ammo ${bot.ammo} | fuel ${standbyFuelPct}%`,
     );
     lastStatusRefresh = Date.now();
     standbyLogged = true;

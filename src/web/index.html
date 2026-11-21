@@ -34581,6 +34581,7 @@ ignoreBlacklist: document.getElementById(
         const fleetBattleConfirmSeconds = h.fleetBattleConfirmSeconds ?? 10;
         const fleetFightPlayers = h.fleetFightPlayers ?? true;
         const fleetUndockToFight = h.fleetUndockToFight ?? true;
+        const fleetRefuelThreshold = h.fleetRefuelThreshold ?? h.refuelThreshold ?? 40;
         const showBoardingSettings =
           hunterMode === "boarding" || isFleetArenaMode(hunterMode);
 
@@ -34721,6 +34722,14 @@ ignoreBlacklist: document.getElementById(
           <option value="true"${fleetUndockToFight ? " selected" : ""}>Enabled</option>
           <option value="false"${!fleetUndockToFight ? " selected" : ""}>Disabled</option>
         </select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Fleet Refuel Threshold %</div>
+          <div class="setting-hint">While standing by, refuel from cargo fuel cells (or dock fuel when docked) once fuel drops below this level, without leaving the fleet. 0 = use the standard Refuel Threshold above.</div>
+        </div>
+        <input type="number" id="set-hunter-fleetRefuelThreshold" min="0" max="100" value="${fleetRefuelThreshold}">
       </div>
     </div>
       `
@@ -35427,6 +35436,11 @@ ignoreBlacklist: document.getElementById(
           fleetUndockToFight:
             document.getElementById("set-hunter-fleetUndockToFight")?.value ===
             "true",
+          fleetRefuelThreshold:
+            parseInt(
+              document.getElementById("set-hunter-fleetRefuelThreshold")?.value,
+              10,
+            ) || 0,
           targetPlayer: (document.getElementById("set-hunter-targetPlayer")?.value || "").trim(),
           hunterPatrols: Array.isArray(settings.hunter?.hunterPatrols)
             ? settings.hunter.hunterPatrols

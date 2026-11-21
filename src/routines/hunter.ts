@@ -3706,9 +3706,13 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
               totalKills++;
               sweepKills++;
               engagedRepeaterHere = true;
-              repeaterKilledThisSweep = true;
               ctx.log("combat", `Kill #${totalKills} (${target.name}) — looting before next...`);
-              if (!disableWreckSalvaging) await sweepWrecksAtPoi(ctx);
+              // Only flag a POI-sweep restart when looting the kill site turned up
+              // nothing: the repeater's wreck can surface in a different POI, so we
+              // re-sweep once to hunt for it. If we already looted the wrecks here,
+              // there is nothing to find and no restart is needed.
+              const lootedHere = disableWreckSalvaging ? 1 : await sweepWrecksAtPoi(ctx);
+              if (!lootedHere) repeaterKilledThisSweep = true;
               const cset = getHunterSettings(bot.username);
               await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
               await useRepairKits(ctx);
@@ -3757,13 +3761,16 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
           }
         }
 
-        // A repeater's wreck can surface in any POI — restart the POI sweep so
-        // every POI is visited again and all the wrecks are looted.
-        if (repeaterKilledThisSweep && poiSweepRestarts < REPEATER_POI_SWEEP_RESET_LIMIT && !cargoFull && !disableWreckSalvaging) {
+        // A repeater's wreck can surface in any POI — but we only restart the POI
+        // sweep ONCE, and only when the kill-site looting turned up nothing (i.e.
+        // the wrecks are elsewhere and still worth hunting). `repeaterKilledThisSweep`
+        // is only set when the kill-site sweep found no loot, so this never loops
+        // merely because we already recovered the wrecks.
+        if (repeaterKilledThisSweep && poiSweepRestarts < 1 && !cargoFull && !disableWreckSalvaging) {
           poiSweepRestarts++;
           repeaterKilledThisSweep = false;
           poiIdx = -1;
-          ctx.log("combat", `Repeater killed in ${targetSystem} — restarting POI sweep (${poiSweepRestarts}/${REPEATER_POI_SWEEP_RESET_LIMIT}) to loot wrecks across all POIs`);
+          ctx.log("combat", `Repeater killed in ${targetSystem} — wrecks not at kill site, restarting POI sweep (${poiSweepRestarts}/1) to loot wrecks across all POIs`);
         }
       }
 

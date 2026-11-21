@@ -3453,11 +3453,15 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
     const targetPois = profile.targetPois || [];
     const targetSystem = effectiveSystems[sysIndex];
 
-    const loopsPerSystem = settings.creatureFarmLoopsPerSystem > 0 ? settings.creatureFarmLoopsPerSystem : 3;
     const cargoFullPct = settings.creatureFarmCargoFullPct > 0 ? settings.creatureFarmCargoFullPct : 0.95;
     const maxPasses = settings.creatureFarmMaxPassesPerPoi > 0 ? settings.creatureFarmMaxPassesPerPoi : 6;
     const maxSweeps = settings.creatureFarmMaxSystemSweeps > 0 ? settings.creatureFarmMaxSystemSweeps : 40;
-    const loopCap = Math.min(loopsPerSystem, maxSweeps);
+    // Repeater hunter visits each system exactly ONCE: we walk every POI a single
+    // time. Re-looping the same system's POIs is never wanted here — if we had to
+    // traverse the system to find the repeaters, their wrecks are at the POI where
+    // we killed them (already looted). The only multi-POI search is the
+    // "attacked on entering" wreck roam, which stops as soon as wrecks are found.
+    const loopCap = Math.min(1, maxSweeps);
     const disableWreckSalvaging = settings.disableWreckSalvaging === true;
 
     const safetyOpts = {
@@ -3579,13 +3583,14 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
 
       ctx.log("info", `Repeater hunter sweep ${sweeps}/${loopCap} — ${patrolPois.length} POI(s) in ${targetSystem}`);
       let sweepKills = 0;
-      let repeaterKilledThisSweep = false;
-      let poiSweepRestarts = 0;
       // Set when a battle we did NOT start involved a repeater: the kill's wreck
       // may be in another POI, so we roam the system for it before moving on.
       let wreckHuntPending = false;
       let wreckHuntsThisSweep = 0;
-      const WRECK_HUNTS_PER_SWEEP = 2;
+      // When attacked on entry (no local repeater engaged) we search each POI ONCE
+      // for the repeater wrecks, stopping as soon as they're found. One roam per
+      // sweep keeps this to a single pass — we never loop the system's POIs.
+      const WRECK_HUNTS_PER_SWEEP = 1;
 
       for (let poiIdx = 0; poiIdx < patrolPois.length; poiIdx++) {
         const poi = patrolPois[poiIdx];
@@ -3611,7 +3616,7 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
         // us while we were travelling) must be finished before we scan here.
         const carriedInfo: UnexpectedBattleInfo = { handled: false, involvesRepeater: false };
         await checkAndHandleExistingBattle(ctx, settings, carriedInfo);
-        if (carriedInfo.handled && carriedInfo.involvesRepeater && !repeaterKilledThisSweep) {
+        if (carriedInfo.handled && carriedInfo.involvesRepeater) {
           wreckHuntPending = true;
         }
 
@@ -3707,12 +3712,9 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
               sweepKills++;
               engagedRepeaterHere = true;
               ctx.log("combat", `Kill #${totalKills} (${target.name}) — looting before next...`);
-              // Only flag a POI-sweep restart when looting the kill site turned up
-              // nothing: the repeater's wreck can surface in a different POI, so we
-              // re-sweep once to hunt for it. If we already looted the wrecks here,
-              // there is nothing to find and no restart is needed.
-              const lootedHere = disableWreckSalvaging ? 1 : await sweepWrecksAtPoi(ctx);
-              if (!lootedHere) repeaterKilledThisSweep = true;
+              // Loot the kill site. We never re-sweep the system's POIs: if we had to
+              // traverse the system to find this repeater, its wreck is right here.
+              if (!disableWreckSalvaging) await sweepWrecksAtPoi(ctx);
               const cset = getHunterSettings(bot.username);
               await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
               await useRepairKits(ctx);
@@ -3736,8 +3738,10 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
           await sweepWrecksAtPoi(ctx);
         }
 
-        // We were attacked without engaging a local repeater → roam every POI
-        // until the repeater wrecks are recovered, then resume the route.
+        // Attacked without engaging a local repeater → the attacker was a repeater
+        // that shot us on entry, so its wreck can be in any POI of the system. Roam
+        // each POI ONCE, stopping as soon as the wrecks are recovered, then resume
+        // the normal single-pass route. We never re-walk the system's POIs here.
         if (wreckHuntPending && !disableWreckSalvaging && bot.state === "running" && !bot.docked) {
           if (wreckHuntsThisSweep >= WRECK_HUNTS_PER_SWEEP) {
             wreckHuntPending = false;
@@ -3752,25 +3756,9 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
             } else if (roam === "empty") {
               ctx.log("combat", `No repeater wrecks found in ${targetSystem} — resuming route`);
             }
-            // Restart the POI sweep from the first POI so the route is still
-            // fully covered after the roam (unless combat interrupted us).
-            if (roam !== "interrupted") {
-              poiIdx = -1;
-              continue;
-            }
+            // Do NOT restart the POI sweep: the roam already visited every POI once,
+            // and re-walking them would loop the system's POIs more than once.
           }
-        }
-
-        // A repeater's wreck can surface in any POI — but we only restart the POI
-        // sweep ONCE, and only when the kill-site looting turned up nothing (i.e.
-        // the wrecks are elsewhere and still worth hunting). `repeaterKilledThisSweep`
-        // is only set when the kill-site sweep found no loot, so this never loops
-        // merely because we already recovered the wrecks.
-        if (repeaterKilledThisSweep && poiSweepRestarts < 1 && !cargoFull && !disableWreckSalvaging) {
-          poiSweepRestarts++;
-          repeaterKilledThisSweep = false;
-          poiIdx = -1;
-          ctx.log("combat", `Repeater killed in ${targetSystem} — wrecks not at kill site, restarting POI sweep (${poiSweepRestarts}/1) to loot wrecks across all POIs`);
         }
       }
 
@@ -3812,9 +3800,9 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
     sysIndex = (sysIndex + 1) % effectiveSystems.length;
     const nextSystem = effectiveSystems[sysIndex];
     if (nextSystem !== prevSystem) {
-      ctx.log("info", `Repeater hunter: completed ${loopsPerSystem} loop(s) in ${prevSystem} — routing to ${nextSystem} (${sysIndex + 1}/${effectiveSystems.length})`);
+      ctx.log("info", `Repeater hunter: swept ${prevSystem} once — routing to ${nextSystem} (${sysIndex + 1}/${effectiveSystems.length})`);
     } else {
-      ctx.log("debug", `Repeater hunter: completed ${loopsPerSystem} loop(s) in ${prevSystem} (only system in profile)`);
+      ctx.log("debug", `Repeater hunter: swept ${prevSystem} once (only system in profile)`);
     }
 
     if (settings.singleLoop && wasLastSystem) {

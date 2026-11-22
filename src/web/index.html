@@ -35159,9 +35159,9 @@ ignoreBlacklist: document.getElementById(
     <div class="setting-row">
       <div>
         <div class="setting-label">Ammo Reload: Absolute Threshold</div>
-        <div class="setting-hint">For weapons with ≤50 ammo capacity, reload when ammo drops to this absolute number. Higher value = earlier reload.</div>
+        <div class="setting-hint">For weapons with ≤50 ammo capacity, reload when ammo drops to this absolute number. Higher value = earlier reload. 0 = only reload when the magazine is completely empty (avoids wasting a round on small magazines).</div>
       </div>
-      <input type="number" id="set-hunter-ammoReloadAbsoluteThreshold" min="1" max="50" value="${ammoReloadAbsoluteThreshold}">
+      <input type="number" id="set-hunter-ammoReloadAbsoluteThreshold" min="0" max="50" value="${ammoReloadAbsoluteThreshold}">
     </div>
 
     <div class="setting-row">
@@ -35324,6 +35324,10 @@ ignoreBlacklist: document.getElementById(
         const fleetBattleConfirmSecondsValue = parseInt(
           document.getElementById("set-hunter-fleetBattleConfirmSeconds")?.value,
         );
+        const ammoReloadAbsoluteThreshold = parseInt(
+          document.getElementById("set-hunter-ammoReloadAbsoluteThreshold").value,
+          10,
+        );
         const s = {
           system: document.getElementById("set-hunter-system").value,
           refuelThreshold:
@@ -35406,11 +35410,9 @@ ignoreBlacklist: document.getElementById(
           homeStation: document
             .getElementById("set-hunter-homeStation")
             .value.trim(),
-          ammoReloadAbsoluteThreshold:
-            parseInt(
-              document.getElementById("set-hunter-ammoReloadAbsoluteThreshold")
-                .value,
-            ) || 1,
+          ammoReloadAbsoluteThreshold: Number.isFinite(ammoReloadAbsoluteThreshold)
+            ? ammoReloadAbsoluteThreshold
+            : 1,
           ammoReloadPercentThreshold:
             parseInt(
               document.getElementById("set-hunter-ammoReloadPercentThreshold")
@@ -36397,9 +36399,9 @@ ignoreBlacklist: document.getElementById(
     <div class="setting-row">
       <div>
         <div class="setting-label">Ammo Reload: Absolute Threshold</div>
-        <div class="setting-hint">For weapons with ≤50 ammo capacity, reload when ammo drops to this absolute number.</div>
+        <div class="setting-hint">For weapons with ≤50 ammo capacity, reload when ammo drops to this absolute number. 0 = only reload when the magazine is completely empty (avoids wasting a round on small magazines).</div>
       </div>
-      <input type="number" id="set-fleet-hunter-ammoReloadAbsoluteThreshold" min="1" max="50" value="${ammoReloadAbsoluteThreshold}">
+      <input type="number" id="set-fleet-hunter-ammoReloadAbsoluteThreshold" min="0" max="50" value="${ammoReloadAbsoluteThreshold}">
     </div>
 
     <div class="setting-row">
@@ -36436,6 +36438,10 @@ ignoreBlacklist: document.getElementById(
       }
 
       function saveFleetHunterSettings() {
+        const ammoReloadAbsoluteThreshold = parseInt(
+          document.getElementById("set-fleet-hunter-ammoReloadAbsoluteThreshold").value,
+          10,
+        );
         const s = {
           fleetId:
             document.getElementById("set-fleet-hunter-fleetId").value.trim() ||
@@ -36477,12 +36483,9 @@ ignoreBlacklist: document.getElementById(
             parseInt(
               document.getElementById("set-fleet-hunter-ammoThreshold").value,
             ) || 5,
-          ammoReloadAbsoluteThreshold:
-            parseInt(
-              document.getElementById(
-                "set-fleet-hunter-ammoReloadAbsoluteThreshold",
-              ).value,
-            ) || 1,
+          ammoReloadAbsoluteThreshold: Number.isFinite(ammoReloadAbsoluteThreshold)
+            ? ammoReloadAbsoluteThreshold
+            : 1,
           ammoReloadPercentThreshold:
             parseInt(
               document.getElementById(

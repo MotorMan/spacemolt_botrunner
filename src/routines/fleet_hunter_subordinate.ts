@@ -104,7 +104,7 @@ function getFleetHunterSettings(): FleetHunterSettings {
     cloakOnStart: (h.cloakOnStart as boolean) ?? false,
     ammoThreshold: (h.ammoThreshold as number) || 5,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
-    ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) || 1,
+    ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) ?? 1,
     ammoReloadPercentThreshold: (h.ammoReloadPercentThreshold as number) || 25,
     huntingEnabled: (h.huntingEnabled as boolean) ?? true,
     manualMode: (h.manualMode as boolean) ?? false,

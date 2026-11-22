@@ -608,10 +608,13 @@ export async function ensureAmmoLoaded(
 
     let needsReload = false;
     if (weapon.maxAmmo > 0) {
-      const absThreshold = weapon.maxAmmo <= 50 ? absoluteThreshold : 0;
-      const pctThreshold = weapon.maxAmmo > 50 ? percentThreshold : 0;
-      const absCheck = absThreshold > 0 ? weapon.currentAmmo <= absThreshold : false;
-      const pctCheck = pctThreshold > 0 ? weapon.currentAmmo <= Math.floor(weapon.maxAmmo * pctThreshold / 100) : false;
+      const lowCapacity = weapon.maxAmmo <= 50;
+      const absThreshold = lowCapacity ? Math.max(0, absoluteThreshold) : 0;
+      const pctThreshold = lowCapacity ? 0 : percentThreshold;
+      const absCheck = lowCapacity ? weapon.currentAmmo <= absThreshold : false;
+      const pctCheck = !lowCapacity && pctThreshold > 0
+        ? weapon.currentAmmo <= Math.floor(weapon.maxAmmo * pctThreshold / 100)
+        : false;
       needsReload = absCheck || pctCheck;
       if (needsReload) {
         ctx.log("combat", `Weapon "${weapon.name}" ammo low: ${weapon.currentAmmo}/${weapon.maxAmmo} (abs:${absThreshold}, pct:${pctThreshold}%)`);

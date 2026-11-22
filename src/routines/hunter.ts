@@ -55,7 +55,7 @@
  *   ignorePirates    â€” never attack pirates (creatures only); intended for
  *                     creature-farm hunter bots that operate in pirate strongholds
  *                     and must avoid station reputation penalties (default: false)
- *   ammoReloadAbsoluteThreshold â€” ammo count to reload when weapon has â‰¤50 total ammo (default: 1)
+ *   ammoReloadAbsoluteThreshold â€” ammo count to reload when weapon has â‰¤50 total ammo (default: 1; 0 = only reload when empty, avoids wasting a round on small magazines)
  *   ammoReloadPercentThreshold â€” % of max ammo to reload when weapon has >50 total ammo (default: 25)
  *   pirateBaseSystem â€” system ID for patrol_radius mode (default: "" - currently configured base)
  *   patrolRadius    â€” max jumps from pirate base for patrol_radius mode (default: 5)
@@ -754,7 +754,7 @@ export function getHunterSettings(username?: string): {
     autoCloak: (h.autoCloak as boolean) ?? false,
     cloakOnStart: (h.cloakOnStart as boolean) ?? false,
     ammoThreshold: (h.ammoThreshold as number) || 5,
-    ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) || 1,
+    ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) ?? 1,
     ammoReloadPercentThreshold: (h.ammoReloadPercentThreshold as number) || 25,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
     responseRange: (h.responseRange as number) ?? 3,

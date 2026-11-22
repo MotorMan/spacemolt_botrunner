@@ -3632,7 +3632,31 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
         const carriedInfo: UnexpectedBattleInfo = { handled: false, involvesRepeater: false };
         await checkAndHandleExistingBattle(ctx, settings, carriedInfo);
         if (carriedInfo.handled && carriedInfo.involvesRepeater) {
-          wreckHuntPending = true;
+          // The repeater died at our current (local) POI — loot its wreck HERE,
+          // before travelling to the next POI. The wreck is almost always at the
+          // POI where the repeater was killed; roaming off to the other POIs first
+          // (and only reaching this one last) is exactly the bug we're fixing.
+          let localLoot = 0;
+          if (!disableWreckSalvaging && bot.state === "running" && !bot.docked) {
+            localLoot = await sweepWrecksAtPoi(ctx);
+          }
+          if (localLoot > 0) {
+            ctx.log("combat", `Recovered ${localLoot} item(s) from the local repeater wreck — continuing route`);
+          } else if (!disableWreckSalvaging && bot.state === "running" && !bot.docked && wreckHuntsThisSweep < WRECK_HUNTS_PER_SWEEP) {
+            // Local POI is empty — roam every POI once (starting here) until the
+            // repeater wrecks are found, then resume the route.
+            wreckHuntsThisSweep++;
+            const localPoiIdx = patrolPois.findIndex(p => p.id === bot.poi || p.name === bot.poi);
+            ctx.log("combat", `No repeater wrecks at local POI — roaming ${patrolPois.length} POI(s) in ${targetSystem} for the repeater wrecks`);
+            const roam = await roamPoisForRepeaterWrecks(ctx, patrolPois, localPoiIdx >= 0 ? localPoiIdx : poiIdx);
+            if (roam === "found") {
+              ctx.log("combat", "Repeater wrecks recovered — resuming route");
+            } else if (roam === "empty") {
+              ctx.log("combat", `No repeater wrecks found in ${targetSystem} — resuming route`);
+            }
+          }
+          // Handled here (looted or roamed) — the in-loop roam must not fire again.
+          wreckHuntPending = false;
         }
 
         // ── Travel to POI ──
@@ -3770,7 +3794,10 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
             wreckHuntPending = false;
             wreckHuntsThisSweep++;
             ctx.log("combat", `Attacked without engaging a local repeater — roaming ${patrolPois.length} POI(s) in ${targetSystem} for the repeater wrecks`);
-            const roam = await roamPoisForRepeaterWrecks(ctx, patrolPois, 0);
+            // Start at our current POI so the local wreck is re-checked first
+            // (it may have spawned items a moment after the last sweep), then
+            // move outward through the rest of the system's POIs.
+            const roam = await roamPoisForRepeaterWrecks(ctx, patrolPois, poiIdx);
             if (roam === "found") {
               ctx.log("combat", "Repeater wrecks recovered — resuming route");
             } else if (roam === "empty") {

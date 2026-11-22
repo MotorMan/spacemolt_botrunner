@@ -1,5 +1,5 @@
 import type { Routine, RoutineContext } from "../bot.js";
-import { mapStore } from "../mapstore.js";
+import { mapStore, type StoredSystem } from "../mapstore.js";
 import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { getEffectiveSystemBlacklist } from "../web/server.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "../bot_chat_channel.js";
@@ -210,7 +210,7 @@ const RESOURCE_REFRESH_MINS = 120;
 
 // ── Per-bot settings ─────────────────────────────────────────
 
-export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all" | "achievement" | "fixed_route" | "frontier_exploration" | "frontier_survey";
+export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all" | "achievement" | "fixed_route" | "frontier_exploration" | "frontier_survey" | "frontier_update";
 
 function getExplorerSettings(username?: string): {
   mode: ExplorerMode;
@@ -234,6 +234,11 @@ function getExplorerSettings(username?: string): {
   frontierFuelThreshold: number;
   frontierAutoReturn: boolean;
   frontierThoroughScan: boolean;
+  frontierUpdateOrigin: string;
+  frontierUpdateEntry: string;
+  frontierUpdateMaxSystems: number;
+  frontierUpdateMaxPathfinderJumps: number;
+  frontierUpdateStaleMinutes: number;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -344,8 +349,15 @@ function getExplorerSettings(username?: string): {
       ? Boolean(e.frontierThoroughScan)
       : true;
 
+  // Frontier Update mode (pathfinder route through every frontier system)
+  const frontierUpdateOrigin = (botOverrides.frontierUpdateOrigin as string) || (e.frontierUpdateOrigin as string) || "tiaki";
+  const frontierUpdateEntry = (botOverrides.frontierUpdateEntry as string) || (e.frontierUpdateEntry as string) || "mile_mark";
+  const frontierUpdateMaxSystems = Number(botOverrides.frontierUpdateMaxSystems ?? e.frontierUpdateMaxSystems) || 600;
+  const frontierUpdateMaxPathfinderJumps = Number(botOverrides.frontierUpdateMaxPathfinderJumps ?? e.frontierUpdateMaxPathfinderJumps) || 300;
+  const frontierUpdateStaleMinutes = Number(botOverrides.frontierUpdateStaleMinutes ?? e.frontierUpdateStaleMinutes) || 24 * 60;
+
   return {
-    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : mode === "achievement" ? "achievement" : mode === "fixed_route" ? "fixed_route" : mode === "frontier_exploration" ? "frontier_exploration" : mode === "frontier_survey" ? "frontier_survey" : "explore") as ExplorerMode,
+    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : mode === "achievement" ? "achievement" : mode === "fixed_route" ? "fixed_route" : mode === "frontier_exploration" ? "frontier_exploration" : mode === "frontier_survey" ? "frontier_survey" : mode === "frontier_update" ? "frontier_update" : "explore") as ExplorerMode,
     acceptMissions,
     focusAreaSystem,
     maxJumps,
@@ -366,6 +378,11 @@ function getExplorerSettings(username?: string): {
     frontierFuelThreshold: Number(frontierFuelThreshold) || 30,
     frontierAutoReturn: Boolean(frontierAutoReturn),
     frontierThoroughScan: Boolean(frontierThoroughScan),
+    frontierUpdateOrigin,
+    frontierUpdateEntry,
+    frontierUpdateMaxSystems: Number(frontierUpdateMaxSystems) || 600,
+    frontierUpdateMaxPathfinderJumps: Number(frontierUpdateMaxPathfinderJumps) || 300,
+    frontierUpdateStaleMinutes: Number(frontierUpdateStaleMinutes) || 24 * 60,
   };
 }
 
@@ -415,6 +432,13 @@ export function setExplorerFrontierExploration(username: string, enabled: boolea
 export function setExplorerFrontierSurvey(username: string, enabled: boolean): void {
   writeSettings({
     [username]: { explorerMode: enabled ? "frontier_survey" : "explore" },
+  });
+}
+
+/** Persist frontier_update mode setting for a specific bot. */
+export function setExplorerFrontierUpdate(username: string, enabled: boolean): void {
+  writeSettings({
+    [username]: { explorerMode: enabled ? "frontier_update" : "explore" },
   });
 }
 
@@ -562,6 +586,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
   if (initialSettings.mode === "frontier_survey") {
     yield* frontierSurveyRoutine(ctx);
+    return;
+  }
+  if (initialSettings.mode === "frontier_update") {
+    yield* frontierUpdateRoutine(ctx);
     return;
   }
 
@@ -943,6 +971,12 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("system", "Mode changed to frontier_survey — switching routines...");
       clearExplorerPosition(bot.username);
       yield* frontierSurveyRoutine(ctx);
+      return;
+    }
+    if (modeCheck.mode === "frontier_update") {
+      ctx.log("system", "Mode changed to frontier_update — switching routines...");
+      clearExplorerPosition(bot.username);
+      yield* frontierUpdateRoutine(ctx);
       return;
     }
 
@@ -1370,7 +1404,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           const mainNetwork = getMainNetworkSystems();
           const isInMainNetwork = mainNetwork.has(bot.system.toLowerCase());
           
-          if (isNewFrontierSystem && !isInMainNetwork && explorerSettings.mode !== "frontier_exploration") {
+          if (isNewFrontierSystem && !isInMainNetwork && explorerSettings.mode !== "frontier_exploration" && explorerSettings.mode !== "frontier_update") {
             ctx.log("exploration", `🌌 NEW FRONTIER SYSTEM DISCOVERED: ${bot.system} — switching to frontier_exploration mode!`);
             ctx.log("exploration", `This system was not in our map — it's a previously unknown system accessible only via wormhole.`);
             
@@ -4417,7 +4451,11 @@ function logFixedRouteOverlap(botName: string, route: FixedPathRouteEntry[], ctx
 
 /** Full system exploration for one fixed-route target, reusing existing POI
  *  scanning logic and staleness thresholds (STATION_REFRESH_MINS / RESOURCE_REFRESH_MINS). */
-async function* exploreFixedRouteSystem(ctx: RoutineContext, systemId: string): AsyncGenerator<string, void, void> {
+async function* exploreFixedRouteSystem(
+  ctx: RoutineContext,
+  systemId: string,
+  opts: { avoidWormholes?: boolean } = {},
+): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
   const explorerSettings = getExplorerSettings(bot.username);
 
@@ -4540,6 +4578,12 @@ async function* exploreFixedRouteSystem(ctx: RoutineContext, systemId: string): 
     // ── Wormhole test ──
     const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
     if (isWormholePoi) {
+      // Frontier update routes stay inside the mapped frontier group. Do not
+      // let a random wormhole pull the bot off the planned route.
+      if (opts.avoidWormholes) {
+        mapStore.markExplored(systemId, poi.id);
+        continue;
+      }
       // Check fuel cells before testing wormhole - if we get dropped in a frontier
       // system with no station and no fuel cells, we'll be stuck
       await bot.refreshCargo();
@@ -4618,6 +4662,9 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
       }
       if (modeCheck.mode === "frontier_survey") {
         yield* frontierSurveyRoutine(ctx);
+      }
+      if (modeCheck.mode === "frontier_update") {
+        yield* frontierUpdateRoutine(ctx);
       }
       return;
     }
@@ -4897,6 +4944,988 @@ const homeSystem = fixed.homeSystem || getGlobalHomeBase().system || "sol";
   }
 }
 
+// ── Frontier Update Routine ───────────────────────────────────────
+
+interface FrontierUpdateGroup {
+  index: number;
+  systems: StoredSystem[];
+  ids: Set<string>;
+  idByKey: Map<string, string>;
+  adj: Map<string, string[]>;
+  center: { x: number; y: number };
+  staleIds: Set<string>;
+}
+
+interface FrontierTransition {
+  kind: "direct" | "via-main";
+  from: string;
+  to: string;
+  cost: number;
+  viaMain?: string;
+  toMain?: string;
+}
+
+interface FrontierUpdateState {
+  scanned: number;
+  pathfinderJumps: number;
+}
+
+/** True when a frontier system has never been scanned, was never visited, or
+ *  has POIs whose normal refresh interval has elapsed. */
+function isFrontierSystemStale(sys: StoredSystem): boolean {
+  if (!sys.visited) return true;
+  if (!sys.pois || sys.pois.length === 0) return true;
+
+  for (const poi of sys.pois) {
+    const minutes = mapStore.minutesSinceExplored(sys.id, poi.id);
+    if (!Number.isFinite(minutes)) return true;
+
+    const hasBase = poi.has_base || !!poi.base_id;
+    if (hasBase) {
+      if (minutes >= STATION_REFRESH_MINS) return true;
+    } else if (isMinablePoi(poi.type)) {
+      if (minutes >= RESOURCE_REFRESH_MINS) return true;
+    } else if (minutes >= RESOURCE_REFRESH_MINS) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Loose system key matching mapstore's normalization. The public map can
+ *  contain case/space variants of the same system (e.g. "hr_8832" and
+ *  "HR 8832"); collapsing them prevents duplicate frontier nodes. */
+function frontierSystemKey(systemId: string): string {
+  return systemId.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Build the regular-connection components that make up the frontier. */
+function buildFrontierUpdateGroups(): FrontierUpdateGroup[] {
+  const frontier = mapStore.getSystems().filter((sys) => mapStore.isFrontierSystem(sys.id));
+  const byKey = new Map<string, StoredSystem>();
+  for (const sys of frontier) {
+    const key = frontierSystemKey(sys.id);
+    const existing = byKey.get(key);
+    if (!existing ||
+        (!existing.position && sys.position) ||
+        (existing.pois.length === 0 && sys.pois.length > 0)) {
+      byKey.set(key, sys);
+    }
+  }
+
+  const seen = new Set<string>();
+  const groups: FrontierUpdateGroup[] = [];
+
+  for (const start of byKey.values()) {
+    const startKey = frontierSystemKey(start.id);
+    if (seen.has(startKey)) continue;
+
+    const queue: StoredSystem[] = [start];
+    const members: StoredSystem[] = [];
+    seen.add(startKey);
+
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      members.push(cur);
+      for (const conn of cur.connections || []) {
+        const nextKey = frontierSystemKey(conn.system_id || "");
+        if (!nextKey || seen.has(nextKey)) continue;
+        const next = byKey.get(nextKey);
+        if (!next) continue;
+        seen.add(nextKey);
+        queue.push(next);
+      }
+    }
+
+    members.sort((a, b) => a.id.localeCompare(b.id));
+    const idByKey = new Map<string, string>();
+    const ids = new Set<string>();
+    const adj = new Map<string, string[]>();
+    for (const member of members) {
+      const key = frontierSystemKey(member.id);
+      idByKey.set(key, member.id);
+      ids.add(key);
+      adj.set(key, []);
+    }
+
+    for (const member of members) {
+      const fromKey = frontierSystemKey(member.id);
+      for (const conn of member.connections || []) {
+        const toKey = frontierSystemKey(conn.system_id || "");
+        if (!toKey || !ids.has(toKey)) continue;
+        adj.get(fromKey)!.push(toKey);
+      }
+    }
+
+    let sx = 0;
+    let sy = 0;
+    let positioned = 0;
+    for (const member of members) {
+      if (!member.position) continue;
+      sx += member.position.x;
+      sy += member.position.y;
+      positioned++;
+    }
+
+    groups.push({
+      index: groups.length,
+      systems: members,
+      ids,
+      idByKey,
+      adj,
+      center: positioned > 0 ? { x: sx / positioned, y: sy / positioned } : { x: 0, y: 0 },
+      staleIds: new Set(members.filter((m) => isFrontierSystemStale(m)).map((m) => frontierSystemKey(m.id))),
+    });
+  }
+
+  return groups;
+}
+
+function findFrontierUpdateGroup(groups: FrontierUpdateGroup[], systemId: string): FrontierUpdateGroup | null {
+  const key = frontierSystemKey(systemId);
+  return groups.find((g) => g.ids.has(key)) || null;
+}
+
+/** Shortest path between two systems inside one regular frontier component. */
+function regularPathInFrontierGroup(group: FrontierUpdateGroup, fromSystemId: string, toSystemId: string): string[] | null {
+  const from = frontierSystemKey(fromSystemId);
+  const to = frontierSystemKey(toSystemId);
+  if (from === to) return [from];
+  if (!group.ids.has(from) || !group.ids.has(to)) return null;
+
+  const prev = new Map<string, string | null>([[from, null]]);
+  const queue: string[] = [from];
+  let head = 0;
+
+  while (head < queue.length) {
+    const cur = queue[head++];
+    for (const next of group.adj.get(cur) || []) {
+      if (prev.has(next)) continue;
+      prev.set(next, cur);
+      if (next === to) {
+        const path: string[] = [to];
+        let cursor: string | null = cur;
+        while (cursor) {
+          path.push(cursor);
+          cursor = prev.get(cursor) ?? null;
+        }
+        return path.reverse();
+      }
+      queue.push(next);
+    }
+  }
+  return null;
+}
+
+/** Visit timestamps for systems other bots looked at recently. */
+function getRecentFrontierVisitTimes(botName: string, windowMs: number): Map<string, number> {
+  const result = new Map<string, number>();
+  const cutoff = Date.now() - windowMs;
+  const data = explorerHistoryStore.getData();
+
+  for (const [name, records] of Object.entries(data.bots)) {
+    if (name.toLowerCase() === botName.toLowerCase()) continue;
+    for (const record of records) {
+      const ts = new Date(record.visitedAt).getTime();
+      if (!Number.isFinite(ts) || ts < cutoff) continue;
+      const key = frontierSystemKey(record.systemId);
+      if (ts > (result.get(key) ?? 0)) result.set(key, ts);
+    }
+  }
+  return result;
+}
+
+function frontierOverlapPenalty(systemId: string, recentVisits: Map<string, number>): number {
+  const ts = recentVisits.get(frontierSystemKey(systemId));
+  if (!ts) return 0;
+  const minutes = (Date.now() - ts) / 60000;
+  if (minutes < 20) return 12;
+  if (minutes < 60) return 6;
+  return 2;
+}
+
+/** Greedy nearest-neighbour ordering with optional fixed end node. */
+function nearestFrontierOrder<T>(
+  start: T,
+  nodes: T[],
+  distance: (a: T, b: T) => number,
+  end?: T,
+): T[] {
+  const remaining = new Set<T>();
+  for (const node of nodes) {
+    if (node === start) continue;
+    if (end !== undefined && node === end) continue;
+    remaining.add(node);
+  }
+
+  const order: T[] = [];
+  let current = start;
+  while (remaining.size > 0) {
+    let best: T | null = null;
+    let bestDistance = Infinity;
+    for (const candidate of remaining) {
+      const d = distance(current, candidate);
+      if (d < bestDistance) {
+        bestDistance = d;
+        best = candidate;
+      }
+    }
+    if (best === null) break;
+    order.push(best);
+    remaining.delete(best);
+    current = best;
+  }
+
+  if (end !== undefined && end !== start) order.push(end);
+  return order;
+}
+
+/** 2-opt improvement for an open path with a fixed start node. */
+function improveFrontierOpenOrder<T>(start: T, order: T[], distance: (a: T, b: T) => number): T[] {
+  if (order.length < 2) return [...order];
+  const result = [...order];
+  let improved = true;
+  let guard = 0;
+
+  while (improved && guard++ < 20) {
+    improved = false;
+    for (let i = 0; i < result.length - 1; i++) {
+      for (let j = i + 1; j < result.length; j++) {
+        const prev = i === 0 ? start : result[i - 1];
+        const next = j === result.length - 1 ? null : result[j + 1];
+        const oldCost = distance(prev, result[i]) + (next ? distance(result[j], next) : 0);
+        const newCost = distance(prev, result[j]) + (next ? distance(result[i], next) : 0);
+        if (newCost + 1e-9 < oldCost) {
+          let left = i;
+          let right = j;
+          while (left < right) {
+            const tmp = result[left];
+            result[left] = result[right];
+            result[right] = tmp;
+            left++;
+            right--;
+          }
+          improved = true;
+        }
+      }
+    }
+  }
+  return result;
+}
+
+function orderFrontierUpdateGroups(
+  startGroup: FrontierUpdateGroup,
+  groups: FrontierUpdateGroup[],
+  recentVisits: Map<string, number>,
+): FrontierUpdateGroup[] {
+  const remaining = groups.filter((g) => g.index !== startGroup.index && g.staleIds.size > 0);
+  if (remaining.length === 0) return [startGroup];
+
+  const distance = (a: FrontierUpdateGroup, b: FrontierUpdateGroup): number => {
+    const dx = a.center.x - b.center.x;
+    const dy = a.center.y - b.center.y;
+    let overlap = 0;
+    for (const id of b.staleIds) overlap += frontierOverlapPenalty(id, recentVisits);
+    overlap = overlap / Math.max(1, b.staleIds.size);
+    return Math.sqrt(dx * dx + dy * dy) + overlap * 100;
+  };
+
+  const order = nearestFrontierOrder(startGroup, remaining, distance);
+  const improved = improveFrontierOpenOrder(startGroup, order, distance);
+  return [startGroup, ...improved];
+}
+
+interface MainGateway {
+  systemId: string;
+  frontierId: string;
+  distance: number;
+}
+
+/** Find a main-network system with a safe direct pathfinder jump to/from a
+ *  frontier system. Searches nearest candidates first. */
+function findFrontierMainGateway(
+  frontierId: string,
+  direction: "from" | "to",
+  blacklist: string[],
+  cache: Map<string, MainGateway | null>,
+): MainGateway | null {
+  const key = `${frontierId.toLowerCase()}:${direction}`;
+  if (cache.has(key)) return cache.get(key)!;
+
+  const frontier = mapStore.getSystem(frontierId);
+  if (!frontier?.position) {
+    cache.set(key, null);
+    return null;
+  }
+
+  const blacklistSet = new Set(blacklist.map((s) => s.toLowerCase()));
+  const candidates = mapStore.getSystems()
+    .filter((sys) => !!sys.position && !mapStore.isFrontierSystem(sys.id) && !isPirateSystem(sys.id))
+    .filter((sys) => !blacklistSet.has(sys.id.toLowerCase()))
+    .map((sys) => {
+      const dx = sys.position!.x - frontier.position!.x;
+      const dy = sys.position!.y - frontier.position!.y;
+      return { sys, distance: Math.sqrt(dx * dx + dy * dy) };
+    })
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, 80);
+
+  for (const candidate of candidates) {
+    const safe = direction === "from"
+      ? mapStore.computeSafePathfinderBearing(frontierId, candidate.sys.id)
+      : mapStore.computeSafePathfinderBearing(candidate.sys.id, frontierId);
+    if (safe?.safe && safe.landing) {
+      const gateway: MainGateway = {
+        systemId: candidate.sys.id,
+        frontierId,
+        distance: candidate.distance,
+      };
+      cache.set(key, gateway);
+      return gateway;
+    }
+  }
+
+  cache.set(key, null);
+  return null;
+}
+
+/** Pick the cheapest safe way to move from one frontier component to another.
+ *  Prefers a direct pathfinder jump; otherwise routes through the main network. */
+function findFrontierTransition(
+  fromSystemId: string,
+  fromGroup: FrontierUpdateGroup,
+  toGroup: FrontierUpdateGroup,
+  blacklist: string[],
+  gatewayCache: Map<string, MainGateway | null>,
+): FrontierTransition | null {
+  const fromLower = fromSystemId.toLowerCase();
+  if (!fromGroup.ids.has(frontierSystemKey(fromLower))) return null;
+
+  const staging = fromGroup.systems
+    .filter((sys) => !!sys.position)
+    .map((sys) => {
+      const path = regularPathInFrontierGroup(fromGroup, fromLower, sys.id.toLowerCase());
+      return { sys, hops: path ? path.length - 1 : Infinity };
+    })
+    .filter((entry) => Number.isFinite(entry.hops))
+    .sort((a, b) => a.hops - b.hops);
+
+  let best: FrontierTransition | null = null;
+
+  for (const from of staging) {
+    const fromPos = from.sys.position!;
+    const currentToStaging = from.hops * 500;
+
+    for (const to of toGroup.systems) {
+      if (!to.position) continue;
+      const safe = mapStore.computeSafePathfinderBearing(from.sys.id, to.id);
+      if (!safe?.safe || !safe.landing) continue;
+      const dx = to.position.x - fromPos.x;
+      const dy = to.position.y - fromPos.y;
+      const cost = currentToStaging + Math.sqrt(dx * dx + dy * dy);
+      if (!best || cost < best.cost) {
+        best = {
+          kind: "direct",
+          from: from.sys.id,
+          to: to.id,
+          cost,
+        };
+      }
+    }
+  }
+
+  if (best) return best;
+
+  for (const from of staging) {
+    const gatewayFrom = findFrontierMainGateway(from.sys.id, "from", blacklist, gatewayCache);
+    if (!gatewayFrom) continue;
+    const fromPos = from.sys.position!;
+    const stagingCost = from.hops * 500;
+    const frontierToMain = Math.sqrt(
+      Math.pow(fromPos.x - (mapStore.getSystem(gatewayFrom.systemId)?.position?.x ?? fromPos.x), 2) +
+      Math.pow(fromPos.y - (mapStore.getSystem(gatewayFrom.systemId)?.position?.y ?? fromPos.y), 2),
+    );
+
+    for (const to of toGroup.systems) {
+      if (!to.position) continue;
+      const gatewayTo = findFrontierMainGateway(to.id, "to", blacklist, gatewayCache);
+      if (!gatewayTo) continue;
+
+      const route = mapStore.findRoute(gatewayFrom.systemId, gatewayTo.systemId, blacklist);
+      if (!route) continue;
+      const mainJumps = Math.max(0, route.length - 1);
+
+      const toPos = to.position;
+      const gatewayToPos = mapStore.getSystem(gatewayTo.systemId)?.position;
+      const mainToFrontier = gatewayToPos
+        ? Math.sqrt(Math.pow(toPos.x - gatewayToPos.x, 2) + Math.pow(toPos.y - gatewayToPos.y, 2))
+        : 0;
+
+      const cost = stagingCost + frontierToMain + mainJumps * 500 + mainToFrontier;
+      if (!best || cost < best.cost) {
+        best = {
+          kind: "via-main",
+          from: from.sys.id,
+          to: to.id,
+          viaMain: gatewayFrom.systemId,
+          toMain: gatewayTo.systemId,
+          cost,
+        };
+      }
+    }
+  }
+
+  return best;
+}
+
+async function performFrontierPathfinderJump(ctx: RoutineContext, targetSystemId: string): Promise<boolean> {
+  const { bot } = ctx;
+  await bot.refreshShipMods();
+  if (!bot.hasPathfinderDrive) {
+    ctx.log("error", "Frontier update pathfinder jump attempted without a Pathfinder Drive.");
+    return false;
+  }
+
+  await ensureUndocked(ctx);
+  const wasCloaked = bot.isCloaked;
+  if (wasCloaked) {
+    ctx.log("travel", "Disabling cloak for frontier pathfinder jump...");
+    await bot.exec("cloak", { enable: false });
+  }
+
+  try {
+    ctx.log("travel", `Frontier pathfinder jump: ${bot.system} -> ${targetSystemId}`);
+    const result = await bot.performPathfinderJump(targetSystemId);
+    await bot.refreshLocation();
+    if (result.success && frontierSystemKey(bot.system) === frontierSystemKey(targetSystemId)) {
+      ctx.log("travel", `Frontier pathfinder jump complete: arrived at ${bot.system}`);
+      return true;
+    }
+    ctx.log("error", `Frontier pathfinder jump to ${targetSystemId} failed (now at ${bot.system})`);
+    return false;
+  } finally {
+    if (wasCloaked && bot.state === "running") {
+      await bot.exec("cloak", { enable: true });
+    }
+  }
+}
+
+async function travelWithinFrontierUpdateGroup(
+  ctx: RoutineContext,
+  group: FrontierUpdateGroup,
+  fromSystemId: string,
+  toSystemId: string,
+  fuelThresholdPct: number,
+): Promise<boolean> {
+  const path = regularPathInFrontierGroup(group, fromSystemId, toSystemId);
+  if (!path) {
+    ctx.log("error", `No regular path in frontier group from ${fromSystemId} to ${toSystemId}`);
+    return false;
+  }
+  if (path.length <= 1) return true;
+
+  for (let i = 1; i < path.length; i++) {
+    if (ctx.bot.state !== "running") return false;
+    const nextKey = path[i];
+    const nextSystemId = group.idByKey.get(nextKey);
+    if (!nextSystemId) {
+      ctx.log("error", `Could not resolve frontier system key ${nextKey}`);
+      return false;
+    }
+    const arrived = await navigateToSystem(ctx, nextSystemId, {
+      fuelThresholdPct,
+      hullThresholdPct: 30,
+      skipBlacklist: true,
+    });
+    if (!arrived) {
+      ctx.log("error", `Could not move within frontier group to ${nextSystemId}`);
+      return false;
+    }
+    ctx.bot.stats.totalSystems++;
+  }
+  return true;
+}
+
+async function travelFrontierTransition(
+  ctx: RoutineContext,
+  transition: FrontierTransition,
+  fuelThresholdPct: number,
+  state: FrontierUpdateState,
+): Promise<boolean> {
+  if (transition.kind === "direct") {
+    const fueled = await ensureFueled(ctx, Math.max(fuelThresholdPct, 50));
+    if (!fueled) {
+      ctx.log("error", "Not enough fuel for frontier pathfinder transition");
+      return false;
+    }
+    const ok = await performFrontierPathfinderJump(ctx, transition.to);
+    if (ok) state.pathfinderJumps++;
+    return ok;
+  }
+
+  if (!transition.viaMain || !transition.toMain) return false;
+
+  const fueled = await ensureFueled(ctx, Math.max(fuelThresholdPct, 50));
+  if (!fueled) {
+    ctx.log("error", "Not enough fuel for frontier main-network transition");
+    return false;
+  }
+
+  if (!await performFrontierPathfinderJump(ctx, transition.viaMain)) return false;
+  state.pathfinderJumps++;
+
+  if (frontierSystemKey(transition.viaMain) !== frontierSystemKey(transition.toMain)) {
+    const arrived = await navigateToSystem(ctx, transition.toMain, {
+      fuelThresholdPct,
+      hullThresholdPct: 30,
+      skipBlacklist: false,
+    });
+    if (!arrived) {
+      ctx.log("error", `Could not cross main network to ${transition.toMain}`);
+      return false;
+    }
+  }
+
+  const fueledAgain = await ensureFueled(ctx, Math.max(fuelThresholdPct, 50));
+  if (!fueledAgain) {
+    ctx.log("error", "Not enough fuel for final frontier pathfinder jump");
+    return false;
+  }
+
+  const ok = await performFrontierPathfinderJump(ctx, transition.to);
+  if (ok) state.pathfinderJumps++;
+  return ok;
+}
+
+async function* scanFrontierUpdateSystem(ctx: RoutineContext, systemId: string): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+  await bot.refreshLocation();
+  if (frontierSystemKey(bot.system) !== frontierSystemKey(systemId)) {
+    ctx.log("warn", `Expected to be at ${systemId}, but location is ${bot.system} — skipping scan`);
+    return;
+  }
+
+  ctx.log("exploration", `Frontier Update: scanning ${systemId}`);
+  yield* exploreFixedRouteSystem(ctx, systemId, { avoidWormholes: true });
+  mapStore.markSystemVisited(systemId);
+  explorerAssignmentStore.recordCompletedSystem(bot.username, systemId);
+}
+
+async function* scanFrontierUpdateGroup(
+  ctx: RoutineContext,
+  group: FrontierUpdateGroup,
+  fuelThresholdPct: number,
+  staleMinutes: number,
+  state: FrontierUpdateState,
+  maxSystems: number,
+): AsyncGenerator<string, boolean, void> {
+  const { bot } = ctx;
+  const pending = new Set(group.staleIds);
+  const recentVisits = getRecentFrontierVisitTimes(bot.username, staleMinutes * 60000);
+  let guard = 0;
+
+  while (pending.size > 0 && bot.state === "running" && state.scanned < maxSystems && guard++ < maxSystems * 4 + 100) {
+    await bot.refreshLocation();
+    const currentKey = frontierSystemKey(bot.system);
+
+    if (!group.ids.has(currentKey)) {
+      ctx.log("warn", `Left frontier group while scanning (${bot.system}) — aborting group scan`);
+      return false;
+    }
+
+    if (pending.has(currentKey)) {
+      const currentId = group.idByKey.get(currentKey)!;
+      yield* scanFrontierUpdateSystem(ctx, currentId);
+      pending.delete(currentKey);
+      state.scanned++;
+      if (state.scanned >= maxSystems) return true;
+      continue;
+    }
+
+    let bestTarget: string | null = null;
+    let bestPath: string[] | null = null;
+    let bestScore = Infinity;
+
+    for (const candidate of pending) {
+      const path = regularPathInFrontierGroup(group, currentKey, candidate);
+      if (!path) continue;
+      const hops = path.length - 1;
+      const score = hops + frontierOverlapPenalty(candidate, recentVisits);
+      if (score < bestScore) {
+        bestScore = score;
+        bestTarget = candidate;
+        bestPath = path;
+      }
+    }
+
+    if (!bestTarget || !bestPath) {
+      ctx.log("warn", `No reachable pending systems left in frontier group ${group.systems[0]?.name || group.index}`);
+      return pending.size === 0;
+    }
+
+    for (let i = 1; i < bestPath.length; i++) {
+      if (bot.state !== "running") return false;
+      const nextKey = bestPath[i];
+      const nextSystemId = group.idByKey.get(nextKey);
+      if (!nextSystemId) {
+        ctx.log("error", `Could not resolve frontier system key ${nextKey}`);
+        return false;
+      }
+
+      if (nextKey !== currentKey) {
+        const arrived = await navigateToSystem(ctx, nextSystemId, {
+          fuelThresholdPct,
+          hullThresholdPct: 30,
+          skipBlacklist: true,
+        });
+        if (!arrived) {
+          ctx.log("error", `Could not jump to ${nextSystemId} while scanning frontier group`);
+          return false;
+        }
+        bot.stats.totalSystems++;
+      }
+
+      await bot.refreshLocation();
+      if (frontierSystemKey(bot.system) !== nextKey) {
+        ctx.log("warn", `Arrived at ${bot.system}, expected ${nextSystemId} — aborting group scan`);
+        return false;
+      }
+
+      if (pending.has(nextKey)) {
+        yield* scanFrontierUpdateSystem(ctx, nextSystemId);
+        pending.delete(nextKey);
+        state.scanned++;
+        if (state.scanned >= maxSystems) return true;
+      }
+    }
+  }
+
+  return pending.size === 0;
+}
+
+async function frontierUpdateStartupPrep(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  const settings = getExplorerSettings(bot.username);
+  const { pois } = await getSystemInfo(ctx);
+  const station = findStation(pois);
+
+  if (!station) {
+    ctx.log("warn", "Frontier Update: no station in current system — starting with current fuel/cargo");
+    return;
+  }
+
+  ctx.log("system", `Frontier Update: startup prep at ${station.name}...`);
+  if (bot.poi !== station.id) {
+    await ensureUndocked(ctx);
+    const travelResp = await bot.exec("travel", { target_poi: station.id });
+    if (travelResp.error && !travelResp.error.message.includes("already")) {
+      ctx.log("warn", `Could not reach startup station ${station.name}: ${travelResp.error.message}`);
+      return;
+    }
+  }
+
+  if (!bot.docked) {
+    const dockResp = await bot.exec("dock");
+    if (!dockResp.error || dockResp.error.message.includes("already")) {
+      bot.docked = true;
+    }
+  }
+
+  if (!bot.docked) return;
+
+  await collectFromStorage(ctx);
+  if (settings.loadFuelCellsAtHome) {
+    await loadFuelCellsToMax(ctx);
+  }
+  await tryRefuel(ctx);
+  await bot.refreshShip();
+
+  const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+  if (hullPct <= 40) {
+    ctx.log("system", `Frontier Update: hull at ${hullPct}% — repairing`);
+    await repairShip(ctx);
+  }
+}
+
+async function enterFrontierUpdateFromMain(
+  ctx: RoutineContext,
+  originSystem: string,
+  entrySystem: string,
+  fuelThresholdPct: number,
+): Promise<boolean> {
+  const { bot } = ctx;
+
+  if (mapStore.isFrontierSystem(bot.system)) return true;
+
+  if (frontierSystemKey(bot.system) !== frontierSystemKey(originSystem)) {
+    ctx.log("travel", `Frontier Update: travelling to origin ${originSystem}`);
+    const arrived = await navigateToSystem(ctx, originSystem, {
+      fuelThresholdPct,
+      hullThresholdPct: 30,
+      skipBlacklist: false,
+    });
+    if (!arrived) {
+      ctx.log("error", `Could not reach frontier origin ${originSystem}`);
+      return false;
+    }
+  }
+
+  const routeResp = await bot.exec("find_route", { target_system: entrySystem });
+  const routeData = routeResp.result as {
+    found?: boolean;
+    total_jumps?: number;
+    route?: Array<{ system_id?: string; via_wormhole?: boolean }>;
+    message?: string;
+  } | undefined;
+
+  const jumps = routeData?.total_jumps
+    ?? (routeData?.route ? routeData.route.length - 1 : NaN);
+  const hasWormhole = routeData?.route?.some((segment) => segment.via_wormhole === true) ?? false;
+
+  if (jumps === 1 && !hasWormhole) {
+    ctx.log("travel", `Faction jump gate active: ${originSystem} -> ${entrySystem} is 1 jump`);
+    const gateArrived = await navigateToSystem(ctx, entrySystem, {
+      fuelThresholdPct,
+      hullThresholdPct: 30,
+      skipBlacklist: false,
+    });
+    if (gateArrived) return true;
+    ctx.log("warn", "Faction jump gate jump failed — falling back to pathfinder");
+  } else {
+    ctx.log("travel", `Faction jump gate not active (find_route reports ${Number.isFinite(jumps) ? jumps : "no route"} jumps) — using pathfinder`);
+  }
+
+  const fueled = await ensureFueled(ctx, Math.max(fuelThresholdPct, 50));
+  if (!fueled) {
+    ctx.log("error", "Not enough fuel for initial frontier pathfinder jump");
+    return false;
+  }
+
+  return performFrontierPathfinderJump(ctx, entrySystem);
+}
+
+async function finishFrontierUpdate(ctx: RoutineContext, originSystem: string, fuelThresholdPct: number): Promise<void> {
+  const { bot } = ctx;
+  ctx.log("system", "Frontier Update: returning to the main network...");
+
+  const returned = await navigateFrontierToMainNetwork(ctx, {
+    maxJumps: 15,
+    fuelThresholdPct,
+    hullThresholdPct: 30,
+    scanWaitMinutes: 5,
+    scanDelayTicks: 0,
+    frontierMemory: new Map(),
+  });
+
+  if (!returned) {
+    ctx.log("warn", "Frontier Update: could not return to the main network");
+    return;
+  }
+
+  await bot.refreshLocation();
+  if (mapStore.isFrontierSystem(bot.system)) {
+    ctx.log("warn", `Frontier Update: still in frontier at ${bot.system} after return attempt`);
+    return;
+  }
+
+  if (frontierSystemKey(bot.system) !== frontierSystemKey(originSystem)) {
+    const arrived = await navigateToSystem(ctx, originSystem, {
+      fuelThresholdPct,
+      hullThresholdPct: 30,
+      skipBlacklist: false,
+    });
+    if (!arrived) {
+      ctx.log("warn", `Frontier Update: returned to main network but could not reach origin ${originSystem}`);
+      return;
+    }
+  }
+
+  ctx.log("system", `Frontier Update: complete — back at ${bot.system}`);
+}
+
+async function* frontierUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+  const settings = getExplorerSettings(bot.username);
+  const originSystem = settings.frontierUpdateOrigin.toLowerCase();
+  const entrySystem = settings.frontierUpdateEntry.toLowerCase();
+  const maxSystems = settings.frontierUpdateMaxSystems;
+  const maxPathfinderJumps = settings.frontierUpdateMaxPathfinderJumps;
+  const staleMinutes = settings.frontierUpdateStaleMinutes;
+  const state: FrontierUpdateState = { scanned: 0, pathfinderJumps: 0 };
+  const gatewayCache = new Map<string, MainGateway | null>();
+
+  ctx.log("system", `Frontier Update mode — origin=${originSystem}, entry=${entrySystem}, maxSystems=${maxSystems}, maxPathfinderJumps=${maxPathfinderJumps}`);
+
+  yield "startup_prep";
+  await frontierUpdateStartupPrep(ctx);
+
+  let entryAttempted = false;
+
+  while (bot.state === "running") {
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    if (await checkAndFleeFromBattle(ctx, "frontier_update")) {
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    const modeCheck = getExplorerSettings(bot.username);
+    if (modeCheck.mode !== "frontier_update") {
+      ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving frontier_update...`);
+      return;
+    }
+
+    await bot.refreshLocation();
+    const groups = buildFrontierUpdateGroups();
+    const staleGroups = groups.filter((group) => group.staleIds.size > 0);
+
+    if (staleGroups.length === 0) {
+      ctx.log("system", "Frontier Update: every frontier system is up to date");
+      break;
+    }
+
+    if (!mapStore.isFrontierSystem(bot.system)) {
+      if (!entryAttempted) {
+        const entered = await enterFrontierUpdateFromMain(
+          ctx,
+          originSystem,
+          entrySystem,
+          settings.frontierFuelThreshold,
+        );
+        if (!entered) {
+          ctx.log("warn", "Frontier Update: could not enter the frontier — retrying in 60s");
+          await ctx.sleep(60000);
+          continue;
+        }
+        entryAttempted = true;
+      } else {
+        ctx.log("warn", "Frontier Update: still outside the frontier — retrying entry");
+        const entered = await enterFrontierUpdateFromMain(
+          ctx,
+          originSystem,
+          entrySystem,
+          settings.frontierFuelThreshold,
+        );
+        if (!entered) {
+          await ctx.sleep(60000);
+          continue;
+        }
+      }
+
+      await bot.refreshLocation();
+      if (!mapStore.isFrontierSystem(bot.system)) {
+        ctx.log("warn", "Frontier Update: entry did not place us in a frontier system");
+        await ctx.sleep(30000);
+        continue;
+      }
+    }
+
+    const currentGroup = findFrontierUpdateGroup(groups, bot.system);
+    if (!currentGroup) {
+      ctx.log("error", `Frontier Update: current system ${bot.system} is not in a mapped frontier group`);
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    const recentVisits = getRecentFrontierVisitTimes(bot.username, staleMinutes * 60000);
+    const groupOrder = orderFrontierUpdateGroups(currentGroup, staleGroups, recentVisits);
+    ctx.log("exploration", `Frontier Update: planned group order — ${groupOrder.map((g) => `${g.index + 1} (${g.staleIds.size})`).join(" -> ")}`);
+
+    if (currentGroup.staleIds.size > 0) {
+      ctx.log("exploration", `Frontier Update: scanning group ${currentGroup.index + 1} (${currentGroup.staleIds.size} stale system(s))`);
+      const completed = yield* scanFrontierUpdateGroup(
+        ctx,
+        currentGroup,
+        settings.frontierFuelThreshold,
+        staleMinutes,
+        state,
+        maxSystems,
+      );
+
+      if (!completed && state.scanned >= maxSystems) {
+        ctx.log("system", `Frontier Update: reached max systems (${maxSystems})`);
+        break;
+      }
+    }
+
+    if (state.scanned >= maxSystems || state.pathfinderJumps >= maxPathfinderJumps) {
+      ctx.log("system", `Frontier Update: reached run limit (systems=${state.scanned}, pathfinderJumps=${state.pathfinderJumps})`);
+      break;
+    }
+
+    await bot.refreshLocation();
+    let moved = false;
+
+    for (const candidate of groupOrder) {
+      if (candidate.index === currentGroup.index || candidate.staleIds.size === 0) continue;
+
+      const transition = findFrontierTransition(
+        bot.system,
+        currentGroup,
+        candidate,
+        getEffectiveSystemBlacklist(bot),
+        gatewayCache,
+      );
+      if (!transition) {
+        ctx.log("debug", `No safe frontier transition from group ${currentGroup.index + 1} to group ${candidate.index + 1}`);
+        continue;
+      }
+
+      ctx.log("travel", `Frontier Update: group ${currentGroup.index + 1} -> group ${candidate.index + 1} (${transition.kind}, cost ${Math.round(transition.cost)})`);
+
+      if (frontierSystemKey(transition.from) !== frontierSystemKey(bot.system)) {
+        const staged = await travelWithinFrontierUpdateGroup(
+          ctx,
+          currentGroup,
+          bot.system,
+          transition.from,
+          settings.frontierFuelThreshold,
+        );
+        if (!staged) {
+          ctx.log("warn", `Could not reach staging system ${transition.from} for next frontier group`);
+          continue;
+        }
+      }
+
+      const travelled = await travelFrontierTransition(
+        ctx,
+        transition,
+        settings.frontierFuelThreshold,
+        state,
+      );
+      if (!travelled) {
+        ctx.log("warn", `Frontier transition to group ${candidate.index + 1} failed`);
+        continue;
+      }
+
+      moved = true;
+      break;
+    }
+
+    if (!moved) {
+      ctx.log("warn", "Frontier Update: no reachable unsurveyed frontier group from current position");
+      break;
+    }
+
+    if (state.scanned >= maxSystems || state.pathfinderJumps >= maxPathfinderJumps) {
+      ctx.log("system", `Frontier Update: reached run limit (systems=${state.scanned}, pathfinderJumps=${state.pathfinderJumps})`);
+      break;
+    }
+
+    await ctx.sleep(1000);
+  }
+
+  if (settings.frontierAutoReturn && mapStore.isFrontierSystem(bot.system)) {
+    await finishFrontierUpdate(ctx, originSystem, settings.frontierFuelThreshold);
+  } else {
+    ctx.log("system", `Frontier Update: stopped in ${bot.system} (systems scanned=${state.scanned}, pathfinder jumps=${state.pathfinderJumps})`);
+  }
+}
+
 // ── Frontier Exploration Routine ──────────────────────────────────
 
 /**
@@ -5056,13 +6085,18 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
 
     // ── Re-check mode (user may have changed it, or session restarted) ──
     const modeCheck = getExplorerSettings(bot.username);
-    if (modeCheck.mode !== "frontier_exploration" && modeCheck.mode !== "frontier_survey") {
+    if (modeCheck.mode !== "frontier_exploration" && modeCheck.mode !== "frontier_survey" && modeCheck.mode !== "frontier_update") {
       ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving frontier_exploration...`);
       return;
     }
     if (modeCheck.mode === "frontier_survey") {
       ctx.log("system", "Mode changed to frontier_survey — switching routines...");
       yield* frontierSurveyRoutine(ctx);
+      return;
+    }
+    if (modeCheck.mode === "frontier_update") {
+      ctx.log("system", "Mode changed to frontier_update — switching routines...");
+      yield* frontierUpdateRoutine(ctx);
       return;
     }
 
@@ -6035,7 +7069,12 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
     // ── Re-check mode (user may have changed it, or session restarted) ──
     const modeCheck = getExplorerSettings(bot.username);
     if (modeCheck.mode !== "frontier_survey") {
-      ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving frontier_survey...`);
+      if (modeCheck.mode === "frontier_update") {
+        ctx.log("system", "Mode changed to frontier_update — switching routines...");
+        yield* frontierUpdateRoutine(ctx);
+      } else {
+        ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving frontier_survey...`);
+      }
       return;
     }
 

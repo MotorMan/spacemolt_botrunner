@@ -556,10 +556,31 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
   return weapons;
 }
 
+interface BulkReloadEntryResult {
+  index: number;
+  weapon_id: string;
+  success: boolean;
+  error?: string;
+  error_code?: string;
+  result?: unknown;
+}
+
+function extractBulkReloadResults(raw: unknown): BulkReloadEntryResult[] | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const candidates: unknown[] = [r, r.details, r.result];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const results = (candidate as Record<string, unknown>).results;
+    if (Array.isArray(results)) return results as BulkReloadEntryResult[];
+  }
+  return null;
+}
+
 /**
  * Ensure the hunter has ammo loaded.
  * Uses absolute threshold for low-capacity weapons (≤50 ammo), percent threshold for high-capacity weapons (>50 ammo).
- * Uses proper reload command with weapon_instance_id and ammo_item_id from cargo.
+ * Reloads all eligible weapons in a single bulk reload action (one tick).
  * Returns false if out of ammo and needs to dock for resupply.
  * 
  * Handles both traditional weapons (with reported ammo) and missile launchers
@@ -586,7 +607,14 @@ export async function ensureAmmoLoaded(
     quantity: item.quantity,
   }));
 
-  let anyReloaded = false;
+  const remainingAmmo = new Map<string, number>();
+  for (const item of cargoItems) {
+    remainingAmmo.set(item.itemId, (remainingAmmo.get(item.itemId) || 0) + item.quantity);
+  }
+
+  const reloadEntries: Array<{ weapon_instance_id: string; ammo_item_id: string }> = [];
+  let needsResupply = false;
+
   for (const weapon of weapons) {
     ctx.log("debug", `Weapon "${weapon.name}": currentAmmo=${weapon.currentAmmo}, maxAmmo=${weapon.maxAmmo}, ammoType="${weapon.ammoType || 'empty'}"`);
     
@@ -632,39 +660,89 @@ export async function ensureAmmoLoaded(
     if (!needsReload) continue;
 
     const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, effectiveAmmoType);
-    if (matchingAmmo.length === 0) {
+    const ammoItem = matchingAmmo.find(a => (remainingAmmo.get(a.itemId) || 0) > 0);
+    if (!ammoItem) {
       ctx.log("combat", `⚠️ No ${effectiveAmmoType} ammo in cargo for "${weapon.name}" — need to resupply`);
-      return false;
+      needsResupply = true;
+      continue;
     }
 
-    const ammoItem = matchingAmmo[0];
-    ctx.log("combat", `Found ${ammoItem.quantity}x ${ammoItem.itemId} (${effectiveAmmoType}) — reloading "${weapon.name}"...`);
+    remainingAmmo.set(ammoItem.itemId, (remainingAmmo.get(ammoItem.itemId) || 0) - 1);
+    ctx.log("combat", `Queuing reload for "${weapon.name}" with ${ammoItem.itemId} (${effectiveAmmoType})`);
+    reloadEntries.push({ weapon_instance_id: weapon.instanceId, ammo_item_id: ammoItem.itemId });
+  }
 
-    for (let i = 0; i < maxAttempts; i++) {
-      const resp = await bot.exec("reload", { weapon_instance_id: weapon.instanceId, ammo_item_id: ammoItem.itemId });
+  const BULK_MAX_ENTRIES = 50;
+  const maxRounds = Math.max(1, maxAttempts);
+  let pending = reloadEntries;
+  let anyReloaded = false;
+
+  for (let round = 0; round < maxRounds && pending.length > 0; round++) {
+    const stillPending: Array<{ weapon_instance_id: string; ammo_item_id: string }> = [];
+
+    for (let offset = 0; offset < pending.length; offset += BULK_MAX_ENTRIES) {
+      const chunk = pending.slice(offset, offset + BULK_MAX_ENTRIES);
+      ctx.log("combat", `Bulk reloading ${chunk.length} weapon(s) (round ${round + 1}/${maxRounds})...`);
+
+      const resp = await bot.exec("reload", { weapons: chunk });
 
       if (resp.error) {
         const msg = resp.error.message.toLowerCase();
-        if (msg.includes("full") || msg.includes("already")) {
-          ctx.log("combat", `Weapon "${weapon.name}" already full or reload skipped`);
-          break;
-        }
         if (msg.includes("no ammo") || msg.includes("no_ammo") || msg.includes("empty")) {
-          ctx.log("combat", `No ${effectiveAmmoType} ammo available — need to resupply at station`);
+          ctx.log("combat", `No ammo available — need to resupply at station`);
           return false;
         }
-        if (msg.includes("must specify") || msg.includes("missing")) {
-          ctx.log("error", `Reload failed: ${resp.error.message} — weapon_instance_id: ${weapon.instanceId}, ammo_item_id: ${ammoItem.itemId}`);
-          break;
-        }
-        ctx.log("combat", `Reload attempt ${i + 1} failed for "${weapon.name}": ${resp.error.message}`);
+        ctx.log("combat", `Bulk reload attempt ${round + 1} failed: ${resp.error.message}`);
+        stillPending.push(...chunk);
         continue;
       }
 
-      ctx.log("combat", `✅ Reloaded "${weapon.name}" with ${ammoItem.itemId}`);
-      anyReloaded = true;
-      break;
+      const results = extractBulkReloadResults(resp.result);
+      if (!results) {
+        ctx.log("combat", `Bulk reload returned no per-weapon results — verifying via ship state`);
+        continue;
+      }
+
+      for (const entry of results) {
+        const source = chunk[entry.index] || reloadEntries.find(e => e.weapon_instance_id === entry.weapon_id);
+        const weaponName = weapons.find(w => w.instanceId === entry.weapon_id)?.name || entry.weapon_id;
+
+        if (entry.success) {
+          const detail = entry.result && typeof entry.result === "object"
+            ? entry.result as Record<string, unknown>
+            : undefined;
+          const discarded = typeof detail?.rounds_discarded === "number" ? detail.rounds_discarded : 0;
+          if (discarded > 0) {
+            ctx.log("combat", `⚠️ Reloaded "${weaponName}" but discarded ${discarded} round(s)`);
+          } else {
+            ctx.log("combat", `✅ Reloaded "${weaponName}"`);
+          }
+          anyReloaded = true;
+          continue;
+        }
+
+        const errMsg = `${entry.error || ""} ${entry.error_code || ""}`.toLowerCase();
+        if (errMsg.includes("no ammo") || errMsg.includes("no_ammo") || errMsg.includes("empty")) {
+          ctx.log("combat", `No ammo for "${weaponName}" — need to resupply`);
+          needsResupply = true;
+        } else if (errMsg.includes("full") || errMsg.includes("already")) {
+          ctx.log("combat", `Weapon "${weaponName}" already full or reload skipped`);
+          anyReloaded = true;
+        } else if (errMsg.includes("missing_weapon") || errMsg.includes("must specify")) {
+          ctx.log("error", `Reload failed for "${weaponName}": ${entry.error || entry.error_code}`);
+        } else {
+          ctx.log("combat", `Reload failed for "${weaponName}": ${entry.error || entry.error_code || "unknown error"}`);
+          if (source) stillPending.push(source);
+        }
+      }
     }
+
+    pending = stillPending;
+  }
+
+  if (needsResupply) {
+    ctx.log("combat", `⚠️ Ammo resupply needed`);
+    return false;
   }
 
   await bot.refreshShip();

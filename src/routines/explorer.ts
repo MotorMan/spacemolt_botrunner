@@ -5775,7 +5775,18 @@ async function* frontierUpdateRoutine(ctx: RoutineContext): AsyncGenerator<strin
 
     const modeCheck = getExplorerSettings(bot.username);
     if (modeCheck.mode !== "frontier_update") {
-      ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving frontier_update...`);
+      if (modeCheck.mode === "fixed_route") {
+        ctx.log("system", "Mode changed to fixed_route — switching routines...");
+        yield* fixedRouteRoutine(ctx);
+      } else if (modeCheck.mode === "frontier_exploration") {
+        ctx.log("system", "Mode changed to frontier_exploration — switching routines...");
+        yield* frontierExplorationRoutine(ctx);
+      } else if (modeCheck.mode === "frontier_survey") {
+        ctx.log("system", "Mode changed to frontier_survey — switching routines...");
+        yield* frontierSurveyRoutine(ctx);
+      } else {
+        ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving frontier_update...`);
+      }
       return;
     }
 
@@ -6086,6 +6097,11 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
     // ── Re-check mode (user may have changed it, or session restarted) ──
     const modeCheck = getExplorerSettings(bot.username);
     if (modeCheck.mode !== "frontier_exploration" && modeCheck.mode !== "frontier_survey" && modeCheck.mode !== "frontier_update") {
+      if (modeCheck.mode === "fixed_route") {
+        ctx.log("system", "Mode changed to fixed_route — switching routines...");
+        yield* fixedRouteRoutine(ctx);
+        return;
+      }
       ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving frontier_exploration...`);
       return;
     }
@@ -6786,7 +6802,8 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
           ctx.log("system", "Successfully returned to main network via pathfinder jumps!");
           // Switch back to fixed_route mode since we're back in known space
           setExplorerMode(bot.username, "fixed_route");
-          continue;
+          yield* fixedRouteRoutine(ctx);
+          return;
         } else {
           ctx.log("warn", "Pathfinder return to main network failed — falling back to home base return");
         }
@@ -7072,6 +7089,12 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
       if (modeCheck.mode === "frontier_update") {
         ctx.log("system", "Mode changed to frontier_update — switching routines...");
         yield* frontierUpdateRoutine(ctx);
+      } else if (modeCheck.mode === "frontier_exploration") {
+        ctx.log("system", "Mode changed to frontier_exploration — switching routines...");
+        yield* frontierExplorationRoutine(ctx);
+      } else if (modeCheck.mode === "fixed_route") {
+        ctx.log("system", "Mode changed to fixed_route — switching routines...");
+        yield* fixedRouteRoutine(ctx);
       } else {
         ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving frontier_survey...`);
       }
@@ -7787,6 +7810,7 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
           ctx.log("system", "Successfully returned to main network via pathfinder jumps!");
           // Switch back to fixed_route mode since we're back in known space
           setExplorerMode(bot.username, "fixed_route");
+          yield* fixedRouteRoutine(ctx);
           return;
         } else {
           ctx.log("warn", "Pathfinder return to main network failed — falling back to entry system return");

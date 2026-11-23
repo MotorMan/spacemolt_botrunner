@@ -22,6 +22,13 @@ export interface FrontierTravelConfig {
    * mining ship flying the long way around).
    */
   jumpThreshold: number;
+  /**
+   * Hard cap on a pathfinder frontier trip, counted as:
+   *   main-network jumps to the staging hub + 1 (the pathfinder jump)
+   *   + frontier jumps from the entry to the target.
+   * Candidates whose total exceeds this are rejected. Defaults to 10.
+   */
+  maxJumps: number;
 }
 
 export type FrontierRoutePlan =
@@ -43,14 +50,22 @@ export type FrontierRoutePlan =
       frontierPath: string[];
       mainJumps: number;
       frontierJumps: number;
+      /** Total jumps for the trip: mainJumps + frontierJumps + 1 pathfinder jump. */
+      totalJumps: number;
       cost: number;
     }
   | { kind: "unreachable"; reason: string };
 
 const DEFAULT_JUMP_THRESHOLD = 15;
+const DEFAULT_MAX_JUMPS = 10;
 
 export function buildFrontierTravelConfig(
-  settings: { pathfinderFrontierJumpThreshold?: number } | undefined,
+  settings:
+    | {
+        pathfinderFrontierJumpThreshold?: number;
+        pathfinderFrontierMaxJumps?: number;
+      }
+    | undefined,
   hasPathfinderDrive: boolean | undefined,
 ): FrontierTravelConfig {
   const threshold =
@@ -58,7 +73,12 @@ export function buildFrontierTravelConfig(
     !isNaN(settings.pathfinderFrontierJumpThreshold)
       ? settings.pathfinderFrontierJumpThreshold
       : DEFAULT_JUMP_THRESHOLD;
-  return { enabled: hasPathfinderDrive === true, jumpThreshold: threshold };
+  const maxJumps =
+    typeof settings?.pathfinderFrontierMaxJumps === "number" &&
+    !isNaN(settings.pathfinderFrontierMaxJumps)
+      ? settings.pathfinderFrontierMaxJumps
+      : DEFAULT_MAX_JUMPS;
+  return { enabled: hasPathfinderDrive === true, jumpThreshold: threshold, maxJumps };
 }
 
 /** Collect the frontier component (regular-connection reachable) containing `start`. */
@@ -182,6 +202,7 @@ export function planFrontierRoute(
         frontierPath: string[];
         mainJumps: number;
         frontierJumps: number;
+        totalJumps: number;
         cost: number;
       }
     | null = null;
@@ -205,6 +226,11 @@ export function planFrontierRoute(
       if (!mainRoute) continue;
       const mainJumps = Math.max(0, mainRoute.length - 1);
 
+      // Total trip = main jumps to the hub + 1 pathfinder jump + frontier jumps.
+      // Reject anything beyond the configured frontier jump limit.
+      const totalJumps = mainJumps + frontierJumps + 1;
+      if (totalJumps > cfg.maxJumps) continue;
+
       const serviceBonus = systemHasStation(hub.id) ? 250 : 0;
       const cost = mainJumps * 500 + hub.distance + frontierJumps * 500 - serviceBonus;
 
@@ -217,6 +243,7 @@ export function planFrontierRoute(
           frontierPath,
           mainJumps,
           frontierJumps,
+          totalJumps,
           cost,
         };
       }
@@ -226,7 +253,7 @@ export function planFrontierRoute(
   if (!best) {
     return {
       kind: "unreachable",
-      reason: "no safe Pathfinder jump found to any frontier entry system",
+      reason: `no safe Pathfinder jump within the ${cfg.maxJumps}-jump frontier limit`,
     };
   }
 
@@ -241,6 +268,7 @@ export function planFrontierRoute(
     frontierPath: best.frontierPath,
     mainJumps: best.mainJumps,
     frontierJumps: best.frontierJumps,
+    totalJumps: best.totalJumps,
     cost: best.cost,
   };
 }

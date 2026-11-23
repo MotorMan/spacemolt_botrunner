@@ -31971,6 +31971,22 @@ async function fetchPersonalFacilityTypes(username) {
           <span>Block frontier systems (one-way wormholes)</span>
         </label>
       </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Pathfinder Frontier Max Jumps</div>
+          <div class="setting-hint">Maximum total jumps for a Pathfinder frontier trip: main-network jumps to the staging hub + 1 (the pathfinder jump) + frontier jumps to the target. Frontier targets beyond this are skipped. Only applies when a Pathfinder Drive is fitted. Default 10.</div>
+        </div>
+        <input type="number" id="set-miner-pathfinderFrontierMaxJumps" min="1" max="100" value="${m.pathfinderFrontierMaxJumps ?? 10}" style="width:80px" />
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Pathfinder Wormhole Jump Threshold</div>
+          <div class="setting-hint">If a temporary wormhole route to a frontier target is at most this many jumps, the miner uses it instead of a Pathfinder crossing. Higher = prefer wormholes more. Default 15.</div>
+        </div>
+        <input type="number" id="set-miner-pathfinderFrontierJumpThreshold" min="1" max="100" value="${m.pathfinderFrontierJumpThreshold ?? 15}" style="width:80px" />
+      </div>
     </div>
 
 
@@ -32516,6 +32532,20 @@ async function fetchPersonalFacilityTypes(username) {
             (() => {
               const v = parseInt(
                 document.getElementById("set-miner-maxJumps").value,
+              );
+              return Number.isNaN(v) ? 10 : v;
+            })(),
+          pathfinderFrontierJumpThreshold:
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-pathfinderFrontierJumpThreshold").value,
+              );
+              return Number.isNaN(v) ? 15 : v;
+            })(),
+          pathfinderFrontierMaxJumps:
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-pathfinderFrontierMaxJumps").value,
               );
               return Number.isNaN(v) ? 10 : v;
             })(),

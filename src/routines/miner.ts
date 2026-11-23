@@ -668,8 +668,11 @@ async function getMinerSettings(username?: string): Promise<{
 stayOutUntilFull: boolean;
    maxJumps: number;
    /** If a wormhole route to a frontier target is at most this many jumps, use it
-    *  instead of a Pathfinder Drive crossing. Higher = prefer wormholes more. */
+   *  instead of a Pathfinder Drive crossing. Higher = prefer wormholes more. */
    pathfinderFrontierJumpThreshold: number;
+   /** Max jumps for a Pathfinder frontier trip (main jumps + 1 pathfinder jump +
+    *  frontier jumps). Targets beyond this are skipped. Default 10. */
+   pathfinderFrontierMaxJumps: number;
    minimumFuelCells: number;
    returnHomeOnFuelCellsRemaining: number;
    noMidMiningRetarget: boolean;
@@ -782,6 +785,7 @@ iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
     maxJumps: (m.maxJumps as number) ?? 10,
     pathfinderFrontierJumpThreshold: (m.pathfinderFrontierJumpThreshold as number) ?? 15,
+    pathfinderFrontierMaxJumps: (m.pathfinderFrontierMaxJumps as number) ?? 10,
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
     returnHomeOnFuelCellsRemaining: (m.returnHomeOnFuelCellsRemaining as number) ?? 2,
     noMidMiningRetarget: (m.noMidMiningRetarget as boolean) ?? false,

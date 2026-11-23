@@ -199,11 +199,6 @@ export async function travelToSystemSmart(
     return navigateToSystem(ctx, target, opts);
   }
 
-  if (plan.kind === "unreachable") {
-    ctx.log("warn", `[frontier] ${plan.reason} — attempting normal navigation`);
-    return navigateToSystem(ctx, target, opts);
-  }
-
   if (plan.kind === "wormhole") {
     ctx.log(
       "travel",
@@ -216,21 +211,47 @@ export async function travelToSystemSmart(
     await bot.refreshLocation();
   }
 
-  // pathfinder — re-plan from our (possibly moved) current location
+  // Pathfinder fallback (also covers the initial "unreachable" case). Ignore the
+  // wormhole option here — otherwise a failed wormhole route would just be
+  // re-selected forever ("route changed — aborting").
   const current = bot.system || from;
-  const pfPlan = planFrontierRoute(current, target, blacklist, cfg);
-  if (pfPlan.kind !== "pathfinder") {
-    if (pfPlan.kind === "normal") return navigateToSystem(ctx, target, opts);
-    ctx.log(
-      "error",
-      `[frontier] ${pfPlan.kind === "unreachable" ? pfPlan.reason : "route changed"} — aborting frontier travel`,
-    );
-    return false;
+  const pfCfg: FrontierTravelConfig = { ...cfg, jumpThreshold: -1 };
+  let pfPlan = planFrontierRoute(current, target, blacklist, pfCfg);
+
+  // If nothing is reachable within the configured limits, relax them so we can
+  // always find a crossing home instead of getting stranded in the frontier.
+  // Only do this when returning to a main-network system (home) — an outbound
+  // frontier target should still respect the configured limits.
+  if (pfPlan.kind === "unreachable" && cfg.enabled && !mapStore.isFrontierSystem(target)) {
+    const relaxed = planFrontierRoute(current, target, blacklist, {
+      ...pfCfg,
+      maxJumps: Number.MAX_SAFE_INTEGER,
+      maxJumpMinutes: Number.MAX_SAFE_INTEGER,
+    });
+    if (relaxed.kind === "pathfinder") {
+      ctx.log("warn", "[frontier] No route within limits — using a relaxed (longer) crossing to avoid being stranded");
+      pfPlan = relaxed;
+    }
   }
 
-  ctx.log(
-    "travel",
-    `[frontier] Pathfinder route to ${target}: hub=${pfPlan.hubName}, entry=${pfPlan.entryName}, main=${pfPlan.mainJumps}j, frontier=${pfPlan.frontierJumps}j, total=${pfPlan.totalJumps}j (limit ${cfg.maxJumps}), jump=${Math.round(pfPlan.jumpSeconds / 60)}min (limit ${cfg.maxJumpMinutes}min), outbound=${pfPlan.outbound}`,
-  );
-  return executePathfinderRoute(ctx, target, opts, pfPlan);
+  if (pfPlan.kind === "pathfinder") {
+    ctx.log(
+      "travel",
+      `[frontier] Pathfinder route to ${target}: hub=${pfPlan.hubName}, entry=${pfPlan.entryName}, main=${pfPlan.mainJumps}j, frontier=${pfPlan.frontierJumps}j, total=${pfPlan.totalJumps}j (limit ${cfg.maxJumps}), jump=${Math.round(pfPlan.jumpSeconds / 60)}min (limit ${cfg.maxJumpMinutes}min), outbound=${pfPlan.outbound}`,
+    );
+    return executePathfinderRoute(ctx, target, opts, pfPlan);
+  }
+
+  if (pfPlan.kind === "normal") {
+    return navigateToSystem(ctx, target, opts);
+  }
+
+  // No Pathfinder Drive — fall back to normal navigation (may still work for
+  // non-frontier edge cases).
+  if (!cfg.enabled) {
+    return navigateToSystem(ctx, target, opts);
+  }
+
+  ctx.log("error", `[frontier] ${pfPlan.kind === "unreachable" ? pfPlan.reason : "route changed"} — aborting frontier travel`);
+  return false;
 }

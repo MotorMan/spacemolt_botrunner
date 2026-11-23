@@ -148,6 +148,9 @@ function nearestMainHubs(
     if (!sys.position || typeof sys.position.x !== "number" || typeof sys.position.y !== "number") continue;
     if (mapStore.isFrontierSystem(sys.id)) continue;
     if (bl.has(sys.id.toLowerCase())) continue;
+    // Never stage a pathfinder jump through a pirate stronghold — that means
+    // landing right in the middle of it.
+    if (mapStore.isPirateSystem(sys.id)) continue;
     const dx = sys.position.x - x;
     const dy = sys.position.y - y;
     out.push({
@@ -191,10 +194,19 @@ export function planFrontierRoute(
   const toFrontier = mapStore.isFrontierSystem(to);
   if (fromFrontier === toFrontier) return { kind: "normal" };
 
-  // Short wormhole shortcut? (Only when the route is genuinely short.)
+  // Short wormhole shortcut? (Only when the route is genuinely short.) Must
+  // exclude frontier wormholes here too — navigateToSystem won't route through
+  // them, so proposing one would just fail and loop.
   let wormholeRoute: string[] | null = null;
   try {
-    wormholeRoute = mapStore.findRouteWithMode(from, to, blacklist, blacklist.length > 0, true);
+    wormholeRoute = mapStore.findRouteWithMode(
+      from,
+      to,
+      blacklist,
+      blacklist.length > 0,
+      true, // allowWormholes
+      true, // excludeFrontierWormholes
+    );
   } catch {
     wormholeRoute = null;
   }

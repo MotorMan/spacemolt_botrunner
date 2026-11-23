@@ -466,7 +466,7 @@ class MapStore {
   // ── Pirate System Check ─────────────────────────────────
 
   /** Check if a system is a pirate system (hostile). */
-  private isPirateSystem(systemId: string): boolean {
+  isPirateSystem(systemId: string): boolean {
     const lower = systemId.toLowerCase();
     const pirateSystems = [
       "alhena",

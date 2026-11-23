@@ -2933,6 +2933,19 @@ const locations = this.findOreLocations(oreId, blacklist);
     return simulatePathfinderLanding(origin, bearingDegrees, all);
   }
 
+  /** Bearing from an arbitrary galactic position to a target system (for mid-flight storm correction). */
+  calculatePathfinderBearingFromPosition(x: number, y: number, targetSystemId: string): number | null {
+    const to = this.data.systems[targetSystemId.toLowerCase()];
+    if (!to?.position) return null;
+    return calculatePathfinderBearing(x, y, to.position.x, to.position.y);
+  }
+
+  /** Simulate a pathfinder landing from an arbitrary galactic position. */
+  simulatePathfinderLandingFromPosition(x: number, y: number, bearingDegrees: number): PathfinderResult | null {
+    const all = this.getAllSystemPositions();
+    return simulatePathfinderLanding({ id: "", x, y }, bearingDegrees, all);
+  }
+
   computeSafePathfinderBearing(fromSystemId: string, toSystemId: string): { bearing: number; safe: boolean; landing: PathfinderResult | null; blocker?: PathfinderResult } | null {
     const fromSys = this.data.systems[fromSystemId.toLowerCase()];
     const toSys = this.data.systems[toSystemId.toLowerCase()];

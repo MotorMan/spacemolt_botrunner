@@ -14,7 +14,7 @@ import {
   PIRATE_SYSTEMS,
   isPirateSystem,
 } from "./common.js";
-import { formatBearing, PATHFINDER_SPEED, generateScanPattern } from "../pathfinder.js";
+import { formatBearing, PATHFINDER_SPEED, generateScanPattern, isPathfinderLandingAtVoid } from "../pathfinder.js";
 import { getMainNetworkSystems } from "./explorer.js";
 import { getEffectiveSystemBlacklist } from "../web/server.js";
 
@@ -241,7 +241,7 @@ export async function executePathfinderJumpToBearing(
   ctx: RoutineContext,
   bearingDegrees: number,
   originPos: { x: number; y: number } | null,
-  options: { waitForCompletion?: boolean; midTransitWaitMs?: number } = {}
+  options: { waitForCompletion?: boolean; midTransitWaitMs?: number; targetSystemId?: string } = {}
 ): Promise<{ success: boolean; landedSystem: string; arrivalPos: { x: number; y: number } | null; ticksTraveled: number }> {
   const { bot } = ctx;
   if (bot.state !== "running") {
@@ -347,6 +347,41 @@ export async function executePathfinderJumpToBearing(
       const p = poiResp.result as Record<string, unknown>;
       inTransit = (p.in_transit as boolean) ?? false;
       ticksRemaining = (p.ticks_remaining as number) ?? ticksRemaining;
+    }
+
+    // ── Storm / drift correction ──
+    const targetId = options.targetSystemId;
+    if (targetId && inTransit && (poll % 15 === 0 || bot.pathfinderStormDeflected)) {
+      bot.pathfinderStormDeflected = false;
+      try {
+        const locResp = await bot.exec("get_location");
+        const loc = locResp.result && typeof locResp.result === "object" ? (locResp.result as Record<string, unknown>) : null;
+        const tx = loc?.transit_x as number | undefined;
+        const ty = loc?.transit_y as number | undefined;
+        const tb = loc?.transit_bearing as number | undefined;
+        if (typeof tx === "number" && typeof ty === "number" && !isNaN(tx) && !isNaN(ty)) {
+          const desired = mapStore.calculatePathfinderBearingFromPosition(tx, ty, targetId);
+          if (desired !== null) {
+            const currentB = typeof tb === "number" && !isNaN(tb) ? tb : bearing;
+            const diff = Math.abs(((desired - currentB + 540) % 360) - 180);
+            if (diff > 10) {
+              const landing = mapStore.simulatePathfinderLandingFromPosition(tx, ty, desired);
+              if (landing && !isPathfinderLandingAtVoid(landing)) {
+                ctx.log("travel", `[pathfinder] Course correction: off by ${diff.toFixed(1)}° — re-jumping at ${formatBearing(desired, 2)}° (landing ${landing.systemId})`);
+                const corrResp = await bot.exec("jump", { target_system: desired });
+                if (corrResp.error) {
+                  ctx.log("error", `[pathfinder] Storm correction jump failed: ${corrResp.error.message}`);
+                } else {
+                  ctx.log("travel", `[pathfinder] Storm correction jump issued`);
+                  await ctx.sleep(1000);
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        ctx.log("debug", `[pathfinder] Storm check failed: ${e}`);
+      }
     }
 
     if (poll % 6 === 0) {
@@ -1066,6 +1101,7 @@ export async function navigateFrontierToMainNetwork(
     const result = await executePathfinderJumpToBearing(ctx, bearing, currentPos, {
       waitForCompletion: true,
       midTransitWaitMs,
+      targetSystemId: target.systemId,
     });
 
     if (!result.success) {

@@ -183,6 +183,8 @@ export class Bot {
   account: Account | null = null;
   /** Unsubscribe functions for the event subscriptions registered in `subscribeEvents`. */
   private eventUnsubscribers: Array<() => void> = [];
+  /** Set when a `pathfinder_storm` notification reports the ship was deflected. Consumed by performPathfinderJump. */
+  pathfinderStormDeflected = false;
   /** Unsubscribe function for the realtime market push stream (only used by trade routines). */
   private marketUnsubscriber: (() => void) | null = null;
   private baseDir: string;
@@ -3284,7 +3286,10 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     }
 
     await this.refreshStatus();
-    
+
+    // Clear any stale storm-deflection flag from a previous jump.
+    this.pathfinderStormDeflected = false;
+
     const originSystem = this.system;
     
     let directJump = getDirectPathfinderJump(originSystem, targetSystemId);
@@ -3489,6 +3494,48 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
               }
             }
           }
+        }
+      }
+
+      // ── Storm / drift correction ──────────────────────────────────────────
+      // Pathfinder storms near aggressive stars can deflect the ship tens of
+      // degrees off its plotted bearing. Every ~30s (or immediately when a
+      // pathfinder_storm push arrives) re-plot a jump from the CURRENT position
+      // back toward the target system.
+      if (inTransit && (poll % 6 === 0 || this.pathfinderStormDeflected) && poll > 1) {
+        this.pathfinderStormDeflected = false;
+        try {
+          const locResp = await this.libExec("get_location");
+          const loc = locResp.result && typeof locResp.result === "object" ? (locResp.result as Record<string, unknown>) : null;
+          const tx = loc?.transit_x as number | undefined;
+          const ty = loc?.transit_y as number | undefined;
+          const tbearing = loc?.transit_bearing as number | undefined;
+          if (typeof tx === "number" && typeof ty === "number" && !isNaN(tx) && !isNaN(ty)) {
+            const desired = mapStore.calculatePathfinderBearingFromPosition(tx, ty, targetSystemId);
+            if (desired !== null) {
+              const currentB = typeof tbearing === "number" && !isNaN(tbearing) ? tbearing : bearing;
+              const diff = Math.abs(((desired - currentB + 540) % 360) - 180);
+              if (diff > 10) {
+                const landing = mapStore.simulatePathfinderLandingFromPosition(tx, ty, desired);
+                if (landing && !isPathfinderLandingAtVoid(landing)) {
+                  this.log("travel", `[pathfinder] Course correction: off by ${diff.toFixed(1)}° — re-jumping at ${desired.toFixed(2)}° (landing ${landing.systemId})`);
+                  recordPathfinderCorrection(this.username, (tick ?? 0) + 1, desired);
+                  const corrResp = await this.exec("jump", { target_system: desired });
+                  if (corrResp.error) {
+                    this.log("error", `[pathfinder] Storm correction jump failed: ${corrResp.error.message}`);
+                  } else {
+                    this.log("travel", `[pathfinder] Storm correction jump issued`);
+                    currentBearing = desired;
+                    await new Promise(r => setTimeout(r, 1000));
+                  }
+                } else {
+                  this.log("warn", `[pathfinder] Off course by ${diff.toFixed(1)}° but no safe correction landing — holding`);
+                }
+              }
+            }
+          }
+        } catch (e) {
+          this.log("debug", `[pathfinder] Storm check failed: ${e}`);
         }
       }
     }
@@ -4129,6 +4176,16 @@ return {
       }
       if (msgType === "battle_left" && data && typeof data === "object" && (data as Record<string, unknown>).reason === "emergency_warp") {
         this.triggerEmergencyWarpStabilizer();
+        continue;
+      }
+
+      // Pathfinder storm deflection (solar flare from an aggressive star while
+      // mid-jump). Flag it so performPathfinderJump can re-plot a correction.
+      if (msgType === "pathfinder_storm" || type === "pathfinder_storm") {
+        if (data && typeof data === "object" && (data as Record<string, unknown>).deflected === true) {
+          this.pathfinderStormDeflected = true;
+          this.log("travel", `[pathfinder] Storm deflection detected${(data as Record<string, unknown>).message ? `: ${(data as Record<string, unknown>).message}` : ""}`);
+        }
         continue;
       }
 

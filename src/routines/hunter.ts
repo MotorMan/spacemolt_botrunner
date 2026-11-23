@@ -3591,6 +3591,19 @@ async function* repeaterHunterRoutine(ctx: RoutineContext): AsyncGenerator<strin
       if (targetPois.length > 0) {
         patrolPois = patrolPois.filter(p => targetPois.includes(p.id) || targetPois.includes(p.name));
       }
+      // Look at the POI we are already in FIRST before running off to the first
+      // POI in the list. When the hunter starts (or resumes) already sitting in a
+      // patrolled POI, walking the route from index 0 makes it jump away and then
+      // back just to scan where it already is — wasting travel time and missing
+      // repeaters that are right here. Rotating the current POI to the front
+      // makes the loop scan it first (travel is a no-op "already there") and only
+      // then continue through the rest of the system.
+      const currentPoiIdx = patrolPois.findIndex(p => p.id === bot.poi || p.name === bot.poi);
+      if (currentPoiIdx > 0) {
+        const [currentPoi] = patrolPois.splice(currentPoiIdx, 1);
+        patrolPois.unshift(currentPoi);
+        ctx.log("info", `Repeater hunter: starting sweep at current POI ${currentPoi.name} before travelling the route`);
+      }
       if (patrolPois.length === 0) {
         ctx.log("info", "Repeater hunter: no non-station POIs in target system — waiting 30s");
         await ctx.sleep(30000);

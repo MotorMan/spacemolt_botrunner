@@ -81,6 +81,12 @@ import {
   clearFlockState,
   type FlockState,
 } from "./flock.js";
+import {
+  buildFrontierTravelConfig,
+  travelToSystemSmart,
+  type FrontierNavOpts,
+} from "./frontierTravel.js";
+import { topUpShields, useRepairKits } from "./common.js";
 
 // ── Cloaking module detection and enablement ────────────────────────────────
 
@@ -159,14 +165,62 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
  * When the bot is cloaked and cloakIgnoreBlacklist is enabled, returns an empty array
  * to allow mining in pirate/hot zones that would otherwise be blacklisted.
  * For non-explorers, also includes the frontier system blacklist.
+ *
+ * A Pathfinder Drive is a deliberate, user-installed module that lets the miner
+ * cross into the Frontier, so when it is fitted the frontier systems are removed
+ * from the blacklist — mirroring how a cloaking module bypasses the pirate
+ * blacklist. Without a drive the frontier stays blacklisted (the ship could not
+ * get back out if a wormhole closed behind it).
  */
-function getMiningBlacklist(bot: { routineName: string | null; username?: string }, settings: Awaited<ReturnType<typeof getMinerSettings>>, isCloaked: boolean): string[] {
+function getMiningBlacklist(bot: { routineName: string | null; username?: string }, settings: Awaited<ReturnType<typeof getMinerSettings>>, isCloaked: boolean, hasPathfinderDrive: boolean = false): string[] {
   const baseBlacklist = getEffectiveSystemBlacklist(bot);
   if (isCloaked && settings.cloakIgnoreBlacklist) {
     // Logging is done by the caller since ctx is not available here
     return [];
   }
+  if (hasPathfinderDrive) {
+    // Pathfinder Drive unlocks the Frontier (the module exists to go there).
+    return baseBlacklist.filter((id) => !mapStore.isFrontierSystem(id));
+  }
   return baseBlacklist;
+}
+
+/**
+ * Continuous shield/hull safety for hazardous POIs (very common in the
+ * Frontier, where hazard POIs damage the ship while it is stationed inside).
+ *
+ * Every harvest iteration this keeps shields topped up with shield charges and
+ * patches the hull with repair kits in the field. It returns the current
+ * hull/shield percentages and whether the hull has fallen to the critical
+ * threshold at which the caller should flee home.
+ */
+async function monitorHazardSafety(
+  ctx: RoutineContext,
+  criticalHullPct: number,
+): Promise<{ hullPct: number; shieldsPct: number; critical: boolean }> {
+  const { bot } = ctx;
+  await bot.refreshShip();
+  const shieldsPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+  const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+
+  // Keep shields topped up before they collapse.
+  if (shieldsPct < 80) {
+    const ok = await topUpShields(ctx, 0.8);
+    if (ok) {
+      ctx.log("combat", `Hazard damage: shields at ${shieldsPct}% — used a shield charge to top up`);
+    }
+  }
+
+  // Patch the hull with repair kits while in the field (never while docked —
+  // the station repairs for free). useRepairKits no-ops for small deficits.
+  if (hullPct < 95 && !bot.docked) {
+    const patched = await useRepairKits(ctx);
+    if (patched) {
+      ctx.log("combat", `Hazard damage: hull at ${hullPct}% — used a repair kit`);
+    }
+  }
+
+  return { hullPct, shieldsPct, critical: hullPct <= criticalHullPct };
 }
 
 /**
@@ -259,7 +313,10 @@ function isDeepCoreRadioactiveOre(resourceId: string): boolean {
  * must not target them. This check is intentionally limited to radioactive
  * mining so regular miners keep their existing behavior.
  */
-function isForbiddenRadioactiveSystem(systemId: string): boolean {
+function isForbiddenRadioactiveSystem(systemId: string, allowFrontier: boolean = false): boolean {
+  // A Pathfinder Drive lets a radioactive miner reach the Frontier and jump
+  // back out, so the wormhole-stranding ban is lifted when it is fitted.
+  if (allowFrontier) return false;
   return mapStore.isFrontierSystem(systemId);
 }
 
@@ -585,8 +642,11 @@ async function getMinerSettings(username?: string): Promise<{
   jettisonIce: string[]; // Ice IDs to jettison when ice mining
   depletionTimeoutHours: number;
   ignoreDepletion: boolean;
-  stayOutUntilFull: boolean;
+stayOutUntilFull: boolean;
    maxJumps: number;
+   /** If a wormhole route to a frontier target is at most this many jumps, use it
+    *  instead of a Pathfinder Drive crossing. Higher = prefer wormholes more. */
+   pathfinderFrontierJumpThreshold: number;
    minimumFuelCells: number;
    returnHomeOnFuelCellsRemaining: number;
    noMidMiningRetarget: boolean;
@@ -698,6 +758,7 @@ iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     ignoreDepletion: (m.ignoreDepletion as boolean) ?? false,
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
     maxJumps: (m.maxJumps as number) ?? 10,
+    pathfinderFrontierJumpThreshold: (m.pathfinderFrontierJumpThreshold as number) ?? 15,
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
     returnHomeOnFuelCellsRemaining: (m.returnHomeOnFuelCellsRemaining as number) ?? 2,
     noMidMiningRetarget: (m.noMidMiningRetarget as boolean) ?? false,
@@ -1607,6 +1668,7 @@ export function pickTargetFromQuotas(
   totalMiningPower: number = 0,
   jettisonOres: string[] = [],
   hasModulatedMiningLaser?: boolean,
+  allowFrontier: boolean = false,
 ): string {
   const jettisonSet = new Set(jettisonOres.map(o => o.toLowerCase()));
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number; hasViableLocations: boolean }> = [];
@@ -1620,7 +1682,7 @@ export function pickTargetFromQuotas(
       const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
         // Radioactive miners must not target Frontier systems (wormhole stranding risk).
-        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId)) return false;
+        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
         if (shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
           return false;
         }
@@ -1641,7 +1703,7 @@ export function pickTargetFromQuotas(
       if (jettisonSet.has(resourceId.toLowerCase())) continue;
       const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
-        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId)) return false;
+        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
         if (shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
           return false;
         }
@@ -1687,6 +1749,7 @@ export function findFirstAvailableQuotaTarget(
   botSystem?: string,
   maxJumps?: number,
   hasModulatedMiningLaser?: boolean,
+  allowFrontier: boolean = false,
 ): string {
   const excludeSet = new Set<string>();
   if (excludeTargets) {
@@ -1753,6 +1816,7 @@ export function findFirstAvailableQuotaTarget(
       skipPirateSystems ?? true,
       undefined,
       hasModulatedMiningLaser,
+      allowFrontier,
     );
     if (reachable.length > 0) {
       return entry.resourceId;
@@ -1793,6 +1857,7 @@ function getReachableOreLocations(
   skipPirateSystems: boolean,
   excludeSystems?: Set<string>,
   hasModulatedMiningLaser?: boolean,
+  allowFrontier: boolean = false,
 ): Array<{
   systemId: string; systemName: string; poiId: string; poiName: string;
   remaining: number; maxRemaining: number; richness: number;
@@ -1813,7 +1878,7 @@ function getReachableOreLocations(
     // POI type / hidden-access checks
     if (miningType === "radioactive") {
       // Frontier systems are wormhole-only and can strand the miner.
-      if (isForbiddenRadioactiveSystem(loc.systemId)) continue;
+      if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) continue;
       if (poi.hidden === true && !canMineHiddenRadioactive) continue;
     } else if (miningType === "ice") {
       if (poi.hidden === true && !canMineHiddenIce) continue;
@@ -1923,6 +1988,7 @@ function pickTargetFromQuotasOrClosest(
   botUsername?: string,
   jettisonOres: string[] = [],
   hasModulatedMiningLaser?: boolean,
+  allowFrontier: boolean = false,
 ): { target: string; hasDeficit: boolean } {
   const jettisonSet = new Set(jettisonOres.map(o => o.toLowerCase()));
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number; hasViableLocations: boolean }> = [];
@@ -1937,7 +2003,7 @@ function pickTargetFromQuotasOrClosest(
 
     const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
-        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId)) return false;
+        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
         const hasScanData = loc.minutesSinceScan !== Infinity;
         const isLowRemainingWithUnknownPower = shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
         if (isLowRemainingWithUnknownPower) {
@@ -2443,11 +2509,12 @@ function findBestHiddenPoiForOre(
   minRichness: number = 50, // Only consider POIs with richness >= this
   blacklist: string[] = [], // Systems to exclude (can be empty for cloaked miners)
   excludeFrontier: boolean = false, // Radioactive miners must skip Frontier systems
+  allowFrontier: boolean = false, // Pathfinder Drive fitted: Frontier is reachable
 ): { poiId: string; poiName: string; systemId: string; systemName: string; richness: number; remaining: number; jumps: number; isHidden: boolean; supportedPower: number } | null {
   // Radioactive ores are different from deep-core ores: any richness is viable
-  // and Frontier systems are always off-limits (wormhole stranding risk).
+  // and Frontier systems are off-limits unless a Pathfinder Drive is fitted.
   const radioactiveOre = isRadioactiveOre(oreId);
-  const effectiveExcludeFrontier = excludeFrontier || radioactiveOre;
+  const effectiveExcludeFrontier = (excludeFrontier || radioactiveOre) && !allowFrontier;
   const effectiveMinRichness = radioactiveOre ? 0 : minRichness;
 
   const locations = mapStore.findOreLocations(oreId, blacklist, blacklist.length === 0).filter(loc => {
@@ -2455,7 +2522,7 @@ function findBestHiddenPoiForOre(
     if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
 
     // Frontier systems are wormhole-only and can strand the miner.
-    if (effectiveExcludeFrontier && isForbiddenRadioactiveSystem(loc.systemId)) return false;
+    if (effectiveExcludeFrontier && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
     
     // Must be a hidden POI
     const sys = mapStore.getSystem(loc.systemId);
@@ -2525,13 +2592,14 @@ function areAllHiddenPoisDepleted(
   currentPoiId: string,
   ignoreDepletion: boolean,
   depletionTimeoutMs: number,
+  allowFrontier: boolean = false,
 ): boolean {
   const allHiddenLocations = mapStore.findOreLocations(oreId, undefined, true).filter(loc => {
     // Skip current POI
     if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
 
     // Radioactive miners must not count Frontier systems as available.
-    if (isRadioactiveOre(oreId) && isForbiddenRadioactiveSystem(loc.systemId)) return false;
+    if (isRadioactiveOre(oreId) && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
     
     // Must be a hidden POI
     const sys = mapStore.getSystem(loc.systemId);
@@ -2630,6 +2698,20 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let lastFlockHeartbeat = 0;
     let lastFlockStateUpdate = 0;
 
+    // ── Pathfinder Drive detection ──
+    // A fitted Pathfinder Drive is a deliberate signal that this miner is meant
+    // to work in the Frontier. Refresh the capability flag once at startup so
+    // frontier systems unlock (blacklist bypass) and pathfinder crossings are
+    // enabled for the whole run.
+    try {
+      await bot.refreshShipMods();
+    } catch (e) {
+      ctx.log("warn", `Failed to refresh ship modules for Pathfinder detection: ${e}`);
+    }
+    if (bot.hasPathfinderDrive) {
+      ctx.log("mining", "Pathfinder Drive detected — Frontier systems unlocked for this miner");
+    }
+
     // ── Escort location broadcast tracking ──
     let lastEscortLocationBroadcast = 0;
 
@@ -2710,10 +2792,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const adequacy = await checkFuelCellAdequacy(ctx, homeSystem, homeSystem, bot);
         ctx.log("mining", `Started in the field with low fuel cells (${startupFuelCells.summary}) — ${adequacy.reason} — returning to home system ${homeSystem} to stock up before mining`);
         try {
-          const wentHome = await navigateToSystem(ctx, homeSystem, {
+          const startupFrontierCfg = buildFrontierTravelConfig(settings0, bot.hasPathfinderDrive);
+          const startupBlacklist = getMiningBlacklist({ routineName: bot.routineName, username: bot.username }, settings0, bot.isCloaked === true, bot.hasPathfinderDrive === true);
+          const wentHome = await travelToSystemSmart(ctx, homeSystem, {
             fuelThresholdPct: settings0.refuelThreshold,
             hullThresholdPct: settings0.repairThreshold,
-          });
+            blacklist: startupBlacklist,
+          }, startupFrontierCfg);
           if (wentHome) {
             await ensureDocked(ctx);
             ctx.log("mining", "Returned home and docked — running normal home-station startup routine");
@@ -2873,22 +2958,27 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       };
 
       const settings = await getMinerSettings(bot.username);
+      // Radioactive miners may enter the Frontier when a Pathfinder Drive is fitted.
+      const allowFrontier = bot.hasPathfinderDrive === true;
       if (await hasModulatedMiningLaser(ctx, cachedModules)) {
         settings.ignoreDepletion = true;
         ctx.log("mining", "Modulated Mining Laser detected — ignoring depletion lockout for this cycle");
       }
       const hasCloak = await hasCloakingModule(ctx, cachedModules);
       const cargoThresholdRatio = settings.cargoThreshold / 100;
-      const safetyOpts = {
+      // Get blacklist - use empty only if bot actually has a cloaking module and is cloaked.
+      // A fitted Pathfinder Drive unlocks the Frontier (see getMiningBlacklist).
+      const blacklist = getMiningBlacklist({ routineName: bot.routineName, username: bot.username }, settings, hasCloak && bot.isCloaked, bot.hasPathfinderDrive === true);
+      const safetyOpts: FrontierNavOpts & { blacklist: string[] } = {
         fuelThresholdPct: settings.refuelThreshold,
         hullThresholdPct: settings.repairThreshold,
         skipBlacklist: hasCloak && bot.isCloaked && settings.cloakIgnoreBlacklist,
         ignoreBlacklistWhenCloaked: false,
+        blacklist,
       };
+      // Frontier travel config for this cycle (auto-enabled when a Pathfinder Drive is fitted).
+      const frontierCfg = buildFrontierTravelConfig(settings, bot.hasPathfinderDrive);
       const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
-      
-      // Get blacklist - use empty only if bot actually has a cloaking module and is cloaked
-      const blacklist = getMiningBlacklist({ routineName: bot.routineName, username: bot.username }, settings, hasCloak && bot.isCloaked);
 
       // ── Low fuel cells check ──
       // Return home to deposit loot and resupply when fuel cells drop to or below
@@ -2908,7 +2998,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             await refuelAtStation(ctx, currentStation, safetyOpts.fuelThresholdPct);
           }
         }
-        const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+        const homeArrived = await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
         if (!homeArrived) {
           ctx.log("error", "Failed to return to home system — will retry next cycle");
           await ctx.sleep(30000);
@@ -3342,7 +3432,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 // When docked at home, use enhanced selection that always picks a target
        // This ensures the miner keeps cycling through ores even when all quotas are met
        if (bot.docked && bot.system === homeSystem) {
-            const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings, bot.username, getJettisonListForMiningType(settings, miningType), hasModulatedLaser);
+            const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings, bot.username, getJettisonListForMiningType(settings, miningType), hasModulatedLaser, allowFrontier);
          quotaTargetResource = quotaResult.target;
          quotaHasDeficit = quotaResult.hasDeficit;
          if (quotaResult.target) {
@@ -3358,7 +3448,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
          }
 } else {
           // Original behavior when not at home
-          quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, getJettisonListForMiningType(settings, miningType), hasModulatedLaser);
+          quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, getJettisonListForMiningType(settings, miningType), hasModulatedLaser, allowFrontier);
           if (quotaTargetResource) {
             ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
           } else {
@@ -3503,7 +3593,7 @@ if (shouldAbandon) {
         quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
         canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois,
         Array.from(triedAndRejectedTargets), !(hasCloak && bot.isCloaked), totalMiningPower, bot.username,
-        blacklist, bot.system, maxJumps, hasModulatedLaser
+        blacklist, bot.system, maxJumps, hasModulatedLaser, allowFrontier
       );
       if (freshTarget) {
         effectiveTarget = freshTarget;
@@ -3546,7 +3636,7 @@ if (shouldAbandon) {
           }
         }
       }
-      const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const homeArrived = await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
       if (!homeArrived) {
         ctx.log("error", "Failed to return to home system — will retry next cycle");
         await ctx.sleep(30000);
@@ -3893,7 +3983,7 @@ const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system,
 
     // Radioactive miners must never be sent into a Frontier system, even when
     // one is configured, because the wormhole can expire and strand the ship.
-    if (miningType === "radioactive" && configuredSystem && isForbiddenRadioactiveSystem(configuredSystem)) {
+    if (miningType === "radioactive" && configuredSystem && isForbiddenRadioactiveSystem(configuredSystem, allowFrontier)) {
       ctx.log("warn", `Configured radioactive system ${configuredSystem} is a Frontier system — ignoring (wormhole stranding risk)`);
       configuredSystem = "";
     }
@@ -3922,7 +4012,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         }
         if (miningType === "radioactive") {
           // Frontier systems are wormhole-only and can strand the miner.
-          if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
+          if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
           if (poi.hidden === true && !canMineHiddenRadioactive) return false;
           return true;
         }
@@ -3980,7 +4070,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
            return true;
          }
           if (miningType === "radioactive") {
-            if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
+            if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
             if (poi.hidden === true && !canMineHiddenRadioactive) return false;
             return true;
           }
@@ -4079,7 +4169,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
             const availableQuotaTarget = findFirstAvailableQuotaTarget(
               quotaTargetsToUse, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
               canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois, originalTarget, true, totalMiningPower, bot.username,
-              blacklist, bot.system, maxJumps, hasModulatedLaser
+              blacklist, bot.system, maxJumps, hasModulatedLaser, allowFrontier
             );
           if (availableQuotaTarget && availableQuotaTarget !== originalTarget) {
             effectiveTarget = availableQuotaTarget;
@@ -4095,7 +4185,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                   return true;
                 }
                 if (miningType === "radioactive") {
-                  if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
+                  if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
                   if (poi.hidden === true && !canMineHiddenRadioactive) return false;
                   return true;
                 }
@@ -4351,7 +4441,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                 return true;
               }
               if (miningType === "radioactive") {
-                if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
+                if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
                 if (poi.hidden === true && !canMineHiddenRadioactive) return false;
                 return true;
               }
@@ -4741,7 +4831,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
             await refuelAtStation(ctx, currentStation, safetyOpts.fuelThresholdPct);
           }
         }
-        const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+        const homeArrived = await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
         if (!homeArrived) {
           ctx.log("error", "Failed to return home for fuel cells — will retry next cycle");
           await ctx.sleep(30000);
@@ -4755,7 +4845,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
 
       ctx.log("mining", `Navigating to ${targetSystemId} for ${effectiveTarget || resourceLabel || miningType} mining (fuel cells: ${preNavFuelCells.cells}, ${preNavFuelCells.fuel} fuel — ${fuelAdequacy.reason})`);
 
-      const arrived = await navigateToSystem(ctx, targetSystemId, travelOpts);
+      const arrived = await travelToSystemSmart(ctx, targetSystemId, travelOpts, frontierCfg);
       if (!arrived) {
         // CRITICAL: do NOT fall back to local mining here. The whole point of the
         // quota-driven targeting is to keep searching for a reachable ore/system.
@@ -4803,7 +4893,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           }
         }
         
-        const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+        const homeArrived = await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
         if (!homeArrived) {
           ctx.log("error", "Failed to return to home system — will retry next cycle");
         }
@@ -5092,7 +5182,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           const newTarget = findFirstAvailableQuotaTarget(
             quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
             canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois, excludeTarget, !(hasCloak && bot.isCloaked), totalMiningPower, bot.username,
-            blacklist, bot.system, maxJumps, hasModulatedLaser
+            blacklist, bot.system, maxJumps, hasModulatedLaser, allowFrontier
           );
           if (newTarget && newTarget !== effectiveTarget) {
             searchTarget = newTarget;
@@ -5116,7 +5206,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
            }
           if (miningType === "radioactive") {
             // Frontier systems are wormhole-only and can strand the miner.
-            if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
+            if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
             const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                               (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
                                                loc.poiName.toLowerCase().includes('mineral field') ||
@@ -5240,7 +5330,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                   continue;
                 }
               }
-              const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+              const homeArrived = await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
               if (!homeArrived) {
                 ctx.log("error", "Failed to return to home system — will retry next cycle");
               }
@@ -5268,7 +5358,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               continue;
             }
             
-            const arrived = await navigateToSystem(ctx, chosen.systemId, safetyOpts);
+            const arrived = await travelToSystemSmart(ctx, chosen.systemId, safetyOpts, frontierCfg);
             if (arrived) {
               // Refresh pois list for new system and retry travel
               const { pois: newPois } = await getSystemInfo(ctx);
@@ -5300,7 +5390,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               targetResource = "";
               await ensureUndocked(ctx);
               const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-              if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+              if (fueled) await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
               await ensureDocked(ctx);
               await dumpCargo(ctx, settings);
               await tryRefuel(ctx, { skipApprovedCheck: true });
@@ -5311,7 +5401,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               isValid = !chosenPoi.hidden || canMineHiddenPois;
             } else if (miningType === "radioactive") {
               isValid = canMineBasicRadioactive &&
-                !isForbiddenRadioactiveSystem(chosen.systemId) &&
+                !isForbiddenRadioactiveSystem(chosen.systemId, allowFrontier) &&
                 (!chosenPoi.hidden || canMineHiddenRadioactive);
             } else if (miningType === "gas") {
               isValid = true;
@@ -5347,7 +5437,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                  targetResource = "";
                  await ensureUndocked(ctx);
                 const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-                if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+                if (fueled) await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
                 await ensureDocked(ctx);
                 await dumpCargo(ctx, settings);
                 await tryRefuel(ctx, { skipApprovedCheck: true });
@@ -5357,7 +5447,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               ctx.log("error", "Failed to reach alternative system — returning home to retry next cycle");
               await ensureUndocked(ctx);
               const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-              if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+              if (fueled) await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
               await ensureDocked(ctx);
               await dumpCargo(ctx, settings);
               await tryRefuel(ctx, { skipApprovedCheck: true });
@@ -5375,7 +5465,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             // Still need to return home to deposit cargo
             await ensureUndocked(ctx);
             const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-            if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+            if (fueled) await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
             await ensureDocked(ctx);
             await dumpCargo(ctx, settings);
             await tryRefuel(ctx, { skipApprovedCheck: true });
@@ -5393,7 +5483,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           // Still need to return home to deposit cargo
           await ensureUndocked(ctx);
           const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-          if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (fueled) await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
           await ensureDocked(ctx);
           await dumpCargo(ctx, settings);
           await tryRefuel(ctx, { skipApprovedCheck: true });
@@ -5432,7 +5522,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           continue;
         }
       }
-      const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const homeArrived = await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
       if (!homeArrived) {
         ctx.log("error", "Failed to return to home system — will retry next cycle");
       }
@@ -5540,7 +5630,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               } catch (e) {
                 ctx.log("error", `Failed to return to ${homeSys}: ${e}`);
                 // Navigate back using normal navigation
-                await navigateToSystem(ctx, homeSys, safetyOpts);
+                await travelToSystemSmart(ctx, homeSys, safetyOpts, frontierCfg);
               }
             } catch (e) {
               ctx.log("error", `Failed to travel to ${targetSysName}: ${e}`);
@@ -5948,10 +6038,9 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
         ctx.log("flock", `Leader heartbeat: target=${effectiveTarget || "none"}, phase=${flockPhase}`);
       }
 
-      await bot.refreshShip();
-
-      const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-      if (midHull <= 40) { stopReason = `hull critical (${midHull}%)`; break; }
+      // ── Continuous shield/hull safety (hazard POIs, especially in the Frontier) ──
+      const { hullPct: midHull, shieldsPct: midShields, critical: hullCritical } = await monitorHazardSafety(ctx, 40);
+      if (hullCritical) { stopReason = `hull critical (${midHull}%, shields ${midShields}%)`; break; }
 
       const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (midFuel < safetyOpts.fuelThresholdPct) { stopReason = `fuel low (${midFuel}%)`; break; }
@@ -6075,7 +6164,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             const poi = sys?.pois.find(p => p.id === loc.poiId);
             if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               if (miningType === "radioactive") return canMineBasicRadioactive &&
-                !isForbiddenRadioactiveSystem(loc.systemId) && (
+                !isForbiddenRadioactiveSystem(loc.systemId, allowFrontier) && (
                 isOreBeltPoi(poi?.type || "") ||
                 (!poi?.hidden && canMineDeepCoreRadioactive) ||
                 (poi?.hidden && canMineHiddenRadioactive)
@@ -6176,7 +6265,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                         continue;
                       }
                     }
-                    const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+                    const homeArrived = await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
                     if (!homeArrived) {
                       ctx.log("error", "Failed to return to home system — will retry next cycle");
                     }
@@ -6226,7 +6315,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                       return true;
                     }
                   };
-                  const arrived = await navigateToSystem(ctx, bestLoc.systemId, travelOpts);
+                  const arrived = await travelToSystemSmart(ctx, bestLoc.systemId, travelOpts, frontierCfg);
                   if (arrived) {
                     const { pois: newPois } = await getSystemInfo(ctx);
                     pois = newPois;
@@ -6412,7 +6501,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
           continue;
         }
       }
-      const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const homeArrived = await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
                           if (!homeArrived) {
                             ctx.log("error", "Failed to return to home system — will retry next cycle");
                           }
@@ -6457,7 +6546,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                               return true;
                             }
                           };
-                          const arrived = await navigateToSystem(ctx, chosen.systemId, travelOpts);
+                          const arrived = await travelToSystemSmart(ctx, chosen.systemId, travelOpts, frontierCfg);
                           if (arrived) {
                             const { pois: newPois } = await getSystemInfo(ctx);
                             pois = newPois;
@@ -6679,8 +6768,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               settings.ignoreDepletion,
               depletionTimeoutMs,
               50,
-              blacklist
-            );
+              blacklist, allowFrontier);
             if (nextHiddenPoi) {
               newTarget = entry.oreId;
               newPoiId = nextHiddenPoi.poiId;
@@ -6703,8 +6791,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
             settings.ignoreDepletion,
             depletionTimeoutMs,
             0,
-            blacklist
-          );
+            blacklist, allowFrontier);
           if (anyPoi) {
             newTarget = effectiveTarget;
             newPoiId = anyPoi.poiId;
@@ -6731,7 +6818,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
           // Travel to new POI if in different system
           if (newSystemId && newSystemId !== bot.system) {
             ctx.log("mining", `Traveling to ${newTarget} in ${newSystemId}`);
-            const arrived = await navigateToSystem(ctx, newSystemId, safetyOpts);
+            const arrived = await travelToSystemSmart(ctx, newSystemId, safetyOpts, frontierCfg);
             if (!arrived) {
               ctx.log("error", "Failed to reach new system — returning home");
               stopReason = "deposit too sparse for equipment";
@@ -6867,8 +6954,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                 settings.ignoreDepletion,
                 depletionTimeoutMs,
                 50,
-                blacklist
-              );
+                blacklist, allowFrontier);
               if (nextHiddenPoi) {
                 newTarget = entry.oreId;
                 newPoiId = nextHiddenPoi.poiId;
@@ -6891,8 +6977,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               settings.ignoreDepletion,
               depletionTimeoutMs,
               0,
-              blacklist
-            );
+              blacklist, allowFrontier);
             if (anyPoi) {
               newTarget = effectiveTarget;
               newPoiId = anyPoi.poiId;
@@ -6919,7 +7004,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
             // Travel to new POI if in different system
             if (newSystemId && newSystemId !== bot.system) {
               ctx.log("mining", `Traveling to ${newTarget} in ${newSystemId}`);
-              const arrived = await navigateToSystem(ctx, newSystemId, safetyOpts);
+              const arrived = await travelToSystemSmart(ctx, newSystemId, safetyOpts, frontierCfg);
               if (!arrived) {
                 ctx.log("error", "Failed to reach new system — returning home");
                 stopReason = "deposit too sparse for equipment";
@@ -7016,8 +7101,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                 settings.ignoreDepletion,
                 depletionTimeoutMs,
                 50,
-                blacklist
-              );
+                blacklist, allowFrontier);
               if (nextHiddenPoi) {
                 newTarget = entry.oreId;
                 newPoiId = nextHiddenPoi.poiId;
@@ -7040,8 +7124,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               settings.ignoreDepletion,
               depletionTimeoutMs,
               0,
-              blacklist
-            );
+              blacklist, allowFrontier);
             if (anyPoi) {
               newTarget = effectiveTarget;
               newPoiId = anyPoi.poiId;
@@ -7068,7 +7151,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
             // Travel to new POI if in different system
             if (newSystemId && newSystemId !== bot.system) {
               ctx.log("mining", `Traveling to ${newTarget} in ${newSystemId}`);
-              const arrived = await navigateToSystem(ctx, newSystemId, safetyOpts);
+              const arrived = await travelToSystemSmart(ctx, newSystemId, safetyOpts, frontierCfg);
               if (!arrived) {
                 ctx.log("error", "Failed to reach new system — returning home");
                 stopReason = "deposit too sparse for equipment";
@@ -7207,8 +7290,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               settings.ignoreDepletion,
               depletionTimeoutMs,
               50,
-              blacklist
-            );
+              blacklist, allowFrontier);
             
             if (hiddenPoi) {
               newTarget = effectiveTarget;
@@ -7222,8 +7304,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                 bot.system,
                 bot.poi || "",
                 settings.ignoreDepletion,
-                depletionTimeoutMs
-              );
+                depletionTimeoutMs, allowFrontier);
               
               if (allHiddenDepleted) {
                 ctx.log("mining", `All hidden POIs for ${effectiveTarget} are depleted (on timer) — switching to next quota ore`);
@@ -7257,8 +7338,7 @@ for (const quotaEntry of sortedOres) {
                       settings.ignoreDepletion,
                       depletionTimeoutMs,
                       50,
-                      blacklist
-                    );
+                      blacklist, allowFrontier);
                     
                     if (nextHiddenPoi) {
                       newTarget = quotaEntry.oreId;
@@ -7281,8 +7361,7 @@ for (const quotaEntry of sortedOres) {
                         settings.ignoreDepletion,
                         depletionTimeoutMs,
                         30,
-                        blacklist
-                      );
+                        blacklist, allowFrontier);
                       if (anyPoi) {
                         anyHiddenAvailable = true;
                         break;
@@ -7301,8 +7380,7 @@ for (const quotaEntry of sortedOres) {
                           settings.ignoreDepletion,
                           depletionTimeoutMs,
                           0,
-                          blacklist
-                        );
+                          blacklist, allowFrontier);
 
                       if (anyPoiResult) {
                         newTarget = oreEntry.oreId;
@@ -7351,8 +7429,7 @@ for (const quotaEntry of sortedOres) {
                     settings.ignoreDepletion,
                     depletionTimeoutMs,
                     50,
-                    blacklist
-                  );
+                    blacklist, allowFrontier);
                   
                   if (nextHiddenPoi) {
                     newTarget = quotaEntry.oreId;
@@ -7411,8 +7488,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                   settings.ignoreDepletion,
                   depletionTimeoutMs,
                   50,
-                  blacklist
-                );
+                  blacklist, allowFrontier);
 
               if (hiddenPoiResult) {
                 newTarget = deepCoreOre;
@@ -7436,8 +7512,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                   settings.ignoreDepletion,
                   depletionTimeoutMs,
                   0,
-                  blacklist
-                );
+                  blacklist, allowFrontier);
 
                 if (anyPoiResult) {
                   newTarget = deepCoreOre;
@@ -7497,7 +7572,8 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                 depletionTimeoutMs,
                 0, // radioactive ores are viable at any richness
                 blacklist,
-                true // never target Frontier systems
+                true, // never target Frontier systems
+                allowFrontier
               );
 
               if (hiddenPoiResult) {
@@ -7526,7 +7602,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               if (miningType === "radioactive") {
-                if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
+                if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
                 const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                                   (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
                                                    loc.poiName.toLowerCase().includes('mineral field') ||
@@ -7591,7 +7667,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
                 if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               if (miningType === "radioactive") {
-                if (isForbiddenRadioactiveSystem(loc.systemId)) return false;
+                if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
                 const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                                   (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
                                                    loc.poiName.toLowerCase().includes('mineral field') ||
@@ -7730,7 +7806,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                     if (poi.hidden) continue; // Hidden POIs need special handling
                   }
                   if (miningType === "radioactive") {
-                    if (isForbiddenRadioactiveSystem(loc.systemId)) continue;
+                    if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) continue;
                     if (poi.hidden && !canMineHiddenRadioactive) continue;
                   }
                   if (miningType === "gas") {
@@ -7740,7 +7816,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                     if (poi.hidden && !canMineHiddenIce) continue;
                   }
                   if (miningType === "radioactive" && !(canMineBasicRadioactive &&
-                    !isForbiddenRadioactiveSystem(loc.systemId) && (
+                    !isForbiddenRadioactiveSystem(loc.systemId, allowFrontier) && (
                     isOreBeltPoi(poi.type) ||
                     (!poi.hidden && canMineDeepCoreRadioactive) ||
                     (poi.hidden && canMineHiddenRadioactive)
@@ -7819,7 +7895,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                   return true;
                 }
               };
-              const arrived = await navigateToSystem(ctx, newSystemId, travelOpts);
+              const arrived = await travelToSystemSmart(ctx, newSystemId, travelOpts, frontierCfg);
               if (!arrived) {
                 ctx.log("error", "Failed to reach new system — returning home");
                 stopReason = `${resourceLabel} field depleted (travel failed)`;
@@ -8276,7 +8352,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
         await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
       }
 
-      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const arrived = await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
       if (!arrived) {
         ctx.log("error", "Failed to return to home system — docking at nearest station");
       }
@@ -8331,7 +8407,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
     
     if (!isAtHome) {
       ctx.log("mining", `Not at home system (${bot.system}) — will navigate home before depositing cargo`);
-      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const arrived = await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
       if (!arrived) {
         ctx.log("error", "Failed to reach home system — keeping cargo, will retry next cycle");
         // Don't deposit - keep cargo and restart mining loop

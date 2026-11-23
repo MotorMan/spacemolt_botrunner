@@ -222,7 +222,14 @@ export function planFrontierRoute(
       const safe = mapStore.computeSafePathfinderBearing(jumpFrom, jumpTo);
       if (!safe || !safe.safe) continue;
 
-      const mainRoute = mapStore.findRoute(mainEnd, hub.id, blacklist);
+      const mainRoute = mapStore.findRouteWithMode(
+        mainEnd,
+        hub.id,
+        blacklist,
+        blacklist.length > 0,
+        true, // allowWormholes — main-to-main permanent wormholes are fair game
+        true, // excludeFrontierWormholes — never route through one-way frontier wormholes
+      );
       if (!mainRoute) continue;
       const mainJumps = Math.max(0, mainRoute.length - 1);
 

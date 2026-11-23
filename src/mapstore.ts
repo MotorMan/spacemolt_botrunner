@@ -1997,7 +1997,7 @@ const locations = this.findOreLocations(oreId, blacklist);
 
   /** Pathfinding with mode selection: useNoPirate=false for full routes (cloaked bots), useNoPirate=true for pirate-avoiding routes.
    *  `allowWormholes` is opt-in and defaults to false — see the note in the body. */
-  findRouteWithMode(fromSystemId: string, toSystemId: string, blacklist?: string[], useNoPirate: boolean = false, allowWormholes: boolean = false): string[] | null {
+  findRouteWithMode(fromSystemId: string, toSystemId: string, blacklist?: string[], useNoPirate: boolean = false, allowWormholes: boolean = false, excludeFrontierWormholes: boolean = false): string[] | null {
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
 
@@ -2013,7 +2013,10 @@ const locations = this.findOreLocations(oreId, blacklist);
     if (fromId === toId) return [fromId];
 
     const precalcRoutes = useNoPirate ? this.precalcNoPirateRoutes : this.precalcRoutes;
-    if (precalcRoutes[fromId] && precalcRoutes[fromId][toId] !== undefined) {
+    // When wormholes are allowed we must NOT short-circuit on the precalc cache:
+    // the cached route is jump-gate-only, so returning it here would hide a
+    // shorter permanent-wormhole shortcut. Let the BFS + wormhole logic below run.
+    if (!allowWormholes && precalcRoutes[fromId] && precalcRoutes[fromId][toId] !== undefined) {
       const route = precalcRoutes[fromId][toId];
       if (route && !route.some(s => blacklistSet.has(s.toLowerCase()))) {
         return route;
@@ -2040,7 +2043,7 @@ const locations = this.findOreLocations(oreId, blacklist);
     // was 11 jumps away. Only use a wormhole route when the caller asked for it
     // AND it is genuinely shorter.
     if (allowWormholes) {
-      const wormholeRoute = this.tryFindWormholeRoute(fromId, toId, blacklistArr);
+      const wormholeRoute = this.tryFindWormholeRoute(fromId, toId, blacklistArr, excludeFrontierWormholes);
       if (wormholeRoute && (!directRoute || wormholeRoute.length < directRoute.length)) {
         return wormholeRoute;
       }
@@ -2182,7 +2185,7 @@ const locations = this.findOreLocations(oreId, blacklist);
     * Try to find a route using wormholes as shortcuts.
     * Strategy: Check if we can reach a wormhole entrance, jump through, then reach the destination.
     */
-  private tryFindWormholeRoute(fromSystemId: string, toSystemId: string, blacklist: string[]): string[] | null {
+  private tryFindWormholeRoute(fromSystemId: string, toSystemId: string, blacklist: string[], excludeFrontierWormholes: boolean = false): string[] | null {
     const blacklistSet = new Set(blacklist.map(s => s.toLowerCase()));
     
     // Normalize system IDs
@@ -2214,6 +2217,14 @@ const locations = this.findOreLocations(oreId, blacklist);
       // Both ends must be real, known systems — registerWormhole creates empty
       // stub records for unknown ends, and routing through a stub is nonsense.
       if (!this.data.systems[entranceSystem] || !this.data.systems[exitSystem]) continue;
+
+      // Frontier wormholes are one-way / can strand the ship. Main-to-main
+      // (permanent) wormholes are safe shortcuts. When asked, skip any wormhole
+      // that touches a Frontier system on either end.
+      if (excludeFrontierWormholes &&
+          (this.isFrontierSystem(entranceSystem) || this.isFrontierSystem(exitSystem))) {
+        continue;
+      }
       
       // Calculate path segments
       const toEntrance = this.findRegularBfsRoute(fromId, entranceSystem, blacklist);

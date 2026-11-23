@@ -75,13 +75,16 @@ async function executePathfinderRoute(
   plan: Extract<FrontierRoutePlan, { kind: "pathfinder" }>,
 ): Promise<boolean> {
   const { bot } = ctx;
+  // Main-network legs may use permanent main-to-main wormholes (fast shortcuts
+  // the explorers keep updated). Frontier wormholes are excluded inside routing.
+  const mainOpts: FrontierNavOpts = { ...opts, allowWormholes: true };
 
   if (plan.outbound) {
     // main -> hub (normal jumps)
     await bot.refreshLocation();
     if ((bot.system || "").toLowerCase() !== plan.hub.toLowerCase()) {
       ctx.log("travel", `[frontier] Staging via main hub ${plan.hubName} (${plan.hub}) — ${plan.mainJumps} jump(s)`);
-      const okHub = await navigateToSystem(ctx, plan.hub, opts);
+      const okHub = await navigateToSystem(ctx, plan.hub, mainOpts);
       if (!okHub) {
         ctx.log("error", `[frontier] Failed to reach staging hub ${plan.hubName}`);
         return false;
@@ -135,7 +138,7 @@ async function executePathfinderRoute(
 
   await bot.refreshLocation();
   if ((bot.system || "").toLowerCase() === target.toLowerCase()) return true;
-  return navigateToSystem(ctx, target, opts);
+  return navigateToSystem(ctx, target, mainOpts);
 }
 
 /**

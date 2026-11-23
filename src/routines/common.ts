@@ -3409,6 +3409,31 @@ export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
   return route.some(seg => seg.via_wormhole === true);
 }
 
+/**
+ * Local-map route for navigation. When `allowWormholes` is set, use main-to-main
+ * wormhole shortcuts (permanent wormholes the explorers keep updated) but never
+ * wormholes that touch a Frontier system — those are one-way and can strand the
+ * ship. Falls back to the plain jump-gate BFS otherwise.
+ */
+function computeLocalRoute(
+  bot: { system: string },
+  targetSystemId: string,
+  blacklist: string[],
+  allowWormholes: boolean,
+): string[] | null {
+  if (allowWormholes) {
+    return mapStore.findRouteWithMode(
+      bot.system,
+      targetSystemId,
+      blacklist,
+      blacklist.length > 0,
+      true, // allowWormholes
+      true, // excludeFrontierWormholes
+    );
+  }
+  return mapStore.findRoute(bot.system, targetSystemId, blacklist);
+}
+
 /** Route resolution outcome from the server `find_route` API. */
 async function resolveNextSystemViaServer(
   bot: any,
@@ -3508,7 +3533,7 @@ export async function navigateToSystem(
     // Plan route from current position. When preferServerRoute is set, the
     // server's find_route (which knows wormhole shortcuts the local BFS
     // cannot express) is tried FIRST and only falls back to the local map.
-    let route = preferServerRoute ? null : mapStore.findRoute(bot.system, targetSystemId, blacklist);
+    let route = preferServerRoute ? null : computeLocalRoute(bot, targetSystemId, blacklist, allowWormholes);
     let nextSystem: string | null = null;
 
     if (preferServerRoute) {
@@ -3529,7 +3554,7 @@ export async function navigateToSystem(
       nextSystem = resolved.nextSystem;
       if (!nextSystem) {
         // Fall back to the local BFS map before giving up.
-        route = mapStore.findRoute(bot.system, targetSystemId, blacklist);
+        route = computeLocalRoute(bot, targetSystemId, blacklist, allowWormholes);
       }
     }
 
@@ -3634,7 +3659,7 @@ export async function navigateToSystem(
     if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) return true;
 
     // Recalculate route from CURRENT position (ensureFueled may have moved us, use blacklist)
-    const postFuelRoute = preferServerRoute ? null : mapStore.findRoute(bot.system, targetSystemId, blacklist);
+    const postFuelRoute = preferServerRoute ? null : computeLocalRoute(bot, targetSystemId, blacklist, allowWormholes);
     if (postFuelRoute && postFuelRoute.length > 1) {
       nextSystem = postFuelRoute[1];
       ctx.log("travel", `Route recalculated from ${bot.system}: ${postFuelRoute.length - 1} jump${postFuelRoute.length - 1 !== 1 ? "s" : ""} remaining`);

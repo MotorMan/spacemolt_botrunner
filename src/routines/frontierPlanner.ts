@@ -231,8 +231,13 @@ export function planFrontierRoute(
       const totalJumps = mainJumps + frontierJumps + 1;
       if (totalJumps > cfg.maxJumps) continue;
 
-      const serviceBonus = systemHasStation(hub.id) ? 250 : 0;
-      const cost = mainJumps * 500 + hub.distance + frontierJumps * 500 - serviceBonus;
+      // Approximate travel time in seconds: ~60s per jump-gate jump, ~1s per GU of
+      // pathfinder flight (10 GU per tick, ~10s per tick), ~60s per frontier jump.
+      // This favours a hub with a SHORT pathfinder hop over one that is merely a
+      // few jumps closer — a long pathfinder flight is what actually makes the
+      // trip slow (e.g. 17 jumps to a hub that then needs a 189-tick hop).
+      const serviceBonus = systemHasStation(hub.id) ? 120 : 0;
+      const cost = mainJumps * 60 + hub.distance + frontierJumps * 60 - serviceBonus;
 
       if (!best || cost < best.cost) {
         best = {

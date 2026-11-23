@@ -186,6 +186,29 @@ function getMiningBlacklist(bot: { routineName: string | null; username?: string
 }
 
 /**
+ * Route from `botSystem` to `systemId` for mining target selection.
+ *
+ * Normal targets use the real jump-gate route. When a Pathfinder Drive is
+ * fitted, Frontier systems are reachable by a pathfinder crossing even though
+ * `findRoute` returns null (there is no wormhole/gate path), so a synthetic
+ * `[botSystem, systemId]` route is returned. Callers that only need
+ * reachability / a jump count then treat the Frontier as one hop away.
+ */
+function findMiningRoute(
+  botSystem: string,
+  systemId: string,
+  blacklist: string[],
+  allowFrontier: boolean,
+): string[] | null {
+  const route = mapStore.findRoute(botSystem, systemId, blacklist);
+  if (route) return route;
+  if (allowFrontier && mapStore.isFrontierSystem(systemId)) {
+    return [botSystem, systemId];
+  }
+  return null;
+}
+
+/**
  * Continuous shield/hull safety for hazardous POIs (very common in the
  * Frontier, where hazard POIs damage the ship while it is stationed inside).
  *
@@ -1913,7 +1936,7 @@ function getReachableOreLocations(
     // to this POI's system runs through a blacklisted system, findRoute returns
     // null and the location is unreachable for our purposes.
     if (!botSystem) continue;
-    const route = mapStore.findRoute(botSystem, loc.systemId, blacklist);
+    const route = findMiningRoute(botSystem, loc.systemId, blacklist, allowFrontier);
     if (!route) continue;
     const jumps = route.length - 1;
     if (jumps > maxJumps) continue;
@@ -2551,7 +2574,7 @@ function findBestHiddenPoiForOre(
   // Score and sort by distance and richness
   const scored = locations
 .map(loc => {
-       const route = mapStore.findRoute(currentSystem, loc.systemId, blacklist);
+       const route = findMiningRoute(currentSystem, loc.systemId, blacklist, allowFrontier);
        return { ...loc, jumps: route ? route.length - 1 : 999 };
      })
      .filter(loc => loc.jumps <= maxJumps)
@@ -3813,7 +3836,7 @@ if (shouldAbandon) {
 const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system, blacklist)
                  .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
                  .map(loc => {
-                   const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                   const route = findMiningRoute(bot.system, loc.systemId, blacklist, allowFrontier);
                    return { ...loc, jumps: route ? route.length - 1 : 999 };
                  })
              .filter(loc => loc.jumps <= maxJumps || isDeepCoreOre(effectiveTarget));
@@ -4007,7 +4030,12 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         if (!poi) return true;
         // Only filter by hidden status - trust map data
         if (miningType === "ore") {
-          if (poi.hidden === true && !canMineHiddenPois) return false;
+          // Frontier POIs are frequently hidden. A forced/global target with a
+          // Pathfinder Drive is explicitly meant to reach the Frontier, so keep
+          // hidden Frontier deposits instead of silently dropping them.
+          const forcedFrontierHidden =
+            poi.hidden === true && allowFrontier && hasGlobalTarget && mapStore.isFrontierSystem(loc.systemId);
+          if (poi.hidden === true && !canMineHiddenPois && !forcedFrontierHidden) return false;
           return true;
         }
         if (miningType === "radioactive") {
@@ -4311,7 +4339,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
             })
             .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
             .map(loc => {
-              const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+              const route = findMiningRoute(bot.system, loc.systemId, blacklist, allowFrontier);
               const jumps = route ? route.length - 1 : Infinity;
               return { ...loc, resourceId: effectiveTarget, jumpsAway: jumps, score: 0, jumps };
             })
@@ -4344,7 +4372,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               return matches;
             })
             .map(loc => {
-              const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+              const route = findMiningRoute(bot.system, loc.systemId, blacklist, allowFrontier);
               // A null route means every path to this system runs through a
               // blacklisted system — treat it as unreachable so we pick the next
               // best system for this ore instead of "mining locally".
@@ -4495,7 +4523,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                  return true;
                })
                 .map(loc => {
-                 const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                 const route = findMiningRoute(bot.system, loc.systemId, blacklist, allowFrontier);
                  const jumps = route ? route.length - 1 : Infinity;
                  return { ...loc, resourceId: oreId, jumpsAway: jumps, score: 0, jumps };
                })
@@ -5261,7 +5289,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           // Prefer configured system, then closest by jumps
           const scored = broaderLocations
             .map(loc => {
-              const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+              const route = findMiningRoute(bot.system, loc.systemId, blacklist, allowFrontier);
               return { ...loc, jumps: route ? route.length - 1 : 999 };
             })
 .filter(loc => loc.jumps <= maxJumps)
@@ -5294,7 +5322,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           ctx.log("debug", `[BROADER_SEARCH] scored.length=${scored.length} bot.system=${bot.system}`);
           if (scored.length === 0 && broaderLocations.length > 0) {
             const noRouteLocs = broaderLocations.filter(l => {
-              const route = mapStore.findRoute(bot.system, l.systemId, blacklist);
+              const route = findMiningRoute(bot.system, l.systemId, blacklist, allowFrontier);
               const jumps = route ? route.length - 1 : 999;
               return jumps > maxJumps;
             });
@@ -6202,7 +6230,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           if (allLocations.length > 0) {
             const scoredLocations = allLocations
               .map(loc => {
-                const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                const route = findMiningRoute(bot.system, loc.systemId, blacklist, allowFrontier);
                 const jumps = route ? route.length - 1 : 999;
                 return { ...loc, jumps };
               })
@@ -6460,7 +6488,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                     if (newLocs.length > 0) {
                       const locsWithDist = newLocs
                         .map(loc => {
-                          const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                          const route = findMiningRoute(bot.system, loc.systemId, blacklist, allowFrontier);
                           return { ...loc, jumps: route ? route.length - 1 : 999 };
                         })
                         .filter(loc => loc.jumps <= maxJumps)
@@ -7633,7 +7661,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
             if (globalTargetLocs.length > 0) {
               const locsWithDist = globalTargetLocs
                 .map(loc => {
-                  const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                  const route = findMiningRoute(bot.system, loc.systemId, blacklist, allowFrontier);
                   return { ...loc, jumps: route ? route.length - 1 : 999 };
                 })
                 .filter(loc => loc.jumps <= maxJumps)
@@ -7701,7 +7729,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                 // Prefer current system, then closest by jumps (use blacklist)
                 const locsWithDist = newLocs
                 .map(loc => {
-                  const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                  const route = findMiningRoute(bot.system, loc.systemId, blacklist, allowFrontier);
                   return { ...loc, jumps: route ? route.length - 1 : 999 };
                 })
                 .filter(loc => loc.jumps <= maxJumps)

@@ -29,7 +29,8 @@
  *
  * Loop:
  *   1. Navigate to configured patrol system
- *   2. Visit each non-station POI looking for pirate targets
+ *   2. Visit each POI looking for pirate targets (boarding mode includes
+ *      station POIs, so pirate stations on the jump-in point are checked too)
  *   3. Scan -> engage -> loot each target
  *   4. Flee and dock if hull drops below flee threshold
  *   5. Post-patrol: complete missions, accept new missions,
@@ -7856,6 +7857,28 @@ function resolveMarineCommitment(fitMarines: number, configured: number): number
  * Used by boarding to ensure we engage the most vulnerable target.
  * Stations are excluded â€” boarding is not currently supported on stations.
  */
+/**
+ * Returns true when a battle-roster participant is a creature or repeater and so
+ * must NEVER be chosen as a boarding target (creatures/repeaters are not capturable
+ * ships — issuing a board stance against them fails with "creatures are not
+ * capturable ships"). The battle roster only carries the display name + ship_class,
+ * so we check both the name indexes and the ship_class/kind markers.
+ */
+function isNonBoardableParticipant(p: {
+  username?: string;
+  player_id?: string;
+  ship_class?: string;
+  kind?: string;
+}): boolean {
+  const name = p.username || p.player_id || "";
+  const shipClass = (p.ship_class || "").toLowerCase();
+  const kind = ((p as any).kind || "").toLowerCase();
+  if (isCreatureName(name) || isRepeaterName(name)) return true;
+  if (shipClass === "creature" || shipClass.includes("creature")) return true;
+  if (shipClass.includes("repeater") || kind.includes("repeater")) return true;
+  return false;
+}
+
 function pickLowestShieldsEnemy(
   status: NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>,
   ourSideId: number | undefined,
@@ -7865,13 +7888,15 @@ function pickLowestShieldsEnemy(
   const enemies = status.participants.filter(
     p => side === undefined || p.side_id !== side,
   );
-  const nonStation = enemies.filter(p => {
+  const boardable = enemies.filter(p => !isNonBoardableParticipant(p as any));
+  const source = boardable.length > 0 ? boardable : enemies;
+  const nonStation = source.filter(p => {
     const shipClass = (p.ship_class || "").toLowerCase();
     const kind = (p as any).kind || "";
     return shipClass !== "station" && kind.toLowerCase() !== "station";
   });
-  const source = nonStation.length > 0 ? nonStation : enemies;
-  const alive = source.filter(p => !p.is_destroyed && (p.player_id || p.username));
+  const candidates = nonStation.length > 0 ? nonStation : source;
+  const alive = candidates.filter(p => !p.is_destroyed && (p.player_id || p.username));
   if (alive.length === 0) return null;
   const sorted = alive.sort(
     (a, b) =>
@@ -7959,7 +7984,15 @@ export async function boardingSubroutine(
 ): Promise<"captured" | "target_eliminated" | "failed" | "retreat"> {
   const { bot } = ctx;
   if (!target.id) {
-    ctx.log("combat", "Boarding: no target ID â€” aborting");
+    ctx.log("combat", "Boarding: no target ID — aborting");
+    return "failed";
+  }
+
+  // Defensive guard: creatures and repeaters are not capturable ships. Issuing a
+  // board stance against them fails ("creatures are not capturable ships"). Never
+  // enter the boarding subroutine for one — let the caller finish with fire stance.
+  if (isCreatureTarget(target as any, true) || isRepeaterTarget(target as any) || isNonBoardableParticipant(target as any)) {
+    ctx.log("combat", `⚠️ Boarding: ${target.name} is a creature/repeater — cannot board, not a capturable ship`);
     return "failed";
   }
 
@@ -8234,6 +8267,9 @@ export async function boardingSubroutine(
         const nextEnemy = status.participants.find(p => {
           if (p.side_id === status.your_side_id || p.is_destroyed) return false;
           if (p.player_id === target.id || p.username === target.name) return false;
+          // NEVER switch a boarding target to a creature/repeater — they are
+          // not capturable ships and the board stance would fail.
+          if (isNonBoardableParticipant(p as any)) return false;
           const shipClass = (p.ship_class || "").toLowerCase();
           const kind = (p as any).kind || "";
           if (shipClass === "station" || kind.toLowerCase() === "station") return false;
@@ -10110,10 +10146,20 @@ async function* boardingSystemPass(
   yield "scan_system";
   await fetchSecurityLevel(ctx, bot.system);
   const { pois } = await getSystemInfo(ctx);
-  const patrolPois = pois.filter(p => !isStationPoi(p));
+  // Boarding mode sweeps every POI, including station POIs. Other hunter modes
+  // skip stations to avoid station fights/docking, but pirate NPCs can spawn
+  // around a pirate station (e.g. Nyx Nexus), and inter-system jumps often drop
+  // the bot at that station. If it is filtered out here the bot leaves the
+  // system without ever scanning the POI it arrived at.
+  const patrolPois = [...pois];
+  const currentPoi = patrolPois.find(p => p.id === bot.poi || p.name === bot.poi);
+  if (currentPoi) {
+    patrolPois.splice(patrolPois.indexOf(currentPoi), 1);
+    patrolPois.unshift(currentPoi);
+  }
 
   if (patrolPois.length === 0) {
-    ctx.log("info", "No non-station POIs to patrol â€” waiting 30s");
+    ctx.log("info", "No POIs to patrol â€” waiting 30s");
     await ctx.sleep(30000);
     return [totalKills, totalBoardings];
   }
@@ -10147,15 +10193,19 @@ async function* boardingSystemPass(
       }
     }
 
-    yield "travel_to_poi";
-    ctx.log("travel", `Boarding patrol: ${poi.name}...`);
-    await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
-    const travelResp = await bot.exec("travel", { target_poi: poi.id });
-    if (travelResp.error && !travelResp.error.message.includes("already")) {
-      ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
-      continue;
+    if (bot.poi !== poi.id) {
+      yield "travel_to_poi";
+      ctx.log("travel", `Boarding patrol: ${poi.name}...`);
+      await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+      const travelResp = await bot.exec("travel", { target_poi: poi.id });
+      if (travelResp.error && !travelResp.error.message.includes("already")) {
+        ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
+        continue;
+      }
+      bot.poi = poi.id;
+    } else {
+      ctx.log("travel", `Boarding patrol: already at ${poi.name} — scanning...`);
     }
-    bot.poi = poi.id;
     bot.clearObservationState();
     await ctx.sleep(1000);
 

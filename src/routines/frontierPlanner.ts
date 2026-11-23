@@ -29,6 +29,12 @@ export interface FrontierTravelConfig {
    * Candidates whose total exceeds this are rejected. Defaults to 10.
    */
   maxJumps: number;
+  /**
+   * Reject a candidate if the pathfinder flight itself would take longer than
+   * this many minutes (ticks * 10s). Most hops are 5-10 min; anything over this
+   * is a waste. Defaults to 15.
+   */
+  maxJumpMinutes: number;
 }
 
 export type FrontierRoutePlan =
@@ -52,18 +58,22 @@ export type FrontierRoutePlan =
       frontierJumps: number;
       /** Total jumps for the trip: mainJumps + frontierJumps + 1 pathfinder jump. */
       totalJumps: number;
+      /** Pathfinder flight time in seconds (ticks * 10). */
+      jumpSeconds: number;
       cost: number;
     }
   | { kind: "unreachable"; reason: string };
 
 const DEFAULT_JUMP_THRESHOLD = 15;
 const DEFAULT_MAX_JUMPS = 10;
+const DEFAULT_MAX_JUMP_MINUTES = 15;
 
 export function buildFrontierTravelConfig(
   settings:
     | {
         pathfinderFrontierJumpThreshold?: number;
         pathfinderFrontierMaxJumps?: number;
+        pathfinderJumpTimeLimitMin?: number;
       }
     | undefined,
   hasPathfinderDrive: boolean | undefined,
@@ -78,7 +88,17 @@ export function buildFrontierTravelConfig(
     !isNaN(settings.pathfinderFrontierMaxJumps)
       ? settings.pathfinderFrontierMaxJumps
       : DEFAULT_MAX_JUMPS;
-  return { enabled: hasPathfinderDrive === true, jumpThreshold: threshold, maxJumps };
+  const maxJumpMinutes =
+    typeof settings?.pathfinderJumpTimeLimitMin === "number" &&
+    !isNaN(settings.pathfinderJumpTimeLimitMin)
+      ? settings.pathfinderJumpTimeLimitMin
+      : DEFAULT_MAX_JUMP_MINUTES;
+  return {
+    enabled: hasPathfinderDrive === true,
+    jumpThreshold: threshold,
+    maxJumps,
+    maxJumpMinutes,
+  };
 }
 
 /** Collect the frontier component (regular-connection reachable) containing `start`. */
@@ -203,6 +223,7 @@ export function planFrontierRoute(
         mainJumps: number;
         frontierJumps: number;
         totalJumps: number;
+        jumpSeconds: number;
         cost: number;
       }
     | null = null;
@@ -221,6 +242,13 @@ export function planFrontierRoute(
       const jumpTo = fromFrontier ? entryId : hub.id;
       const safe = mapStore.computeSafePathfinderBearing(jumpFrom, jumpTo);
       if (!safe || !safe.safe) continue;
+
+      // Pathfinder flight time: ticks * 10s (10 GU per tick). Reject hops that
+      // would take longer than the configured cap — anything over ~15 min is a
+      // waste when most hops are 5-10 min.
+      const jumpTicks = safe.landing?.ticks ?? Math.ceil(hub.distance / 10);
+      const jumpSeconds = jumpTicks * 10;
+      if (jumpSeconds > cfg.maxJumpMinutes * 60) continue;
 
       const mainRoute = mapStore.findRouteWithMode(
         mainEnd,
@@ -256,6 +284,7 @@ export function planFrontierRoute(
           mainJumps,
           frontierJumps,
           totalJumps,
+          jumpSeconds,
           cost,
         };
       }
@@ -281,6 +310,7 @@ export function planFrontierRoute(
     mainJumps: best.mainJumps,
     frontierJumps: best.frontierJumps,
     totalJumps: best.totalJumps,
+    jumpSeconds: best.jumpSeconds,
     cost: best.cost,
   };
 }

@@ -202,7 +202,7 @@ export async function travelToSystemSmart(
 
   ctx.log(
     "travel",
-    `[frontier] Pathfinder route to ${target}: hub=${pfPlan.hubName}, entry=${pfPlan.entryName}, main=${pfPlan.mainJumps}j, frontier=${pfPlan.frontierJumps}j, total=${pfPlan.totalJumps}j (limit ${cfg.maxJumps}), outbound=${pfPlan.outbound}`,
+    `[frontier] Pathfinder route to ${target}: hub=${pfPlan.hubName}, entry=${pfPlan.entryName}, main=${pfPlan.mainJumps}j, frontier=${pfPlan.frontierJumps}j, total=${pfPlan.totalJumps}j (limit ${cfg.maxJumps}), jump=${Math.round(pfPlan.jumpSeconds / 60)}min (limit ${cfg.maxJumpMinutes}min), outbound=${pfPlan.outbound}`,
   );
   return executePathfinderRoute(ctx, target, opts, pfPlan);
 }

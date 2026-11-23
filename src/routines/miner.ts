@@ -673,6 +673,9 @@ stayOutUntilFull: boolean;
    /** Max jumps for a Pathfinder frontier trip (main jumps + 1 pathfinder jump +
     *  frontier jumps). Targets beyond this are skipped. Default 10. */
    pathfinderFrontierMaxJumps: number;
+   /** Reject a pathfinder jump whose flight would take longer than this many
+    *  minutes (most are 5-10 min). Default 15. */
+   pathfinderJumpTimeLimitMin: number;
    minimumFuelCells: number;
    returnHomeOnFuelCellsRemaining: number;
    noMidMiningRetarget: boolean;
@@ -786,6 +789,7 @@ iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     maxJumps: (m.maxJumps as number) ?? 10,
     pathfinderFrontierJumpThreshold: (m.pathfinderFrontierJumpThreshold as number) ?? 15,
     pathfinderFrontierMaxJumps: (m.pathfinderFrontierMaxJumps as number) ?? 10,
+    pathfinderJumpTimeLimitMin: (m.pathfinderJumpTimeLimitMin as number) ?? 15,
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
     returnHomeOnFuelCellsRemaining: (m.returnHomeOnFuelCellsRemaining as number) ?? 2,
     noMidMiningRetarget: (m.noMidMiningRetarget as boolean) ?? false,

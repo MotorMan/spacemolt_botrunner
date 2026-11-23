@@ -31987,6 +31987,14 @@ async function fetchPersonalFacilityTypes(username) {
         </div>
         <input type="number" id="set-miner-pathfinderFrontierJumpThreshold" min="1" max="100" value="${m.pathfinderFrontierJumpThreshold ?? 15}" style="width:80px" />
       </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Pathfinder Jump Time Limit (minutes)</div>
+          <div class="setting-hint">Reject a pathfinder jump whose flight would take longer than this. Most hops are 5-10 minutes; anything over this is a waste. Default 15.</div>
+        </div>
+        <input type="number" id="set-miner-pathfinderJumpTimeLimitMin" min="1" max="120" value="${m.pathfinderJumpTimeLimitMin ?? 15}" style="width:80px" />
+      </div>
     </div>
 
 
@@ -32548,6 +32556,13 @@ async function fetchPersonalFacilityTypes(username) {
                 document.getElementById("set-miner-pathfinderFrontierMaxJumps").value,
               );
               return Number.isNaN(v) ? 10 : v;
+            })(),
+          pathfinderJumpTimeLimitMin:
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-pathfinderJumpTimeLimitMin").value,
+              );
+              return Number.isNaN(v) ? 15 : v;
             })(),
           minimumFuelCells:
             (() => {

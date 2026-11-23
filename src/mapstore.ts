@@ -102,11 +102,29 @@ function calculateExpiryFromText(text: string): string {
   return new Date(Date.now() + msFromNow).toISOString();
 }
 
-/** Check if a wormhole is still active (not expired). */
-function isWormholeActive(wormhole: { expires_at: string | null }): boolean {
-  if (!wormhole.expires_at) return true; // No expiry = always active
-  const expiryTime = new Date(wormhole.expires_at).getTime();
-  return Date.now() < expiryTime;
+/**
+ * Temporary wormholes only persist a few days, but many records are stored with
+ * `expires_at: null` (no expiry) and never cleaned up. Without this, a wormhole
+ * discovered months ago is treated as permanently active and routing will happily
+ * send a ship through a jump that no longer exists. Treat a no-expiry wormhole as
+ * stale once it is older than this.
+ */
+const MAX_WORMHOLE_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/** Check if a wormhole is still active (not expired / not stale). */
+function isWormholeActive(wormhole: { expires_at: string | null; discovered_at?: string | null }): boolean {
+  if (wormhole.expires_at) {
+    return Date.now() < new Date(wormhole.expires_at).getTime();
+  }
+  // No recorded expiry — fall back to an age check so ancient, never-cleaned-up
+  // wormhole records are not treated as permanent shortcuts.
+  if (wormhole.discovered_at) {
+    const discovered = new Date(wormhole.discovered_at).getTime();
+    if (!isNaN(discovered) && Date.now() - discovered > MAX_WORMHOLE_AGE_MS) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Calculate human-readable time remaining until expiry. */

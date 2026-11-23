@@ -46,6 +46,25 @@ async function hopAlongPath(
   return true;
 }
 
+/** Toggle the ship's cloak. Returns true on success (or if already in that state). */
+async function setCloak(ctx: RoutineContext, enable: boolean): Promise<boolean> {
+  const { bot } = ctx;
+  if (!!bot.isCloaked === enable) return true;
+  try {
+    const resp = await bot.exec("cloak", { enable });
+    if (resp.error) {
+      ctx.log("warn", `[frontier] Failed to ${enable ? "enable" : "disable"} cloak: ${resp.error.message}`);
+      return false;
+    }
+    bot.isCloaked = enable;
+    ctx.log("travel", `[frontier] Cloak ${enable ? "enabled" : "disabled"}`);
+    return true;
+  } catch (e) {
+    ctx.log("warn", `[frontier] Cloak toggle failed: ${e}`);
+    return false;
+  }
+}
+
 /** Top up fuel before a pathfinder crossing when a station is reachable (main network only). */
 async function ensurePathfinderFuel(
   ctx: RoutineContext,
@@ -93,12 +112,17 @@ async function executePathfinderRoute(
 
     // hub -> frontier entry (pathfinder jump)
     await ensurePathfinderFuel(ctx, opts);
+    // Nothing in the void can see or attack us — drop the cloak for the flight
+    // (it only burns fuel out here) and restore it once we land.
+    const wasCloaked = bot.isCloaked;
+    if (wasCloaked) await setCloak(ctx, false);
     await ensureUndocked(ctx);
     ctx.log(
       "travel",
       `[frontier] Pathfinder jump ${plan.hubName} -> ${plan.entryName} (${plan.entry}) at ${plan.bearing.toFixed(2)}°`,
     );
     const jump = await bot.performPathfinderJump(plan.entry);
+    if (wasCloaked) await setCloak(ctx, true);
     await bot.refreshLocation();
     if (!jump.success || (bot.system || "").toLowerCase() !== plan.entry.toLowerCase()) {
       ctx.log(
@@ -121,12 +145,16 @@ async function executePathfinderRoute(
   }
 
   await ensurePathfinderFuel(ctx, opts);
+  // Drop the cloak for the void crossing, restore it after landing.
+  const wasCloaked = bot.isCloaked;
+  if (wasCloaked) await setCloak(ctx, false);
   await ensureUndocked(ctx);
   ctx.log(
     "travel",
     `[frontier] Return pathfinder jump ${plan.entryName} -> ${plan.hubName} (${plan.hub}) at ${plan.bearing.toFixed(2)}°`,
   );
   const jump = await bot.performPathfinderJump(plan.hub);
+  if (wasCloaked) await setCloak(ctx, true);
   await bot.refreshLocation();
   if (!jump.success || (bot.system || "").toLowerCase() !== plan.hub.toLowerCase()) {
     ctx.log(

@@ -9278,6 +9278,27 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
     await bot.refreshStatus();
     const recoveries = bot.prizeRecoveries;
 
+    // Defensive: if we are still pinned in a battle whose only remaining enemies
+    // are stations/creatures/repeaters (e.g. a fleeing attempt failed, or a
+    // creature like Blanket re-joined the fight), break off so prize claims can
+    // proceed. Without this the claim loop below spins forever while the
+    // indestructible station keeps the battle active.
+    const battleCheck = await getBattleStatus(ctx);
+    if (battleCheck) {
+      const threats = (battleCheck.participants || []).filter(p => {
+        if (p.side_id === battleCheck.your_side_id || p.is_destroyed) return false;
+        if (isNonBoardableParticipant(p as any)) return false;
+        const shipClass = (p.ship_class || "").toLowerCase();
+        const kind = (p as any).kind || "";
+        return shipClass !== "station" && kind.toLowerCase() !== "station";
+      });
+      if (threats.length === 0) {
+        ctx.log("combat", `RecoverPrize: still in battle with only station/creature enemies — fleeing to unlock prize claim (tick ${waitTick}/${maxWaitTicks})`);
+        await retreatFromStronghold(ctx, settings);
+        continue;
+      }
+    }
+
     // PHASE 1: Claim every available prize at the current POI.
     // Keep looping until get_nearby reports NO available prizes,
     // so we never leave a prize behind because a single claim attempt
@@ -9553,7 +9574,14 @@ async function retreatFromStronghold(
 
 /**
  * If we are still in a battle after boarding and the only remaining enemies
- * are stations, flee that battle so prize claims can proceed.
+ * are stations, creatures, or repeaters (i.e. nothing we can or want to fight
+ * or board), flee that battle so prize claims can proceed.
+ *
+ * Creatures/repeaters count as non-threats here: they are not capturable ships,
+ * a hunter cannot board them, and a creature that is merely following a pirate
+ * (e.g. "Blanket" trailing Overlord Nyx) must not keep us pinned in a battle
+ * that never ends. Without this, the prize claim loop spins forever because the
+ * indestructible station keeps the battle active.
  */
 async function maybeFleeStationAfterBoarding(
   ctx: RoutineContext,
@@ -9564,13 +9592,16 @@ async function maybeFleeStationAfterBoarding(
 
   const nonStationEnemies = status.participants.filter(p => {
     if (p.side_id === status.your_side_id || p.is_destroyed) return false;
+    // Ignore stations, creatures and repeaters — none are fightable/boardable
+    // prizes worth staying in the battle for.
+    if (isNonBoardableParticipant(p as any)) return false;
     const shipClass = (p.ship_class || "").toLowerCase();
     const kind = (p as any).kind || "";
     return shipClass !== "station" && kind.toLowerCase() !== "station";
   });
 
   if (nonStationEnemies.length === 0) {
-    ctx.log("combat", "Boarding cleanup: only station enemies remain â€” fleeing battle");
+    ctx.log("combat", "Boarding cleanup: only station/creature/repeater enemies remain — fleeing battle");
     await retreatFromStronghold(ctx, settings);
   }
 }

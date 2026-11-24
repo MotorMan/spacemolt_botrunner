@@ -541,6 +541,53 @@ export function setExplorerFrontierThoroughScan(username: string, frontierThorou
 }
 
 /**
+ * After a client/process restart the ship may still be mid-jump (pathfinder or
+ * normal). The server keeps that transit running, but the freshly-started
+ * process has no location, so every navigation call fails with
+ * "You are not in a system" and the routine spins trying to route from an
+ * unknown position. Poll get_poi until any in-flight transit completes so we can
+ * re-establish a concrete location before doing anything else.
+ *
+ * Returns true once the ship is stationary (or was never in transit) and its
+ * location has been refreshed; false if stopped or still in transit after the
+ * wait cap.
+ */
+async function waitForInflightJumpAfterRestart(ctx: RoutineContext, maxWaitMs = 60 * 60 * 1000): Promise<boolean> {
+  const { bot } = ctx;
+
+  const probe = await bot.exec("get_poi");
+  const pr = probe.result && typeof probe.result === "object"
+    ? probe.result as Record<string, unknown>
+    : undefined;
+  const inTransit = pr ? (pr.in_transit as boolean) === true : false;
+
+  if (!inTransit) {
+    // Stationary (or couldn't read transit) — make sure we hold a concrete location.
+    await bot.refreshPOI();
+    return true;
+  }
+
+  const start = Date.now();
+  const from = (pr?.from_system as string) || "?";
+  const to = (pr?.to_system as string) || "?";
+  ctx.log("travel", `Resuming after restart — ship is mid-jump ${from} -> ${to} (${pr?.ticks_remaining ?? "?"} ticks remaining); waiting to land before continuing...`);
+
+  while (bot.state === "running") {
+    await ctx.sleep(5000);
+    await bot.refreshPOI();
+    if (!bot.inTransit) {
+      ctx.log("travel", `Landed in ${bot.system ?? "unknown system"} — resuming frontier/exploration routine`);
+      return true;
+    }
+    if (Date.now() - start > maxWaitMs) {
+      ctx.log("warn", "Gave up waiting for in-flight jump to finish after restart");
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
  * Explorer routine — systematically maps the galaxy:
  *
  * Exploration logic per POI:
@@ -553,6 +600,10 @@ export function setExplorerFrontierThoroughScan(username: string, frontierThorou
  */
 export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
+
+  // If we restarted mid-jump, wait for the in-flight transit to finish so we
+  // know where we are before trying to route anywhere.
+  await waitForInflightJumpAfterRestart(ctx);
 
   // DEBUG: Log system blacklist at startup
   const systemBlacklist = getEffectiveSystemBlacklist(bot);

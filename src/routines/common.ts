@@ -632,6 +632,15 @@ export async function ensureDocked(
   opts?: { skipApprovedCheck?: boolean; targetStationId?: string; strictTarget?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
+
+  // If the bot owes an empire an outstanding bounty (unpaid taxes/crimes), docking
+  // at a station in that empire's territory triggers DETENTION, which blocks every
+  // subsequent jump until the bounty is paid. Clear any bounties up front so we
+  // never dock straight into detention. Skipped entirely when there is nothing owed.
+  if (bot.bounties && Object.values(bot.bounties).some((amt) => amt > 0)) {
+    await payOutstandingBounties(ctx, { reason: "before docking" });
+  }
+
   if (bot.docked) {
     await bot.refreshStatus();
     if (bot.docked) return true;
@@ -910,6 +919,87 @@ export async function sellAllCargo(ctx: RoutineContext): Promise<number> {
     if (!resp.error) sold++;
   }
   return sold;
+}
+
+/**
+ * Clear outstanding empire bounties with `pay_bounty`.
+ *
+ * Bounties (unpaid income/property tax and other crimes) trigger DETENTION the
+ * moment the bot docks at a station in that empire's territory, and every jump is
+ * then refused until the bounty is cleared. `pay_bounty` works anywhere — docked,
+ * in open space, or mid-jump — so paying these off keeps the bot moving instead
+ * of stranding it in an endless navigation-failure loop.
+ *
+ * Funding order per empire: wallet (source="self") first, then the faction
+ * treasury (source="faction", needs ManageTreasury) when the wallet is short.
+ *
+ * Returns how many empire bounties were cleared and how much is still owed.
+ */
+export async function payOutstandingBounties(
+  ctx: RoutineContext,
+  opts?: { reason?: string },
+): Promise<{ paid: number; remaining: number }> {
+  const { bot } = ctx;
+  const reason = opts?.reason ? ` (${opts.reason})` : "";
+
+  // get_status is the source of truth for per-empire bounties — force a fresh read
+  // so we never act on a stale (already-cleared) cache.
+  await bot.refreshStatus(true);
+  const bounties = bot.bounties ?? {};
+  const owed = Object.entries(bounties).filter(([, amt]) => amt > 0);
+
+  if (owed.length === 0) {
+    ctx.log("travel", `No outstanding bounties to pay${reason}`);
+    return { paid: 0, remaining: 0 };
+  }
+
+  let paid = 0;
+  let remaining = 0;
+  for (const [empire, amount] of owed) {
+    let resp = await bot.exec("pay_bounty", { id: empire, source: "self" });
+
+    // Wallet short (or self-payment rejected) — try the faction treasury.
+    if (resp.error) {
+      const treasuryResp = await bot.exec("pay_bounty", { id: empire, source: "faction" });
+      if (!treasuryResp.error) resp = treasuryResp;
+    }
+
+    if (!resp.error) {
+      ctx.log("travel", `Cleared ${amount}cr bounty with ${empire}${reason}`);
+      paid++;
+    } else {
+      ctx.log("warn", `Could not clear ${amount}cr bounty with ${empire}${reason}: ${resp.error.message}`);
+      remaining += amount;
+    }
+  }
+
+  return { paid, remaining };
+}
+
+/**
+ * Resolve a detention by paying off the outstanding bounty that triggered it.
+ *
+ * Tries the wallet / faction treasury first (see {@link payOutstandingBounties});
+ * if credits are still short and the bot is docked, sells cargo to raise the rest
+ * (the detention message keeps the station exchange open for exactly this) and
+ * pays again. Returns true once nothing is owed.
+ */
+export async function clearBountiesForDetention(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+
+  let result = await payOutstandingBounties(ctx, { reason: "detention" });
+  if (result.remaining === 0) return true;
+
+  // Still short — sell cargo to raise bail, then pay again.
+  ctx.log("travel", `Short ${result.remaining}cr for bail — selling cargo to raise credits`);
+  const sold = await sellAllCargo(ctx);
+  if (sold > 0) {
+    result = await payOutstandingBounties(ctx, { reason: "detention (after selling cargo)" });
+    if (result.remaining === 0) return true;
+  }
+
+  ctx.log("error", `Unable to clear ${result.remaining}cr in bounties — still detained`);
+  return false;
 }
 
 /**
@@ -3856,6 +3946,22 @@ export async function navigateToSystem(
           ctx.log("combat", "Escort detected battle - returning to let escort routine handle engagement");
           return false;
         }
+      }
+
+      // DETENTION: docking in an empire's territory while owing it a bounty (unpaid
+      // taxes/crimes) gets the bot detained, and every jump is refused until the
+      // bounty is cleared. `pay_bounty` works while detained, so pay it off and
+      // retry instead of stranding the bot in an endless navigation-failure loop.
+      if (errorMsg.includes("detained") || errorMsg.includes("pay_bounty") || errorMsg.includes("bounty")) {
+        ctx.log("travel", `Jump refused — bot is detained for an unpaid bounty, attempting to pay it off`);
+        const cleared = await clearBountiesForDetention(ctx);
+        if (cleared) {
+          ctx.log("travel", `Bounty cleared — retrying jump to ${nextSystem}`);
+          await sleep(2000);
+          continue;
+        }
+        ctx.log("error", `Still detained and unable to pay bounty — cannot jump to ${nextSystem}`);
+        return false;
       }
 
       // Check if error is transient (network timeout, connection issue, etc.)

@@ -26,6 +26,7 @@ import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
 import { isConnectionError, isStalePositionError } from "./connection.js";
 import { isRateLimitError, parseServerDelayMs, reportCleanSend, reportRateLimitHit, shouldLogGateClosed, waitForGate } from "./ratelimitgate.js";
+import { GAME_TICK_MS, READ_REPEAT_MAX_RETRIES, ReadGate, isReadRepeatError, isStateChanging, limitedReadKey } from "./readRepeatGate.js";
 
 /** A login() promise older than this (ms) is treated as wedged and reset, so a
  *  dead socket can never permanently park the routine on an unresolved promise. */
@@ -337,6 +338,15 @@ docked = false;
    */
   private _recovery: Promise<boolean> | null = null;
 
+  /**
+   * Per-tick read cache for the limited reads (`get_ship`/`get_cargo`/
+   * `get_state`/storage `view`). A repeat read inside one tick is served from
+   * here instead of re-hitting the server (which would draw
+   * `read_repeat_limited`). Invalidated on any state-changing command so
+   * post-mutation reads are always fresh. See readRepeatGate.ts.
+   */
+  private _readGate = new ReadGate();
+
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
@@ -612,20 +622,55 @@ docked = false;
   }
 
   /**
-   * Resilient `account.send`: on a transport/connection error, DROP the dead
-   * socket and force a brand-new one — we never sit and hope a closed socket
-   * magically revives (it won't, you told me). Used by the `instrumentSend`
-   * wrapper so it covers EVERY command path (libExec and direct
-   * bot.commands.*). Returns the result, or throws (the original error) only
-   * when the recovery is aborted (bot stopped), the connection is terminal
-   * (player connected elsewhere), or we exhaust the bounded force attempts — in
-   * which case the caller should end the routine cleanly instead of hanging.
+   * Resilient `account.send` with the per-tick read gate in front.
+   *
+   * The game refuses a second read of `get_state`/`get_ship`/`get_cargo`/
+   * storage within one tick (`read_repeat_limited`). Every command path
+   * (libExec + direct `bot.commands.*`) funnels through here, so this is the
+   * one place to coalesce and cache those reads: a repeat inside a tick is
+   * served from the `ReadGate` cache, concurrent duplicates share one in-flight
+   * request, and any state-changing command invalidates the cache so
+   * post-mutation reads are always fresh. See readRepeatGate.ts.
+   *
+   * The actual send + transport/rate-limit recovery lives in `doSend`.
+   */
+  private async sendResilient(
+    tool: string,
+    action: string,
+    payload: Record<string, unknown> | undefined,
+  ): Promise<unknown> {
+    const readKey = limitedReadKey(tool, action, payload);
+    if (readKey) {
+      return this._readGate.run(readKey, () => this.doSend(tool, action, payload));
+    }
+
+    // Any state-changing command invalidates the read cache so the next read
+    // reflects the post-mutation state (e.g. `mine` then `get_cargo`).
+    if (isStateChanging(tool, action)) {
+      this._readGate.clear();
+    }
+    return this.doSend(tool, action, payload);
+  }
+
+  /**
+   * The raw resilient send: rate-limit / connection-loss recovery and the
+   * bounded in-place retries. Wrapped by `sendResilient`, which adds the
+   * per-tick read gate for the limited reads.
+   *
+   * On a transport/connection error, DROP the dead socket and force a
+   * brand-new one — we never sit and hope a closed socket magically revives
+   * (it won't, you told me). Used by the `instrumentSend` wrapper so it covers
+   * EVERY command path (libExec and direct `bot.commands.*`). Returns the
+   * result, or throws (the original error) only when the recovery is aborted
+   * (bot stopped), the connection is terminal (player connected elsewhere), or
+   * we exhaust the bounded force attempts — in which case the caller should end
+   * the routine cleanly instead of hanging.
    *
    * Each retry uses the LIVE `Account`'s `send` (via `liveRawSend`), so after a
    * forced reconnect swaps in a fresh socket the very next attempt goes out on
    * the new socket — not the dead one it replaced.
    */
-  private async sendResilient(
+  private async doSend(
     tool: string,
     action: string,
     payload: Record<string, unknown> | undefined,
@@ -637,6 +682,7 @@ docked = false;
     // rejected from parking forever inside send; after that we surface the
     // error so the routine can end cleanly.
     let rateLimitHits = 0;
+    let readRepeatHits = 0;
     for (;;) {
       // Global IP-block gate (see ratelimitgate.ts): the server blocks the
       // whole IP, so when any bot trips a block EVERY outbound command from
@@ -702,6 +748,21 @@ docked = false;
           // Stagger the resume so the fleet's parked commands don't hit the
           // server as one synchronized burst the instant the gate opens.
           await new Promise((r) => setTimeout(r, Math.random() * 500));
+          continue;
+        }
+        if (isReadRepeatError(err)) {
+          // The server refused a duplicate read of a per-tick-limited command.
+          // This is a backstop: the read gate in sendResilient normally prevents
+          // it, but a reconnect/replay burst can still produce one. It never
+          // counts toward an IP block, so wait out the current tick and retry —
+          // the routine keeps running instead of crashing.
+          if (++readRepeatHits > READ_REPEAT_MAX_RETRIES) throw err;
+          if (this.state === "stopping" || this._abortController?.signal.aborted) {
+            throw err;
+          }
+          this.log("warn", `Read ${tool}/${action} limited to once per tick — waiting for the next tick before retrying...`);
+          await new Promise((r) => setTimeout(r, GAME_TICK_MS));
+          if (this.state !== "running") throw err;
           continue;
         }
         if (!isConnectionError(message)) throw err;

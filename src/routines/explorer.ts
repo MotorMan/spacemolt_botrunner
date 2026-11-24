@@ -5289,6 +5289,22 @@ function findFrontierMainGateway(
   return null;
 }
 
+/**
+ * Estimated real-time cost (in seconds) of one normal in-group jump used when
+ * staging toward a frontier-to-frontier pathfinder jump.
+ *
+ * Frontier transition costs are compared on a single axis: the pathfinder leg
+ * contributes its euclidean position distance, which is ≈ flight seconds
+ * (PATHFINDER_SPEED = 10 GU/tick, 1 tick = 10s → proj ≈ seconds). A normal
+ * jump (bot.calculateJumpTimeout) only takes ~30-90s depending on ship speed,
+ * plus a little overhead to undock/arrive. Using a realistic per-hop estimate
+ * keeps both legs in the same units, so the planner will happily hop a few safe
+ * systems within the current group to reach a much shorter jump-off point
+ * instead of over-penalising staging and firing one enormous pathfinder jump
+ * from whatever system it happens to be in.
+ */
+const FRONTIER_STAGING_HOP_SECONDS = 90;
+
 /** Pick the cheapest safe way to move from one frontier component to another.
  *  Prefers a direct pathfinder jump; otherwise routes through the main network. */
 function findFrontierTransition(
@@ -5314,7 +5330,7 @@ function findFrontierTransition(
 
   for (const from of staging) {
     const fromPos = from.sys.position!;
-    const currentToStaging = from.hops * 500;
+    const currentToStaging = from.hops * FRONTIER_STAGING_HOP_SECONDS;
 
     for (const to of toGroup.systems) {
       if (!to.position) continue;
@@ -5340,7 +5356,7 @@ function findFrontierTransition(
     const gatewayFrom = findFrontierMainGateway(from.sys.id, "from", blacklist, gatewayCache);
     if (!gatewayFrom) continue;
     const fromPos = from.sys.position!;
-    const stagingCost = from.hops * 500;
+    const stagingCost = from.hops * FRONTIER_STAGING_HOP_SECONDS;
     const frontierToMain = Math.sqrt(
       Math.pow(fromPos.x - (mapStore.getSystem(gatewayFrom.systemId)?.position?.x ?? fromPos.x), 2) +
       Math.pow(fromPos.y - (mapStore.getSystem(gatewayFrom.systemId)?.position?.y ?? fromPos.y), 2),
@@ -5361,7 +5377,7 @@ function findFrontierTransition(
         ? Math.sqrt(Math.pow(toPos.x - gatewayToPos.x, 2) + Math.pow(toPos.y - gatewayToPos.y, 2))
         : 0;
 
-      const cost = stagingCost + frontierToMain + mainJumps * 500 + mainToFrontier;
+      const cost = stagingCost + frontierToMain + mainJumps * FRONTIER_STAGING_HOP_SECONDS + mainToFrontier;
       if (!best || cost < best.cost) {
         best = {
           kind: "via-main",

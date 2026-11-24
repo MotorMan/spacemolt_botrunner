@@ -3503,8 +3503,20 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       }
 
       if (ticksRemaining <= 0) {
+        // Ticks elapsed — the ship has physically travelled the full distance, but
+        // get_poi may not have cleared in_transit on this poll, so the !inTransit
+        // branch above (the only place this.system is refreshed from get_location)
+        // may not have run. Sync from get_location here too; otherwise this.system
+        // stays at the origin and callers that trust bot.system (e.g. frontier
+        // update) will issue every following jump from the wrong system.
+        const locResp = await this.libExec("get_location");
+        if (locResp.result && typeof locResp.result === "object") {
+          const loc = locResp.result as Record<string, unknown>;
+          const newSystem = (loc.system_id as string) || (loc.system_name as string) || null;
+          if (newSystem) this.system = newSystem;
+        }
         arrived = true;
-        this.log("travel", `Pathfinder jump complete: all ticks elapsed`);
+        this.log("travel", `Pathfinder jump complete: all ticks elapsed (now at ${this.system})`);
         break;
       }
 

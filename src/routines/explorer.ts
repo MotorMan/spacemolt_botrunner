@@ -5462,9 +5462,25 @@ async function performFrontierPathfinderJump(ctx: RoutineContext, targetSystemId
 
   try {
     ctx.log("travel", `Frontier pathfinder jump: ${bot.system} -> ${targetSystemId}`);
-    const result = await bot.performPathfinderJump(targetSystemId);
+    await bot.performPathfinderJump(targetSystemId);
+
+    // performPathfinderJump can return on its "all ticks elapsed" path a poll
+    // before get_poi clears in_transit, in which case it never refreshes
+    // this.system. For library (account) bots refreshLocation() is a no-op for
+    // position, so bot.system would stay at the ORIGIN — making this falsely
+    // report failure and, worse, causing every subsequent jump to be issued from
+    // the wrong system ("<old system> is not connected to <target>"). Re-sync the
+    // position from authoritative sources (get_poi / get_ship), waiting out any
+    // last in-transit ticks, and judge success by the real position.
+    for (let i = 0; i < 12 && bot.state === "running"; i++) {
+      await bot.refreshPOI();
+      if (!bot.inTransit) break;
+      await ctx.sleep(5000);
+    }
+    await bot.refreshShip();
     await bot.refreshLocation();
-    if (result.success && frontierSystemKey(bot.system) === frontierSystemKey(targetSystemId)) {
+
+    if (frontierSystemKey(bot.system) === frontierSystemKey(targetSystemId)) {
       ctx.log("travel", `Frontier pathfinder jump complete: arrived at ${bot.system}`);
       return true;
     }

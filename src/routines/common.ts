@@ -930,8 +930,16 @@ export async function sellAllCargo(ctx: RoutineContext): Promise<number> {
  * in open space, or mid-jump — so paying these off keeps the bot moving instead
  * of stranding it in an endless navigation-failure loop.
  *
- * Funding order per empire: wallet (source="self") first, then the faction
- * treasury (source="faction", needs ManageTreasury) when the wallet is short.
+ * Funding source per empire is chosen by what can actually cover the amount:
+ *   - wallet (source="self") when `bot.credits >= amount`;
+ *   - faction treasury (source="faction", needs ManageTreasury) otherwise — a
+ *     broke (0-credit) bot MUST use the treasury or it stays detained, because
+ *     pay_bounty is all-or-nothing and a self-pay it can't afford never clears.
+ *
+ * `pay_bounty` is a queued mutation that only settles on the next ~10s server
+ * tick, and the library reports a queued command as success before the server
+ * has actually processed it. We therefore issue the payment(s), wait for the
+ * tick to resolve, then re-read `get_status` to see what ACTUALLY cleared.
  *
  * Returns how many empire bounties were cleared and how much is still owed.
  */
@@ -945,34 +953,57 @@ export async function payOutstandingBounties(
   // get_status is the source of truth for per-empire bounties — force a fresh read
   // so we never act on a stale (already-cleared) cache.
   await bot.refreshStatus(true);
-  const bounties = bot.bounties ?? {};
-  const owed = Object.entries(bounties).filter(([, amt]) => amt > 0);
+  const before = Object.entries(bot.bounties ?? {}).filter(([, amt]) => amt > 0);
 
-  if (owed.length === 0) {
+  if (before.length === 0) {
     ctx.log("travel", `No outstanding bounties to pay${reason}`);
     return { paid: 0, remaining: 0 };
   }
 
-  let paid = 0;
-  let remaining = 0;
-  for (const [empire, amount] of owed) {
-    let resp = await bot.exec("pay_bounty", { id: empire, source: "self" });
+  for (const [empire, amount] of before) {
+    // Pick a source that can cover the whole amount (pay_bounty is all-or-nothing):
+    // wallet when it can afford it, otherwise the faction treasury.
+    const wallet = bot.credits ?? 0;
+    const order: Array<"self" | "faction"> =
+      wallet >= amount ? ["self", "faction"] : ["faction", "self"];
 
-    // Wallet short (or self-payment rejected) — try the faction treasury.
-    if (resp.error) {
-      const treasuryResp = await bot.exec("pay_bounty", { id: empire, source: "faction" });
-      if (!treasuryResp.error) resp = treasuryResp;
+    let issued = false;
+    let lastErr = "";
+    for (const source of order) {
+      const resp = await bot.exec("pay_bounty", { id: empire, source });
+      if (!resp.error) {
+        issued = true;
+        ctx.log("travel", `Submitted ${amount}cr bounty payment to ${empire} from ${source === "faction" ? "faction treasury" : "wallet"}${reason}`);
+        break;
+      }
+      lastErr = resp.error.message;
+      ctx.log("warn", `pay_bounty source=${source} for ${empire}${reason} failed: ${lastErr}`);
     }
-
-    if (!resp.error) {
-      ctx.log("travel", `Cleared ${amount}cr bounty with ${empire}${reason}`);
-      paid++;
-    } else {
-      ctx.log("warn", `Could not clear ${amount}cr bounty with ${empire}${reason}: ${resp.error.message}`);
-      remaining += amount;
+    if (!issued) {
+      ctx.log("warn", `Could not submit ${amount}cr bounty payment to ${empire}${reason}: ${lastErr}`);
     }
   }
 
+  // Let the queued payment(s) resolve on the server tick, then verify via get_status
+  // what actually cleared. (A queued self-pay the bot can't afford LOOKS successful
+  // here but never clears — the status re-read is the only reliable confirmation.)
+  const deadline = Date.now() + 30_000;
+  let after = bot.bounties ?? {};
+  do {
+    await ctx.sleep(5000);
+    if (bot.state !== "running") { after = bot.bounties ?? {}; break; }
+    await bot.refreshStatus(true);
+    after = bot.bounties ?? {};
+  } while (Date.now() < deadline && before.some(([emp]) => (after[emp] ?? 0) > 0));
+
+  let paid = 0;
+  let remaining = 0;
+  for (const [empire] of before) {
+    const still = after[empire] ?? 0;
+    if (still <= 0) paid++;
+    else remaining += still;
+  }
+  ctx.log("travel", `Bounty payment result: ${paid} empire(s) cleared, ${remaining}cr still owed${reason}`);
   return { paid, remaining };
 }
 

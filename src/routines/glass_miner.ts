@@ -1443,6 +1443,14 @@ async function checkAndHandleNearbyThreats(
       if (!engaged) {
         ctx.log("combat", `Failed to engage ${info.name} — may have fled or been destroyed`);
       }
+      // Loot the wreck (repeaters drop valuable modules/cargo) before resuming mining.
+      if (!bot.docked) {
+        ctx.log("combat", `Scavenging wrecks after engaging ${info.name}`);
+        const looted = await scavengeWrecks(ctx);
+        if (looted > 0) {
+          ctx.log("scavenge", `Looted ${looted} item stack(s) from ${info.name} wreck`);
+        }
+      }
       return true;
     }
   }

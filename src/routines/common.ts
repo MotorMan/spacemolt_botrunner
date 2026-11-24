@@ -922,6 +922,43 @@ export async function sellAllCargo(ctx: RoutineContext): Promise<number> {
 }
 
 /**
+ * Read the bot's current per-empire outstanding bounties as `[empireId, credits]`.
+ *
+ * Primary source is `get_tax_estimate.outstanding_bounties` — a fresh command that
+ * lists each empire's settlement amount (missed taxes + crimes). This is reliable
+ * even when the client's `get_status` cache was never seeded (e.g. a manual page
+ * opened before login left `bot.bounties` empty). We then fold in `get_status`
+ * standings so non-tax crimes that only appear there are not missed.
+ */
+async function fetchOutstandingBounties(ctx: RoutineContext): Promise<Array<[string, number]>> {
+  const { bot } = ctx;
+  const map = new Map<string, number>();
+
+  const est = await bot.exec("get_tax_estimate");
+  if (!est.error && est.result && typeof est.result === "object") {
+    const rows = (est.result as Record<string, unknown>).outstanding_bounties;
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        const r = row as Record<string, unknown>;
+        const emp = String(r.empire ?? r.id ?? "").trim().toLowerCase();
+        const amt = Number(r.bounty ?? r.amount ?? 0);
+        if (emp && Number.isFinite(amt) && amt > 0) map.set(emp, amt);
+      }
+    }
+  }
+
+  // Supplement with get_status standings (may carry non-tax crimes). Can be stale,
+  // so it only ever raises an amount, never lowers one.
+  await bot.refreshStatus(true);
+  for (const [emp, amt] of Object.entries(bot.bounties ?? {})) {
+    const key = emp.trim().toLowerCase();
+    if (amt > 0) map.set(key, Math.max(map.get(key) ?? 0, amt));
+  }
+
+  return [...map.entries()];
+}
+
+/**
  * Clear outstanding empire bounties with `pay_bounty`.
  *
  * Bounties (unpaid income/property tax and other crimes) trigger DETENTION the
@@ -939,7 +976,7 @@ export async function sellAllCargo(ctx: RoutineContext): Promise<number> {
  * `pay_bounty` is a queued mutation that only settles on the next ~10s server
  * tick, and the library reports a queued command as success before the server
  * has actually processed it. We therefore issue the payment(s), wait for the
- * tick to resolve, then re-read `get_status` to see what ACTUALLY cleared.
+ * tick to resolve, then re-read the bounty list to see what ACTUALLY cleared.
  *
  * Returns how many empire bounties were cleared and how much is still owed.
  */
@@ -950,10 +987,7 @@ export async function payOutstandingBounties(
   const { bot } = ctx;
   const reason = opts?.reason ? ` (${opts.reason})` : "";
 
-  // get_status is the source of truth for per-empire bounties — force a fresh read
-  // so we never act on a stale (already-cleared) cache.
-  await bot.refreshStatus(true);
-  const before = Object.entries(bot.bounties ?? {}).filter(([, amt]) => amt > 0);
+  const before = await fetchOutstandingBounties(ctx);
 
   if (before.length === 0) {
     ctx.log("travel", `No outstanding bounties to pay${reason}`);
@@ -984,25 +1018,22 @@ export async function payOutstandingBounties(
     }
   }
 
-  // Let the queued payment(s) resolve on the server tick, then verify via get_status
-  // what actually cleared. (A queued self-pay the bot can't afford LOOKS successful
-  // here but never clears — the status re-read is the only reliable confirmation.)
+  // Let the queued payment(s) resolve on the server tick, then verify via a fresh
+  // bounty read what actually cleared. (A queued self-pay the bot can't afford LOOKS
+  // successful here but never clears — the re-read is the only reliable confirmation.)
+  const stillOwed = (rows: Array<[string, number]>): number =>
+    before.reduce((sum, [emp]) => sum + (rows.find(([e]) => e === emp)?.[1] ?? 0), 0);
+
   const deadline = Date.now() + 30_000;
-  let after = bot.bounties ?? {};
+  let after = await fetchOutstandingBounties(ctx);
   do {
     await ctx.sleep(5000);
-    if (bot.state !== "running") { after = bot.bounties ?? {}; break; }
-    await bot.refreshStatus(true);
-    after = bot.bounties ?? {};
-  } while (Date.now() < deadline && before.some(([emp]) => (after[emp] ?? 0) > 0));
+    if (bot.state !== "running") { after = await fetchOutstandingBounties(ctx); break; }
+    after = await fetchOutstandingBounties(ctx);
+  } while (Date.now() < deadline && stillOwed(after) > 0);
 
-  let paid = 0;
-  let remaining = 0;
-  for (const [empire] of before) {
-    const still = after[empire] ?? 0;
-    if (still <= 0) paid++;
-    else remaining += still;
-  }
+  const remaining = stillOwed(after);
+  const paid = before.filter(([emp]) => (after.find(([e]) => e === emp)?.[1] ?? 0) <= 0).length;
   ctx.log("travel", `Bounty payment result: ${paid} empire(s) cleared, ${remaining}cr still owed${reason}`);
   return { paid, remaining };
 }

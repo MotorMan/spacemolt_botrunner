@@ -679,6 +679,11 @@ stayOutUntilFull: boolean;
    minimumFuelCells: number;
    returnHomeOnFuelCellsRemaining: number;
    noMidMiningRetarget: boolean;
+   /** When true, pick the closest system with the target ore instead of the
+    *  fullest. Quotas are untouched — this only changes which system is chosen
+    *  for the selected ore (nearest first, regardless of remaining). Useful for
+    *  depleting newly-accessible local systems before expanding outward. */
+   preferClosestDeposit: boolean;
   enableCloak: boolean;
   cloakIgnoreBlacklist: boolean;
   desiredEmergencyWarpDevices: number;
@@ -793,6 +798,7 @@ iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
     returnHomeOnFuelCellsRemaining: (m.returnHomeOnFuelCellsRemaining as number) ?? 2,
     noMidMiningRetarget: (m.noMidMiningRetarget as boolean) ?? false,
+    preferClosestDeposit: (m.preferClosestDeposit as boolean) ?? false,
     enableCloak: (m.enableCloak as boolean) ?? false,
     cloakIgnoreBlacklist: (m.cloakIgnoreBlacklist as boolean) ?? false,
     enableMissions: (m.enableMissions as boolean) ?? true,
@@ -4398,11 +4404,22 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                }
                return true;
              })
-             .sort((a, b) => {
-               if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
-               if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
-               const isCommon = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
-               if (isCommon) {
+              .sort((a, b) => {
+                if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+                if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+                const isCommon = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
+                // Prefer-closest mode: pick the nearest system holding this ore,
+                // ignoring how full it is. Quotas are unaffected — this only
+                // reorders candidate systems. Nearest first, then fuller as a
+                // tie-breaker within the same jump count.
+                if (settings.preferClosestDeposit) {
+                  if (a.jumps !== b.jumps) return a.jumps - b.jumps;
+                  const aRem = a.remaining ?? 0;
+                  const bRem = b.remaining ?? 0;
+                  if (aRem !== bRem) return bRem - aRem;
+                  return (b.richness ?? 0) - (a.richness ?? 0);
+                }
+                if (isCommon) {
                  if (a.jumps !== b.jumps) return a.jumps - b.jumps;
                  const aRem = a.remaining ?? 0;
                  const bRem = b.remaining ?? 0;

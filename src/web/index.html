@@ -31858,6 +31858,17 @@ async function fetchPersonalFacilityTypes(username) {
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Prefer Closest Deposit</div>
+          <div class="setting-hint">When enabled, the miner focuses on local deposits first: it picks the nearest system holding the target ore (fewest jumps) and mines it until depleted, then expands outward. Quotas are not overridden — this only changes which system is chosen for the selected ore. Useful for clearing newly-accessible nearby systems before traveling farther.</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="set-miner-preferClosestDeposit"${m.preferClosestDeposit ? " checked" : ""} />
+          <span>Mine local deposits first</span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Stay Out Until Full</div>
           <div class="setting-hint">When enabled, miners will continue to the next POI with target ore instead of returning home when a POI is depleted. Saves time and fuel by staying out until cargo is full.</div>
         </div>
@@ -32526,6 +32537,9 @@ async function fetchPersonalFacilityTypes(username) {
             .checked,
           noMidMiningRetarget: document.getElementById(
             "set-miner-noMidMiningRetarget",
+          ).checked,
+          preferClosestDeposit: document.getElementById(
+            "set-miner-preferClosestDeposit",
           ).checked,
           enableCloak: document.getElementById(
             "set-miner-enableCloak",

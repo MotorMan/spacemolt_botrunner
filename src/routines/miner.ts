@@ -182,6 +182,12 @@ function getMiningBlacklist(bot: { routineName: string | null; username?: string
     // Pathfinder Drive unlocks the Frontier (the module exists to go there).
     return baseBlacklist.filter((id) => !mapStore.isFrontierSystem(id));
   }
+  if (settings.enableFactionGateFrontier) {
+    // Faction jump gates are permanent two-way routes, so Frontier systems
+    // reachable by one are safe without a Pathfinder Drive. Keep wormhole-only
+    // Frontier systems blacklisted (those can still strand the ship).
+    return baseBlacklist.filter((id) => !mapStore.isFrontierSystemJumpGateReachable(id));
+  }
   return baseBlacklist;
 }
 
@@ -336,10 +342,13 @@ function isDeepCoreRadioactiveOre(resourceId: string): boolean {
  * must not target them. This check is intentionally limited to radioactive
  * mining so regular miners keep their existing behavior.
  */
-function isForbiddenRadioactiveSystem(systemId: string, allowFrontier: boolean = false): boolean {
+function isForbiddenRadioactiveSystem(systemId: string, allowFrontier: boolean = false, allowFactionGateFrontier: boolean = false): boolean {
   // A Pathfinder Drive lets a radioactive miner reach the Frontier and jump
   // back out, so the wormhole-stranding ban is lifted when it is fitted.
   if (allowFrontier) return false;
+  // A faction jump gate is a permanent two-way route: the miner can always jump
+  // back out, so jump-gate-connected Frontier systems are safe when enabled.
+  if (allowFactionGateFrontier && mapStore.isFrontierSystemJumpGateReachable(systemId)) return false;
   return mapStore.isFrontierSystem(systemId);
 }
 
@@ -679,6 +688,11 @@ stayOutUntilFull: boolean;
    minimumFuelCells: number;
    returnHomeOnFuelCellsRemaining: number;
    noMidMiningRetarget: boolean;
+   /** When true, miners without a Pathfinder Drive may mine Frontier systems that
+    *  are reachable by a normal jump-gate (e.g. a faction jump gate). The gate is a
+    *  permanent two-way route, so the ship can always jump back out. Frontier
+    *  systems reachable only via temporary wormholes stay blocked. */
+   enableFactionGateFrontier: boolean;
    /** When true, pick the closest system with the target ore instead of the
     *  fullest. Quotas are untouched — this only changes which system is chosen
     *  for the selected ore (nearest first, regardless of remaining). Useful for
@@ -798,6 +812,7 @@ iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
     returnHomeOnFuelCellsRemaining: (m.returnHomeOnFuelCellsRemaining as number) ?? 2,
     noMidMiningRetarget: (m.noMidMiningRetarget as boolean) ?? false,
+    enableFactionGateFrontier: (m.enableFactionGateFrontier as boolean) ?? false,
     preferClosestDeposit: (m.preferClosestDeposit as boolean) ?? false,
     enableCloak: (m.enableCloak as boolean) ?? false,
     cloakIgnoreBlacklist: (m.cloakIgnoreBlacklist as boolean) ?? false,
@@ -1706,6 +1721,7 @@ export function pickTargetFromQuotas(
   jettisonOres: string[] = [],
   hasModulatedMiningLaser?: boolean,
   allowFrontier: boolean = false,
+  allowFactionGateFrontier: boolean = false,
 ): string {
   const jettisonSet = new Set(jettisonOres.map(o => o.toLowerCase()));
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number; hasViableLocations: boolean }> = [];
@@ -1719,7 +1735,7 @@ export function pickTargetFromQuotas(
       const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
         // Radioactive miners must not target Frontier systems (wormhole stranding risk).
-        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
         if (shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
           return false;
         }
@@ -1740,7 +1756,7 @@ export function pickTargetFromQuotas(
       if (jettisonSet.has(resourceId.toLowerCase())) continue;
       const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
-        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
         if (shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
           return false;
         }
@@ -1787,6 +1803,7 @@ export function findFirstAvailableQuotaTarget(
   maxJumps?: number,
   hasModulatedMiningLaser?: boolean,
   allowFrontier: boolean = false,
+  allowFactionGateFrontier: boolean = false,
 ): string {
   const excludeSet = new Set<string>();
   if (excludeTargets) {
@@ -1854,6 +1871,7 @@ export function findFirstAvailableQuotaTarget(
       undefined,
       hasModulatedMiningLaser,
       allowFrontier,
+      allowFactionGateFrontier,
     );
     if (reachable.length > 0) {
       return entry.resourceId;
@@ -1895,6 +1913,7 @@ function getReachableOreLocations(
   excludeSystems?: Set<string>,
   hasModulatedMiningLaser?: boolean,
   allowFrontier: boolean = false,
+  allowFactionGateFrontier: boolean = false,
 ): Array<{
   systemId: string; systemName: string; poiId: string; poiName: string;
   remaining: number; maxRemaining: number; richness: number;
@@ -1915,7 +1934,7 @@ function getReachableOreLocations(
     // POI type / hidden-access checks
     if (miningType === "radioactive") {
       // Frontier systems are wormhole-only and can strand the miner.
-      if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) continue;
+      if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) continue;
       if (poi.hidden === true && !canMineHiddenRadioactive) continue;
     } else if (miningType === "ice") {
       if (poi.hidden === true && !canMineHiddenIce) continue;
@@ -2026,6 +2045,7 @@ function pickTargetFromQuotasOrClosest(
   jettisonOres: string[] = [],
   hasModulatedMiningLaser?: boolean,
   allowFrontier: boolean = false,
+  allowFactionGateFrontier: boolean = false,
 ): { target: string; hasDeficit: boolean } {
   const jettisonSet = new Set(jettisonOres.map(o => o.toLowerCase()));
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number; hasViableLocations: boolean }> = [];
@@ -2040,7 +2060,7 @@ function pickTargetFromQuotasOrClosest(
 
     const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
-        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+        if (miningType === "radioactive" && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
         const hasScanData = loc.minutesSinceScan !== Infinity;
         const isLowRemainingWithUnknownPower = shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
         if (isLowRemainingWithUnknownPower) {
@@ -2547,6 +2567,7 @@ function findBestHiddenPoiForOre(
   blacklist: string[] = [], // Systems to exclude (can be empty for cloaked miners)
   excludeFrontier: boolean = false, // Radioactive miners must skip Frontier systems
   allowFrontier: boolean = false, // Pathfinder Drive fitted: Frontier is reachable
+  allowFactionGateFrontier: boolean = false, // Faction jump gate: jump-gate Frontier is reachable
 ): { poiId: string; poiName: string; systemId: string; systemName: string; richness: number; remaining: number; jumps: number; isHidden: boolean; supportedPower: number } | null {
   // Radioactive ores are different from deep-core ores: any richness is viable
   // and Frontier systems are off-limits unless a Pathfinder Drive is fitted.
@@ -2559,7 +2580,7 @@ function findBestHiddenPoiForOre(
     if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
 
     // Frontier systems are wormhole-only and can strand the miner.
-    if (effectiveExcludeFrontier && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+    if (effectiveExcludeFrontier && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
     
     // Must be a hidden POI
     const sys = mapStore.getSystem(loc.systemId);
@@ -2630,13 +2651,14 @@ function areAllHiddenPoisDepleted(
   ignoreDepletion: boolean,
   depletionTimeoutMs: number,
   allowFrontier: boolean = false,
+  allowFactionGateFrontier: boolean = false,
 ): boolean {
   const allHiddenLocations = mapStore.findOreLocations(oreId, undefined, true).filter(loc => {
     // Skip current POI
     if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
 
     // Radioactive miners must not count Frontier systems as available.
-    if (isRadioactiveOre(oreId) && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+    if (isRadioactiveOre(oreId) && isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
     
     // Must be a hidden POI
     const sys = mapStore.getSystem(loc.systemId);
@@ -2997,6 +3019,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const settings = await getMinerSettings(bot.username);
       // Radioactive miners may enter the Frontier when a Pathfinder Drive is fitted.
       const allowFrontier = bot.hasPathfinderDrive === true;
+      // Miners without a Pathfinder Drive may still reach Frontier systems that
+      // have a permanent faction jump gate (two-way, shows up in find_route).
+      const allowFactionGateFrontier = !allowFrontier && settings.enableFactionGateFrontier === true;
       if (await hasModulatedMiningLaser(ctx, cachedModules)) {
         settings.ignoreDepletion = true;
         ctx.log("mining", "Modulated Mining Laser detected — ignoring depletion lockout for this cycle");
@@ -3469,7 +3494,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 // When docked at home, use enhanced selection that always picks a target
        // This ensures the miner keeps cycling through ores even when all quotas are met
        if (bot.docked && bot.system === homeSystem) {
-            const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings, bot.username, getJettisonListForMiningType(settings, miningType), hasModulatedLaser, allowFrontier);
+            const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings, bot.username, getJettisonListForMiningType(settings, miningType), hasModulatedLaser, allowFrontier, allowFactionGateFrontier);
          quotaTargetResource = quotaResult.target;
          quotaHasDeficit = quotaResult.hasDeficit;
          if (quotaResult.target) {
@@ -3485,7 +3510,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
          }
 } else {
           // Original behavior when not at home
-          quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, getJettisonListForMiningType(settings, miningType), hasModulatedLaser, allowFrontier);
+          quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, getJettisonListForMiningType(settings, miningType), hasModulatedLaser, allowFrontier, allowFactionGateFrontier);
           if (quotaTargetResource) {
             ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
           } else {
@@ -4020,7 +4045,7 @@ const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system,
 
     // Radioactive miners must never be sent into a Frontier system, even when
     // one is configured, because the wormhole can expire and strand the ship.
-    if (miningType === "radioactive" && configuredSystem && isForbiddenRadioactiveSystem(configuredSystem, allowFrontier)) {
+    if (miningType === "radioactive" && configuredSystem && isForbiddenRadioactiveSystem(configuredSystem, allowFrontier, allowFactionGateFrontier)) {
       ctx.log("warn", `Configured radioactive system ${configuredSystem} is a Frontier system — ignoring (wormhole stranding risk)`);
       configuredSystem = "";
     }
@@ -4054,7 +4079,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         }
         if (miningType === "radioactive") {
           // Frontier systems are wormhole-only and can strand the miner.
-          if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+          if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
           if (poi.hidden === true && !canMineHiddenRadioactive) return false;
           return true;
         }
@@ -4112,7 +4137,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
            return true;
          }
           if (miningType === "radioactive") {
-            if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+            if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
             if (poi.hidden === true && !canMineHiddenRadioactive) return false;
             return true;
           }
@@ -4211,7 +4236,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
             const availableQuotaTarget = findFirstAvailableQuotaTarget(
               quotaTargetsToUse, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
               canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois, originalTarget, true, totalMiningPower, bot.username,
-              blacklist, bot.system, maxJumps, hasModulatedLaser, allowFrontier
+        blacklist, bot.system, maxJumps, hasModulatedLaser, allowFrontier, allowFactionGateFrontier
             );
           if (availableQuotaTarget && availableQuotaTarget !== originalTarget) {
             effectiveTarget = availableQuotaTarget;
@@ -4227,7 +4252,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                   return true;
                 }
                 if (miningType === "radioactive") {
-                  if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+                  if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
                   if (poi.hidden === true && !canMineHiddenRadioactive) return false;
                   return true;
                 }
@@ -4494,7 +4519,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                 return true;
               }
               if (miningType === "radioactive") {
-                if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+                if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
                 if (poi.hidden === true && !canMineHiddenRadioactive) return false;
                 return true;
               }
@@ -5235,7 +5260,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           const newTarget = findFirstAvailableQuotaTarget(
             quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
             canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois, excludeTarget, !(hasCloak && bot.isCloaked), totalMiningPower, bot.username,
-            blacklist, bot.system, maxJumps, hasModulatedLaser, allowFrontier
+              blacklist, bot.system, maxJumps, hasModulatedLaser, allowFrontier, allowFactionGateFrontier
           );
           if (newTarget && newTarget !== effectiveTarget) {
             searchTarget = newTarget;
@@ -5259,7 +5284,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
            }
           if (miningType === "radioactive") {
             // Frontier systems are wormhole-only and can strand the miner.
-            if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+            if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
             const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                               (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
                                                loc.poiName.toLowerCase().includes('mineral field') ||
@@ -5454,7 +5479,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               isValid = !chosenPoi.hidden || canMineHiddenPois;
             } else if (miningType === "radioactive") {
               isValid = canMineBasicRadioactive &&
-                !isForbiddenRadioactiveSystem(chosen.systemId, allowFrontier) &&
+                !isForbiddenRadioactiveSystem(chosen.systemId, allowFrontier, allowFactionGateFrontier) &&
                 (!chosenPoi.hidden || canMineHiddenRadioactive);
             } else if (miningType === "gas") {
               isValid = true;
@@ -6217,7 +6242,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             const poi = sys?.pois.find(p => p.id === loc.poiId);
             if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               if (miningType === "radioactive") return canMineBasicRadioactive &&
-                !isForbiddenRadioactiveSystem(loc.systemId, allowFrontier) && (
+                !isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier) && (
                 isOreBeltPoi(poi?.type || "") ||
                 (!poi?.hidden && canMineDeepCoreRadioactive) ||
                 (poi?.hidden && canMineHiddenRadioactive)
@@ -6821,7 +6846,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               settings.ignoreDepletion,
               depletionTimeoutMs,
               50,
-              blacklist, allowFrontier);
+              blacklist, allowFrontier, false, allowFactionGateFrontier);
             if (nextHiddenPoi) {
               newTarget = entry.oreId;
               newPoiId = nextHiddenPoi.poiId;
@@ -6844,7 +6869,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
             settings.ignoreDepletion,
             depletionTimeoutMs,
             0,
-            blacklist, allowFrontier);
+            blacklist, allowFrontier, false, allowFactionGateFrontier);
           if (anyPoi) {
             newTarget = effectiveTarget;
             newPoiId = anyPoi.poiId;
@@ -7007,7 +7032,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                 settings.ignoreDepletion,
                 depletionTimeoutMs,
                 50,
-                blacklist, allowFrontier);
+                blacklist, allowFrontier, false, allowFactionGateFrontier);
               if (nextHiddenPoi) {
                 newTarget = entry.oreId;
                 newPoiId = nextHiddenPoi.poiId;
@@ -7030,7 +7055,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               settings.ignoreDepletion,
               depletionTimeoutMs,
               0,
-              blacklist, allowFrontier);
+              blacklist, allowFrontier, false, allowFactionGateFrontier);
             if (anyPoi) {
               newTarget = effectiveTarget;
               newPoiId = anyPoi.poiId;
@@ -7154,7 +7179,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                 settings.ignoreDepletion,
                 depletionTimeoutMs,
                 50,
-                blacklist, allowFrontier);
+                blacklist, allowFrontier, false, allowFactionGateFrontier);
               if (nextHiddenPoi) {
                 newTarget = entry.oreId;
                 newPoiId = nextHiddenPoi.poiId;
@@ -7177,7 +7202,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               settings.ignoreDepletion,
               depletionTimeoutMs,
               0,
-              blacklist, allowFrontier);
+              blacklist, allowFrontier, false, allowFactionGateFrontier);
             if (anyPoi) {
               newTarget = effectiveTarget;
               newPoiId = anyPoi.poiId;
@@ -7343,7 +7368,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               settings.ignoreDepletion,
               depletionTimeoutMs,
               50,
-              blacklist, allowFrontier);
+              blacklist, allowFrontier, false, allowFactionGateFrontier);
             
             if (hiddenPoi) {
               newTarget = effectiveTarget;
@@ -7357,7 +7382,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                 bot.system,
                 bot.poi || "",
                 settings.ignoreDepletion,
-                depletionTimeoutMs, allowFrontier);
+                depletionTimeoutMs, allowFrontier, allowFactionGateFrontier);
               
               if (allHiddenDepleted) {
                 ctx.log("mining", `All hidden POIs for ${effectiveTarget} are depleted (on timer) — switching to next quota ore`);
@@ -7391,7 +7416,7 @@ for (const quotaEntry of sortedOres) {
                       settings.ignoreDepletion,
                       depletionTimeoutMs,
                       50,
-                      blacklist, allowFrontier);
+                      blacklist, allowFrontier, false, allowFactionGateFrontier);
                     
                     if (nextHiddenPoi) {
                       newTarget = quotaEntry.oreId;
@@ -7414,7 +7439,7 @@ for (const quotaEntry of sortedOres) {
                         settings.ignoreDepletion,
                         depletionTimeoutMs,
                         30,
-                        blacklist, allowFrontier);
+                        blacklist, allowFrontier, false, allowFactionGateFrontier);
                       if (anyPoi) {
                         anyHiddenAvailable = true;
                         break;
@@ -7433,7 +7458,7 @@ for (const quotaEntry of sortedOres) {
                           settings.ignoreDepletion,
                           depletionTimeoutMs,
                           0,
-                          blacklist, allowFrontier);
+                          blacklist, allowFrontier, false, allowFactionGateFrontier);
 
                       if (anyPoiResult) {
                         newTarget = oreEntry.oreId;
@@ -7482,7 +7507,7 @@ for (const quotaEntry of sortedOres) {
                     settings.ignoreDepletion,
                     depletionTimeoutMs,
                     50,
-                    blacklist, allowFrontier);
+                    blacklist, allowFrontier, false, allowFactionGateFrontier);
                   
                   if (nextHiddenPoi) {
                     newTarget = quotaEntry.oreId;
@@ -7541,7 +7566,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                   settings.ignoreDepletion,
                   depletionTimeoutMs,
                   50,
-                  blacklist, allowFrontier);
+                  blacklist, allowFrontier, false, allowFactionGateFrontier);
 
               if (hiddenPoiResult) {
                 newTarget = deepCoreOre;
@@ -7565,7 +7590,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                   settings.ignoreDepletion,
                   depletionTimeoutMs,
                   0,
-                  blacklist, allowFrontier);
+                  blacklist, allowFrontier, false, allowFactionGateFrontier);
 
                 if (anyPoiResult) {
                   newTarget = deepCoreOre;
@@ -7655,7 +7680,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               if (miningType === "radioactive") {
-                if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+                if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
                 const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                                   (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
                                                    loc.poiName.toLowerCase().includes('mineral field') ||
@@ -7711,7 +7736,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
            if (!newTarget) {
              ctx.log("mining", `Global target not available — checking quotas...`);
              await bot.refreshFactionStorage();
-              const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, getJettisonListForMiningType(settings, miningType), hasModulatedLaser);
+              const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, getJettisonListForMiningType(settings, miningType), hasModulatedLaser, allowFrontier, allowFactionGateFrontier);
 
             if (newQuotaTarget) {
               // Find locations for the new quota target
@@ -7720,7 +7745,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
                 if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               if (miningType === "radioactive") {
-                if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) return false;
+                if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) return false;
                 const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                                   (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
                                                    loc.poiName.toLowerCase().includes('mineral field') ||
@@ -7801,7 +7826,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                                             p.name.toLowerCase().includes('mineral field') ||
                                             p.name.toLowerCase().includes('asteroid')));
                               return canMineBasicRadioactive &&
-                                !isForbiddenRadioactiveSystem(bot.system) && (
+                                !isForbiddenRadioactiveSystem(bot.system, allowFrontier, allowFactionGateFrontier) && (
                                 isOreBelt ||
                                 (!p.hidden && canMineDeepCoreRadioactive) ||
                                 (p.hidden && canMineHiddenRadioactive)
@@ -7859,7 +7884,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                     if (poi.hidden) continue; // Hidden POIs need special handling
                   }
                   if (miningType === "radioactive") {
-                    if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier)) continue;
+                    if (isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier)) continue;
                     if (poi.hidden && !canMineHiddenRadioactive) continue;
                   }
                   if (miningType === "gas") {
@@ -7869,7 +7894,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                     if (poi.hidden && !canMineHiddenIce) continue;
                   }
                   if (miningType === "radioactive" && !(canMineBasicRadioactive &&
-                    !isForbiddenRadioactiveSystem(loc.systemId, allowFrontier) && (
+                    !isForbiddenRadioactiveSystem(loc.systemId, allowFrontier, allowFactionGateFrontier) && (
                     isOreBeltPoi(poi.type) ||
                     (!poi.hidden && canMineDeepCoreRadioactive) ||
                     (poi.hidden && canMineHiddenRadioactive)

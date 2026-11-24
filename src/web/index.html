@@ -31985,6 +31985,17 @@ async function fetchPersonalFacilityTypes(username) {
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Allow Faction Jump-Gate Frontier</div>
+          <div class="setting-hint">When enabled, miners without a Pathfinder Drive may mine Frontier systems that are reachable by a faction jump gate. The gate is a permanent two-way jump route (shows up in find_route), so the ship can always jump back out. Frontier systems reachable only via temporary one-way wormholes stay blocked. Ignored when a Pathfinder Drive is fitted (that already unlocks the whole Frontier).</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="set-miner-enableFactionGateFrontier"${m.enableFactionGateFrontier ? " checked" : ""} />
+          <span>Allow jump-gate frontier systems</span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Pathfinder Frontier Max Jumps</div>
           <div class="setting-hint">Maximum total jumps for a Pathfinder frontier trip: main-network jumps to the staging hub + 1 (the pathfinder jump) + frontier jumps to the target. Frontier targets beyond this are skipped. Only applies when a Pathfinder Drive is fitted. Default 10.</div>
         </div>
@@ -32640,6 +32651,9 @@ async function fetchPersonalFacilityTypes(username) {
             })(),
           blockFrontierSystems: document.getElementById(
             "set-miner-blockFrontierSystems",
+          ).checked,
+          enableFactionGateFrontier: document.getElementById(
+            "set-miner-enableFactionGateFrontier",
           ).checked,
 
           // Note: oreQuotas, gasQuotas, iceQuotas, deepCoreQuotas, radioactiveQuotas are managed in Miner Quotas settings page

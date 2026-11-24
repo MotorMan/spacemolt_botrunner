@@ -3053,6 +3053,28 @@ const locations = this.findOreLocations(oreId, blacklist);
   }
 
   /**
+   * Whether a Frontier system is reachable from the main network by a normal
+   * jump-gate connection (e.g. a faction jump gate). Such a system is safe to
+   * visit without a Pathfinder Drive: the gate is a permanent, two-way jump
+   * route that shows up in find_route, so the ship can always jump back out.
+   *
+   * This is distinct from `isFrontierSystem` (insertion-order based): a jump-gate
+   * Frontier system is still "Frontier" by insertion order, but because it has a
+   * normal connection it is part of the main connected component. Frontier
+   * systems reachable ONLY via temporary (one-way) wormholes are NOT in the main
+   * component and therefore return false here — those remain off-limits.
+   */
+  isFrontierSystemJumpGateReachable(systemId: string): boolean {
+    if (!systemId) return false;
+    const id = this.resolveSystemId(systemId);
+    if (!id) return false;
+    if (!this.isFrontierSystem(id)) return false;
+    // getMainNetworkSystems() keys are lowercase ids; it is built from normal
+    // jump-gate connections (plus the two permanent bidirectional wormholes).
+    return this.getMainNetworkSystems().has(id.toLowerCase());
+  }
+
+  /**
    * Get the set of system IDs in the main connected component (the original ~506 systems).
    * Uses the same logic as buildFixedRouteGraph in explorer.ts to identify the main network.
    * Returns a Set of lowercase system IDs.
@@ -3181,4 +3203,9 @@ export function getMainNetworkSystems(): Set<string> {
 /** Whether a system is a Frontier system (appended after the original 506). */
 export function isFrontierSystem(systemId: string): boolean {
   return mapStore.isFrontierSystem(systemId);
+}
+
+/** Whether a Frontier system is reachable by a normal jump-gate (e.g. faction gate). */
+export function isFrontierSystemJumpGateReachable(systemId: string): boolean {
+  return mapStore.isFrontierSystemJumpGateReachable(systemId);
 }

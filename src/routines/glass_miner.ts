@@ -2252,7 +2252,7 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
       const safetyOpts = {
         fuelThresholdPct: settings.refuelThreshold,
         hullThresholdPct: settings.repairThreshold,
-        autoCloak: settings.enableCloak,
+        autoCloak: true,
         skipBlacklist: false,
         isCombatBot: true,
         joinBattles: true,
@@ -2485,20 +2485,28 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
           await collectFromStorage(ctx);
           await ensureGlassMinerResupply(ctx);
           await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
+          // Stay DOCKED (cloaked, zero fuel burn) for the whole replenish wait.
+          // Undocking only wastes fuel — the next navigation undocks automatically.
+          const waitHours = settings.depletionTimeoutHours;
+          ctx.log("system", `Docked and waiting ${waitHours} h (Depletion Timeout) for the depleted POI to replenish before returning to ${target.systemId}/${target.poiId}`);
+          await ctx.sleep(waitHours * 60 * 60 * 1000);
           await ensureUndocked(ctx);
-          // Re-cloak after undocking so we are never exposed while waiting.
+          // Re-cloak after undocking so we are never exposed while traveling back.
           await enableCloakingIfPossible(ctx, cachedModules);
         } else {
           ctx.log("error", `Could not reach home system ${homeSystem} — will retry after the replenish wait`);
+          // Still wait out the depletion timer before retrying, even if we never
+          // made it home (no point hammering the exhausted seam).
+          const waitHours = settings.depletionTimeoutHours;
+          ctx.log("system", `Waiting ${waitHours} h (Depletion Timeout) for the depleted POI to replenish before retrying`);
+          await ctx.sleep(waitHours * 60 * 60 * 1000);
         }
       } else if (!homeSystem) {
         ctx.log("warn", "No home system configured — cannot return to deposit; waiting for the POI to replenish instead");
+        const waitHours = settings.depletionTimeoutHours;
+        ctx.log("system", `Waiting ${waitHours} h (Depletion Timeout) for the depleted POI to replenish`);
+        await ctx.sleep(waitHours * 60 * 60 * 1000);
       }
-      // Give the depleted POI time to replenish before we come back to it.
-      // Log clearly so the long wait doesn't look like the routine is stuck.
-      const waitMin = settings.deepSleepIntervalMin;
-      ctx.log("system", `Waiting ${waitMin} min (cloaked) for the depleted POI to replenish before returning to ${target.systemId}/${target.poiId}`);
-      await ctx.sleep(waitMin * 60 * 1000);
       continue;
     }
   }

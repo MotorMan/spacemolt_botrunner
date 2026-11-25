@@ -1910,6 +1910,25 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
     await enableCloakingIfPossible(ctx, cachedModules);
   }
 
+  // Startup: if we begin at the home system with cargo in the hold (e.g. after a
+  // restart mid-route), clear it out before heading back to the seam. Otherwise
+  // the bot runs off to mine more and never unloads what it already has.
+  {
+    await bot.refreshLocation();
+    await bot.refreshCargo();
+    const startupHome = settings.systemOre || settings.system || settings.homeSystem;
+    if (!settings.mineOnly && startupHome && bot.system === startupHome && bot.cargo > 0) {
+      ctx.log("system", `At home (${startupHome}) with ${bot.cargo} cargo aboard — depositing before heading out`);
+      await ensureDocked(ctx);
+      await depositNonFuelCargo(ctx);
+      await collectFromStorage(ctx);
+      await ensureGlassMinerResupply(ctx);
+      await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
+      await ensureUndocked(ctx);
+      await enableCloakingIfPossible(ctx, cachedModules);
+    }
+  }
+
   while (bot.state === "running") {
     const blacklist = getMiningBlacklist(bot, settings, bot.isCloaked);
     

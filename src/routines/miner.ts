@@ -4499,9 +4499,15 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           }
           
           // Loop through ALL quota ores to find one with locations within range
-          // This ensures we try every available ore before giving up
+          // This ensures we try every available ore before giving up.
+          // CRITICAL: Exclude jettison-listed ores (e.g. iron/copper when station
+          // storage is full). Selecting them here makes the miner fly out, mine,
+          // and immediately jettison the ore — a pointless loop that wastes fuel
+          // and time. findFirstAvailableQuotaTarget already filters these; this
+          // manual loop must do the same.
           let foundAlternative = false;
-          const allQuotaOres = Object.keys(quotas).filter(ore => quotas[ore] > 0 && !isDeepCoreOre(ore));
+          const altJettisonSet = new Set(getJettisonListForMiningType(settings, miningType).map(o => o.toLowerCase()));
+          const allQuotaOres = Object.keys(quotas).filter(ore => quotas[ore] > 0 && !isDeepCoreOre(ore) && !altJettisonSet.has(ore.toLowerCase()));
           
           for (const oreId of allQuotaOres) {
             if (oreId === effectiveTarget) continue;
@@ -6829,7 +6835,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
         if (!newTarget && Object.keys(quotas).length > 0) {
           await bot.refreshFactionStorage();
           const quotaEntries = Object.entries(quotas)
-            .filter(([oreId]) => oreId !== effectiveTarget && quotas[oreId] > 0)
+            .filter(([oreId]) => oreId !== effectiveTarget && quotas[oreId] > 0 && !getJettisonListForMiningType(settings, miningType).some(j => j.toLowerCase() === oreId.toLowerCase()))
             .map(([oreId, target]) => {
               const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
               return { oreId, deficit: target - current };
@@ -7015,7 +7021,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
           if (!newTarget && Object.keys(quotas).length > 0) {
             await bot.refreshFactionStorage();
             const quotaEntries = Object.entries(quotas)
-              .filter(([oreId]) => oreId !== effectiveTarget && quotas[oreId] > 0)
+              .filter(([oreId]) => oreId !== effectiveTarget && quotas[oreId] > 0 && !getJettisonListForMiningType(settings, miningType).some(j => j.toLowerCase() === oreId.toLowerCase()))
               .map(([oreId, target]) => {
                 const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
                 return { oreId, deficit: target - current };
@@ -7162,7 +7168,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
           if (!newTarget && Object.keys(quotas).length > 0) {
             await bot.refreshFactionStorage();
             const quotaEntries = Object.entries(quotas)
-              .filter(([oreId]) => oreId !== effectiveTarget && quotas[oreId] > 0)
+              .filter(([oreId]) => oreId !== effectiveTarget && quotas[oreId] > 0 && !getJettisonListForMiningType(settings, miningType).some(j => j.toLowerCase() === oreId.toLowerCase()))
               .map(([oreId, target]) => {
                 const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
                 return { oreId, deficit: target - current };

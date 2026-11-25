@@ -20,6 +20,7 @@ import {
   parseOreFromMineResult,
   parseOreFromCargoDelta,
   collectFromStorage,
+  depositNonFuelCargo,
   ensureDocked,
   ensureUndocked,
   tryRefuel,
@@ -1900,7 +1901,12 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
   // replenish instead of hammering the same exhausted deposit forever.
   let forceReturnHome = false;
 
-  if (settings.enableCloak) {
+  // Cloak whenever a cloaking module is fitted. Cloak persists through travel,
+  // docking, undocking and mining, and costs no fuel while docked — so the ship
+  // is never left sitting undocked and uncloaked (e.g. while waiting out a
+  // depleted POI). enableCloak still forces the attempt even if detection is
+  // ever wrong.
+  if (settings.enableCloak || await hasCloakingModule(ctx, cachedModules)) {
     await enableCloakingIfPossible(ctx, cachedModules);
   }
 
@@ -1957,10 +1963,12 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
           const homeSystem = settings.systemOre || settings.system || settings.homeSystem;
           if (homeSystem && bot.system === homeSystem) {
             await ensureDocked(ctx);
+            await depositNonFuelCargo(ctx);
             await collectFromStorage(ctx);
             await ensureGlassMinerResupply(ctx);
             await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
             await ensureUndocked(ctx);
+            await enableCloakingIfPossible(ctx, cachedModules);
             continue;
           }
         }
@@ -2015,7 +2023,7 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
         const safetyOpts = {
           fuelThresholdPct: 10,
           hullThresholdPct: settings.repairThreshold,
-          autoCloak: settings.enableCloak,
+          autoCloak: true,
           skipBlacklist: false,
           isCombatBot: true,
           joinBattles: true,
@@ -2023,10 +2031,15 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
         const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
         if (arrived) {
           await ensureDocked(ctx);
+          // Unload the valuable cargo FIRST (before withdrawing supplies) so it
+          // is never left sitting in a full hold while undocked.
+          await depositNonFuelCargo(ctx);
           await collectFromStorage(ctx);
           await ensureGlassMinerResupply(ctx);
           await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
           await ensureUndocked(ctx);
+          // Re-cloak after undocking so we are never exposed at base.
+          await enableCloakingIfPossible(ctx, cachedModules);
         }
       }
       continue;
@@ -2440,7 +2453,7 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
         const safetyOpts = {
           fuelThresholdPct: 10,
           hullThresholdPct: settings.repairThreshold,
-          autoCloak: settings.enableCloak,
+          autoCloak: true,
           skipBlacklist: false,
           isCombatBot: true,
           joinBattles: true,
@@ -2448,10 +2461,14 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
         const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
         if (arrived) {
           await ensureDocked(ctx);
+          // Unload the valuable cargo FIRST so it is safe in storage while we wait.
+          await depositNonFuelCargo(ctx);
           await collectFromStorage(ctx);
           await ensureGlassMinerResupply(ctx);
           await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
           await ensureUndocked(ctx);
+          // Re-cloak after undocking so we are never exposed while waiting.
+          await enableCloakingIfPossible(ctx, cachedModules);
         } else {
           ctx.log("error", `Could not reach home system ${homeSystem} — will retry after the replenish wait`);
         }
@@ -2459,7 +2476,10 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
         ctx.log("warn", "No home system configured — cannot return to deposit; waiting for the POI to replenish instead");
       }
       // Give the depleted POI time to replenish before we come back to it.
-      await ctx.sleep(settings.deepSleepIntervalMin * 60 * 1000);
+      // Log clearly so the long wait doesn't look like the routine is stuck.
+      const waitMin = settings.deepSleepIntervalMin;
+      ctx.log("system", `Waiting ${waitMin} min (cloaked) for the depleted POI to replenish before returning to ${target.systemId}/${target.poiId}`);
+      await ctx.sleep(waitMin * 60 * 1000);
       continue;
     }
   }

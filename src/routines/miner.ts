@@ -1327,6 +1327,9 @@ async function reportNoViableTargetsAndDeepSleep(
   botUsername: string | undefined,
   candidateOres: string[],
   hasModulatedMiningLaser?: boolean,
+  botSystem?: string,
+  maxJumps?: number,
+  allowFrontier: boolean = false,
 ): Promise<void> {
   const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
   const oreList = [...new Set(candidateOres.filter(Boolean))].sort();
@@ -1394,6 +1397,20 @@ async function reportNoViableTargetsAndDeepSleep(
         if (viable && settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
           if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, botUsername)) {
             viable = false; reason = "coordination: system full";
+          }
+        }
+        // Reachability: the actual selection requires a route within maxJumps.
+        // The old diagnostic ignored this, so it reported POIs as VIABLE that the
+        // selector then rejected as unreachable — making deep-sleeps look bogus.
+        if (viable && botSystem && maxJumps !== undefined) {
+          const route = findMiningRoute(botSystem, loc.systemId, blacklist, allowFrontier);
+          const jumps = route ? route.length - 1 : Infinity;
+          if (!route) {
+            viable = false; reason = "no route (all paths cross a blacklisted system)";
+          } else if (jumps > maxJumps) {
+            viable = false; reason = `out of range (${jumps}j > maxJumps ${maxJumps})`;
+          } else {
+            reason = `${jumps}j (within maxJumps ${maxJumps})`;
           }
         }
         if (viable) viableCount++;
@@ -1958,7 +1975,7 @@ function getReachableOreLocations(
     const hasScanData = loc.minutesSinceScan !== Infinity;
     const lowRemUnknown = shouldEnforceStandardMiningLimits(oreId, hasModulatedMiningLaser) && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
     if (lowRemUnknown) continue;
-    if (shouldEnforceStandardMiningLimits(oreId, hasModulatedMiningLaser) && totalMiningPower > 0 && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) continue;
+    if (shouldEnforceStandardMiningLimits(oreId, hasModulatedMiningLaser) && settings.preferClosestDeposit !== true && totalMiningPower > 0 && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) continue;
 
     // Coordination: skip over capacity systems
     if (settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
@@ -2067,7 +2084,7 @@ function pickTargetFromQuotasOrClosest(
           return false;
         }
 
-      if (shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && totalMiningPower && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+      if (shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && settings?.preferClosestDeposit !== true && totalMiningPower && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
         return false;
       }
 
@@ -4327,12 +4344,12 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                  excludedNavSystems.clear();
                  continue;
                }
-               await reportNoViableTargetsAndDeepSleep(
-                 ctx, settings, miningType, totalMiningPower, blacklist,
-                 canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
-                 hasModulatedLaser,
-               );
-               continue;
+                await reportNoViableTargetsAndDeepSleep(
+                  ctx, settings, miningType, totalMiningPower, blacklist,
+                  canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
+                  hasModulatedLaser, bot.system, maxJumps, allowFrontier,
+                );
+                continue;
              }
              const decision = await handleNoReachableTarget(
                ctx, settings, miningType, totalMiningPower, blacklist,
@@ -4493,7 +4510,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
             await reportNoViableTargetsAndDeepSleep(
               ctx, settings, miningType, totalMiningPower, blacklist,
               canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
-              hasModulatedLaser,
+              hasModulatedLaser, bot.system, maxJumps, allowFrontier,
             );
             continue;
           }
@@ -5323,7 +5340,8 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               return false;
             }
             // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-            if (shouldEnforceStandardMiningLimits(effectiveTarget, hasModulatedLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+            // (skipped in preferClosestDeposit mode so nearby low-power deposits are still mined first)
+            if (settings.preferClosestDeposit !== true && shouldEnforceStandardMiningLimits(effectiveTarget, hasModulatedLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
               return false;
             }
             // No depletion filtering - trust the map data

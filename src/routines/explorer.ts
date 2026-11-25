@@ -4501,12 +4501,14 @@ function logFixedRouteOverlap(botName: string, route: FixedPathRouteEntry[], ctx
 }
 
 /** Full system exploration for one fixed-route target, reusing existing POI
- *  scanning logic and staleness thresholds (STATION_REFRESH_MINS / RESOURCE_REFRESH_MINS). */
+ *  scanning logic and staleness thresholds (STATION_REFRESH_MINS / RESOURCE_REFRESH_MINS).
+ *  Returns true if the POI tour completed (or there was nothing to do), false
+ *  if it aborted early (e.g. battle) so callers can avoid marking the system fresh. */
 async function* exploreFixedRouteSystem(
   ctx: RoutineContext,
   systemId: string,
   opts: { avoidWormholes?: boolean } = {},
-): AsyncGenerator<string, void, void> {
+): AsyncGenerator<string, boolean, void> {
   const { bot } = ctx;
   const explorerSettings = getExplorerSettings(bot.username);
 
@@ -4519,13 +4521,16 @@ async function* exploreFixedRouteSystem(
 
   let currentFaintSignatures: FaintSignature[] = [];
   let pois: SystemPOI[] = [];
+  // POI ids already known before this survey, so the "revealed N new" log
+  // reports genuinely-new POIs rather than the system's total POI count.
+  const knownPoiIds = new Set((mapStore.getSystem(systemId)?.pois || []).map((p) => p.id));
 
   if (explorerSettings.scanPois) {
     yield "survey_system";
     const surveyResp = await bot.exec("survey_system");
     if (await checkBattleAfterCommand(ctx, surveyResp.notifications, "survey_system")) {
       ctx.log("combat", "Battle detected during survey - aborting system scan");
-      return;
+      return false;
     }
     if (!surveyResp.error) {
       const surveyResult = surveyResp.result as Record<string, unknown> | undefined;
@@ -4534,8 +4539,9 @@ async function* exploreFixedRouteSystem(
         currentFaintSignatures = extractFaintSignatures(surveyResult);
       }
       const refreshed = await getSystemInfo(ctx);
-      if (refreshed.pois.length > pois.length) {
-        ctx.log("info", `Survey revealed ${refreshed.pois.length - pois.length} new POI(s) in ${systemId}`);
+      const newPoiCount = refreshed.pois.filter((p) => !knownPoiIds.has(p.id)).length;
+      if (newPoiCount > 0) {
+        ctx.log("info", `Survey revealed ${newPoiCount} new POI(s) in ${systemId}`);
       }
       pois = refreshed.pois;
     } else {
@@ -4574,11 +4580,19 @@ async function* exploreFixedRouteSystem(
         toVisit.push({ poi, reason: "refresh" });
       }
     } else if (isScenic) {
-      if (explorerSettings.surveyMode === "quick") continue;
+      if (explorerSettings.surveyMode === "quick") {
+        // Intentionally skipped in quick mode — mark explored so it doesn't
+        // pin the system as perpetually stale (minutesSinceExplored stays Infinity).
+        mapStore.markExplored(systemId, poi.id);
+        continue;
+      }
       if (minutesAgo < Infinity) continue;
       toVisit.push({ poi, reason: "new" });
     } else {
-      if (explorerSettings.surveyMode === "quick") continue;
+      if (explorerSettings.surveyMode === "quick") {
+        mapStore.markExplored(systemId, poi.id);
+        continue;
+      }
       if (minutesAgo < RESOURCE_REFRESH_MINS) continue;
       toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : "refresh" });
     }
@@ -4599,7 +4613,7 @@ async function* exploreFixedRouteSystem(
 
   if (toVisit.length === 0) {
     ctx.log("info", `${systemId}: all POIs up to date — moving on`);
-    return;
+    return true;
   }
   ctx.log("info", `${systemId}: ${toVisit.length} POI(s) to visit`);
 
@@ -4660,7 +4674,7 @@ async function* exploreFixedRouteSystem(
       await bot.refreshLocation();
       if (bot.system && bot.system !== systemId) {
         ctx.log("info", `Wormhole dropped us in ${bot.system} (off route from ${systemId}) — returning to route target on next cycle`);
-        return;
+        return false;
       }
       continue;
     }
@@ -4675,6 +4689,8 @@ async function* exploreFixedRouteSystem(
 
     mapStore.markExplored(systemId, poi.id);
   }
+
+  return true;
 }
 
 /** Fixed-route explorer: walks a pre-determined route through all known
@@ -5019,6 +5035,9 @@ interface FrontierTransition {
 interface FrontierUpdateState {
   scanned: number;
   pathfinderJumps: number;
+  /** Group index we most recently scanned — avoided as the next transition
+   *  target so the bot doesn't ping-pong between the same two groups. */
+  lastGroupIndex?: number;
 }
 
 /** True when a frontier system has never been scanned, was never visited, or
@@ -5589,9 +5608,18 @@ async function* scanFrontierUpdateSystem(ctx: RoutineContext, systemId: string):
   }
 
   ctx.log("exploration", `Frontier Update: scanning ${systemId}`);
-  yield* exploreFixedRouteSystem(ctx, systemId, { avoidWormholes: true });
+  const completed = yield* exploreFixedRouteSystem(ctx, systemId, { avoidWormholes: true });
   mapStore.markSystemVisited(systemId);
   explorerAssignmentStore.recordCompletedSystem(bot.username, systemId);
+
+  // Reconcile phantom POIs: hidden POIs preserved by mapStore.updateSystem that
+  // the server no longer returns keep last_explored = null (minutesSinceExplored
+  // === Infinity), which pins the system as perpetually stale and makes the group
+  // planner route back to it forever. If the scan completed, mark every known POI
+  // fresh so the system actually clears its stale flag and the run progresses.
+  if (completed && mapStore.isFrontierSystem(systemId)) {
+    mapStore.markAllPoisExplored(systemId);
+  }
 }
 
 async function* scanFrontierUpdateGroup(
@@ -5944,6 +5972,10 @@ async function* frontierUpdateRoutine(ctx: RoutineContext): AsyncGenerator<strin
         ctx.log("system", `Frontier Update: reached max systems (${maxSystems})`);
         break;
       }
+
+      // Remember the group we just scanned so the transition pass below avoids
+      // routing straight back to it (prevents the two-group ping-pong loop).
+      state.lastGroupIndex = currentGroup.index;
     }
 
     if (state.scanned >= maxSystems || state.pathfinderJumps >= maxPathfinderJumps) {
@@ -5954,50 +5986,58 @@ async function* frontierUpdateRoutine(ctx: RoutineContext): AsyncGenerator<strin
     await bot.refreshLocation();
     let moved = false;
 
-    for (const candidate of groupOrder) {
-      if (candidate.index === currentGroup.index || candidate.staleIds.size === 0) continue;
+    // Two-pass transition selection: first prefer any group other than the one
+    // we just scanned; only fall back to the just-scanned group if nothing else
+    // is reachable, so forward progress is favoured over oscillation.
+    for (let pass = 0; pass < 2 && !moved; pass++) {
+      const skipIndex = pass === 0 ? state.lastGroupIndex : undefined;
 
-      const transition = findFrontierTransition(
-        bot.system,
-        currentGroup,
-        candidate,
-        getEffectiveSystemBlacklist(bot),
-        gatewayCache,
-      );
-      if (!transition) {
-        ctx.log("debug", `No safe frontier transition from group ${currentGroup.index + 1} to group ${candidate.index + 1}`);
-        continue;
-      }
+      for (const candidate of groupOrder) {
+        if (candidate.index === currentGroup.index || candidate.staleIds.size === 0) continue;
+        if (skipIndex !== undefined && candidate.index === skipIndex) continue;
 
-      ctx.log("travel", `Frontier Update: group ${currentGroup.index + 1} -> group ${candidate.index + 1} (${transition.kind}, cost ${Math.round(transition.cost)})`);
-
-      if (frontierSystemKey(transition.from) !== frontierSystemKey(bot.system)) {
-        const staged = await travelWithinFrontierUpdateGroup(
-          ctx,
-          currentGroup,
+        const transition = findFrontierTransition(
           bot.system,
-          transition.from,
-          settings.frontierFuelThreshold,
+          currentGroup,
+          candidate,
+          getEffectiveSystemBlacklist(bot),
+          gatewayCache,
         );
-        if (!staged) {
-          ctx.log("warn", `Could not reach staging system ${transition.from} for next frontier group`);
+        if (!transition) {
+          ctx.log("debug", `No safe frontier transition from group ${currentGroup.index + 1} to group ${candidate.index + 1}`);
           continue;
         }
-      }
 
-      const travelled = await travelFrontierTransition(
-        ctx,
-        transition,
-        settings.frontierFuelThreshold,
-        state,
-      );
-      if (!travelled) {
-        ctx.log("warn", `Frontier transition to group ${candidate.index + 1} failed`);
-        continue;
-      }
+        ctx.log("travel", `Frontier Update: group ${currentGroup.index + 1} -> group ${candidate.index + 1} (${transition.kind}, cost ${Math.round(transition.cost)})`);
 
-      moved = true;
-      break;
+        if (frontierSystemKey(transition.from) !== frontierSystemKey(bot.system)) {
+          const staged = await travelWithinFrontierUpdateGroup(
+            ctx,
+            currentGroup,
+            bot.system,
+            transition.from,
+            settings.frontierFuelThreshold,
+          );
+          if (!staged) {
+            ctx.log("warn", `Could not reach staging system ${transition.from} for next frontier group`);
+            continue;
+          }
+        }
+
+        const travelled = await travelFrontierTransition(
+          ctx,
+          transition,
+          settings.frontierFuelThreshold,
+          state,
+        );
+        if (!travelled) {
+          ctx.log("warn", `Frontier transition to group ${candidate.index + 1} failed`);
+          continue;
+        }
+
+        moved = true;
+        break;
+      }
     }
 
     if (!moved) {

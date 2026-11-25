@@ -970,6 +970,31 @@ class MapStore {
     this.scheduleSave();
   }
 
+  /** Mark every POI currently known for a system as explored (sets
+   *  last_explored timestamp). Used by frontier_update to reconcile phantom
+   *  hidden POIs that the server no longer returns, which would otherwise pin
+   *  a system as perpetually stale (minutesSinceExplored === Infinity). */
+  markAllPoisExplored(systemId: string): void {
+    let sys = this.data.systems[systemId];
+    if (!sys) {
+      const lower = systemId.toLowerCase();
+      for (const key of Object.keys(this.data.systems)) {
+        if (key.toLowerCase() === lower) {
+          sys = this.data.systems[key];
+          break;
+        }
+      }
+    }
+    if (!sys) return;
+
+    const ts = now();
+    for (const poi of sys.pois) {
+      poi.last_explored = ts;
+      poi.last_updated = ts;
+    }
+    this.scheduleSave();
+  }
+
   /** Mark a system as visited (sets visited=true and visited_at timestamp). */
   markSystemVisited(systemId: string): void {
     const sys = this.data.systems[systemId];

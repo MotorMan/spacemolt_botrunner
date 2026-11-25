@@ -485,6 +485,14 @@ export interface GlassMinerRouteProfile {
   name: string;
   /** Ordered list of system IDs/names to jump through using regular jumps */
   routeSystems: string[];
+  /**
+   * Optional: simple destination system. When set (and no pathfinder jump is
+   * used), the bot navigates here with regular find_route jumps — which now
+   * traverse faction jump gates as normal connections — then mines. If a
+   * mining POI/resource is not specified, a target is auto-selected in this
+   * system. This is the "just give me a destination" path; no pathfinder needed.
+   */
+  destinationSystem?: string;
   /** Optional: Pathfinder jump from this system to the hazardous area */
   pathfinderStartSystem?: string;
   /** Optional: Target system for the pathfinder jump (hazardous mining area) */
@@ -618,6 +626,7 @@ async function getGlassMinerSettings(username?: string): Promise<GlassMinerSetti
     return val.map((p: Record<string, unknown>) => ({
       name: (p.name as string) || "unnamed_route",
       routeSystems: Array.isArray(p.routeSystems) ? (p.routeSystems as string[]) : [],
+      destinationSystem: (p.destinationSystem as string) || undefined,
       pathfinderStartSystem: (p.pathfinderStartSystem as string) || undefined,
       pathfinderTargetSystem: (p.pathfinderTargetSystem as string) || undefined,
       miningPoiId: (p.miningPoiId as string) || undefined,
@@ -1240,6 +1249,8 @@ function getRouteProfileTarget(settings: GlassMinerSettings, bot: Bot): { system
 
   const targetSystemId = activeRoute.pathfinderTargetSystem
     ? resolveSystemId(activeRoute.pathfinderTargetSystem)
+    : activeRoute.destinationSystem
+    ? resolveSystemId(activeRoute.destinationSystem)
     : bot.system;
 
   if (!targetSystemId) return null;
@@ -1264,6 +1275,7 @@ async function findBestMiningTarget(
   hasModulatedMiningLaser: boolean,
   fieldTestActive: boolean,
   cachedModules: unknown[],
+  onlySystemId?: string,
 ): Promise<{ systemId: string; poiId: string; resourceId: string; poiName: string } | null> {
   const { bot } = ctx;
   const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
@@ -1307,6 +1319,9 @@ async function findBestMiningTarget(
       
       const sys = mapStore.getSystem(loc.systemId);
       if (!sys) continue;
+
+      // When a destination system is pinned, only mine there.
+      if (onlySystemId && loc.systemId !== onlySystemId) continue;
       
       const poi = sys.pois.find(p => p.id === loc.poiId);
       if (!poi) continue;
@@ -2102,6 +2117,17 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     // Fallback to automatic target finding if no route profile or profile didn't set target
     if (!target) {
+      // If the active route pins a simple destination (no pathfinder jump), keep
+      // the search inside that system so "just set a destination" works: the
+      // normal navigation below uses find_route, which traverses faction jump
+      // gates as ordinary connections — no pathfinder required.
+      let pinnedSystemId: string | undefined;
+      if (activeRoute && !activeRoute.usePathfinderJump && activeRoute.destinationSystem) {
+        pinnedSystemId = resolveSystemId(activeRoute.destinationSystem) || undefined;
+        if (pinnedSystemId) {
+          ctx.log("system", `Route profile pins destination ${pinnedSystemId} — searching for a mining target there`);
+        }
+      }
       target = await findBestMiningTarget(
         ctx,
         settings,
@@ -2112,7 +2138,8 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
         canMineHiddenIce,
         hasModulatedLaser,
         fieldTestActive,
-        cachedModules
+        cachedModules,
+        pinnedSystemId
       );
     }
 

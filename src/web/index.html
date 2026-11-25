@@ -33342,6 +33342,14 @@ async function fetchPersonalFacilityTypes(username) {
 
         + '<div class="setting-row">' +
             '<div>' +
+              '<div class="setting-label">Destination System (simple, no pathfinder)</div>' +
+              '<div class="setting-hint">Just set a destination and the bot uses find_route (faction jump gates count as normal jumps) to get there, then mines. Leave Mining POI/Resource blank to auto-pick a target in that system. Ignored when a Pathfinder Target System is set.</div>' +
+            '</div>' +
+            '<input type="text" value="' + esc(rp.destinationSystem || "") + '" onchange="updateGlassMinerRouteProfile(' + idx + ', \'destinationSystem\', this.value)" placeholder="destination_system" style="width:100%">' +
+          '</div>'
+
+        + '<div class="setting-row">' +
+            '<div>' +
               '<div class="setting-label">Pathfinder Start System</div>' +
               '<div class="setting-hint">System to jump FROM using pathfinder drive.</div>' +
             '</div>' +
@@ -33520,9 +33528,10 @@ async function fetchPersonalFacilityTypes(username) {
       <button class="btn primary" onclick="saveGlassMinerSettings()">Save Glass Miner Settings</button>
     </div>
         `;
+      }
 
-        // Helper functions for jettison lists
-        function collectJettisonOres() {
+      // Helper functions for jettison lists
+      function collectJettisonOres() {
           return Array.from(document.querySelectorAll("#glass_miner-jettisonOresTable tr"))
             .map(tr => tr.dataset.oreId)
             .filter(Boolean);
@@ -33609,7 +33618,7 @@ async function fetchPersonalFacilityTypes(username) {
             mineOnly: document.getElementById("set-glass_miner-mineOnly").checked,
             
             // Routing profiles
-            routeProfiles: routeProfiles,
+            routeProfiles: (settings.glass_miner && settings.glass_miner.routeProfiles) || [],
             activeRouteProfile: document.getElementById("set-glass_miner-activeRouteProfile").value,
           };
 
@@ -33622,7 +33631,6 @@ async function fetchPersonalFacilityTypes(username) {
           }).catch(() => {});
           window.saveGlassMinerSettings = saveGlassMinerSettings;
       }
-    }
 
       // ── Missions Settings ────────────────────────────────────────────────
 
@@ -33868,6 +33876,7 @@ ${generateMissionStepsHtml()}
         const newProfile = {
           name: "New Route " + (g.routeProfiles.length + 1),
           routeSystems: [],
+          destinationSystem: "",
           pathfinderStartSystem: "",
           pathfinderTargetSystem: "",
           miningPoiId: "",

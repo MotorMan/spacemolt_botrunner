@@ -1015,6 +1015,40 @@ async function hasModulatedMiningLaser(ctx: RoutineContext, cachedModules?: unkn
   return false;
 }
 
+/**
+ * Damped Mining Heads are hazard-mining modules that can scale their output
+ * down to 1 power, so they can work a seam_glass deposit all the way down to
+ * the server's per-tick reservation floor (~1 power) instead of being rejected
+ * for "equipment power exceeds 4x deposit density". When one is fitted we must
+ * NOT enforce the standard power-vs-density limits.
+ */
+async function hasDampedMiningHead(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+  let modules: unknown[];
+
+  if (cachedModules && cachedModules.length > 0) {
+    modules = cachedModules;
+  } else {
+    const shipResp = await bot.commands.spacemolt.get_ship();
+    const shipData = shipResp.structuredContent as Record<string, unknown> | undefined;
+    if (!shipData) return false;
+    modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  }
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
+    const modName = ((modObj?.name as string) || "").toLowerCase();
+    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`;
+    if (checkStr.includes("damped_mining_head") || checkStr.includes("damped mining head")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function getDeepCoreCapability(ctx: RoutineContext, fieldTestActive: boolean = false): Promise<{
   hasScanner: boolean;
   hasExtractor: boolean;
@@ -2013,6 +2047,11 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
     const useDeepCore = deepCoreCap.canMineVisibleDeepCore;
     const canMineHiddenPois = deepCoreCap.canMineHidden;
     hasModulatedLaser = await hasModulatedMiningLaser(ctx, cachedModules);
+    // Damped Mining Heads scale down to 1 power, so they (like the modulated
+    // laser) bypass the power-vs-deposit-density limits and can work a seam
+    // all the way to the server's reservation floor.
+    const hasDampedHead = await hasDampedMiningHead(ctx, cachedModules);
+    const bypassPowerLimits = hasModulatedLaser || hasDampedHead;
     totalMiningPower = getTotalMiningPower(cachedModules);
 
     // Radioactive capability
@@ -2136,7 +2175,7 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
         blacklist,
         canMineHiddenRadioactive,
         canMineHiddenIce,
-        hasModulatedLaser,
+        bypassPowerLimits,
         fieldTestActive,
         cachedModules,
         pinnedSystemId

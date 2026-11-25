@@ -1330,6 +1330,7 @@ async function reportNoViableTargetsAndDeepSleep(
   botSystem?: string,
   maxJumps?: number,
   allowFrontier: boolean = false,
+  canMineHiddenPois?: boolean,
 ): Promise<void> {
   const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
   const oreList = [...new Set(candidateOres.filter(Boolean))].sort();
@@ -1371,6 +1372,8 @@ async function reportNoViableTargetsAndDeepSleep(
             viable = false; reason = "hidden POI (no radioactive hidden access)";
           } else if (miningType === "ice" && !canMineHiddenIce) {
             viable = false; reason = "hidden POI (no ice hidden access)";
+          } else if (miningType === "ore" && canMineHiddenPois === false) {
+            viable = false; reason = "hidden POI (no hidden-ore access)";
           }
         }
         if (viable && !settings.ignoreDepletion) {
@@ -3323,7 +3326,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Deep core capability check - needed for target selection
     const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
     const useDeepCore = deepCoreCap.canMineVisibleDeepCore;
-    const canMineHiddenPois = deepCoreCap.canMineHidden;
+    // Hidden POIs distributed via the faction intel facility are enterable by any
+    // ship (verified: a basic Mining Laser II can dock and mine a hidden belt).
+    // Only deep-core ORES are equipment-gated, and those are excluded from the ore
+    // quota set / filtered by isDeepCoreOre separately — so do not block hidden
+    // ore POIs here. Deep-core-designated POIs simply error on mine and are skipped.
+    const canMineHiddenPois = true;
 
     // Check for strip miner (limited to basic ores only)
     const usingStripMiner = await hasStripMiner(ctx, cachedModules || undefined);
@@ -4347,7 +4355,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                 await reportNoViableTargetsAndDeepSleep(
                   ctx, settings, miningType, totalMiningPower, blacklist,
                   canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
-                  hasModulatedLaser, bot.system, maxJumps, allowFrontier,
+                  hasModulatedLaser, bot.system, maxJumps, allowFrontier, canMineHiddenPois,
                 );
                 continue;
              }
@@ -4510,7 +4518,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
             await reportNoViableTargetsAndDeepSleep(
               ctx, settings, miningType, totalMiningPower, blacklist,
               canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
-              hasModulatedLaser, bot.system, maxJumps, allowFrontier,
+              hasModulatedLaser, bot.system, maxJumps, allowFrontier, canMineHiddenPois,
             );
             continue;
           }

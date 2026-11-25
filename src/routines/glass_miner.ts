@@ -1895,6 +1895,10 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
   let fieldTestActive = await hasFieldTestMission(ctx);
   let totalMiningPower = 0;
   let hasModulatedLaser = false;
+  // Set when the active seam is worked out (depleted / too sparse for the
+  // array). After the mining session we return to base and let the POI
+  // replenish instead of hammering the same exhausted deposit forever.
+  let forceReturnHome = false;
 
   if (settings.enableCloak) {
     await enableCloakingIfPossible(ctx, cachedModules);
@@ -2317,10 +2321,16 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
         
         if (errMsg.includes("depleted") || errMsg.includes("empty") || errMsg.includes("no more")) {
           ctx.log("mining", `Deposit depleted — ending session`);
+          // On a fixed route the seam is the whole trip, so head home to let it
+          // replenish. In auto mode, just end the session and pick a new target.
+          if (activeRoute) forceReturnHome = true;
           break;
         }
         if (errMsg.includes("too sparse") || errMsg.includes("deposit_too_sparse")) {
-          ctx.log("error", "Deposit too sparse for current mining array — equipment power exceeds deposit density");
+          ctx.log("error", "Deposit too sparse for current mining array — equipment power exceeds deposit density (seam worked to the server floor)");
+          // The seam is exhausted down to the server's reservation floor; leave
+          // and let it replenish rather than retrying the same POI forever.
+          forceReturnHome = true;
           break;
         }
         ctx.log("error", `Mine failed: ${mineResp.error.message}`);
@@ -2419,6 +2429,39 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     await completeMiningSession(bot.username);
     unregisterCoordinationTarget(bot.username, target.systemId, target.poiId);
+
+    // Seam exhausted: go back to base to deposit/resupply, then wait for the
+    // POI to replenish before returning to it.
+    if (forceReturnHome) {
+      forceReturnHome = false;
+      const homeSystem = settings.systemOre || settings.system || settings.homeSystem;
+      if (homeSystem && !settings.mineOnly) {
+        ctx.log("system", `Deposit exhausted — returning to ${homeSystem} to deposit/resupply and let the POI replenish`);
+        const safetyOpts = {
+          fuelThresholdPct: 10,
+          hullThresholdPct: settings.repairThreshold,
+          autoCloak: settings.enableCloak,
+          skipBlacklist: false,
+          isCombatBot: true,
+          joinBattles: true,
+        };
+        const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+        if (arrived) {
+          await ensureDocked(ctx);
+          await collectFromStorage(ctx);
+          await ensureGlassMinerResupply(ctx);
+          await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
+          await ensureUndocked(ctx);
+        } else {
+          ctx.log("error", `Could not reach home system ${homeSystem} — will retry after the replenish wait`);
+        }
+      } else if (!homeSystem) {
+        ctx.log("warn", "No home system configured — cannot return to deposit; waiting for the POI to replenish instead");
+      }
+      // Give the depleted POI time to replenish before we come back to it.
+      await ctx.sleep(settings.deepSleepIntervalMin * 60 * 1000);
+      continue;
+    }
   }
 };
 

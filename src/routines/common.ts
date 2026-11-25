@@ -3552,6 +3552,10 @@ export interface RouteSegment {
   name: string;
   jumps?: number;
   via_wormhole?: boolean;
+  /** True when the jump into this system traverses a permanent faction jump gate
+   *  (two-way, always usable). Distinct from via_wormhole, which the bot cannot
+   *  traverse without unlocking the wormhole POI. */
+  via_gate?: boolean;
   entrance_poi?: string;
 }
 
@@ -3559,6 +3563,12 @@ export interface RouteSegment {
 export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
   if (!route) return false;
   return route.some(seg => seg.via_wormhole === true);
+}
+
+/** Check if a route traverses a permanent faction jump gate (always passable). */
+export function routeHasGate(route: RouteSegment[] | undefined): boolean {
+  if (!route) return false;
+  return route.some(seg => seg.via_gate === true);
 }
 
 /**
@@ -3618,6 +3628,7 @@ async function resolveNextSystemViaServer(
     const routeStartsHere = serverRouteSystemIds[0] &&
       normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
     const hasWormhole = routeHasWormhole(routeData.route);
+    const hasGate = routeHasGate(routeData.route);
 
     if (blacklistedOnRoute && !bypassBlacklist) {
       ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route${contextSuffix}`);
@@ -3632,6 +3643,8 @@ async function resolveNextSystemViaServer(
     } else {
       if (hasWormhole) {
         ctx.log("travel", `Server route uses wormhole shortcut (allowed) — next: ${routeData.route[1].system_id}${contextSuffix}`);
+      } else if (hasGate) {
+        ctx.log("travel", `Server route uses faction jump gate (allowed) — next: ${routeData.route[1].system_id}${contextSuffix}`);
       }
       const fullRoute = routeData.route.map(r => r.system_id).join(" → ");
       ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${routeData.route[1].system_id}${contextSuffix}`);

@@ -3655,7 +3655,7 @@ if (shouldAbandon) {
         quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
         canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois,
         Array.from(triedAndRejectedTargets), !(hasCloak && bot.isCloaked), totalMiningPower, bot.username,
-        blacklist, bot.system, maxJumps, hasModulatedLaser, allowFrontier
+        blacklist, bot.system, maxJumps, hasModulatedLaser, allowFrontier, allowFactionGateFrontier
       );
       if (freshTarget) {
         effectiveTarget = freshTarget;
@@ -5339,6 +5339,16 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
         if (broaderLocations.length === 0 && broaderLocationsRaw.length > 0) {
           const sampleRaw = broaderLocationsRaw.slice(0,3).map(l => `${l.systemName}/${l.poiName} type(map)=${mapStore.getSystem(l.systemId)?.pois.find(p=>p.id===l.poiId)?.type}`).join("; ");
           ctx.log("debug", `[BROADER_SEARCH] All raw locations filtered out. Sample: ${sampleRaw}`);
+        } else if (broaderLocations.length < broaderLocationsRaw.length) {
+          // Show which candidates the POI-type / depletion / power / hidden filters
+          // dropped, so we can see why a closer or fuller deposit was skipped.
+          const keptIds = new Set(broaderLocations.map(l => `${l.systemId}|${l.poiId}`));
+          const dropped = broaderLocationsRaw.filter(l => !keptIds.has(`${l.systemId}|${l.poiId}`));
+          const sampleDropped = dropped.slice(0, 5).map(l => {
+            const poi = mapStore.getSystem(l.systemId)?.pois.find(p => p.id === l.poiId);
+            return `${l.systemName}/${l.poiName} hidden=${poi?.hidden === true} rem=${l.remaining} max=${l.maxRemaining} supPwr=${l.supportedPower} scanMin=${l.minutesSinceScan === Infinity ? "never" : Math.round(l.minutesSinceScan)}`;
+          }).join("; ");
+          ctx.log("debug", `[BROADER_SEARCH] ${dropped.length} candidate(s) dropped by filters: ${sampleDropped}`);
         }
 
         if (broaderLocations.length > 0) {

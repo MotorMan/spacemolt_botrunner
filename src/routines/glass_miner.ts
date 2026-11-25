@@ -771,6 +771,7 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   let hasIceHarvester = false;
   let hasLeadLinedCargo = false;
   let hasRadHarvester = false;
+  let hasDampedHead = false;
 
   for (const mod of modules) {
     const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
@@ -799,12 +800,15 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
     if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester") || checkStr.includes("rad_harvesting")) {
       hasRadHarvester = true;
     }
+    if (checkStr.includes("damped_mining_head") || checkStr.includes("damped mining head")) {
+      hasDampedHead = true;
+    }
   }
 
   const hasRadioactiveEquipment = hasLeadLinedCargo && hasRadHarvester;
 
   const detectedTypes: string[] = [];
-  if (hasMiningLaser || hasStripMiner) detectedTypes.push("ore");
+  if (hasMiningLaser || hasStripMiner || hasDampedHead) detectedTypes.push("ore");
   if (hasGasHarvester) detectedTypes.push("gas");
   if (hasIceHarvester) detectedTypes.push("ice");
   if (hasRadioactiveEquipment) detectedTypes.push("radioactive");
@@ -835,8 +839,12 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
     ctx.log("info", "Mining laser detected — ore mining mode");
     return "ore";
   }
+  if (hasDampedHead) {
+    ctx.log("info", "Damped mining head detected — ore mining mode (hazard/seam_glass capable, scales to 1 power)");
+    return "ore";
+  }
 
-  if (usingCachedModules && !hasMiningLaser && !hasStripMiner && !hasGasHarvester && !hasIceHarvester && !hasRadioactiveEquipment) {
+  if (usingCachedModules && !hasMiningLaser && !hasStripMiner && !hasGasHarvester && !hasIceHarvester && !hasRadioactiveEquipment && !hasDampedHead) {
     ctx.log("warn", "Cached modules incomplete — retrying with fresh ship data");
     const freshResp = await bot.commands.spacemolt.get_ship();
     const freshShipData = freshResp.structuredContent as Record<string, unknown> | undefined;
@@ -849,6 +857,7 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
       hasIceHarvester = false;
       hasLeadLinedCargo = false;
       hasRadHarvester = false;
+      hasDampedHead = false;
 
       for (const mod of freshModules) {
         const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
@@ -877,6 +886,9 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
         if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester") || checkStr.includes("rad_harvesting")) {
           hasRadHarvester = true;
         }
+        if (checkStr.includes("damped_mining_head") || checkStr.includes("damped mining head")) {
+          hasDampedHead = true;
+        }
       }
 
       const freshHasRadioactiveEquipment = hasLeadLinedCargo && hasRadHarvester;
@@ -900,6 +912,10 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
       }
       if (hasMiningLaser) {
         ctx.log("info", "Mining laser detected (fresh data) — ore mining mode");
+        return "ore";
+      }
+      if (hasDampedHead) {
+        ctx.log("info", "Damped mining head detected (fresh data) — ore mining mode (hazard/seam_glass capable, scales to 1 power)");
         return "ore";
       }
     }
@@ -1133,7 +1149,7 @@ function getTotalMiningPower(modules: unknown[]): number {
 
   const MINING_PREFIXES = [
     "mining_laser", "strip_miner", "rad_harvester", "ice_harvester",
-    "gas_harvester", "deep_core_extractor",
+    "gas_harvester", "deep_core_extractor", "damped_mining_head",
   ];
 
   function toSnakeCase(str: string): string {
@@ -2038,7 +2054,11 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
     }
     
     if (!detectedMiningType && settings.autoDetectMiningType) {
+      // No mining equipment recognized. Re-cache once, then back off so we don't
+      // hammer get_ship (the game server null-returns extra calls per tick).
+      ctx.log("warn", "No mining equipment recognized — re-caching ship modules and backing off");
       cachedModules = await cacheShipModules(ctx);
+      await ctx.sleep(30000);
       continue;
     }
 

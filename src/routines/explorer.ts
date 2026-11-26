@@ -541,6 +541,44 @@ export function setExplorerFrontierThoroughScan(username: string, frontierThorou
 }
 
 /**
+ * Keep an auto-cloak explorer cloaked.
+ *
+ * Jumps (pathfinder and normal) and battles all drop the cloak. The old
+ * one-shot `cloakEnabled` flag meant the ship was never re-cloaked after the
+ * first jump or fled battle, leaving it exposed (and, with the monolith/repeater
+ * kill-on-sight bug, dead). This re-issues `cloak { enable: true }` whenever
+ * autoCloak is on and the ship is currently exposed.
+ *
+ * It syncs the real cloak/dock/transit state from the server first — the
+ * in-memory `isCloaked` flag can be stale right after a jump — and never
+ * cloaks while docked (cloaking force-undocks) or mid-transit. Returns true
+ * when the bot ends up cloaked.
+ */
+async function ensureAutoCloak(ctx: RoutineContext, autoCloak: boolean): Promise<boolean> {
+  const { bot } = ctx;
+  if (!autoCloak) return bot.isCloaked;
+  try {
+    await bot.refreshStatus();
+  } catch {
+    // best-effort — fall back to the local flag
+  }
+  if (bot.docked || bot.inTransit || bot.isCloaked) return bot.isCloaked;
+  const resp = await bot.exec("cloak", { enable: true });
+  if (!resp.error) {
+    bot.isCloaked = true;
+    ctx.log("system", `Auto-cloak: cloak (re)activated in ${bot.system}`);
+    return true;
+  }
+  const msg = String(resp.error.message || "").toLowerCase();
+  if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+    bot.isCloaked = true;
+    return true;
+  }
+  ctx.log("warn", `Auto-cloak failed: ${resp.error.message}`);
+  return false;
+}
+
+/**
  * After a client/process restart the ship may still be mid-jump (pathfinder or
  * normal). The server keeps that transit running, but the freshly-started
  * process has no location, so every navigation call fails with
@@ -898,8 +936,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   // occupied by another explorer (shared with the coordination helper)
   const occupiedWaitState: ExplorerWaitState = { blockedCount: 0 };
 
-  // Track if we've already enabled cloak (mutation command - don't re-issue)
-  let cloakEnabled = false;
+
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -908,22 +945,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Enable cloak if autoCloak is enabled and not already cloaked ──
     const cloakSettings = getExplorerSettings(bot.username);
-    if (cloakSettings.autoCloak && !bot.isCloaked && !cloakEnabled) {
-      ctx.log("system", "Auto-cloak enabled - activating cloak for full-time stealth mode");
-      const cloakResp = await bot.exec("cloak", { enable: true });
-      if (!cloakResp.error) {
-        cloakEnabled = true;
-        ctx.log("info", "Cloak activated successfully - bot is now stealthed");
-      } else {
-        const msg = cloakResp.error.message.toLowerCase();
-        if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
-          cloakEnabled = true;
-          ctx.log("info", "Cloak already active");
-        } else {
-          ctx.log("warn", `Cloak command failed: ${cloakResp.error.message}`);
-        }
-      }
-    }
+    // Re-cloak whenever autoCloak is on and the cloak has been dropped (jumps
+    // and battles both decloak). Replaces the old one-shot flag that never
+    // re-cloaked, which left explorers exposed after a pathfinder jump.
+    await ensureAutoCloak(ctx, cloakSettings.autoCloak);
 
     // ── Clean up expired temporary blacklists ──
     cleanupTemporaryBlacklist();
@@ -2461,6 +2486,8 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await ctx.sleep(30000); continue; }
 
+    await ensureAutoCloak(ctx, getExplorerSettings(bot.username).autoCloak);
+
     // ── Battle check ──
     if (bot.isInBattle()) {
       ctx.log("combat", "[WebSocket] Battle detected via WebSocket - fleeing immediately!");
@@ -2785,7 +2812,6 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
   const { bot } = ctx;
   const fledFromSystems = new Set<string>();
   const path: string[] = [];
-  let cloakEnabled = false;
 
   await bot.refreshStatus();
   const homeSystem = bot.system;
@@ -2838,22 +2864,10 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // ── Enable cloak if autoCloak is enabled and not already cloaked ──
     const cloakSettings = getExplorerSettings(bot.username);
-    if (cloakSettings.autoCloak && !bot.isCloaked && !cloakEnabled) {
-      ctx.log("system", "Auto-cloak enabled - activating cloak for full-time stealth mode");
-      const cloakResp = await bot.exec("cloak", { enable: true });
-      if (!cloakResp.error) {
-        cloakEnabled = true;
-        ctx.log("info", "Cloak activated successfully - bot is now stealthed");
-      } else {
-        const msg = cloakResp.error.message.toLowerCase();
-        if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
-          cloakEnabled = true;
-          ctx.log("info", "Cloak already active");
-        } else {
-          ctx.log("warn", `Cloak command failed: ${cloakResp.error.message}`);
-        }
-      }
-    }
+    // Re-cloak whenever autoCloak is on and the cloak has been dropped (jumps
+    // and battles both decloak). Replaces the old one-shot flag that never
+    // re-cloaked, which left explorers exposed after a pathfinder jump.
+    await ensureAutoCloak(ctx, cloakSettings.autoCloak);
 
     // ── Build list of known systems with stations, sorted by stalest market data ──
     yield "plan_route";
@@ -3349,6 +3363,8 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
   botChatChannel.onMessage(bot.username, processExplorationTarget);
 
   while (bot.state === "running") {
+    await ensureAutoCloak(ctx, getExplorerSettings(bot.username).autoCloak);
+
     // Check for battle
     if (await checkAndFleeFromBattle(ctx, "visit_all")) {
       await ctx.sleep(5000);
@@ -3667,8 +3683,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     path.push(bot.system);
   }
 
-  // Track if we've already enabled cloak (mutation command - don't re-issue)
-  let cloakEnabled = false;
+
 
   while (bot.state === "running") {
     // Check for battle
@@ -3686,22 +3701,10 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // ── Enable cloak if autoCloak is enabled and not already cloaked ──
     const cloakSettings = getExplorerSettings(bot.username);
-    if (cloakSettings.autoCloak && !bot.isCloaked && !cloakEnabled) {
-      ctx.log("system", "Auto-cloak enabled - activating cloak for full-time stealth mode");
-      const cloakResp = await bot.exec("cloak", { enable: true });
-      if (!cloakResp.error) {
-        cloakEnabled = true;
-        ctx.log("info", "Cloak activated successfully - bot is now stealthed");
-      } else {
-        const msg = cloakResp.error.message.toLowerCase();
-        if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
-          cloakEnabled = true;
-          ctx.log("info", "Cloak already active");
-        } else {
-          ctx.log("warn", `Cloak command failed: ${cloakResp.error.message}`);
-        }
-      }
-    }
+    // Re-cloak whenever autoCloak is on and the cloak has been dropped (jumps
+    // and battles both decloak). Replaces the old one-shot flag that never
+    // re-cloaked, which left explorers exposed after a pathfinder jump.
+    await ensureAutoCloak(ctx, cloakSettings.autoCloak);
 
     // ── Check fuel cell depletion — return to home base if enabled and out of fuel cells ──
     // Runs before any refuel gate so a stranded bot returns home instead of looping.
@@ -4713,6 +4716,8 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await ctx.sleep(30000); continue; }
 
+    await ensureAutoCloak(ctx, getExplorerSettings(bot.username).autoCloak);
+
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "fixed_route")) {
       await ctx.sleep(5000);
@@ -5473,11 +5478,15 @@ async function performFrontierPathfinderJump(ctx: RoutineContext, targetSystemId
   }
 
   await ensureUndocked(ctx);
-  const wasCloaked = bot.isCloaked;
-  if (wasCloaked) {
+  // Pathfinder jumps require the cloak to be down. Always issue the decloak
+  // (harmless if already down) so a stale isCloaked flag can't leave us cloaked
+  // mid-jump, and remember whether we should re-cloak on the far side.
+  const autoCloak = getExplorerSettings(bot.username).autoCloak;
+  if (bot.isCloaked) {
     ctx.log("travel", "Disabling cloak for frontier pathfinder jump...");
-    await bot.exec("cloak", { enable: false });
   }
+  await bot.exec("cloak", { enable: false });
+  bot.isCloaked = false;
 
   try {
     ctx.log("travel", `Frontier pathfinder jump: ${bot.system} -> ${targetSystemId}`);
@@ -5506,8 +5515,10 @@ async function performFrontierPathfinderJump(ctx: RoutineContext, targetSystemId
     ctx.log("error", `Frontier pathfinder jump to ${targetSystemId} failed (now at ${bot.system})`);
     return false;
   } finally {
-    if (wasCloaked && bot.state === "running") {
-      await bot.exec("cloak", { enable: true });
+    // Re-cloak on the far side if autoCloak is on. This is the fix for the lost
+    // explorer: the cloak was dropped for the jump and never restored.
+    if (autoCloak && bot.state === "running") {
+      await ensureAutoCloak(ctx, true);
     }
   }
 }
@@ -5879,6 +5890,8 @@ async function* frontierUpdateRoutine(ctx: RoutineContext): AsyncGenerator<strin
       continue;
     }
 
+    await ensureAutoCloak(ctx, getExplorerSettings(bot.username).autoCloak);
+
     if (await checkAndFleeFromBattle(ctx, "frontier_update")) {
       await ctx.sleep(5000);
       continue;
@@ -6165,6 +6178,11 @@ async function* frontierExplorationRoutine(ctx: RoutineContext): AsyncGenerator<
 
   // ── Startup: dock at local station to clear cargo, pack fuel cells & refuel ──
   while (bot.state === "running") {
+    // Only re-cloak once startup docking is done — cloaking force-undocks, so
+    // doing it before the startup station dock would break refuel/repair.
+    if (startupPrepped) {
+      await ensureAutoCloak(ctx, getExplorerSettings(bot.username).autoCloak);
+    }
     if (!startupPrepped) {
       startupPrepped = true;
       yield "startup_prep";
@@ -7154,6 +7172,11 @@ export async function* frontierSurveyRoutine(ctx: RoutineContext): AsyncGenerato
 
   // ── Startup: dock at local station to clear cargo, pack fuel cells & refuel ──
   while (bot.state === "running") {
+    // Only re-cloak once startup docking is done — cloaking force-undocks, so
+    // doing it before the startup station dock would break refuel/repair.
+    if (startupPrepped) {
+      await ensureAutoCloak(ctx, getExplorerSettings(bot.username).autoCloak);
+    }
     if (!startupPrepped) {
       startupPrepped = true;
       yield "startup_prep";

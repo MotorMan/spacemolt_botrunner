@@ -15315,8 +15315,15 @@
       // All other bots (miners, hunters, traders, etc.) will be blocked from routing to them.
 
       function renderFrontierBlacklistSettings(panel) {
-        // Handle both direct array and nested object structures
-        const rawBlacklist = settings.frontier_system_blacklist;
+        // Handle both direct array and nested object structures.
+        // Older saves wrote the list under the "frontier_blacklist" key (the
+        // save routine name), while this UI reads "frontier_system_blacklist".
+        // Adopt the legacy key so previously-saved entries still show up.
+        let rawBlacklist = settings.frontier_system_blacklist;
+        if (!Array.isArray(rawBlacklist) && Array.isArray(settings.frontier_blacklist)) {
+          rawBlacklist = settings.frontier_blacklist;
+          settings.frontier_system_blacklist = rawBlacklist;
+        }
         const blacklist = Array.isArray(rawBlacklist)
           ? rawBlacklist
           : rawBlacklist?.frontier_system_blacklist || [];
@@ -15480,11 +15487,15 @@
       }
 
       function saveFrontierBlacklistSettings() {
-        // Save the array directly, not wrapped in an object
+        // Save the array directly, not wrapped in an object.
+        // Persist under "frontier_system_blacklist" (the key this UI and
+        // getFrontierSystemBlacklist() read) so the list survives a reload
+        // instead of being written to the unused "frontier_blacklist" key.
         const s = settings.frontier_system_blacklist || [];
+        settings.frontier_system_blacklist = s;
         send({
           type: "saveSettings",
-          routine: "frontier_blacklist",
+          routine: "frontier_system_blacklist",
           settings: s,
         });
       }

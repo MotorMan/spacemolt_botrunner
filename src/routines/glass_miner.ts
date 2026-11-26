@@ -2485,11 +2485,26 @@ export const glassMinerRoutine: Routine = async function* (ctx: RoutineContext) 
           await collectFromStorage(ctx);
           await ensureGlassMinerResupply(ctx);
           await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
+          // Refuel while still docked (free at our faction station) BEFORE the
+          // long wait. Undocking with a low tank and no cargo fuel cells strands
+          // the ship in an endless undocked refuel loop — burning fuel while
+          // cloaked and exposed to attack. The tank does not burn while docked.
+          await tryRefuel(ctx, { skipApprovedCheck: true });
           // Stay DOCKED (cloaked, zero fuel burn) for the whole replenish wait.
           // Undocking only wastes fuel — the next navigation undocks automatically.
           const waitHours = settings.depletionTimeoutHours;
           ctx.log("system", `Docked and waiting ${waitHours} h (Depletion Timeout) for the depleted POI to replenish before returning to ${target.systemId}/${target.poiId}`);
           await ctx.sleep(waitHours * 60 * 60 * 1000);
+          // Re-check fuel after the wait: if the docked refuel failed (station had
+          // no fuel and we carry no cells), do NOT undock — staying docked burns no
+          // fuel and keeps us safe. The top of the loop keeps retrying the docked
+          // refuel instead of exposing an under-fueled, cloaked ship.
+          await bot.refreshShip();
+          const postWaitFuelPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 100;
+          if (postWaitFuelPct <= settings.refuelThreshold) {
+            ctx.log("warn", `Fuel still at ${postWaitFuelPct.toFixed(1)}% after docked refuel — staying docked (no fuel burn, safe) instead of undocking into a refuel loop`);
+            continue;
+          }
           await ensureUndocked(ctx);
           // Re-cloak after undocking so we are never exposed while traveling back.
           await enableCloakingIfPossible(ctx, cachedModules);

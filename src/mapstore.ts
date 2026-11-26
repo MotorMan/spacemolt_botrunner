@@ -1114,18 +1114,24 @@ class MapStore {
     if (!poi) return;
 
     const timestamp = now();
+    const prevById = new Map((poi.resources ?? []).map((r) => [r.resource_id, r]));
     poi.resources = resources
       .filter((r) => r.remaining <= r.max_remaining)
-      .map((r) => ({
-        resource_id: r.resource_id,
-        name: r.name,
-        richness: r.richness,
-        remaining: r.remaining,
-        max_remaining: r.max_remaining,
-        depletion_percent: r.depletion_percent,
-        last_scanned: timestamp,
-        supported_power: r.supported_power,
-      }));
+      .map((r) => {
+        const prev = prevById.get(r.resource_id);
+        const keepDepleted = prev?.depleted === true && r.remaining <= 0;
+        return {
+          resource_id: r.resource_id,
+          name: r.name,
+          richness: r.richness,
+          remaining: r.remaining,
+          max_remaining: r.max_remaining,
+          depletion_percent: r.depletion_percent,
+          last_scanned: timestamp,
+          supported_power: r.supported_power,
+          ...(keepDepleted ? { depleted: true, depleted_at: prev!.depleted_at } : {}),
+        };
+      });
 
     poi.last_updated = timestamp;
     this.scheduleSave();
@@ -1199,18 +1205,24 @@ class MapStore {
 
     // Update resources if provided
     if (poiData.resources && poiData.resources.length > 0) {
+      const prevById = new Map((poi.resources ?? []).map((r) => [r.resource_id, r]));
       poi.resources = poiData.resources
         .filter((r) => r.remaining <= r.max_remaining)
-        .map((r) => ({
-          resource_id: r.resource_id,
-          name: r.name,
-          richness: r.richness,
-          remaining: r.remaining,
-          max_remaining: r.max_remaining,
-          depletion_percent: r.depletion_percent,
-          last_scanned: now(),
-          supported_power: r.supported_power,
-        }));
+        .map((r) => {
+          const prev = prevById.get(r.resource_id);
+          const keepDepleted = prev?.depleted === true && r.remaining <= 0;
+          return {
+            resource_id: r.resource_id,
+            name: r.name,
+            richness: r.richness,
+            remaining: r.remaining,
+            max_remaining: r.max_remaining,
+            depletion_percent: r.depletion_percent,
+            last_scanned: now(),
+            supported_power: r.supported_power,
+            ...(keepDepleted ? { depleted: true, depleted_at: prev!.depleted_at } : {}),
+          };
+        });
     }
 
     this.scheduleSave();
@@ -1226,11 +1238,22 @@ class MapStore {
     if (!poi) return;
 
     const existing = poi.ores_found.find((o) => o.item_id === oreId);
+    const resource = poi.resources?.find((r) => r.resource_id === oreId);
+    let changed = false;
     if (existing) {
       existing.depleted = true;
       existing.depleted_at = now();
-      this.scheduleSave();
+      changed = true;
     }
+    // Depletion must also be recorded on the scan-data record. Ores that exist
+    // only as scan data (no ores_found history) would otherwise never be marked
+    // depleted and keep being selected forever.
+    if (resource) {
+      resource.depleted = true;
+      resource.depleted_at = now();
+      changed = true;
+    }
+    if (changed) this.scheduleSave();
   }
 
   /** Clear all resource data from a POI. Use when POI data is known to be corrupted or outdated. */
@@ -1686,6 +1709,11 @@ class MapStore {
           continue;
         }
         if (targetOre?.depleted && !isDepletionExpired(targetOre.depleted_at)) {
+          continue;
+        }
+        // Scan data can be depleted independently of mining history (e.g. an ore
+        // that only ever appeared in a get_poi scan, never in ores_found).
+        if (targetResource?.depleted && !isDepletionExpired(targetResource.depleted_at)) {
           continue;
         }
 

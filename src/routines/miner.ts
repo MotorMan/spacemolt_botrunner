@@ -1965,6 +1965,9 @@ function getReachableOreLocations(
       if (poi.hidden === true && !canMineHiddenIce) continue;
     } else if (miningType === "ore") {
       if (poi.hidden === true && !canMineHiddenPois) continue;
+      // Ores only spawn in mineable POI types (asteroid belts/fields/rings).
+      // Stars, planets and stations never contain mineable ore — never route there.
+      if (poi.hidden !== true && !isOreBeltPoi(poi.type || "")) continue;
     }
 
     // Depletion (skip if still under lockout)
@@ -5166,8 +5169,8 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         const canMineHere = (() => {
           if (miningType === "ore") {
             if (isDeepCoreOre(effectiveTarget)) return deepCoreCap.canMineVisibleDeepCore;
-            // Trust map data - any POI can contain regular ores
-            return true;
+            // Ores only exist in mineable POI types (or hidden deep-core POIs).
+            return isOreBeltPoi(currentPoi.type || "") || isHidden === true;
           }
           if (miningType === "gas") return isGasCloudPoi(currentPoi.type);
           if (miningType === "ice") return isIceFieldPoi(currentPoi.type) || (isHidden && canMineHiddenIce);
@@ -5267,8 +5270,8 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         if (p.id === bot.poi) return false;
         // Skip hidden POIs for ore miners who can't mine them
         if (miningType === "ore" && p.hidden === true && !canMineHiddenPois) return false;
-        // Match POI type - trust the map data
-        const isMatchingPoi = (miningType === "ore") ||
+        // Match POI type - ores only spawn in mineable POI types
+        const isMatchingPoi = (miningType === "ore" && (isOreBeltPoi(p.type) || p.hidden === true)) ||
           (miningType === "radioactive" && (isOreBeltPoi(p.type) || p.hidden === true)) ||
           (miningType === "gas" && isGasCloudPoi(p.type)) ||
           (miningType === "ice" && isIceFieldPoi(p.type));
@@ -5326,9 +5329,10 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
           if (!poi) return true;
-           // No filtering by POI type - trust the map data from findOreLocations
+           // Ores only spawn in mineable POI types (or hidden deep-core POIs).
            if (miningType === "ore") {
              if (poi.hidden === true && !canMineHiddenPois) return false;
+             if (poi.hidden !== true && !isOreBeltPoi(poi.type || "")) return false;
              return true;
            }
           if (miningType === "radioactive") {

@@ -221,7 +221,8 @@ function findMiningRoute(
  * Every harvest iteration this keeps shields topped up with shield charges and
  * patches the hull with repair kits in the field. It returns the current
  * hull/shield percentages and whether the hull has fallen to the critical
- * threshold at which the caller should flee home.
+ * threshold (the miner's configured hull-flee / repair percent) at which the
+ * caller must leave the hazard and head home.
  */
 async function monitorHazardSafety(
   ctx: RoutineContext,
@@ -232,8 +233,11 @@ async function monitorHazardSafety(
   const shieldsPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
   const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
 
-  // Keep shields topped up before they collapse.
-  if (shieldsPct < 80) {
+  // Keep shields topped up before they collapse. Skip ships whose entire shield
+  // pool is smaller than a single charge (100): a charge would be burned to fill
+  // a pool the hazard strips again immediately, and these weak ships must rely on
+  // the hull threshold and leave the hazard instead of wasting charges.
+  if (shieldsPct < 80 && bot.maxShield >= 100) {
     const ok = await topUpShields(ctx, 0.8);
     if (ok) {
       ctx.log("combat", `Hazard damage: shields at ${shieldsPct}% — used a shield charge to top up`);
@@ -6159,7 +6163,12 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
       }
 
       // ── Continuous shield/hull safety (hazard POIs, especially in the Frontier) ──
-      const { hullPct: midHull, shieldsPct: midShields, critical: hullCritical } = await monitorHazardSafety(ctx, 40);
+      // Use the miner's configured hull-flee percent (settings/miner "Repair
+      // Threshold") so the ship leaves the hazard at the level the user set,
+      // not a hardcoded value. Hazards like the Telescope Flicker Field only
+      // damage the ship while it is actively mining, so bailing at this hull
+      // level is what keeps the miner alive.
+      const { hullPct: midHull, shieldsPct: midShields, critical: hullCritical } = await monitorHazardSafety(ctx, settings.repairThreshold);
       if (hullCritical) { stopReason = `hull critical (${midHull}%, shields ${midShields}%)`; break; }
 
       const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
@@ -8408,6 +8417,9 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
     const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
     const isDepleted = stopReason && stopReason.includes("depleted");
     const isFuelLowStop = stopReason && stopReason.includes("fuel low");
+    // A hull-critical stop means the hazard is killing the ship — always leave
+    // for home to repair, regardless of stayOutUntilFull / cargo fill.
+    const isHullCriticalStop = stopReason && stopReason.includes("hull critical");
 
     // When stopping due to fuel low mid-mining:
     // - Don't deposit cargo at the refuel station
@@ -8416,7 +8428,9 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
     const isCargoFull = fillRatio >= cargoThresholdRatio;
     const shouldStayOutDueToFuel = isFuelLowStop && !isCargoFull;
 
-    const shouldReturnHome = settings.noMidMiningRetarget
+    const shouldReturnHome = isHullCriticalStop
+      ? (!!homeSystem && bot.system !== homeSystem)
+      : settings.noMidMiningRetarget
       ? (bot.system !== homeSystem && homeSystem)
       : (settings.stayOutUntilFull
         ? ((fillRatio >= cargoThresholdRatio || isDepleted) && bot.system !== homeSystem && homeSystem)

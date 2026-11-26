@@ -6,6 +6,7 @@ import { perf } from "../perf.js";
 import { getBot, getTotalBandwidth, getDiscoveredBots, getBotStatuses } from "../botmanager.js";
 import { chatBuffer, type ChatMessage } from "../chatbuffer.js";
 import { mapStore, getMainNetworkSystems } from "../mapstore.js";
+import { getTempBlacklist } from "../tempBlacklist.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
@@ -432,14 +433,32 @@ export function getFrontierSystemBlacklist(): string[] {
   return [];
 }
 
+/** Combat routines that can actually kill dangerous repeaters. These are
+ *  exempt from the temp danger-blacklist so they can enter a banned system and
+ *  clear the threat. Keys match the ROUTINES map in botmanager.ts. */
+const TEMP_BLACKLIST_EXEMPT_ROUTINES = new Set([
+  "hunter",
+  "fleet_hunter_commander",
+  "fleet_hunter_subordinate",
+]);
+
 /** Get the effective system blacklist for a specific bot.
  *  Combines the global system blacklist with auto-detected frontier systems (systems outside the main ~506 network),
- *  but excludes frontier systems for explorers (who have pathfinder drives). */
+ *  but excludes frontier systems for explorers (who have pathfinder drives).
+ *
+ *  The TEMP blacklist (systems where a miner was ambushed by dangerous
+ *  repeaters) is appended for every routine EXCEPT the combat routines that
+ *  can actually kill the repeaters (hunters / fleet hunters). Those must be
+ *  able to enter a temp-blacklisted system to clear the threat. The ban is
+ *  unconditional for everyone else (miners, traders, etc.) because those
+ *  repeaters attack through cloak. */
 export function getEffectiveSystemBlacklist(bot: { routineName: string | null; username?: string }): string[] {
   const systemBlacklist = getSystemBlacklist();
-  const routine = bot?.routineName?.toLowerCase();
+  const routine = bot?.routineName?.toLowerCase() ?? "";
+  // Combat routines that can kill repeaters are exempt from the temp danger-ban.
+  const tempBlacklist = TEMP_BLACKLIST_EXEMPT_ROUTINES.has(routine) ? [] : getTempBlacklist();
   if (routine === "explorer" || routine === "pathfinder") {
-    return systemBlacklist;
+    return [...systemBlacklist, ...tempBlacklist];
   }
 
   // Check if frontier blocking is enabled for this bot
@@ -450,7 +469,7 @@ export function getEffectiveSystemBlacklist(bot: { routineName: string | null; u
   const botBlockFrontier = botSettings.blockFrontierSystems !== undefined ? botSettings.blockFrontierSystems : globalBlockFrontier;
 
   if (!botBlockFrontier) {
-    return systemBlacklist;
+    return [...systemBlacklist, ...tempBlacklist];
   }
 
   // Auto-detect frontier systems: any system NOT in the main network
@@ -463,7 +482,7 @@ export function getEffectiveSystemBlacklist(bot: { routineName: string | null; u
     }
   }
 
-  return [...systemBlacklist, ...frontierSystems];
+  return [...systemBlacklist, ...frontierSystems, ...tempBlacklist];
 }
 
 /** Get the global station blacklist from settings. These are POI ids (or

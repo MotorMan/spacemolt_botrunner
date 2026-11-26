@@ -12,6 +12,7 @@ import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleSta
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
 import { getSystemBlacklist, getStationBlacklist, getEffectiveSystemBlacklist, isCustomsDisabled } from "../web/server.js";
+import { addTempBlacklistSystem } from "../tempBlacklist.js";
 import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
   waitForCustomsInspection,
@@ -6308,6 +6309,11 @@ export async function handleBattleNotifications(
         battleState.battleStartTick = Date.now();
         battleState.isFleeing = false;
 
+        // Temp-blacklist the system if a dangerous repeater composition attacked us.
+        if (battleNotif.participants) {
+          await banSystemForDangerousRepeaters(ctx, battleNotif.participants, undefined, battleNotif.battleId);
+        }
+
         // Check for pirates in battle participants first
         if (battleNotif.participants) {
           const pirateResult = parsePiratesFromBattleParticipants(battleNotif.participants);
@@ -6360,6 +6366,8 @@ export async function handleBattleNotifications(
             ctx.log("combat", `⚠️ PIRATES DETECTED IN BATTLE UPDATE! ${pirateResult.pirateCount} pirate(s) - issuing flee!`);
             battleState.isFleeing = false; // Reset to trigger flee
           }
+          // Temp-blacklist on dangerous repeaters (idempotent across ticks).
+          await banSystemForDangerousRepeaters(ctx, battleNotif.participants);
         }
 
         if (battleState.inBattle && !battleState.isFleeing) {
@@ -6437,6 +6445,10 @@ export async function checkAndFleeFromBattle(
     if (status.participants && await checkAndFleeFromBattleMirages(ctx, status.participants)) {
       return true;
     }
+    // Temp-blacklist the system if dangerous repeaters attacked us.
+    if (status.participants) {
+      await banSystemForDangerousRepeaters(ctx, status.participants, status.your_side_id, status.battle_id);
+    }
     ctx.log("combat", `${prefix}BATTLE DETECTED [WebSocket]! - fleeing immediately!`);
     await fleeFromBattle(ctx, true, 35000);
     return true;
@@ -6449,6 +6461,10 @@ export async function checkAndFleeFromBattle(
     // Check for Mirages/Leviathans in battle participants
     if (battleStatus.participants && await checkAndFleeFromBattleMirages(ctx, battleStatus.participants)) {
       return true;
+    }
+    // Temp-blacklist the system if dangerous repeaters attacked us.
+    if (battleStatus.participants) {
+      await banSystemForDangerousRepeaters(ctx, battleStatus.participants, battleStatus.your_side_id, battleStatus.battle_id);
     }
     ctx.log("combat", `${prefix}BATTLE DETECTED! Battle ID: ${battleStatus.battle_id} - fleeing!`);
     await fleeFromBattle(ctx, true, 35000);
@@ -7223,6 +7239,102 @@ export interface BattleMirageDetectionResult {
   hasMirages: boolean;
   mirageCount: number;
   mirageNames: string[];
+}
+
+// ── Dangerous repeater classification (temp-blacklist trigger) ──────────────
+// A system is temp-blacklisted for 6h when the enemies attacking us include a
+// dangerous repeater composition. Slivers are weak and ignored.
+const DANGEROUS_REPEATER_THRESHOLDS = {
+  pane: 2,      // >= 2 Repeater Pane
+  spire: 1,     // >= 1 Repeater Spire
+  monolith: 1,  // >= 1 Repeater Monolith
+};
+
+export interface DangerousRepeaterResult {
+  pane: number;
+  spire: number;
+  monolith: number;
+  sliver: number;
+  qualifies: boolean;
+  reason: string;
+  lastName: string;
+}
+
+/** Classify a repeater name/ship_class into a bucket, or null if not a repeater. */
+function repeaterBucket(name: string, shipClass: string): "pane" | "spire" | "monolith" | "sliver" | null {
+  const hay = `${name} ${shipClass}`.toLowerCase();
+  if (hay.includes("sliver")) return "sliver";
+  if (hay.includes("monolith")) return "monolith";
+  if (hay.includes("spire")) return "spire";
+  if (hay.includes("pane")) return "pane";
+  return null;
+}
+
+/** Parse battle participants to detect a dangerous repeater composition.
+ *  Only ENEMY participants are counted (side_id differs from our side when
+ *  known); friendlies never trigger a ban.
+ *  @param battleParticipants - battle_update / get_battle_status participants
+ *  @param ourSideId - our side id, to exclude friendlies (optional)
+ */
+export function classifyDangerousRepeaters(
+  battleParticipants: unknown[],
+  ourSideId?: number,
+): DangerousRepeaterResult {
+  const result: DangerousRepeaterResult = {
+    pane: 0, spire: 0, monolith: 0, sliver: 0,
+    qualifies: false, reason: "", lastName: "",
+  };
+  if (!Array.isArray(battleParticipants)) return result;
+
+  for (const participant of battleParticipants) {
+    if (!participant || typeof participant !== "object") continue;
+    const p = participant as Record<string, unknown>;
+    const sideId = p.side_id as number | undefined;
+    if (ourSideId !== undefined && sideId !== undefined && sideId !== ourSideId) {
+      // enemy — count it
+    } else if (ourSideId !== undefined && sideId === ourSideId) {
+      continue; // friendly — never a ban trigger
+    }
+    const name = (p.username as string) || (p.name as string) || "";
+    const shipClass = (p.ship_class as string) || "";
+    const bucket = repeaterBucket(name, shipClass);
+    if (!bucket) continue;
+    result[bucket]++;
+    if (bucket !== "sliver" && !result.lastName) result.lastName = name || shipClass;
+  }
+
+  const parts: string[] = [];
+  if (result.pane > 0) parts.push(`${result.pane}x Repeater Pane`);
+  if (result.spire > 0) parts.push(`${result.spire}x Repeater Spire`);
+  if (result.monolith > 0) parts.push(`${result.monolith}x Repeater Monolith`);
+  result.reason = parts.join(", ");
+  result.qualifies =
+    result.pane >= DANGEROUS_REPEATER_THRESHOLDS.pane ||
+    result.spire >= DANGEROUS_REPEATER_THRESHOLDS.spire ||
+    result.monolith >= DANGEROUS_REPEATER_THRESHOLDS.monolith;
+  return result;
+}
+
+/** If the given battle participants qualify, ban the bot's current system for
+ *  6h and log it. Returns true when a ban was written.
+ *  Safe to call from multiple battle paths in one tick (upsert is idempotent). */
+export async function banSystemForDangerousRepeaters(
+  ctx: RoutineContext,
+  battleParticipants: unknown[],
+  ourSideId?: number,
+  battleId?: string,
+): Promise<boolean> {
+  const cls = classifyDangerousRepeaters(battleParticipants, ourSideId);
+  if (!cls.qualifies) return false;
+  const systemId = ctx.bot.system;
+  if (!systemId) return false;
+  addTempBlacklistSystem(systemId, {
+    reason: cls.reason,
+    lastEnemy: cls.lastName,
+    battleId: battleId || "",
+  });
+  ctx.log("combat", `⛔ [tempblacklist] ${systemId} banned 6h — dangerous repeaters (${cls.reason})`);
+  return true;
 }
 
 /** Parse battle participants to detect Mirages/Leviathans.

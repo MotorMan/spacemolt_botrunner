@@ -4,6 +4,7 @@ import { extractLibResult } from "../commandBridge.js";
 import { mapStore, isDepletionExpired } from "../mapstore.js";
 import { getBotChatChannel } from "../botmanager.js";
 import { getEffectiveSystemBlacklist } from "../web/server.js";
+import { isTempBlacklisted } from "../tempBlacklist.js";
 import { onCoordinationUpdate } from "../client_sync_hooks.js";
 import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
@@ -4737,6 +4738,19 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           targetSystemId = chosenLoc.systemId;
           targetPoiId = chosenLoc.poiId;
           targetPoiName = chosenLoc.poiName;
+        }
+
+        // Respect the persistent temp-blacklist: if the chosen target system was
+        // banned (dangerous repeater ambush) within the last 6h, exclude it and
+        // reselect instead of flying back into the death-trap.
+        if (targetSystemId && targetSystemId !== bot.system && isTempBlacklisted(targetSystemId)) {
+          ctx.log("mining", `Target ${targetSystemId} is temp-blacklisted (dangerous repeaters) — excluding and reselecting`);
+          excludedNavSystems.add(targetSystemId);
+          if (recoveredSession) {
+            await failMiningSession(bot.username, `Target ${targetSystemId} temp-blacklisted (dangerous repeaters)`);
+            recoveredSession = null;
+          }
+          continue;
         }
 
         // Create mining session if we don't have one and we're targeting a specific POI

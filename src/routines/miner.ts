@@ -5,6 +5,8 @@ import { mapStore, isDepletionExpired } from "../mapstore.js";
 import { getBotChatChannel } from "../botmanager.js";
 import { getEffectiveSystemBlacklist } from "../web/server.js";
 import { isTempBlacklisted } from "../tempBlacklist.js";
+import { isCombatFleetBlacklisted, getCombatFleetBlacklist } from "../combatFleetBlacklist.js";
+import { fleetStatus, hasCombatDroneMember } from "./fleet.js";
 import { onCoordinationUpdate } from "../client_sync_hooks.js";
 import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
@@ -173,8 +175,16 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
  * blacklist. Without a drive the frontier stays blacklisted (the ship could not
  * get back out if a wormhole closed behind it).
  */
-function getMiningBlacklist(bot: { routineName: string | null; username?: string }, settings: Awaited<ReturnType<typeof getMinerSettings>>, isCloaked: boolean, hasPathfinderDrive: boolean = false): string[] {
-  const baseBlacklist = getEffectiveSystemBlacklist(bot);
+function getMiningBlacklist(bot: { routineName: string | null; username?: string }, settings: Awaited<ReturnType<typeof getMinerSettings>>, isCloaked: boolean, hasPathfinderDrive: boolean = false, hasCombatEscort: boolean = false): string[] {
+  let baseBlacklist = getEffectiveSystemBlacklist(bot);
+  // A Combat Drone escort unlocks the permanent combat-fleet-only systems.
+  // Without an escort those systems stay blacklisted (perm-ban).
+  if (hasCombatEscort && baseBlacklist.length > 0) {
+    const combatFleet = new Set(getCombatFleetBlacklist().map((s) => s.toLowerCase()));
+    if (combatFleet.size > 0) {
+      baseBlacklist = baseBlacklist.filter((id) => !combatFleet.has(id.toLowerCase()));
+    }
+  }
   if (isCloaked && settings.cloakIgnoreBlacklist) {
     // Logging is done by the caller since ctx is not available here
     return [];
@@ -2741,6 +2751,24 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   const homeSystem = settings0.homeSystem || bot.system;
   const cargoThresholdRatio = settings0.cargoThreshold / 100;
 
+  // ── Combat-fleet escort check (once at startup) ──
+  // Systems on the combat-fleet blacklist (permanent big-bad-repeater ambushes)
+  // are off limits to a solo miner. They unlock only when this miner is in a
+  // fleet that contains a `Combat Drone NNN` member (001-999).
+  let hasCombatEscort = false;
+  try {
+    const fleet = await fleetStatus(ctx);
+    hasCombatEscort = hasCombatDroneMember(fleet);
+    if (hasCombatEscort) {
+      const drones = (fleet?.members || []).map((m) => m.username).filter((n) => /^Combat Drone \d{3}$/i.test((n || "").trim()));
+      ctx.log("mining", `Combat Drone escort detected in fleet (${drones.join(", ")}) — combat-fleet-only systems unlocked`);
+    } else if (getCombatFleetBlacklist().length > 0) {
+      ctx.log("mining", `No Combat Drone escort in fleet — ${getCombatFleetBlacklist().length} combat-fleet-only system(s) stay blacklisted`);
+    }
+  } catch (e) {
+    ctx.log("warn", `Failed to check fleet for a Combat Drone escort: ${e}`);
+  }
+
   // Register chat handler for escort queries
   const chatChannel = getBotChatChannel();
   const chatHandler = (message: BotChatMessage) => {
@@ -2880,7 +2908,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("mining", `Started in the field with low fuel cells (${startupFuelCells.summary}) — ${adequacy.reason} — returning to home system ${homeSystem} to stock up before mining`);
         try {
           const startupFrontierCfg = buildFrontierTravelConfig(settings0, bot.hasPathfinderDrive);
-          const startupBlacklist = getMiningBlacklist({ routineName: bot.routineName, username: bot.username }, settings0, bot.isCloaked === true, bot.hasPathfinderDrive === true);
+          const startupBlacklist = getMiningBlacklist({ routineName: bot.routineName, username: bot.username }, settings0, bot.isCloaked === true, bot.hasPathfinderDrive === true, hasCombatEscort);
           const wentHome = await travelToSystemSmart(ctx, homeSystem, {
             fuelThresholdPct: settings0.refuelThreshold,
             hullThresholdPct: settings0.repairThreshold,
@@ -3058,7 +3086,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const cargoThresholdRatio = settings.cargoThreshold / 100;
       // Get blacklist - use empty only if bot actually has a cloaking module and is cloaked.
       // A fitted Pathfinder Drive unlocks the Frontier (see getMiningBlacklist).
-      const blacklist = getMiningBlacklist({ routineName: bot.routineName, username: bot.username }, settings, hasCloak && bot.isCloaked, bot.hasPathfinderDrive === true);
+      const blacklist = getMiningBlacklist({ routineName: bot.routineName, username: bot.username }, settings, hasCloak && bot.isCloaked, bot.hasPathfinderDrive === true, hasCombatEscort);
       const safetyOpts: FrontierNavOpts & { blacklist: string[] } = {
         fuelThresholdPct: settings.refuelThreshold,
         hullThresholdPct: settings.repairThreshold,
@@ -4751,6 +4779,18 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           excludedNavSystems.add(targetSystemId);
           if (recoveredSession) {
             await failMiningSession(bot.username, `Target ${targetSystemId} temp-blacklisted (dangerous repeaters)`);
+            recoveredSession = null;
+          }
+          continue;
+        }
+
+        // Respect the permanent combat-fleet blacklist: a system with big-bad
+        // repeaters is off limits unless this miner has a Combat Drone escort.
+        if (targetSystemId && targetSystemId !== bot.system && !hasCombatEscort && isCombatFleetBlacklisted(targetSystemId)) {
+          ctx.log("mining", `Target ${targetSystemId} requires a Combat Drone escort (perm-blacklisted) — excluding and reselecting`);
+          excludedNavSystems.add(targetSystemId);
+          if (recoveredSession) {
+            await failMiningSession(bot.username, `Target ${targetSystemId} requires a Combat Drone escort`);
             recoveredSession = null;
           }
           continue;

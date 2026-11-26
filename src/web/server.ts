@@ -7,6 +7,7 @@ import { getBot, getTotalBandwidth, getDiscoveredBots, getBotStatuses } from "..
 import { chatBuffer, type ChatMessage } from "../chatbuffer.js";
 import { mapStore, getMainNetworkSystems } from "../mapstore.js";
 import { getTempBlacklist } from "../tempBlacklist.js";
+import { getCombatFleetBlacklist } from "../combatFleetBlacklist.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
@@ -451,14 +452,20 @@ const TEMP_BLACKLIST_EXEMPT_ROUTINES = new Set([
  *  can actually kill the repeaters (hunters / fleet hunters). Those must be
  *  able to enter a temp-blacklisted system to clear the threat. The ban is
  *  unconditional for everyone else (miners, traders, etc.) because those
- *  repeaters attack through cloak. */
+ *  repeaters attack through cloak.
+ *
+ *  The COMBAT-FLEET blacklist (permanent, combat-fleet-only systems) is
+ *  appended the same way. A miner travelling with a Combat Drone escort has
+ *  these entries removed again in getMiningBlacklist (miner.ts). */
 export function getEffectiveSystemBlacklist(bot: { routineName: string | null; username?: string }): string[] {
   const systemBlacklist = getSystemBlacklist();
   const routine = bot?.routineName?.toLowerCase() ?? "";
-  // Combat routines that can kill repeaters are exempt from the temp danger-ban.
-  const tempBlacklist = TEMP_BLACKLIST_EXEMPT_ROUTINES.has(routine) ? [] : getTempBlacklist();
+  // Combat routines that can kill repeaters are exempt from the danger-bans.
+  const combatExempt = TEMP_BLACKLIST_EXEMPT_ROUTINES.has(routine);
+  const tempBlacklist = combatExempt ? [] : getTempBlacklist();
+  const combatFleetBlacklist = combatExempt ? [] : getCombatFleetBlacklist();
   if (routine === "explorer" || routine === "pathfinder") {
-    return [...systemBlacklist, ...tempBlacklist];
+    return [...systemBlacklist, ...tempBlacklist, ...combatFleetBlacklist];
   }
 
   // Check if frontier blocking is enabled for this bot
@@ -469,7 +476,7 @@ export function getEffectiveSystemBlacklist(bot: { routineName: string | null; u
   const botBlockFrontier = botSettings.blockFrontierSystems !== undefined ? botSettings.blockFrontierSystems : globalBlockFrontier;
 
   if (!botBlockFrontier) {
-    return [...systemBlacklist, ...tempBlacklist];
+    return [...systemBlacklist, ...tempBlacklist, ...combatFleetBlacklist];
   }
 
   // Auto-detect frontier systems: any system NOT in the main network
@@ -482,7 +489,7 @@ export function getEffectiveSystemBlacklist(bot: { routineName: string | null; u
     }
   }
 
-  return [...systemBlacklist, ...frontierSystems, ...tempBlacklist];
+  return [...systemBlacklist, ...frontierSystems, ...tempBlacklist, ...combatFleetBlacklist];
 }
 
 /** Get the global station blacklist from settings. These are POI ids (or

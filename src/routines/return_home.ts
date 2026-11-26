@@ -220,7 +220,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       }
       if (!bot.docked) {
         ctx.log("travel", "At home station but not docked — docking now...");
-        const docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation });
+        const docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation, strictTarget: true });
         if (!docked) {
           ctx.log("error", "Failed to dock at home station — routine cancelled");
           return;
@@ -256,7 +256,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       // If so, dock it before treating the routine as complete.
       if (!bot.docked) {
         ctx.log("travel", "At home station but not docked — docking now...");
-        const docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation });
+        const docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation, strictTarget: true });
         if (!docked) {
           ctx.log("error", "Failed to dock at home station — routine cancelled");
           return; // Cancel routine
@@ -276,7 +276,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
         const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isUsableFuelStation(p.id, readSettings(), bot.system));
         if (currentStation) {
           await ensureFueled(ctx, refuelThreshold);
-          await ensureDocked(ctx, true);
+          await ensureDocked(ctx, true, 0, { strictTarget: true });
         } else {
           await ensureFueled(ctx, refuelThreshold);
         }
@@ -300,7 +300,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
         const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isUsableFuelStation(p.id, readSettings(), bot.system));
         if (currentStation) {
           await ensureFueled(ctx, refuelThreshold);
-          await ensureDocked(ctx, true);
+          await ensureDocked(ctx, true, 0, { strictTarget: true });
         } else {
           await ensureFueled(ctx, refuelThreshold);
         }
@@ -324,7 +324,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isUsableFuelStation(p.id, readSettings(), bot.system));
       if (currentStation) {
        await ensureFueled(ctx, refuelThreshold);
-       await ensureDocked(ctx, true, 0, { targetStationId: homeStation });
+       await ensureDocked(ctx, true, 0, { targetStationId: homeStation, strictTarget: true });
      } else {
        await ensureFueled(ctx, refuelThreshold);
      }
@@ -366,7 +366,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
         if (!ok) {
           ctx.log("warn", "Refuel failed (station empty?) — proceeding with current fuel for return trip");
         } else {
-          await ensureDocked(ctx, true);
+          await ensureDocked(ctx, true, 0, { strictTarget: true });
         }
       } else {
         // Not at approved station — use cargo cells directly
@@ -507,7 +507,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   // Refresh status first to ensure bot.docked is current before calling ensureDocked
   yield "dock";
   await bot.refreshStatus();
-  const docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation });
+  const docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation, strictTarget: true });
   if (!docked) {
     ctx.log("error", "Failed to dock at home station — routine cancelled");
     return; // Cancel routine
@@ -527,7 +527,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isUsableFuelStation(p.id, readSettings(), bot.system));
     if (currentStation) {
       await ensureFueled(ctx, refuelThreshold);
-      await ensureDocked(ctx, true);
+      await ensureDocked(ctx, true, 0, { strictTarget: true });
     } else {
       await ensureFueled(ctx, refuelThreshold);
     }
@@ -542,7 +542,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     let docked = false;
     for (let dockAttempt = 1; dockAttempt <= MAX_DOCK_CHECK_ATTEMPTS && !docked; dockAttempt++) {
       ctx.log("system", `Dock double-check attempt ${dockAttempt}/${MAX_DOCK_CHECK_ATTEMPTS}...`);
-      docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation });
+      docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation, strictTarget: true });
       if (!docked) {
         await bot.refreshLocation();
         if (bot.docked) {
@@ -570,7 +570,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       if (reDockedFuelPct < refuelThreshold) {
        ctx.log("system", `Fuel at ${reDockedFuelPct}% — refueling after re-dock...`);
        await ensureFueled(ctx, refuelThreshold);
-       await ensureDocked(ctx, true, 0, { targetStationId: homeStation });
+       await ensureDocked(ctx, true, 0, { targetStationId: homeStation, strictTarget: true });
      }
   }
 

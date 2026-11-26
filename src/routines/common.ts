@@ -13,6 +13,7 @@ import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
 import { getSystemBlacklist, getStationBlacklist, getEffectiveSystemBlacklist, isCustomsDisabled } from "../web/server.js";
 import { addTempBlacklistSystem } from "../tempBlacklist.js";
+import { addCombatFleetBlacklistSystem } from "../combatFleetBlacklist.js";
 import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
   waitForCustomsInspection,
@@ -6184,11 +6185,15 @@ export async function fleeFromBattle(
 
    ctx.log("combat", "Flee stance engaged - escaping battle! (takes 3 ticks)");
 
-  // Wait for disengage confirmation if requested
+  // Wait for disengage confirmation if requested.
+  // The server can silently drop a flee stance (or a tick can be lost to lag),
+  // so re-issue the stance periodically instead of firing once and giving up.
   if (waitForDisengage) {
     ctx.log("combat", "Waiting for disengage confirmation...");
     const startTime = Date.now();
     let disengaged = false;
+    let reissues = 0;
+    const maxReissues = 4;
 
     // Poll for disengage notification or battle status change
     while (!disengaged && Date.now() - startTime < maxWaitMs) {
@@ -6208,6 +6213,18 @@ export async function fleeFromBattle(
         disengaged = true;
         break;
       }
+
+      // Still locked in the same battle — re-issue flee to keep the escape
+      // progressing (a single stance command is not guaranteed to stick).
+      if (reissues < maxReissues) {
+        reissues++;
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        ctx.log("combat", `Still in battle after ${elapsed}s — re-issuing flee stance (${reissues}/${maxReissues})`);
+        const re = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (re.error) {
+          ctx.log("error", `Flee re-issue failed: ${re.error.message}`);
+        }
+      }
     }
 
     if (!disengaged) {
@@ -6219,45 +6236,53 @@ export async function fleeFromBattle(
   // If forceSystemExit is requested, jump to a different system to avoid re-engagement
   if (forceSystemExit) {
     ctx.log("combat", "Force system exit requested after flee - jumping to adjacent system...");
-    
+
     // Verify actual current system
     await bot.refreshLocation();
     const actualCurrentSystem = bot.system;
     const systemInfo = await getSystemInfo(ctx);
     const { connections } = systemInfo;
-    
+
     if (!connections || connections.length === 0) {
       ctx.log("error", "No jump connections available - cannot exit system!");
       return false;
     }
 
-    // Filter out blacklisted systems
+    // Filter out blacklisted systems (includes the system we were just banned
+    // from, so we never jump back into the ambush).
     const blacklist = getEffectiveSystemBlacklist(bot);
     const safeConnections = connections.filter(c =>
       c.id && !blacklist.some(b => b.toLowerCase() === c.id!.toLowerCase())
     );
     const candidates = safeConnections.length > 0 ? safeConnections : connections;
-    
+
     if (candidates.length === 0) {
       ctx.log("error", "No valid jump targets available for system exit!");
       return false;
     }
 
-    // Pick a random safe connection
-    const randomConnection = candidates[Math.floor(Math.random() * candidates.length)];
-    if (!randomConnection || !randomConnection.id) {
-      ctx.log("error", "Could not select jump target for system exit!");
-      return false;
+    // Try candidates (shuffled) until one jump actually moves us out of the
+    // system. A jump can silently fail or be interrupted by re-engagement.
+    const shuffled = [...candidates].sort(() => Math.random() - 0.5);
+    for (const target of shuffled) {
+      if (!target || !target.id) continue;
+      ctx.log("travel", `Force system exit: jumping to ${target.name || target.id}`);
+      const jumpResp = await bot.exec("jump", { target_system: target.id });
+      if (jumpResp.error) {
+        ctx.log("error", `Force system exit jump to ${target.name || target.id} failed: ${jumpResp.error.message}`);
+        continue;
+      }
+
+      await bot.refreshLocation();
+      if (bot.system !== actualCurrentSystem) {
+        ctx.log("combat", `Successfully exited system after flee — now in ${bot.system}!`);
+        return true;
+      }
+      ctx.log("warn", `Force system exit jump to ${target.name || target.id} did not change system — trying next`);
     }
 
-    ctx.log("travel", `Force system exit: jumping to ${randomConnection.name || randomConnection.id}`);
-    const jumpResp = await bot.exec("jump", { target_system: randomConnection.id });
-    if (jumpResp.error) {
-      ctx.log("error", `Force system exit jump failed: ${jumpResp.error.message}`);
-      return false;
-    }
-    
-    ctx.log("combat", "Successfully exited system after Mirage flee!");
+    ctx.log("error", "Force system exit failed — could not leave the system!");
+    return false;
   }
 
   return true;
@@ -6445,12 +6470,15 @@ export async function checkAndFleeFromBattle(
     if (status.participants && await checkAndFleeFromBattleMirages(ctx, status.participants)) {
       return true;
     }
-    // Temp-blacklist the system if dangerous repeaters attacked us.
+    // Temp-blacklist the system if dangerous repeaters attacked us. When that
+    // happens the system is now a known death-trap, so force a system exit
+    // after disengaging instead of lingering and getting re-attacked.
+    let banned = false;
     if (status.participants) {
-      await banSystemForDangerousRepeaters(ctx, status.participants, status.your_side_id, status.battle_id);
+      banned = await banSystemForDangerousRepeaters(ctx, status.participants, status.your_side_id, status.battle_id);
     }
-    ctx.log("combat", `${prefix}BATTLE DETECTED [WebSocket]! - fleeing immediately!`);
-    await fleeFromBattle(ctx, true, 35000);
+    ctx.log("combat", `${prefix}BATTLE DETECTED [WebSocket]! - fleeing immediately!${banned ? " (system banned — will exit)" : ""}`);
+    await fleeFromBattle(ctx, true, banned ? 60000 : 35000, banned);
     return true;
   }
   
@@ -6462,12 +6490,15 @@ export async function checkAndFleeFromBattle(
     if (battleStatus.participants && await checkAndFleeFromBattleMirages(ctx, battleStatus.participants)) {
       return true;
     }
-    // Temp-blacklist the system if dangerous repeaters attacked us.
+    // Temp-blacklist the system if dangerous repeaters attacked us. When that
+    // happens the system is now a known death-trap, so force a system exit
+    // after disengaging instead of lingering and getting re-attacked.
+    let banned = false;
     if (battleStatus.participants) {
-      await banSystemForDangerousRepeaters(ctx, battleStatus.participants, battleStatus.your_side_id, battleStatus.battle_id);
+      banned = await banSystemForDangerousRepeaters(ctx, battleStatus.participants, battleStatus.your_side_id, battleStatus.battle_id);
     }
-    ctx.log("combat", `${prefix}BATTLE DETECTED! Battle ID: ${battleStatus.battle_id} - fleeing!`);
-    await fleeFromBattle(ctx, true, 35000);
+    ctx.log("combat", `${prefix}BATTLE DETECTED! Battle ID: ${battleStatus.battle_id} - fleeing!${banned ? " (system banned — will exit)" : ""}`);
+    await fleeFromBattle(ctx, true, banned ? 60000 : 35000, banned);
     return true;
   }
   return false;
@@ -7316,7 +7347,8 @@ export function classifyDangerousRepeaters(
 }
 
 /** If the given battle participants qualify, ban the bot's current system for
- *  6h and log it. Returns true when a ban was written.
+ *  6h (temp) AND permanently (combat-fleet-only) and log it. Returns true when
+ *  a ban was written.
  *  Safe to call from multiple battle paths in one tick (upsert is idempotent). */
 export async function banSystemForDangerousRepeaters(
   ctx: RoutineContext,
@@ -7333,7 +7365,15 @@ export async function banSystemForDangerousRepeaters(
     lastEnemy: cls.lastName,
     battleId: battleId || "",
   });
+  // Also write the permanent combat-fleet-only ban so the system stays off
+  // limits for solo miners until a Combat Drone escort is present.
+  addCombatFleetBlacklistSystem(systemId, {
+    reason: cls.reason,
+    lastEnemy: cls.lastName,
+    battleId: battleId || "",
+  });
   ctx.log("combat", `⛔ [tempblacklist] ${systemId} banned 6h — dangerous repeaters (${cls.reason})`);
+  ctx.log("combat", `⛔ [combatfleetblacklist] ${systemId} perm-banned — requires a Combat Drone escort (${cls.reason})`);
   return true;
 }
 

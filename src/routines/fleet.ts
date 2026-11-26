@@ -192,3 +192,22 @@ export function isFleetLeader(status: FleetStatusResponse | null, username: stri
   const member = getFleetMemberByUsername(status, username);
   return member?.is_leader ?? false;
 }
+
+/** Matches the user's dedicated combat bots: "Combat Drone 001" … "Combat Drone 999". */
+const COMBAT_DRONE_NAME_RE = /^Combat Drone \d{3}$/i;
+
+/** True if a member name is a Combat Drone NNN combat bot. */
+export function isCombatDroneName(username: string | undefined | null): boolean {
+  if (!username) return false;
+  return COMBAT_DRONE_NAME_RE.test(username.trim());
+}
+
+/**
+ * True if the fleet has at least one `Combat Drone NNN` member.
+ * Used to unlock combat-fleet-only (permanently blacklisted) systems for a
+ * miner that is travelling with a combat escort.
+ */
+export function hasCombatDroneMember(status: FleetStatusResponse | null): boolean {
+  if (!status || !status.in_fleet || !Array.isArray(status.members)) return false;
+  return status.members.some((m) => isCombatDroneName(m?.username));
+}

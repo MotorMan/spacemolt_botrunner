@@ -170,6 +170,60 @@ async function executePathfinderRoute(
 }
 
 /**
+ * Ask the live server whether a normal jump-gate route to `target` exists.
+ *
+ * The local map can lag behind the game world: a faction jump gate may be
+ * active in-game before the connection is recorded in map.json. `find_route`
+ * knows about active gates, so consulting it prevents an unnecessary
+ * Pathfinder crossing (5x fuel, multi-minute flight) when a free gate route is
+ * available. Temporary wormholes are rejected — the bot cannot traverse them
+ * without unlocking the wormhole POI.
+ */
+async function serverHasJumpGateRoute(
+  ctx: RoutineContext,
+  target: string,
+  blacklist: string[],
+  maxJumps: number,
+): Promise<boolean> {
+  const { bot } = ctx;
+  try {
+    const resp = await bot.exec("find_route", { target_system: target });
+    if (resp.error) {
+      ctx.log("debug", `[frontier] Server route check for ${target} failed: ${resp.error.message}`);
+      return false;
+    }
+    const data = resp.result as {
+      found?: boolean;
+      route?: Array<{ system_id: string; via_wormhole?: boolean }>;
+      total_jumps?: number;
+    } | null;
+    if (!data?.found || !Array.isArray(data.route) || data.route.length <= 1) {
+      ctx.log("debug", `[frontier] Server has no jump-gate route to ${target}`);
+      return false;
+    }
+    if (data.route.some((seg) => seg.via_wormhole === true)) {
+      ctx.log("debug", `[frontier] Server route to ${target} uses a wormhole — not usable`);
+      return false;
+    }
+    const bl = new Set(blacklist.map((s) => s.toLowerCase()));
+    const blocked = data.route.slice(1).find((seg) => bl.has((seg.system_id || "").toLowerCase()));
+    if (blocked) {
+      ctx.log("debug", `[frontier] Server route to ${target} passes through blacklisted ${blocked.system_id}`);
+      return false;
+    }
+    const jumps = typeof data.total_jumps === "number" ? data.total_jumps : data.route.length - 1;
+    if (jumps > maxJumps) {
+      ctx.log("debug", `[frontier] Server route to ${target} is ${jumps} jumps (limit ${maxJumps})`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    ctx.log("debug", `[frontier] Server route check for ${target} threw: ${e}`);
+    return false;
+  }
+}
+
+/**
  * Navigate to `target`, transparently bridging the frontier gap with a
  * Pathfinder Drive when needed. Falls back to plain navigation for same-side
  * travel or when no frontier route is available.
@@ -231,6 +285,18 @@ export async function travelToSystemSmart(
     if (relaxed.kind === "pathfinder") {
       ctx.log("warn", "[frontier] No route within limits — using a relaxed (longer) crossing to avoid being stranded");
       pfPlan = relaxed;
+    }
+  }
+
+  // The local map may not yet know about an active faction jump gate. Ask the
+  // server before committing to a slow Pathfinder crossing.
+  if (pfPlan.kind === "pathfinder" || pfPlan.kind === "unreachable") {
+    if (await serverHasJumpGateRoute(ctx, target, blacklist, cfg.maxJumps)) {
+      ctx.log(
+        "travel",
+        `[frontier] Server reports a jump-gate route to ${target} — using it instead of a Pathfinder crossing`,
+      );
+      return navigateToSystem(ctx, target, opts);
     }
   }
 

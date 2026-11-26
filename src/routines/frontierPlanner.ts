@@ -194,6 +194,20 @@ export function planFrontierRoute(
   const toFrontier = mapStore.isFrontierSystem(to);
   if (fromFrontier === toFrontier) return { kind: "normal" };
 
+  // A permanent faction jump gate can bridge the main/Frontier gap (the gate is
+  // a normal two-way connection in the map graph). `findRoute` only follows
+  // real jump-gate connections — never temporary wormholes — so any route it
+  // returns here is a free, always-available crossing. Take it instead of
+  // burning a Pathfinder jump (5x fuel and a multi-minute flight) when the gate
+  // route fits inside the configured jump budget. If it is longer than the
+  // budget, remember it as a fallback so we never strand a ship that has no
+  // Pathfinder route.
+  const gateRoute = mapStore.findRoute(from, to, blacklist);
+  const gateJumps = gateRoute ? Math.max(0, gateRoute.length - 1) : Infinity;
+  if (gateRoute && gateRoute.length > 1 && gateJumps <= cfg.maxJumps) {
+    return { kind: "normal" };
+  }
+
   // Short wormhole shortcut? (Only when the route is genuinely short.) Must
   // exclude frontier wormholes here too — navigateToSystem won't route through
   // them, so proposing one would just fail and loop.
@@ -215,6 +229,9 @@ export function planFrontierRoute(
   }
 
   if (!cfg.enabled) {
+    // No Pathfinder Drive, but a jump gate still crosses the gap (possibly a
+    // long way around) — that is always better than being stranded.
+    if (gateRoute && gateRoute.length > 1) return { kind: "normal" };
     return {
       kind: "unreachable",
       reason: "target is across the frontier gap and no Pathfinder Drive is fitted",
@@ -304,6 +321,9 @@ export function planFrontierRoute(
   }
 
   if (!best) {
+    // No viable Pathfinder crossing, but a jump gate exists — use it rather
+    // than reporting the target unreachable.
+    if (gateRoute && gateRoute.length > 1) return { kind: "normal" };
     return {
       kind: "unreachable",
       reason: `no safe Pathfinder jump within the ${cfg.maxJumps}-jump frontier limit`,

@@ -7053,7 +7053,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       const isProtected =
         allAmmoIds.has(id) ||
         id.includes("cell_pack") ||
-        id.includes("plasma") ||
+        id.includes("plasma_cell") ||
         id.includes("fuel_cell") ||
         id.includes("repair_kit") ||
         id.includes("shield_charge") ||

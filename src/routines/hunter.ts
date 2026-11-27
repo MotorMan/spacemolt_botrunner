@@ -6916,6 +6916,7 @@ async function* poiAmbushRoutine(ctx: RoutineContext): AsyncGenerator<string, vo
   let lastFuelCheck = 0;
   let lastSupplyCheck = 0;
   let standbyLogged = false;
+  let emptyResupplyDone = false;
   let ignoredBattleId = "";
   let consecutiveReengages = 0;
   let battleCount = 0;
@@ -6982,8 +6983,29 @@ async function* poiAmbushRoutine(ctx: RoutineContext): AsyncGenerator<string, vo
         const cargoPct = bot.cargoMax > 0 ? (bot.cargo / bot.cargoMax) * 100 : 0;
         const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
         const cargoFull = settings.ambushCargoFullPct > 0 && cargoPct >= settings.ambushCargoFullPct;
-        if (cargoFull || hullPct <= settings.repairThreshold) {
-          ctx.log("system", `POI Ambush: returning home to deposit + resupply (cargo ${Math.round(cargoPct)}%, hull ${hullPct}%)`);
+
+        // No consumables (no shield charges AND no repair kits) → resupply. Guarded
+        // so it fires once per trip: after a resupply it re-arms only once consumables
+        // are actually back aboard, so an empty faction storage can't cause a
+        // home→back→home loop.
+        const inv = bot.inventory || [];
+        const hasShieldCharges = inv.some((i) => {
+          const id = (i.itemId || "").toLowerCase();
+          return id.includes("shield") && id.includes("charge") && (i.quantity || 0) > 0;
+        });
+        const hasRepairKits = inv.some(
+          (i) => (i.itemId || "").toLowerCase().includes("repair_kit") && (i.quantity || 0) > 0,
+        );
+        const noConsumables = !hasShieldCharges && !hasRepairKits;
+        if (!noConsumables) emptyResupplyDone = false;
+
+        if (cargoFull || hullPct <= settings.repairThreshold || (noConsumables && !emptyResupplyDone)) {
+          if (noConsumables && !cargoFull && hullPct > settings.repairThreshold) {
+            ctx.log("system", "POI Ambush: no shield charges / repair kits aboard — returning home to resupply");
+          } else {
+            ctx.log("system", `POI Ambush: returning home to deposit + resupply (cargo ${Math.round(cargoPct)}%, hull ${hullPct}%)`);
+          }
+          if (noConsumables) emptyResupplyDone = true;
           await returnToHomeAndResupply(ctx, settings);
           await goToSafePoi();
           standbyLogged = false;

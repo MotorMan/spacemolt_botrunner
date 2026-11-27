@@ -5523,6 +5523,7 @@
         <option value="fleet_arena"${hunterMode === "fleet_arena" ? " selected" : ""}>Fleet/Arena Mode (idle until battle)</option>
         <option value="pvp"${hunterMode === "pvp" ? " selected" : ""}>PVP (camp POI, attack player)</option>
         <option value="boarding"${hunterMode === "boarding" ? " selected" : ""}>Boarding (patrol + board eligible targets)</option>
+        <option value="poi_ambush"${hunterMode === "poi_ambush" ? " selected" : ""}>POI Ambush (wait safe, loot hazard)</option>
       </select>`;
 
           // Per-bot PVP target player override (only shown in pvp mode).
@@ -5639,6 +5640,59 @@
         <select id="profile-pirateBaseSystem" onchange="saveProfileHunterPatrolRadius()" style="width:auto;padding:2px 6px;font-size:11px">${sysOpts.join("")}</select>
         <span class="profile-ore-label" style="margin-left:8px">Radius:</span>
 <input type="number" id="profile-patrolRadius" value="${patrolRadius}" min="1" max="20" style="width:60px" onchange="saveProfileHunterPatrolRadius()">`;
+          }
+
+          // poi_ambush specific settings (safe wait POI + hazard loot POI)
+          if (hunterMode === "poi_ambush") {
+            const ambushSystem = botSettings.ambushSystem || "";
+            const ambushPoi = botSettings.ambushPoi || "";
+            const ambushLootPoi = botSettings.ambushLootPoi || "";
+            const ambushCargoFullPct = botSettings.ambushCargoFullPct ?? 90;
+            const ambushSysOpts = [
+              `<option value=""${!ambushSystem ? " selected" : ""}>(select system)</option>`,
+            ];
+            for (const sys of [...knownSystems].sort((a, b) =>
+              (a.name || a.id || "").localeCompare(b.name || b.id || ""),
+            )) {
+              const sel = sys.id === ambushSystem ? " selected" : "";
+              ambushSysOpts.push(
+                `<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`,
+              );
+            }
+            if (ambushSystem && !knownSystems.find((s) => s.id === ambushSystem)) {
+              ambushSysOpts.push(
+                `<option value="${esc(ambushSystem)}" selected>${esc(ambushSystem)} (custom)</option>`,
+              );
+            }
+            const ambushPois = (mapData[ambushSystem] && mapData[ambushSystem].pois) || [];
+            const buildAmbushPoiOpts = (selected) => {
+              const opts = [
+                `<option value=""${!selected ? " selected" : ""}>(select POI)</option>`,
+              ];
+              for (const p of [...ambushPois].sort((a, b) =>
+                ((a.name || a.id) || "").localeCompare((b.name || b.id) || ""),
+              )) {
+                const sel = p.id === selected ? " selected" : "";
+                opts.push(
+                  `<option value="${esc(p.id)}"${sel}>${esc(p.name || p.id)} (${esc(p.type || "")})</option>`,
+                );
+              }
+              if (selected && !ambushPois.find((p) => p.id === selected)) {
+                opts.push(
+                  `<option value="${esc(selected)}" selected>${esc(selected)} (custom)</option>`,
+                );
+              }
+              return opts.join("");
+            };
+            actions += `
+        <span class="profile-ore-label" style="margin-left:8px" title="System the safe/stationary POI lives in">Ambush Sys:</span>
+        <select id="profile-ambushSystem" onchange="refreshProfileAmbushPois()" style="width:auto;padding:2px 6px;font-size:11px">${ambushSysOpts.join("")}</select>
+        <span class="profile-ore-label" style="margin-left:8px" title="Safe POI to wait at (no hazards)">Wait POI:</span>
+        <select id="profile-ambushPoi" onchange="saveProfileHunterAmbush()" style="width:auto;padding:2px 6px;font-size:11px">${buildAmbushPoiOpts(ambushPoi)}</select>
+        <span class="profile-ore-label" style="margin-left:8px" title="Hazard POI to travel to and loot wrecks">Loot POI:</span>
+        <select id="profile-ambushLootPoi" onchange="saveProfileHunterAmbush()" style="width:auto;padding:2px 6px;font-size:11px">${buildAmbushPoiOpts(ambushLootPoi)}</select>
+        <span class="profile-ore-label" style="margin-left:8px" title="Cargo % that triggers a return-home to deposit + resupply">Cargo %:</span>
+        <input type="number" id="profile-ambushCargoFullPct" value="${ambushCargoFullPct}" min="1" max="100" style="width:60px" onchange="saveProfileHunterAmbush()">`;
           }
         }
 
@@ -6165,6 +6219,118 @@
           settings: updated,
         });
         settings[bot.username] = updated;
+      }
+
+      // Refresh the Wait/Loot POI dropdowns when the ambush system changes.
+      function refreshProfileAmbushPois() {
+        const sysSel = document.getElementById("profile-ambushSystem");
+        if (!sysSel) return;
+        const pois = (mapData[sysSel.value] && mapData[sysSel.value].pois) || [];
+        const build = (sel) => {
+          const cur = sel ? sel.value : "";
+          const opts = [
+            `<option value=""${!cur ? " selected" : ""}>(select POI)</option>`,
+          ];
+          for (const p of [...pois].sort((a, b) =>
+            ((a.name || a.id) || "").localeCompare((b.name || b.id) || ""),
+          )) {
+            opts.push(
+              `<option value="${esc(p.id)}"${p.id === cur ? " selected" : ""}>${esc(p.name || p.id)} (${esc(p.type || "")})</option>`,
+            );
+          }
+          if (cur && !pois.find((p) => p.id === cur)) {
+            opts.push(
+              `<option value="${esc(cur)}" selected>${esc(cur)} (custom)</option>`,
+            );
+          }
+          return opts.join("");
+        };
+        const waitSel = document.getElementById("profile-ambushPoi");
+        const lootSel = document.getElementById("profile-ambushLootPoi");
+        if (waitSel) waitSel.innerHTML = build(waitSel);
+        if (lootSel) lootSel.innerHTML = build(lootSel);
+      }
+
+      function saveProfileHunterAmbush() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const sysSel = document.getElementById("profile-ambushSystem");
+        if (!sysSel) return;
+        const waitSel = document.getElementById("profile-ambushPoi");
+        const lootSel = document.getElementById("profile-ambushLootPoi");
+        const cargoInp = document.getElementById("profile-ambushCargoFullPct");
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, {
+          ambushSystem: sysSel.value,
+          ambushPoi: waitSel ? waitSel.value : "",
+          ambushLootPoi: lootSel ? lootSel.value : "",
+          ambushCargoFullPct: cargoInp
+            ? parseInt(cargoInp.value, 10) || 90
+            : 90,
+        });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      // ── Settings → Hunter: POI Ambush per-bot config ──────────────
+      function refreshSettingsAmbushPois(i) {
+        const b = (bots || [])[i];
+        if (!b) return;
+        const sysSel = document.getElementById("ambush-sys-" + i);
+        if (!sysSel) return;
+        const pois = (mapData[sysSel.value] && mapData[sysSel.value].pois) || [];
+        const build = (sel) => {
+          const cur = sel ? sel.value : "";
+          const o = [
+            `<option value=""${!cur ? " selected" : ""}>(select POI)</option>`,
+          ];
+          for (const p of [...pois].sort((x, y) =>
+            ((x.name || x.id) || "").localeCompare((y.name || y.id) || ""),
+          )) {
+            o.push(
+              `<option value="${esc(p.id)}"${p.id === cur ? " selected" : ""}>${esc(p.name || p.id)} (${esc(p.type || "")})</option>`,
+            );
+          }
+          if (cur && !pois.find((p) => p.id === cur)) {
+            o.push(
+              `<option value="${esc(cur)}" selected>${esc(cur)} (custom)</option>`,
+            );
+          }
+          return o.join("");
+        };
+        const waitSel = document.getElementById("ambush-wait-" + i);
+        const lootSel = document.getElementById("ambush-loot-" + i);
+        if (waitSel) waitSel.innerHTML = build(waitSel);
+        if (lootSel) lootSel.innerHTML = build(lootSel);
+      }
+
+      function saveBotAmbushConfig(i) {
+        const b = (bots || [])[i];
+        if (!b) return;
+        const sysSel = document.getElementById("ambush-sys-" + i);
+        if (!sysSel) return;
+        const waitSel = document.getElementById("ambush-wait-" + i);
+        const lootSel = document.getElementById("ambush-loot-" + i);
+        const cargoInp = document.getElementById("ambush-cargo-" + i);
+        const existing = settings[b.username] || {};
+        const updated = Object.assign({}, existing, {
+          ambushSystem: sysSel.value,
+          ambushPoi: waitSel ? waitSel.value : "",
+          ambushLootPoi: lootSel ? lootSel.value : "",
+          ambushCargoFullPct: cargoInp
+            ? parseInt(cargoInp.value, 10) || 90
+            : 90,
+        });
+        send({
+          type: "saveSettings",
+          routine: b.username,
+          settings: updated,
+        });
+        settings[b.username] = updated;
       }
 
       function saveProfileFocusAreaSystem() {
@@ -34783,6 +34949,7 @@ ignoreBlacklist: document.getElementById(
           <option value="fleet_arena">Fleet/Arena Mode (idle until battle)</option>
           <option value="pvp">PVP (camp POI, attack player)</option>
           <option value="boarding">Boarding (patrol + board eligible targets)</option>
+          <option value="poi_ambush">POI Ambush (wait safe, loot hazard)</option>
         </select>
         <button class="primary" onclick="bulkSetHunterMode()">Apply to All Bots</button>
       </div>
@@ -34981,6 +35148,80 @@ ignoreBlacklist: document.getElementById(
          }
        </div>
      </div>
+
+    <!-- POI Ambush / Wreck Looters (per-bot) -->
+    <div class="setting-row" style="flex-direction:column;align-items:stretch;margin-top:16px">
+      <div style="margin-bottom:8px">
+        <div class="setting-label">POI Ambush / Wreck Looters</div>
+        <div class="setting-hint">For the POI Ambush sub-routine: pick the safe system + stationary POI the bot waits at (no hazards) and the hazard POI it travels to for looting wrecks after a kill. Set each bot's mode to "POI Ambush" in its manual control panel. The Cargo % triggers a return-home to deposit + resupply.</div>
+      </div>
+      <div class="blacklist-section">
+        <div class="blacklist-list" style="max-height:260px">
+          ${
+            (bots || []).length > 0
+              ? (bots || []).map((b, i) => {
+                  const bs = settings[b.username] || {};
+                  const aSys = bs.ambushSystem || "";
+                  const aWait = bs.ambushPoi || "";
+                  const aLoot = bs.ambushLootPoi || "";
+                  const aCargo = bs.ambushCargoFullPct ?? 90;
+                  const sysOpts = [
+                    `<option value=""${!aSys ? " selected" : ""}>(select system)</option>`,
+                  ];
+                  for (const s of [...knownSystems].sort((x, y) =>
+                    (x.name || x.id || "").localeCompare(y.name || y.id || ""),
+                  )) {
+                    sysOpts.push(
+                      `<option value="${esc(s.id)}"${s.id === aSys ? " selected" : ""}>${esc(s.name || s.id)}</option>`,
+                    );
+                  }
+                  if (aSys && !knownSystems.find((s) => s.id === aSys)) {
+                    sysOpts.push(
+                      `<option value="${esc(aSys)}" selected>${esc(aSys)} (custom)</option>`,
+                    );
+                  }
+                  const pois = (mapData[aSys] && mapData[aSys].pois) || [];
+                  const poiOpts = (selected) => {
+                    const o = [
+                      `<option value=""${!selected ? " selected" : ""}>(select POI)</option>`,
+                    ];
+                    for (const p of [...pois].sort((x, y) =>
+                      ((x.name || x.id) || "").localeCompare((y.name || y.id) || ""),
+                    )) {
+                      o.push(
+                        `<option value="${esc(p.id)}"${p.id === selected ? " selected" : ""}>${esc(p.name || p.id)} (${esc(p.type || "")})</option>`,
+                      );
+                    }
+                    if (selected && !pois.find((p) => p.id === selected)) {
+                      o.push(
+                        `<option value="${esc(selected)}" selected>${esc(selected)} (custom)</option>`,
+                      );
+                    }
+                    return o.join("");
+                  };
+                  return `
+                <div class="blacklist-item" style="flex-direction:column;align-items:stretch;gap:6px">
+                  <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span class="blacklist-name">${esc(b.username)}</span>
+                    <button class="small primary" onclick="saveBotAmbushConfig(${i})">Save</button>
+                  </div>
+                  <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                    <span class="profile-ore-label">Sys:</span>
+                    <select id="ambush-sys-${i}" onchange="refreshSettingsAmbushPois(${i})" style="flex:1;min-width:150px">${sysOpts.join("")}</select>
+                    <span class="profile-ore-label">Wait POI:</span>
+                    <select id="ambush-wait-${i}" style="flex:1;min-width:150px">${poiOpts(aWait)}</select>
+                    <span class="profile-ore-label">Loot POI:</span>
+                    <select id="ambush-loot-${i}" style="flex:1;min-width:150px">${poiOpts(aLoot)}</select>
+                    <span class="profile-ore-label">Cargo %:</span>
+                    <input type="number" id="ambush-cargo-${i}" value="${aCargo}" min="1" max="100" style="width:70px">
+                  </div>
+                </div>`;
+                }).join("")
+              : '<div class="blacklist-empty">No bots configured.</div>'
+          }
+        </div>
+      </div>
+    </div>
 
     <div class="setting-row" style="flex-direction:column;align-items:stretch;margin-top:16px;padding:12px;background:var(--bg-secondary);border-radius:6px">
       <div style="margin-bottom:8px">

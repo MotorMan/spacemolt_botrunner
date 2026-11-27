@@ -578,7 +578,7 @@ async function handleFuelCheckFailure(
 
 export type HunterCoordinationMode = "off" | "assist" | "avoid";
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "protect_here" | "creature_farm" | "creature_farm_random" | "hunt_big_creatures" | "repeater_hunter" | "fleet_arena" | "fleet" | "pvp" | "boarding";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "protect_here" | "creature_farm" | "creature_farm_random" | "hunt_big_creatures" | "repeater_hunter" | "fleet_arena" | "fleet" | "pvp" | "boarding" | "poi_ambush";
 
 /**
  * A Creature Farm "route" is just a Hunter Patrol Profile (hunter.hunterPatrols).
@@ -705,6 +705,10 @@ export function getHunterSettings(username?: string): {
   creatureFarmRoamJumps: number;
   creatureFarmRecordKills: boolean;
   creatureFarmUseHistoricalData: boolean;
+  ambushSystem: string;
+  ambushPoi: string;
+  ambushLootPoi: string;
+  ambushCargoFullPct: number;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -807,6 +811,10 @@ export function getHunterSettings(username?: string): {
     creatureFarmRoamJumps: (botOverrides.creatureFarmRoamJumps as number) ?? (h.creatureFarmRoamJumps as number) ?? 1,
     creatureFarmRecordKills: (h.creatureFarmRecordKills as boolean) ?? true,
     creatureFarmUseHistoricalData: (h.creatureFarmUseHistoricalData as boolean) ?? false,
+    ambushSystem: (botOverrides.ambushSystem as string) ?? (h.ambushSystem as string) ?? "",
+    ambushPoi: (botOverrides.ambushPoi as string) ?? (h.ambushPoi as string) ?? "",
+    ambushLootPoi: (botOverrides.ambushLootPoi as string) ?? (h.ambushLootPoi as string) ?? "",
+    ambushCargoFullPct: (botOverrides.ambushCargoFullPct as number) ?? (h.ambushCargoFullPct as number) ?? 90,
   };
 }
 
@@ -2586,6 +2594,11 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (isFleetArenaMode(initialSettings.mode)) {
       yield* fleetArenaModeRoutine(ctx);
+      return;
+    }
+
+    if (initialSettings.mode === "poi_ambush") {
+      yield* poiAmbushRoutine(ctx);
       return;
     }
 
@@ -6822,6 +6835,236 @@ async function* fleetArenaModeRoutine(ctx: RoutineContext): AsyncGenerator<strin
 }
 
 // â”€â”€ Patrol Systems Routine (cycle through configured list) â”€â”€â”€â”€â”€â”€â”€â”€
+
+// ─── POI Ambush / Wreck-Looter Routine ───
+//
+// Waits at a SAFE "stationary" POI (fleet-arena standby) while hourly enemies
+// spawn at a separate hazard POI. When the bot is pulled into the battle and the
+// kill is done, it travels to the configured loot POI, loots the wreck(s), then
+// returns to the safe POI and waits again. Repeats until cargo is full (by %),
+// hull is low, or field consumables run out — then it returns home, deposits,
+// resupplies, and heads back out.
+//
+// Per-bot settings (hunter.ambush* / <bot>.ambush*):
+//   ambushSystem       — system the safe POI lives in
+//   ambushPoi          — safe POI id to wait at
+//   ambushLootPoi      — hazard POI id to travel to and loot
+//   ambushCargoFullPct — cargo % that triggers a return-home (default 90)
+
+const AMBUSH_SUPPLY_CHECK_MS = 15000;
+
+async function* poiAmbushRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshLocation();
+
+  const startSettings = getHunterSettings(bot.username);
+  const ambushSystem = startSettings.ambushSystem;
+  const safePoi = startSettings.ambushPoi;
+  const lootPoi = startSettings.ambushLootPoi;
+
+  if (!ambushSystem || !safePoi) {
+    ctx.log("error", "POI Ambush mode: no ambush system / stationary POI configured — set them in the bot's manual control panel or Settings → Hunter");
+    return;
+  }
+  if (!lootPoi) {
+    ctx.log("warn", "POI Ambush mode: no loot POI configured — the bot will wait and fight but cannot loot wrecks");
+  }
+
+  const safetyOpts = {
+    fuelThresholdPct: startSettings.refuelThreshold,
+    hullThresholdPct: startSettings.repairThreshold,
+    autoCloak: startSettings.autoCloak,
+    skipBlacklist: true,
+    isCombatBot: true,
+    joinBattles: true,
+  };
+
+  const inAmbushSystem = () => (bot.system || "").toLowerCase() === ambushSystem.toLowerCase();
+
+  // Travel to the safe POI (navigating to the ambush system first if needed).
+  const goToSafePoi = async (): Promise<void> => {
+    if (bot.state !== "running") return;
+    if (!inAmbushSystem()) {
+      ctx.log("travel", `POI Ambush: returning to ambush system ${ambushSystem}...`);
+      const arrived = await navigateToSystem(ctx, ambushSystem, safetyOpts);
+      await bot.refreshLocation();
+      if (!arrived || !inAmbushSystem()) {
+        ctx.log("error", `POI Ambush: could not reach ${ambushSystem} — will retry`);
+        return;
+      }
+    }
+    if (bot.poi !== safePoi) {
+      ctx.log("travel", `POI Ambush: traveling to safe POI ${safePoi}...`);
+      const travelResp = await bot.exec("travel", { target_poi: safePoi });
+      if (travelResp.error && !travelResp.error.message.includes("already")) {
+        ctx.log("error", `POI Ambush: travel to safe POI ${safePoi} failed: ${travelResp.error.message}`);
+      } else {
+        bot.poi = safePoi;
+        bot.clearObservationState();
+      }
+    }
+  };
+
+  ctx.log(
+    "info",
+    `POI Ambush mode: waiting at ${safePoi} in ${ambushSystem}; looting at ${lootPoi || "(none configured)"}.`,
+  );
+
+  let lastDeathCheck = 0;
+  let lastProbe = 0;
+  let lastFuelCheck = 0;
+  let lastSupplyCheck = 0;
+  let standbyLogged = false;
+  let ignoredBattleId = "";
+  let consecutiveReengages = 0;
+  let battleCount = 0;
+
+  await goToSafePoi();
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+    const idleMs = Math.max(1000, (settings.fleetIdlePollSeconds || 2) * 1000);
+    const confirmSeconds = settings.fleetBattleConfirmSeconds ?? 10;
+    const confirmMs = confirmSeconds > 0 ? Math.max(5000, confirmSeconds * 1000) : 0;
+
+    // Death recovery (throttled — a death can only happen in a battle).
+    if (Date.now() - lastDeathCheck >= FLEET_DEATH_CHECK_MS) {
+      lastDeathCheck = Date.now();
+      const death = await handleDeath(ctx, settings);
+      if (death === "stop") return;
+      if (death === "wait") continue;
+    }
+
+    // Return-home triggers are only evaluated while standing by (never mid-fight)
+    // and are throttled so standby stays quiet on the wire.
+    // Detect: push flag first (free), slow API probe as missed-push insurance.
+    const pushDetected = bot.isInBattle();
+    let status: FleetBattleSnapshot | null = null;
+    if (pushDetected) {
+      status = await probeFleetBattle(ctx);
+      lastProbe = Date.now();
+      syncFleetBattleState(bot, status);
+    } else if (confirmMs > 0 && Date.now() - lastProbe >= confirmMs) {
+      lastProbe = Date.now();
+      status = await probeFleetBattle(ctx);
+      if (status) {
+        ctx.log("combat", "POI Ambush: battle found by fallback poll (no push event arrived) — waking up");
+        syncFleetBattleState(bot, status);
+      }
+    }
+
+    // Standby: genuinely do nothing.
+    if (!status || !isFleetBattleParticipant(status, bot.username, pushDetected)) {
+      if (status && ignoredBattleId !== status.battle_id) {
+        ignoredBattleId = status.battle_id;
+        ctx.log("combat", `POI Ambush: battle ${status.battle_id} visible but we are not a participant — staying on standby.`);
+      }
+      if (!standbyLogged) {
+        ctx.log("info", "POI Ambush: standby — waiting for the next spawn/battle.");
+        standbyLogged = true;
+      }
+      // Return-home triggers: cargo full (by %), low hull, or low field consumables.
+      // Throttled so standby stays quiet; only checked while not in a battle.
+      if (Date.now() - lastSupplyCheck >= AMBUSH_SUPPLY_CHECK_MS) {
+        lastSupplyCheck = Date.now();
+        await bot.refreshShip();
+        await bot.refreshCargo();
+        const cargoPct = bot.cargoMax > 0 ? (bot.cargo / bot.cargoMax) * 100 : 0;
+        const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        const cargoFull = settings.ambushCargoFullPct > 0 && cargoPct >= settings.ambushCargoFullPct;
+        if (cargoFull || hullPct <= settings.repairThreshold || isLowOnFieldConsumables(bot.inventory)) {
+          ctx.log("system", `POI Ambush: returning home to deposit + resupply (cargo ${Math.round(cargoPct)}%, hull ${hullPct}%)`);
+          await returnToHomeAndResupply(ctx, settings);
+          await goToSafePoi();
+          standbyLogged = false;
+          continue;
+        }
+      }
+      // Keep fuel topped up while waiting (throttled, skipped during a live battle).
+      if (Date.now() - lastFuelCheck >= FLEET_FUEL_CHECK_MS) {
+        lastFuelCheck = Date.now();
+        await fleetModeRefuel(ctx, settings);
+      }
+      yield "waiting";
+      await ctx.sleep(idleMs);
+      continue;
+    }
+
+    // Wake up and fight.
+    battleCount++;
+    standbyLogged = false;
+    ignoredBattleId = "";
+    ctx.log("combat", `⚔️ POI Ambush wake-up: joined battle ${status.battle_id} (ambush battle #${battleCount}) — engaging!`);
+    yield "engage";
+    const won = await fleetModeFight(ctx, settings, status);
+
+    // Stand down.
+    // Force a death check on the next iteration: this is the only place a wingman dies.
+    lastDeathCheck = 0;
+    await ctx.sleep(1000);
+    const after = await probeFleetBattle(ctx);
+    lastProbe = Date.now();
+    syncFleetBattleState(bot, after);
+    if (after && isFleetBattleParticipant(after, bot.username, bot.isInBattle())) {
+      consecutiveReengages++;
+      const backoffMs = Math.min(30000, 3000 * consecutiveReengages);
+      ctx.log("combat", `Battle ${after.battle_id} still active after the combat loop — re-engaging in ${Math.round(backoffMs / 1000)}s.`);
+      await ctx.sleep(backoffMs);
+      continue;
+    }
+    consecutiveReengages = 0;
+
+    if (bot.hull <= 0 || bot.isDead) {
+      continue;
+    }
+
+    ctx.log(
+      "combat",
+      won
+        ? `✅ POI Ambush battle #${battleCount} won — going to loot.`
+        : `POI Ambush battle #${battleCount} ended (retreated or disengaged) — going to loot.`,
+    );
+
+    // Loot trip: travel to the loot POI, sweep wrecks, then return to the safe POI.
+    if (lootPoi && !settings.disableWreckSalvaging) {
+      if (!inAmbushSystem()) {
+        await navigateToSystem(ctx, ambushSystem, safetyOpts);
+        await bot.refreshLocation();
+      }
+      if (inAmbushSystem() && bot.poi !== lootPoi) {
+        ctx.log("travel", `POI Ambush: traveling to loot POI ${lootPoi}...`);
+        const travelResp = await bot.exec("travel", { target_poi: lootPoi });
+        if (travelResp.error && !travelResp.error.message.includes("already")) {
+          ctx.log("error", `POI Ambush: travel to loot POI ${lootPoi} failed: ${travelResp.error.message}`);
+        } else {
+          bot.poi = lootPoi;
+          bot.clearObservationState();
+          await ctx.sleep(1000);
+          yield "loot";
+          const looted = await sweepWrecksAtPoi(ctx);
+          ctx.log("loot", `POI Ambush: looted ${looted} item(s) at ${lootPoi}`);
+        }
+      }
+      await goToSafePoi();
+    }
+
+    // Post-battle upkeep.
+    await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+    await useRepairKits(ctx);
+    await ensureAmmoLoaded(
+      ctx,
+      settings.ammoThreshold,
+      settings.maxReloadAttempts,
+      settings.ammoReloadAbsoluteThreshold,
+      settings.ammoReloadPercentThreshold,
+    );
+    await bot.refreshShip();
+    standbyLogged = false;
+  }
+}
+
+// ─── Patrol Systems Routine (cycle through configured list) ───
 
 async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;

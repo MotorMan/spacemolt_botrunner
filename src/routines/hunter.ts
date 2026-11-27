@@ -6972,7 +6972,12 @@ async function* poiAmbushRoutine(ctx: RoutineContext): AsyncGenerator<string, vo
         await bot.refreshCargo();
         // Keep shields topped up (to shieldRechargePct) and patch hull with repair
         // kits while standing by — same as the hunter does in and out of combat.
-        await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+        // Only call topUpShields when actually below target so it doesn't spam
+        // "recharge skipped" every tick; it still logs when it really uses a charge.
+        const shieldPct = (settings.shieldRechargePct ?? 80) / 100;
+        if (bot.maxShield > 0 && bot.shield < Math.floor(bot.maxShield * shieldPct)) {
+          await topUpShields(ctx, shieldPct);
+        }
         await useRepairKits(ctx);
         const cargoPct = bot.cargoMax > 0 ? (bot.cargo / bot.cargoMax) * 100 : 0;
         const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;

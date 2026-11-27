@@ -6964,16 +6964,20 @@ async function* poiAmbushRoutine(ctx: RoutineContext): AsyncGenerator<string, vo
         ctx.log("info", "POI Ambush: standby — waiting for the next spawn/battle.");
         standbyLogged = true;
       }
-      // Return-home triggers: cargo full (by %), low hull, or low field consumables.
-      // Throttled so standby stays quiet; only checked while not in a battle.
+      // Return-home triggers: cargo full (by %) or low hull. Throttled so standby
+      // stays quiet; only checked while not in a battle.
       if (Date.now() - lastSupplyCheck >= AMBUSH_SUPPLY_CHECK_MS) {
         lastSupplyCheck = Date.now();
         await bot.refreshShip();
         await bot.refreshCargo();
+        // Keep shields topped up (to shieldRechargePct) and patch hull with repair
+        // kits while standing by — same as the hunter does in and out of combat.
+        await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+        await useRepairKits(ctx);
         const cargoPct = bot.cargoMax > 0 ? (bot.cargo / bot.cargoMax) * 100 : 0;
         const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
         const cargoFull = settings.ambushCargoFullPct > 0 && cargoPct >= settings.ambushCargoFullPct;
-        if (cargoFull || hullPct <= settings.repairThreshold || isLowOnFieldConsumables(bot.inventory)) {
+        if (cargoFull || hullPct <= settings.repairThreshold) {
           ctx.log("system", `POI Ambush: returning home to deposit + resupply (cargo ${Math.round(cargoPct)}%, hull ${hullPct}%)`);
           await returnToHomeAndResupply(ctx, settings);
           await goToSafePoi();

@@ -7821,6 +7821,10 @@
       <label>Faction Withdraw</label>
       <select id="mc-fac-wit-item">${factionOpts}</select>
       <input type="number" id="mc-fac-wit-qty" min="1" value="1" style="width:90px">
+      <select id="mc-fac-wit-target" title="Withdraw destination">
+        <option value="self">To Storage</option>
+        <option value="cargo">To Cargo</option>
+      </select>
       <button class="sm" onclick="mcFactionWithdraw()">Withdraw</button>
       <button class="sm" onclick="mcRefreshFactionStorage()" title="Reload faction storage list">Refresh</button>
       <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-dim);cursor:pointer;white-space:nowrap">
@@ -8081,20 +8085,33 @@
       function mcFactionWithdraw() {
         const itemId = val("mc-fac-wit-item");
         const qty = intVal("mc-fac-wit-qty");
+        const targetEl = document.getElementById("mc-fac-wit-target");
+        const target = targetEl ? targetEl.value : "self";
         if (!itemId) {
           logResponse(
             '<span class="resp-err">Select an item to withdraw</span>',
           );
           return;
         }
-        // Withdraw from faction storage to personal storage: take from faction, deposit to self
-        mcExec("storage", {
-          action: "deposit",
-          target: "self",
-          item_id: itemId,
-          quantity: qty,
-          source: "faction",
-        });
+        if (target === "cargo") {
+          // Direct withdraw: faction storage → cargo (confirmed working command:
+          // storage action=withdraw item_id=X quantity=Y target=cargo)
+          mcExec("storage", {
+            action: "withdraw",
+            target: "cargo",
+            item_id: itemId,
+            quantity: qty,
+          });
+        } else {
+          // Withdraw from faction storage to personal storage: take from faction, deposit to self
+          mcExec("storage", {
+            action: "deposit",
+            target: "self",
+            item_id: itemId,
+            quantity: qty,
+            source: "faction",
+          });
+        }
       }
 
       function mcRefreshFactionStorage() {

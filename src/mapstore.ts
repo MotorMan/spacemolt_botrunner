@@ -198,6 +198,10 @@ export interface StoredPOI {
   hidden?: boolean;
   /** Difficulty to reveal this hidden POI (0-100) */
   reveal_difficulty?: number;
+  /** True once a mine attempt proves this POI's deposits require a deep core extractor. */
+  deep_core_only?: boolean;
+  /** When the deep-core-only restriction was recorded. */
+  deep_core_only_at?: string;
 }
 
 export interface PirateSighting {
@@ -727,6 +731,8 @@ class MapStore {
           // should remain tracked as hidden for explorer reference)
           hidden: (p.hidden as boolean) || prev?.hidden || false,
           reveal_difficulty: (p.reveal_difficulty as number) ?? prev?.reveal_difficulty,
+          deep_core_only: prev?.deep_core_only,
+          deep_core_only_at: prev?.deep_core_only_at,
         };
       });
 
@@ -1256,6 +1262,26 @@ class MapStore {
     if (changed) this.scheduleSave();
   }
 
+  /** Record that a POI's deposits are gated behind a deep core extractor. */
+  markPoiDeepCoreOnly(systemId: string, poiId: string): boolean {
+    const sys = this.data.systems[systemId];
+    if (!sys) return false;
+
+    const poi = sys.pois.find((p) => p.id === poiId);
+    if (!poi || poi.deep_core_only) return false;
+
+    poi.deep_core_only = true;
+    poi.deep_core_only_at = now();
+    poi.last_updated = now();
+    this.scheduleSave();
+    return true;
+  }
+
+  /** Whether a POI has been recorded as deep-core-only. */
+  isPoiDeepCoreOnly(systemId: string, poiId: string): boolean {
+    return this.data.systems[systemId]?.pois.find((p) => p.id === poiId)?.deep_core_only === true;
+  }
+
   /** Clear all resource data from a POI. Use when POI data is known to be corrupted or outdated. */
   clearPoiResources(systemId: string, poiId: string): void {
     const sys = this.data.systems[systemId];
@@ -1284,6 +1310,8 @@ class MapStore {
     poi.orders = [];
     poi.missions = [];
     poi.last_explored = null;
+    poi.deep_core_only = undefined;
+    poi.deep_core_only_at = undefined;
     poi.last_updated = now();
     this.scheduleSave();
   }
@@ -1637,7 +1665,7 @@ class MapStore {
    *  @param blacklist - Optional blacklist for route calculation.
    *  @param skipPirateSystems - Whether to skip pirate systems (default: true). Set to false when cloaked with cloakIgnoreBlacklist.
    */
-  findOreLocations(oreId: string, blacklist?: string[], skipPirateSystems: boolean = true): Array<{
+  findOreLocations(oreId: string, blacklist?: string[], skipPirateSystems: boolean = true, includeDeepCoreOnly: boolean = false): Array<{
     systemId: string;
     systemName: string;
     poiId: string;
@@ -1654,6 +1682,8 @@ class MapStore {
     minutesSinceScan: number;
     /** Whether this POI is hidden (deep core mining location) */
     isHidden: boolean;
+    /** Whether this POI is gated behind a deep core extractor. */
+    isDeepCoreOnly: boolean;
     /** Richness of the resource (mining efficiency) */
     richness: number;
     /** Supported power - max mining power that can extract from this deposit */
@@ -1671,6 +1701,7 @@ class MapStore {
       depletionPercent: number;
       minutesSinceScan: number;
       isHidden: boolean;
+      isDeepCoreOnly: boolean;
       richness: number;
       supportedPower: number;
     }> = [];
@@ -1686,6 +1717,10 @@ class MapStore {
       for (const poi of sys.pois) {
         // Skip POIs with corrupted resource data
         if (poi.resources && poi.resources.some((r) => r.remaining > r.max_remaining)) {
+          continue;
+        }
+        // Deep-core-only POIs are skipped unless the caller's ship can mine them.
+        if (poi.deep_core_only && !includeDeepCoreOnly) {
           continue;
         }
 
@@ -1752,6 +1787,7 @@ class MapStore {
           depletionPercent,
           minutesSinceScan,
 isHidden: poi.hidden ?? false,
+           isDeepCoreOnly: poi.deep_core_only === true,
            richness,
            supportedPower,
          });
@@ -1792,7 +1828,7 @@ isHidden: poi.hidden ?? false,
    * @param shipCargo - Ship cargo capacity (default 8000)
    * @param isMiningShip - Whether ship has mining ship double-cargo bonus (default false)
    */
-  findBestMiningLocation(oreId: string, fromSystem?: string, blacklist?: string[], shipSpeed?: number, shipCargo?: number, isMiningShip?: boolean): Array<{
+  findBestMiningLocation(oreId: string, fromSystem?: string, blacklist?: string[], shipSpeed?: number, shipCargo?: number, isMiningShip?: boolean, includeDeepCoreOnly: boolean = false): Array<{
     systemId: string;
     systemName: string;
     poiId: string;
@@ -1807,12 +1843,14 @@ isHidden: poi.hidden ?? false,
     jumpsAway: number;
     /** Whether this POI is hidden (deep core mining location) */
     isHidden: boolean;
+    /** Whether this POI is gated behind a deep core extractor. */
+    isDeepCoreOnly: boolean;
     /** Richness of the resource (mining efficiency) */
     richness: number;
     /** Composite score: higher = better. Factors in remaining, depletion, distance, scan freshness, hidden status */
     score: number;
   }> {
-const locations = this.findOreLocations(oreId, blacklist);
+const locations = this.findOreLocations(oreId, blacklist, true, includeDeepCoreOnly);
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
     
@@ -1936,6 +1974,7 @@ const locations = this.findOreLocations(oreId, blacklist);
     shipSpeed?: number,
     shipCargo?: number,
     isMiningShip?: boolean,
+    includeDeepCoreOnly: boolean = false,
   ): Array<{
     systemId: string;
     systemName: string;
@@ -1950,10 +1989,11 @@ const locations = this.findOreLocations(oreId, blacklist);
     minutesSinceScan: number;
     jumpsAway: number;
     isHidden: boolean;
+    isDeepCoreOnly: boolean;
     richness: number;
     score: number;
   }> {
-    const allScored = this.findBestMiningLocation(oreId, fromSystem, blacklist, shipSpeed, shipCargo, isMiningShip);
+    const allScored = this.findBestMiningLocation(oreId, fromSystem, blacklist, shipSpeed, shipCargo, isMiningShip, includeDeepCoreOnly);
     return allScored.filter(loc => loc.systemId === systemId);
   }
 
@@ -1964,6 +2004,7 @@ const locations = this.findOreLocations(oreId, blacklist);
     oreId: string,
     fromSystem?: string,
     blacklist?: string[],
+    includeDeepCoreOnly: boolean = false,
   ): Array<{
     systemId: string;
     systemName: string;
@@ -1978,10 +2019,11 @@ const locations = this.findOreLocations(oreId, blacklist);
     minutesSinceScan: number;
     jumpsAway: number;
     isHidden: boolean;
+    isDeepCoreOnly: boolean;
     richness: number;
     score: number;
   }> {
-const locations = this.findOreLocations(oreId, blacklist);
+const locations = this.findOreLocations(oreId, blacklist, true, includeDeepCoreOnly);
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
 
@@ -1999,6 +2041,7 @@ const locations = this.findOreLocations(oreId, blacklist);
       minutesSinceScan: number;
       jumpsAway: number;
       isHidden: boolean;
+      isDeepCoreOnly: boolean;
       richness: number;
       score: number;
     }> = [];
@@ -2038,6 +2081,7 @@ const locations = this.findOreLocations(oreId, blacklist);
     systemId: string,
     fromSystem?: string,
     blacklist?: string[],
+    includeDeepCoreOnly: boolean = false,
   ): Array<{
     systemId: string;
     systemName: string;
@@ -2052,10 +2096,11 @@ const locations = this.findOreLocations(oreId, blacklist);
     minutesSinceScan: number;
     jumpsAway: number;
     isHidden: boolean;
+    isDeepCoreOnly: boolean;
     richness: number;
     score: number;
   }> {
-    const all = this.findClosestMiningLocations(oreId, fromSystem, blacklist);
+    const all = this.findClosestMiningLocations(oreId, fromSystem, blacklist, includeDeepCoreOnly);
     return all.filter(loc => loc.systemId === systemId);
   }
 

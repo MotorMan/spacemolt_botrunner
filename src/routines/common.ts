@@ -4387,7 +4387,7 @@ function shuffleArray<T>(arr: T[]): T[] {
   return shuffled;
 }
 
-export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: boolean }): Promise<number> {
+export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: boolean; skipJettison?: boolean }): Promise<number> {
   const { bot } = ctx;
   if (bot.docked) return 0; // can't scavenge while docked
 
@@ -4413,7 +4413,19 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
   const fuelOnly = opts?.fuelOnly ?? false;
 
   const wrecksResp = await bot.exec("get_wrecks");
-  const wrecks = parseWrecks(wrecksResp.result);
+  let wrecks = parseWrecks(wrecksResp.result);
+  // Optionally skip "jettison" containers. A miner's own jettisoned (unwanted)
+  // cargo sits in a wreck whose name contains "jettison"; re-looting it creates
+  // a pointless loot→jettison loop and, in a hazardous POI, keeps the ship
+  // parked in the hazard while radiation drains the hull. Miners pass
+  // skipJettison so they NEVER queue a loot_wreck against their own discards —
+  // even a single stale/phantom jettison entry otherwise gets retried every
+  // cycle (and can hang 180s on a missing action_result). Match loosely
+  // (case-insensitive substring) so "Jettison", "jettison_container", etc. all
+  // count.
+  if (opts?.skipJettison) {
+    wrecks = wrecks.filter(w => !(w.name || "").toLowerCase().includes("jettison"));
+  }
   if (wrecks.length === 0) return 0;
 
   let totalLooted = 0;

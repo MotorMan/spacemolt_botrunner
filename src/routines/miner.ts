@@ -3098,6 +3098,38 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const frontierCfg = buildFrontierTravelConfig(settings, bot.hasPathfinderDrive);
       const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
 
+      // ── Early hull/hazard safety check ──
+      // The harvest-loop hazard monitor (monitorHazardSafety) only runs once we
+      // are actively mining. A miner stuck in the pre-harvest cycle — e.g. the
+      // target ore is depleted and we keep `continue`-ing back to the top, or we
+      // are repeatedly scavenging — never reaches that monitor. In a radioactive
+      // or otherwise hazardous POI that means the hull drains to zero and the
+      // ship dies without ever leaving. Check hull here EVERY cycle and bail for
+      // home to repair before doing any scavenge/travel work.
+      await bot.refreshShip();
+      const earlyHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      if (earlyHullPct <= settings.repairThreshold && homeSystem && bot.system !== homeSystem) {
+        ctx.log("system", `Early hull check: ${earlyHullPct}% hull at/below repair threshold (${settings.repairThreshold}%) — leaving hazard for home to repair`);
+        yield "return_home";
+        yield "pre_return_fuel";
+        const earlyReturnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (!earlyReturnFueled) {
+          const { pois: earlyPois } = await getSystemInfo(ctx);
+          const earlyStation = findStation(earlyPois);
+          if (earlyStation) await refuelAtStation(ctx, earlyStation, safetyOpts.fuelThresholdPct);
+        }
+        const earlyHomeArrived = await travelToSystemSmart(ctx, homeSystem, safetyOpts, frontierCfg);
+        if (!earlyHomeArrived) {
+          ctx.log("error", "Failed to return home for hull repair — will retry next cycle");
+          await ctx.sleep(30000);
+          continue;
+        }
+        await ensureDocked(ctx);
+        await repairShip(ctx);
+        ctx.log("mining", "Repaired at home — restarting mining cycle");
+        continue;
+      }
+
       // ── Low fuel cells check ──
       // Return home to deposit loot and resupply when fuel cells drop to or below
       // the configured threshold. This is separate from minimumFuelCells, which
@@ -6067,7 +6099,9 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
 
     // ── Scavenge wrecks before harvesting ──
     yield "scavenge";
-    await scavengeWrecks(ctx);
+    // skipJettison: never re-loot our own jettisoned (unwanted) ore — that is a
+    // pointless loot→jettison loop that also keeps us parked in hazard POIs.
+    await scavengeWrecks(ctx, { skipJettison: true });
 
     // ── CRITICAL FIX: Verify target resource is available at current POI before mining ──
     // This prevents mining at depleted POIs that cause endless equipment errors

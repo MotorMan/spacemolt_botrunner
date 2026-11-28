@@ -77,6 +77,14 @@
  *                               fuel cells while standing by (0 = use refuelThreshold;
  *                               default: refuelThreshold). Stops a follower from
  *                               stalling the whole fleet at the next jump.
+ *   fleetMfcTarget            â€” military_fuel_cell count a docked wingman keeps
+ *                               restocked from faction storage (default: 10, 0 = skip).
+ *
+ * Fleet fuel/refuel coordination (non-API bot chat channel, channel "fleet"):
+ *   Members broadcast tank fuel + MFC reserve; the primary (e.g. the boarding
+ *   hunter) docks the whole fleet for a low wingman before it jumps, and each
+ *   member refuels/restocks itself (a fleet dock docks everyone, but the refuel
+ *   command is per-ship).
  *   boardingEnabled          â€” when true, the hunter switches to boarding stance on eligible targets with low shields instead of killing them (default: false)
  *   boardingShieldThreshold   â€” shield % at or below which to attempt boarding (default: 5)
  *   boardingMarines           â€” marines to commit to the board stance (0 = all fit marines on board; default: 0)
@@ -132,7 +140,7 @@ import {
 } from "./common.js";
 
 import type { Bot } from "../bot.js";
-import { fleetStatus } from "./fleet.js";
+import { fleetStatus, fleetDock, fleetUndock } from "./fleet.js";
 import type { PirateTier, NearbyEntity } from "./battle.js";
 import type { PrizeInfo } from "../types/game.js";
 import {
@@ -693,8 +701,9 @@ export function getHunterSettings(username?: string): {
    fleetIdlePollSeconds: number;
   fleetBattleConfirmSeconds: number;
    fleetFightPlayers: boolean;
-  fleetUndockToFight: boolean;
+   fleetUndockToFight: boolean;
   fleetRefuelThreshold: number;
+  fleetMfcTarget: number;
     boardingEnabled: boolean;
   boardingShieldThreshold: number;
   boardingMarines: number;
@@ -797,6 +806,7 @@ export function getHunterSettings(username?: string): {
     fleetFightPlayers: (botOverrides.fleetFightPlayers as boolean) ?? (h.fleetFightPlayers as boolean) ?? true,
     fleetUndockToFight: (botOverrides.fleetUndockToFight as boolean) ?? (h.fleetUndockToFight as boolean) ?? true,
     fleetRefuelThreshold,
+    fleetMfcTarget: (botOverrides.fleetMfcTarget as number) ?? (h.fleetMfcTarget as number) ?? 10,
     boardingEnabled: (botOverrides.boardingEnabled as boolean) ?? (mode === "boarding"),
     boardingShieldThreshold: (botOverrides.boardingShieldThreshold as number) ?? (h.boardingShieldThreshold as number) ?? 5,
     boardingMarines: (botOverrides.boardingMarines as number) ?? (h.boardingMarines as number) ?? 0,
@@ -1078,6 +1088,11 @@ async function returnToHomeAndResupply(
 
     await ensureHunterResupply(ctx);
     await collectFromStorage(ctx);
+    // Tell the fleet we are docked and refuelling so any docked wingman tops up
+    // its tank and MFCs at the same time (a solo dock does not dock the wingmen).
+    await bot.refreshCargo();
+    broadcastFleetFuelReport(ctx, "primary");
+    broadcastFleetRefuelIntent(ctx);
     await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
     await ensureInsured(ctx);
     await bot.checkSkills();
@@ -6589,6 +6604,262 @@ async function fleetModeFight(
   );
 }
 
+// ─── Fleet fuel / refuel coordination (non-API bot chat channel) ───
+//
+// A fleet jumps and docks as ONE unit, but each ship refuels ITSELF. A single
+// wingman with a low tank therefore stalls the whole fleet at the next jump —
+// the server refuses the jump with "Fleet member <name> has insufficient fuel
+// for the jump", which the primary (the routine that actually commands jumps,
+// e.g. the boarding hunter) sees only as a generic "jump failed" and then skips
+// the system, never realising a wingman is the cause.
+//
+// To fix that, every fleet member broadcasts its tank fuel + military fuel cell
+// (MFC) reserve over the in-memory bot chat channel. The primary uses those
+// reports to dock the fleet (a fleet dock docks everyone) and let a low member
+// refuel + restock MFCs before it tries to jump again. Docking is a fleet
+// command; the refuel itself is per-ship, so each member refuels on its own.
+
+type FleetCoordRole = "primary" | "wingman";
+
+interface FleetFuelReport {
+  sender: string;
+  role: FleetCoordRole;
+  fuelPct: number;
+  fuel: number;
+  maxFuel: number;
+  /** Military fuel cells aboard (the dense 100-fuel cells). */
+  mfcCount: number;
+  /** Tank fuel those MFCs could deliver. */
+  mfcFuel: number;
+  docked: boolean;
+  system: string;
+  poi: string;
+  timestamp: number;
+}
+
+/** Last fuel report per fleet member (lowercased username), with a short TTL. */
+const fleetFuelReports = new Map<string, FleetFuelReport>();
+/** How long a fuel report is considered fresh (members report ~every 30s). */
+const FLEET_FUEL_REPORT_TTL_MS = 90_000;
+/** Usernames (lowercased) that have asked the primary to dock for a refuel. */
+const fleetRefuelRequests = new Set<string>();
+/** Usernames that should run an immediate refuel on their next tick (refuel intent). */
+const fleetRefuelIntentPending = new Set<string>();
+/** Bots that have registered a fleet-coordination chat listener. */
+const fleetCoordRegistered = new Set<string>();
+
+/** Count of military fuel cells (the dense 100-fuel cells) currently aboard. */
+function countMilitaryFuelCells(bot: Bot): number {
+  return (bot.inventory || [])
+    .filter((i) => (i.itemId || "").toLowerCase() === "military_fuel_cell")
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+}
+
+/** True when a fuel report is recent enough to act on. */
+function isFreshFleetReport(r: FleetFuelReport | undefined): r is FleetFuelReport {
+  return !!r && Date.now() - r.timestamp <= FLEET_FUEL_REPORT_TTL_MS;
+}
+
+/** Fresh fuel reports from OTHER members currently below `minPct`. */
+function getLowFuelFleetMembers(minPct: number, self: string): FleetFuelReport[] {
+  const me = (self || "").toLowerCase();
+  const low: FleetFuelReport[] = [];
+  for (const [key, r] of fleetFuelReports) {
+    if (key === me) continue;
+    if (!isFreshFleetReport(r)) continue;
+    if (r.fuelPct < minPct) low.push(r);
+  }
+  return low;
+}
+
+/** Broadcast (and locally record) our own tank fuel + MFC reserve. */
+function broadcastFleetFuelReport(ctx: RoutineContext, role: FleetCoordRole): void {
+  const { bot } = ctx;
+  const mfcCount = countMilitaryFuelCells(bot);
+  const report: FleetFuelReport = {
+    sender: bot.username,
+    role,
+    fuelPct: bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100,
+    fuel: bot.fuel,
+    maxFuel: bot.maxFuel,
+    mfcCount,
+    mfcFuel: mfcCount * getFuelCellFuelValue("military_fuel_cell"),
+    docked: bot.docked,
+    system: bot.system || "",
+    poi: bot.poi || "",
+    timestamp: Date.now(),
+  };
+  fleetFuelReports.set((bot.username || "").toLowerCase(), report);
+  botChatChannel.send({
+    sender: bot.username,
+    recipients: [],
+    channel: "fleet",
+    content: `[FLEET FUEL] ${bot.username} (${role}) fuel ${report.fuelPct}% | MFCs ${mfcCount} (${report.mfcFuel} fuel) | ${bot.docked ? "docked" : "undocked"} @ ${bot.system || "?"}`,
+    metadata: { type: "fleet_fuel_report", ...report },
+  });
+}
+
+/** Primary announces it has docked and is refuelling, so wingmen do the same. */
+function broadcastFleetRefuelIntent(ctx: RoutineContext): void {
+  const { bot } = ctx;
+  botChatChannel.send({
+    sender: bot.username,
+    recipients: [],
+    channel: "fleet",
+    content: `[FLEET REFUEL] ${bot.username} docked and refuelling — wingmen should dock + refuel + restock MFCs`,
+    metadata: { type: "fleet_refuel_intent", system: bot.system || "", poi: bot.poi || "" },
+  });
+}
+
+/** A wingman asks the primary to dock the fleet so it can refuel. */
+function broadcastFleetRefuelRequest(ctx: RoutineContext): void {
+  const { bot } = ctx;
+  fleetRefuelRequests.add((bot.username || "").toLowerCase());
+  botChatChannel.send({
+    sender: bot.username,
+    recipients: [],
+    channel: "fleet",
+    content: `[FLEET REFUEL] ${bot.username} low on fuel — requesting the fleet dock to refuel`,
+    metadata: { type: "fleet_refuel_request", system: bot.system || "", poi: bot.poi || "" },
+  });
+}
+
+/** Register the bot's fleet-coordination listener once. */
+function ensureFleetCoordListener(username: string): void {
+  if (fleetCoordRegistered.has(username)) return;
+  fleetCoordRegistered.add(username);
+  botChatChannel.onMessage(username, (msg) => {
+    if (msg.channel !== "fleet") return;
+    if (msg.sender === username) return;
+    const meta = (msg.metadata || {}) as Record<string, unknown>;
+    if (meta.type === "fleet_fuel_report") {
+      const sender = (msg.sender || "").toLowerCase();
+      if (!sender) return;
+      fleetFuelReports.set(sender, {
+        sender: msg.sender,
+        role: meta.role === "primary" ? "primary" : "wingman",
+        fuelPct: Number(meta.fuelPct) || 0,
+        fuel: Number(meta.fuel) || 0,
+        maxFuel: Number(meta.maxFuel) || 0,
+        mfcCount: Number(meta.mfcCount) || 0,
+        mfcFuel: Number(meta.mfcFuel) || 0,
+        docked: !!meta.docked,
+        system: (meta.system as string) || "",
+        poi: (meta.poi as string) || "",
+        timestamp: msg.timestamp,
+      });
+    } else if (meta.type === "fleet_refuel_request") {
+      const sender = (msg.sender || "").toLowerCase();
+      if (sender) fleetRefuelRequests.add(sender);
+    } else if (meta.type === "fleet_refuel_intent") {
+      // The primary docked to refuel — run an immediate top-up on our next tick.
+      fleetRefuelIntentPending.add(username);
+    }
+  });
+}
+
+/**
+ * While docked, top the military fuel cell (MFC) reserve back up from faction
+ * storage (free). MFCs are the dense 100-fuel cells a wingman burns to refuel
+ * in place without leaving the fleet's POI, so keeping them stocked is what
+ * lets a wingman recover without breaking formation.
+ */
+async function restockMilitaryFuelCells(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+  if (!bot.docked || bot.isInBattle()) return;
+  const target = settings.fleetMfcTarget ?? 10;
+  if (target <= 0) return;
+  await bot.refreshCargo();
+  const have = countMilitaryFuelCells(bot);
+  if (have >= target) return;
+  const size = getItemSize("military_fuel_cell");
+  const freeSpace = Math.max(0, (bot.cargoMax || 0) - (bot.cargo || 0));
+  const qty = Math.min(target - have, Math.floor(freeSpace / size));
+  if (qty <= 0) {
+    ctx.log("system", `Fleet mode: docked but no cargo space for MFCs (${have}/${target} aboard)`);
+    return;
+  }
+  const wResp = await bot.exec("storage", { action: "withdraw", target: "faction", item_id: "military_fuel_cell", quantity: qty });
+  if (!wResp.error) {
+    await bot.refreshCargo();
+    ctx.log("system", `Fleet mode: restocked ${qty}x military_fuel_cell from faction storage (${have + qty}/${target})`);
+  } else {
+    ctx.log("system", `Fleet mode: could not restock MFCs (${wResp.error.message}) — relying on what is aboard`);
+  }
+}
+
+/** How often the primary re-checks the fleet's fuel before travelling. */
+const FLEET_PRIMARY_CHECK_MS = 20 * 1000;
+/** How long the primary waits for a low wingman to refuel after docking. */
+const FLEET_REFUEL_WAIT_MS = 120 * 1000;
+
+/**
+ * Primary-side gate run before the fleet attempts a jump. If any wingman's last
+ * report is below the refuel threshold (or a wingman explicitly asked), dock the
+ * fleet so the low member can refuel + restock MFCs, then wait for the reports
+ * to show it is topped up before undocking and continuing. A no-op when not in a
+ * fleet, so non-fleet primaries are unaffected.
+ */
+async function ensureFleetReadyForJump(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+  if (bot.isInBattle()) return;
+  const roster = await getFleetRoster(ctx);
+  if (!roster.inFleet) return;
+
+  await bot.refreshCargo();
+  broadcastFleetFuelReport(ctx, "primary");
+
+  // Only consider reports from actual fleet members (a stray wingman report from
+  // a non-member must never trigger a fleet dock).
+  const low = getLowFuelFleetMembers(settings.fleetRefuelThreshold, bot.username)
+    .filter((r) => roster.members.has((r.sender || "").toLowerCase()));
+  const lowNames = new Set(low.map((r) => r.sender.toLowerCase()));
+  for (const name of fleetRefuelRequests) {
+    if (roster.members.has(name)) lowNames.add(name);
+  }
+  fleetRefuelRequests.clear();
+  if (lowNames.size === 0) return;
+
+  ctx.log("system", `Fleet mode: ${[...lowNames].join(", ")} low on fuel — docking the fleet to refuel before the next jump`);
+  const docked = await fleetDock(ctx);
+  if (!docked.success) {
+    ctx.log("error", `Fleet mode: could not command fleet dock (${docked.message})`);
+    return;
+  }
+  broadcastFleetRefuelIntent(ctx);
+
+  // Wait for the low members to report a topped-up tank (or time out).
+  const deadline = Date.now() + FLEET_REFUEL_WAIT_MS;
+  while (Date.now() < deadline && bot.state === "running") {
+    // A combat primary must never sit docked through a battle: break out and let
+    // the routine's combat handling take over.
+    if (bot.isInBattle()) {
+      ctx.log("combat", "Fleet mode: battle started while waiting for a wingman refuel — undocking to fight");
+      await fleetUndock(ctx);
+      await bot.refreshLocation();
+      return;
+    }
+    await ctx.sleep(5000);
+    let allReady = true;
+    for (const name of lowNames) {
+      const r = fleetFuelReports.get(name);
+      if (!isFreshFleetReport(r) || r.fuelPct < settings.fleetRefuelThreshold) { allReady = false; break; }
+    }
+    if (allReady) break;
+  }
+
+  await bot.refreshCargo();
+  broadcastFleetFuelReport(ctx, "primary");
+  await fleetUndock(ctx);
+  await bot.refreshLocation();
+}
+
 /** How often a standing-by wingman re-checks its fuel tank. */
 const FLEET_FUEL_CHECK_MS = 30 * 1000;
 
@@ -6609,57 +6880,75 @@ const FLEET_FUEL_CHECK_MS = 30 * 1000;
 async function fleetModeRefuel(
   ctx: RoutineContext,
   settings: ReturnType<typeof getHunterSettings>,
+  announce: boolean = false,
 ): Promise<void> {
   const { bot } = ctx;
   const threshold = settings.fleetRefuelThreshold;
 
   await bot.refreshShip();
   let fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  if (fuelPct >= threshold) return;
 
   // Fuel is not consumed in combat and the fleet needs our guns — top up later.
   if (bot.isInBattle()) {
-    ctx.log("combat", `Fleet mode: fuel at ${fuelPct}% but a battle is live — will refuel after the fight`);
+    if (fuelPct < threshold) {
+      ctx.log("combat", `Fleet mode: fuel at ${fuelPct}% but a battle is live — will refuel after the fight`);
+    }
     return;
   }
 
-  ctx.log("system", `Fleet mode: fuel at ${fuelPct}% (threshold ${threshold}%) — topping up without leaving the fleet`);
-
   if (bot.docked) {
-    await tryRefuel(ctx, { skipApprovedCheck: true, homeSystem: settings.homeSystem });
-    await bot.refreshShip();
-    fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-    if (fuelPct >= threshold) {
-      ctx.log("system", `Fleet mode: refuelled at dock — fuel now ${fuelPct}%`);
-      return;
-    }
-    // Still short and docked: pull cells from faction/station storage or market.
-    await acquireFuelCellsAndRefuel(ctx);
-    await bot.refreshShip();
-    fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  } else {
-    // Undocked: consume cargo fuel cells in place so we never leave the fleet's POI.
-    await bot.refreshCargo();
-    const cargoCellFuel = (bot.inventory || [])
-      .filter((i) => getFuelCellFuelValue(i.itemId) > 0)
-      .reduce((sum, i) => sum + getFuelCellFuelValue(i.itemId) * (i.quantity || 0), 0);
-    if (cargoCellFuel <= 0) {
-      ctx.log("warn", `Fleet mode: fuel at ${fuelPct}% and no fuel cells in cargo — cannot refuel without leaving the fleet`);
-      return;
-    }
-    for (let attempt = 0; attempt < 40 && bot.state === "running"; attempt++) {
-      const resp = await bot.exec("refuel");
-      if (resp.error) {
-        const msg = (resp.error.message || "").toLowerCase();
-        if (msg.includes("already full") || msg.includes("tank_full") || msg.includes("max")) break;
-        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("no fuel")) break;
-        ctx.log("error", `Fleet refuel error: ${resp.error.message}`);
-        break;
-      }
+    // Docked (the fleet docked): always try to top the MFC reserve back up, then
+    // refuel the tank if it is below the threshold.
+    await restockMilitaryFuelCells(ctx, settings);
+    if (fuelPct < threshold) {
+      ctx.log("system", `Fleet mode: docked, fuel at ${fuelPct}% (threshold ${threshold}%) — refuelling`);
+      await tryRefuel(ctx, { skipApprovedCheck: true, homeSystem: settings.homeSystem });
       await bot.refreshShip();
       fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      if (fuelPct >= 95) break;
+      if (fuelPct < threshold) {
+        // Still short and docked: pull cells from faction/station storage or market.
+        await acquireFuelCellsAndRefuel(ctx);
+        await bot.refreshShip();
+        fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      }
     }
+    if (announce) {
+      await bot.refreshCargo();
+      broadcastFleetFuelReport(ctx, "wingman");
+    }
+    return;
+  }
+
+  // Undocked: only act when the tank is below the threshold.
+  if (fuelPct >= threshold) return;
+
+  ctx.log("system", `Fleet mode: fuel at ${fuelPct}% (threshold ${threshold}%) — topping up without leaving the fleet`);
+
+  // Undocked: consume cargo fuel cells in place so we never leave the fleet's POI.
+  await bot.refreshCargo();
+  const cargoCellFuel = (bot.inventory || [])
+    .filter((i) => getFuelCellFuelValue(i.itemId) > 0)
+    .reduce((sum, i) => sum + getFuelCellFuelValue(i.itemId) * (i.quantity || 0), 0);
+  if (cargoCellFuel <= 0) {
+    ctx.log("warn", `Fleet mode: fuel at ${fuelPct}% and no fuel cells in cargo — asking the primary to dock the fleet for a refuel`);
+    if (announce) {
+      broadcastFleetRefuelRequest(ctx);
+      broadcastFleetFuelReport(ctx, "wingman");
+    }
+    return;
+  }
+  for (let attempt = 0; attempt < 40 && bot.state === "running"; attempt++) {
+    const resp = await bot.exec("refuel");
+    if (resp.error) {
+      const msg = (resp.error.message || "").toLowerCase();
+      if (msg.includes("already full") || msg.includes("tank_full") || msg.includes("max")) break;
+      if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("no fuel")) break;
+      ctx.log("error", `Fleet refuel error: ${resp.error.message}`);
+      break;
+    }
+    await bot.refreshShip();
+    fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelPct >= 95) break;
   }
 
   await bot.refreshShip();
@@ -6668,6 +6957,11 @@ async function fleetModeRefuel(
     ctx.log("system", `Fleet mode: refuelled — fuel now ${fuelPct}%`);
   } else {
     ctx.log("warn", `Fleet mode: fuel still at ${fuelPct}% (threshold ${threshold}%) — no usable fuel source without leaving the fleet`);
+    if (announce) broadcastFleetRefuelRequest(ctx);
+  }
+  if (announce) {
+    await bot.refreshCargo();
+    broadcastFleetFuelReport(ctx, "wingman");
   }
 }
 
@@ -6676,7 +6970,7 @@ async function* fleetArenaModeRoutine(ctx: RoutineContext): AsyncGenerator<strin
 
   await bot.refreshLocation();
 
-  const roster = await getFleetRoster(ctx);
+  let roster = await getFleetRoster(ctx);
   if (roster.inFleet) {
     ctx.log("info", `Fleet mode: in fleet (leader ${roster.leader || "unknown"}, ${roster.members.size} member(s)).`);
   } else {
@@ -6686,6 +6980,14 @@ async function* fleetArenaModeRoutine(ctx: RoutineContext): AsyncGenerator<strin
     "info",
     `Fleet mode: standby at ${bot.poi || "(no POI)"} in ${bot.system || "(unknown system)"} â€” doing nothing until a battle starts, then engaging the fleet's target.`,
   );
+
+  // Join the fleet fuel/refuel coordination channel so the primary knows our tank
+  // and MFC reserve, and we learn when it docks to refuel.
+  ensureFleetCoordListener(bot.username);
+  if (roster.inFleet) {
+    await bot.refreshCargo();
+    broadcastFleetFuelReport(ctx, "wingman");
+  }
 
   let battleCount = 0;
   let lastProbe = 0;
@@ -6752,16 +7054,29 @@ async function* fleetArenaModeRoutine(ctx: RoutineContext): AsyncGenerator<strin
       }
       if (Date.now() - lastStatusRefresh >= FLEET_STANDBY_STATUS_REFRESH_MS) {
         lastStatusRefresh = Date.now();
+        // Re-check fleet membership so a fleet formed after we started is picked up.
+        roster = await getFleetRoster(ctx);
         yield "get_status";
         await bot.refreshStatus();
         logStatus(ctx);
       }
       // Keep the wingman fuelled so a low tank never stalls the whole fleet at
       // the next jump. Throttled so standby stays quiet on the wire, and skipped
-      // while a battle is live (handled after the fight).
-      if (Date.now() - lastFuelCheck >= FLEET_FUEL_CHECK_MS) {
+      // while a battle is live (handled after the fight). When docked this also
+      // restocks MFCs; when the primary signals a refuel we run it immediately.
+      const refuelIntent = fleetRefuelIntentPending.delete(bot.username);
+      const dueCheck = Date.now() - lastFuelCheck >= FLEET_FUEL_CHECK_MS;
+      // A refuel intent only helps when we are actually docked (a solo primary
+      // dock does not dock the wingmen), so refresh location to check before
+      // acting on it — otherwise an undocked wingman would just burn cargo cells.
+      if (refuelIntent && !dueCheck) await bot.refreshLocation();
+      if (dueCheck || (refuelIntent && bot.docked)) {
         lastFuelCheck = Date.now();
-        await fleetModeRefuel(ctx, settings);
+        // Refresh location so we notice the fleet docking (which docks us too).
+        await bot.refreshLocation();
+        // announce=true only when we are actually in a fleet, so a solo standby
+        // bot never broadcasts (and never triggers a primary's dock).
+        await fleetModeRefuel(ctx, settings, roster.inFleet);
       }
       yield "waiting";
       await ctx.sleep(idleMs);
@@ -9911,10 +10226,24 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
   await ensureObservationSubscribed();
   await ensureHunterCoordListener(bot.username);
 
+  // Join the fleet fuel/refuel coordination channel as the primary: the wingmen
+  // report their tank + MFC reserve here, and we dock the fleet for a low member
+  // before attempting a jump (a low wingman otherwise stalls the whole fleet).
+  ensureFleetCoordListener(bot.username);
+  {
+    const roster = await getFleetRoster(ctx);
+    if (roster.inFleet) {
+      await bot.refreshCargo();
+      broadcastFleetFuelReport(ctx, "primary");
+      ctx.log("info", `Fleet mode: leading fleet of ${roster.members.size} member(s) — coordinating wingman fuel before jumps.`);
+    }
+  }
+
   const all = readSettings();
   const h = (all.hunter || {}) as any;
   const hunterPatrols: HunterPatrolProfile[] = Array.isArray(h.hunterPatrols) ? h.hunterPatrols : [];
   let stayPoiAnchor: { system: string; poi: string } | null = null;
+  let lastFleetCheck = 0;
 
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
@@ -9948,6 +10277,16 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     // a fuel-cell restock. Tank-level fuel is still checked immediately
     // before any actual inter-system travel (navigateToSystem calls
     // ensureFueled), so intra-POI combat/prize work is never blocked.
+    // ── Fleet fuel coordination (primary) ──
+    // When leading a fleet, make sure no wingman is too low on fuel to jump
+    // before we travel — otherwise the whole fleet stalls at the jump with
+    // "Fleet member <name> has insufficient fuel for the jump". No-op when not
+    // in a fleet.
+    if (Date.now() - lastFleetCheck >= FLEET_PRIMARY_CHECK_MS) {
+      lastFleetCheck = Date.now();
+      await ensureFleetReadyForJump(ctx, settings);
+    }
+
     const inStayInPoi = !!settings.stayInPoi;
     const hasUnresolvedPrize = bot.capturedPrizeTracker.size > 0 || (bot.prizeRecoveries || []).some(r => r.status === "claimed" || r.status === "in_transit");
 

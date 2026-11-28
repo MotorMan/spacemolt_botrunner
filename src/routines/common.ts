@@ -11,7 +11,7 @@ import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type I
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance, BattleCombatState, BoardingPublicStatus } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
-import { getSystemBlacklist, getStationBlacklist, getEffectiveSystemBlacklist, isCustomsDisabled } from "../web/server.js";
+import { getSystemBlacklist, getStationBlacklist, getEffectiveSystemBlacklist, isCustomsDisabled, getApprovedGates, getBlockedGates } from "../web/server.js";
 import { addTempBlacklistSystem } from "../tempBlacklist.js";
 import { addCombatFleetBlacklistSystem } from "../combatFleetBlacklist.js";
 import { safeWriteFileSync } from "../diskSpaceGuard.js";
@@ -3559,6 +3559,10 @@ export interface RouteSegment {
    *  traverse without unlocking the wormhole POI. */
   via_gate?: boolean;
   entrance_poi?: string;
+  /** Toll charged (in credits) to use the gate that jumps into this system.
+   *  Present only on `via_gate` segments whose gate charges a toll. A toll gate
+   *  that is not approved (and not the bot's own faction gate) is blocked. */
+  gate_toll?: number;
 }
 
 /** Check if a route contains wormhole segments that the bot cannot traverse. */
@@ -3571,6 +3575,51 @@ export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
 export function routeHasGate(route: RouteSegment[] | undefined): boolean {
   if (!route) return false;
   return route.some(seg => seg.via_gate === true);
+}
+
+/** System ids that belong to the bot's OWN faction gate and are therefore always
+ *  exempt from toll-gate blocking. Currently the configured home system
+ *  (Settings → General → Faction Storage System); a user can additionally add
+ *  their own gate's system to the Approved Gates list (Settings → Gate Network). */
+export function getOwnGateSystems(): Set<string> {
+  const set = new Set<string>();
+  try {
+    const general = (readSettings().general as Record<string, unknown>) || {};
+    const home = typeof general.factionStorageSystem === "string" ? general.factionStorageSystem.trim() : "";
+    if (home) set.add(home.toLowerCase());
+  } catch { /* settings unreadable — no own-gate exemption */ }
+  return set;
+}
+
+/**
+ * Return the first route segment that traverses a gate the bot must NOT use, or
+ * null when the route is clear.
+ *
+ * A gate is identified by the destination system it jumps into (`system_id` of
+ * the `via_gate` segment). Rules:
+ *   - a gate in the Blocked list is always rejected (even with no toll);
+ *   - the bot's own faction gate (home system) is always allowed;
+ *   - a gate in the Approved list is allowed despite its toll;
+ *   - any other gate that charges a toll (`gate_toll > 0`) is rejected so the
+ *     routine routes around it instead of paying.
+ */
+export function findBlockedGate(
+  route: RouteSegment[] | undefined,
+  ownGateSystems: Set<string>,
+): RouteSegment | null {
+  if (!route) return null;
+  const approved = new Set(getApprovedGates().map(s => s.toLowerCase()));
+  const blocked = new Set(getBlockedGates().map(s => s.toLowerCase()));
+  for (const seg of route) {
+    if (seg.via_gate !== true) continue;
+    const id = (seg.system_id || "").toLowerCase();
+    if (!id) continue;
+    if (blocked.has(id)) return seg;
+    if (ownGateSystems.has(id)) continue;
+    if (approved.has(id)) continue;
+    if (typeof seg.gate_toll === "number" && seg.gate_toll > 0) return seg;
+  }
+  return null;
 }
 
 /**
@@ -3631,6 +3680,7 @@ async function resolveNextSystemViaServer(
       normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
     const hasWormhole = routeHasWormhole(routeData.route);
     const hasGate = routeHasGate(routeData.route);
+    const blockedGate = findBlockedGate(routeData.route, getOwnGateSystems());
 
     if (blacklistedOnRoute && !bypassBlacklist) {
       ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route${contextSuffix}`);
@@ -3642,6 +3692,14 @@ async function resolveNextSystemViaServer(
     } else if (hasWormhole && !allowWormholes) {
       ctx.log("warn", `Server route uses wormhole — rejecting route (bot has not unlocked wormhole POI)${contextSuffix}`);
       ctx.log("debug", `Route contained wormhole segment(s) - forcing reroute to avoid POI the bot cannot access${contextSuffix}`);
+    } else if (blockedGate) {
+      // A toll gate (or explicitly blocked gate) the bot must not use. Reject the
+      // server route so the caller falls back to the local map, which routes
+      // around the gate instead of paying the toll.
+      const toll = typeof blockedGate.gate_toll === "number" && blockedGate.gate_toll > 0
+        ? ` (toll ${blockedGate.gate_toll}cr)`
+        : "";
+      ctx.log("warn", `Server route uses blocked gate to ${blockedGate.system_id}${toll} — rejecting route to avoid the toll${contextSuffix}`);
     } else {
       if (hasWormhole) {
         ctx.log("travel", `Server route uses wormhole shortcut (allowed) — next: ${routeData.route[1].system_id}${contextSuffix}`);

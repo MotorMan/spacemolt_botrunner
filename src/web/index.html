@@ -598,6 +598,12 @@
             >
               Frontier Blacklist
             </div>
+            <div
+              class="sidebar-item"
+              onclick="switchSettingsTab('gate_network')"
+            >
+              Gate Network
+            </div>
             <div class="sidebar-item" onclick="switchSettingsTab('crafter')">
               Crafter
             </div>
@@ -14248,6 +14254,17 @@
         return false;
       }
 
+      function gateNetworkTabDirty() {
+        if (activeSettingsTab !== "gate_network") return false;
+        const gn = settings.gate_network || {};
+        const approved = Array.isArray(gn.approvedGates) ? gn.approvedGates : [];
+        const blocked = Array.isArray(gn.blockedGates) ? gn.blockedGates : [];
+        const panel = document.getElementById("settingsContent");
+        if (!panel) return false;
+        const items = panel.querySelectorAll(".blacklist-item");
+        return items.length !== approved.length + blocked.length;
+      }
+
       function fuelCellSellerTabDirty() {
         if (activeSettingsTab !== "fuel_cell_seller") return false;
         const fc = settings.fuel_cell_seller || {};
@@ -14304,6 +14321,7 @@
         if (minerQuotaTabDirty()) return true;
         if (systemBlacklistTabDirty()) return true;
         if (stationBlacklistTabDirty()) return true;
+        if (gateNetworkTabDirty()) return true;
         if (fuelCellSellerTabDirty()) return true;
         return false;
       }
@@ -14421,6 +14439,7 @@
           system_blacklist: renderSystemBlacklistSettings,
           station_blacklist: renderStationBlacklistSettings,
           frontier_blacklist: renderFrontierBlacklistSettings,
+          gate_network: renderGateNetworkSettings,
           miner: renderMinerSettings,
           miner_quotas: renderMinerQuotasSettings,
           flock_grouping: renderFlockGroupingSettings,
@@ -15680,6 +15699,228 @@
         send({
           type: "saveSettings",
           routine: "frontier_system_blacklist",
+          settings: s,
+        });
+      }
+
+      // ── Gate Network Settings ───────────────────────────────────────
+      // Gates are identified by the destination system reached via the gate
+      // (the `via_gate` segment's system_id in a find_route result). A toll
+      // gate that is not Approved — and is not the bot's own faction gate (the
+      // General → Faction Storage System) — is blocked so routines route
+      // around it instead of paying the toll. Read by getApprovedGates() /
+      // getBlockedGates() in server.ts and enforced in common.ts.
+
+      function gateNetworkEnsure() {
+        if (!settings.gate_network || typeof settings.gate_network !== "object") {
+          settings.gate_network = { approvedGates: [], blockedGates: [] };
+        }
+        if (!Array.isArray(settings.gate_network.approvedGates)) {
+          settings.gate_network.approvedGates = [];
+        }
+        if (!Array.isArray(settings.gate_network.blockedGates)) {
+          settings.gate_network.blockedGates = [];
+        }
+        return settings.gate_network;
+      }
+
+      function renderGateNetworkSettings(panel) {
+        const gn = gateNetworkEnsure();
+        const approved = gn.approvedGates;
+        const blocked = gn.blockedGates;
+        const approvedSet = new Set(approved.map((s) => s.toLowerCase()));
+        const blockedSet = new Set(blocked.map((s) => s.toLowerCase()));
+
+        const allSystems = Object.entries(mapData)
+          .map(([sysId, sys]) => ({ id: sysId, name: sys.name || sysId }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+
+        const renderRows = (list, removeFn) =>
+          list.length > 0
+            ? list
+                .map((id) => {
+                  const sys = mapData[id];
+                  const label = sys ? `${sys.name || id} (${id})` : id;
+                  return `
+        <div class="blacklist-item">
+          <span class="blacklist-name">${esc(label)}</span>
+          <button class="sm danger" onclick="${removeFn}('${esc(id)}')">Remove</button>
+        </div>`;
+                })
+                .join("")
+            : '<div class="blacklist-empty">None.</div>';
+
+        const optionsFor = (set) => {
+          const avail = allSystems.filter((s) => !set.has(s.id.toLowerCase()));
+          return avail.length > 0
+            ? avail
+                .map(
+                  (s) =>
+                    `<option value="${esc(s.id)}">${esc(s.name)} (${esc(s.id)})</option>`,
+                )
+                .join("")
+            : '<option value="">(all known systems already listed)</option>';
+        };
+
+        panel.innerHTML = `
+    <h3>Gate Network</h3>
+    <div class="settings-desc">
+      Control which faction jump gates bots may use. A gate is identified by the
+      destination system it jumps into.
+      <br><br>
+      <strong>Toll gates are blocked by default:</strong> any gate that charges a
+      toll and is not listed under Approved Gates (and is not your own faction
+      gate — the General → Faction Storage System) is avoided so routines route
+      around it instead of paying.<br>
+      Add a gate to <strong>Approved Gates</strong> to allow its toll, or to
+      <strong>Blocked Gates</strong> to forbid it even when it is free.
+    </div>
+
+    <div class="blacklist-section">
+      <div class="blacklist-header">
+        <span>Approved Gates (${approved.length})</span>
+      </div>
+      <div class="blacklist-list">
+        ${renderRows(approved, "removeApprovedGate")}
+      </div>
+    </div>
+
+    <div class="blacklist-section" style="margin-top:16px">
+      <div class="blacklist-header">
+        <span>Add Approved Gate</span>
+      </div>
+      <div class="blacklist-add">
+        <div class="blacklist-add-row">
+          <select id="gate-approved-select" style="flex:1;min-width:200px">
+            <option value="">(select a system)</option>
+            ${optionsFor(approvedSet)}
+          </select>
+          <button class="primary sm" onclick="addApprovedGateFromSelect()">Approve</button>
+        </div>
+        <div class="blacklist-divider"><span>OR</span></div>
+        <div class="blacklist-add-row">
+          <input type="text" id="gate-approved-manual" placeholder="e.g., kochab" style="flex:1;min-width:200px" />
+          <button class="primary sm" onclick="addApprovedGateFromText()">Approve</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="blacklist-section" style="margin-top:16px">
+      <div class="blacklist-header">
+        <span>Blocked Gates (${blocked.length})</span>
+      </div>
+      <div class="blacklist-list">
+        ${renderRows(blocked, "removeBlockedGate")}
+      </div>
+    </div>
+
+    <div class="blacklist-section" style="margin-top:16px">
+      <div class="blacklist-header">
+        <span>Add Blocked Gate</span>
+      </div>
+      <div class="blacklist-add">
+        <div class="blacklist-add-row">
+          <select id="gate-blocked-select" style="flex:1;min-width:200px">
+            <option value="">(select a system)</option>
+            ${optionsFor(blockedSet)}
+          </select>
+          <button class="primary sm" onclick="addBlockedGateFromSelect()">Block</button>
+        </div>
+        <div class="blacklist-divider"><span>OR</span></div>
+        <div class="blacklist-add-row">
+          <input type="text" id="gate-blocked-manual" placeholder="e.g., kochab" style="flex:1;min-width:200px" />
+          <button class="primary sm" onclick="addBlockedGateFromText()">Block</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveGateNetworkSettings()">Save Settings</button>
+    </div>
+  `;
+      }
+
+      function resolveGateSystem(text) {
+        const match = Object.entries(mapData).find(
+          ([id, data]) =>
+            id.toLowerCase() === text.toLowerCase() ||
+            (data.name || "").toLowerCase() === text.toLowerCase(),
+        );
+        return match ? match[0] : text;
+      }
+
+      // Add a gate to one list and remove it from the other so the two lists
+      // stay mutually exclusive.
+      function addGateToList(listKey, id) {
+        const otherKey = listKey === "approvedGates" ? "blockedGates" : "approvedGates";
+        const gn = gateNetworkEnsure();
+        if (!gn[listKey].some((s) => s.toLowerCase() === id.toLowerCase())) {
+          gn[listKey].push(id);
+        }
+        gn[otherKey] = gn[otherKey].filter(
+          (s) => s.toLowerCase() !== id.toLowerCase(),
+        );
+        rerenderCurrentSettings();
+      }
+
+      function addApprovedGateFromSelect() {
+        const v = document.getElementById("gate-approved-select").value;
+        if (!v) return;
+        addGateToList("approvedGates", v);
+      }
+
+      function addApprovedGateFromText() {
+        const input = document.getElementById("gate-approved-manual");
+        const text = input.value.trim();
+        if (!text) return;
+        for (const part of text.split(",").map((s) => s.trim()).filter(Boolean)) {
+          addGateToList("approvedGates", resolveGateSystem(part));
+        }
+        input.value = "";
+      }
+
+      function addBlockedGateFromSelect() {
+        const v = document.getElementById("gate-blocked-select").value;
+        if (!v) return;
+        addGateToList("blockedGates", v);
+      }
+
+      function addBlockedGateFromText() {
+        const input = document.getElementById("gate-blocked-manual");
+        const text = input.value.trim();
+        if (!text) return;
+        for (const part of text.split(",").map((s) => s.trim()).filter(Boolean)) {
+          addGateToList("blockedGates", resolveGateSystem(part));
+        }
+        input.value = "";
+      }
+
+      function removeApprovedGate(id) {
+        const gn = gateNetworkEnsure();
+        gn.approvedGates = gn.approvedGates.filter(
+          (s) => s.toLowerCase() !== id.toLowerCase(),
+        );
+        rerenderCurrentSettings();
+      }
+
+      function removeBlockedGate(id) {
+        const gn = gateNetworkEnsure();
+        gn.blockedGates = gn.blockedGates.filter(
+          (s) => s.toLowerCase() !== id.toLowerCase(),
+        );
+        rerenderCurrentSettings();
+      }
+
+      function saveGateNetworkSettings() {
+        const gn = gateNetworkEnsure();
+        const s = {
+          approvedGates: gn.approvedGates,
+          blockedGates: gn.blockedGates,
+        };
+        settings.gate_network = s;
+        send({
+          type: "saveSettings",
+          routine: "gate_network",
           settings: s,
         });
       }

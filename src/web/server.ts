@@ -510,6 +510,27 @@ export function getStationBlacklist(): string[] {
   return [];
 }
 
+/** Gates (identified by the destination system reached via the gate) that are
+ *  explicitly APPROVED for use even though they charge a toll. A toll gate that
+ *  is NOT in this list — and is not the bot's own faction gate — is blocked so
+ *  routines route around it instead of paying the toll. Read from
+ *  Settings → Gate Network → approvedGates. */
+export function getApprovedGates(): string[] {
+  const settings = loadSettings();
+  const gn = (settings.gate_network as Record<string, unknown>) || {};
+  const raw = gn.approvedGates;
+  return Array.isArray(raw) ? raw.filter((s): s is string => typeof s === "string") : [];
+}
+
+/** Gates explicitly BLOCKED from use regardless of whether they charge a toll.
+ *  Read from Settings → Gate Network → blockedGates. */
+export function getBlockedGates(): string[] {
+  const settings = loadSettings();
+  const gn = (settings.gate_network as Record<string, unknown>) || {};
+  const raw = gn.blockedGates;
+  return Array.isArray(raw) ? raw.filter((s): s is string => typeof s === "string") : [];
+}
+
 function saveSettings(s: RoutineSettings): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
   const payload = JSON.stringify(s, null, 2) + "\n";

@@ -7200,10 +7200,20 @@ async function* poiAmbushRoutine(ctx: RoutineContext): AsyncGenerator<string, vo
   // Travel to the safe POI (navigating to the ambush system first if needed).
   const goToSafePoi = async (): Promise<void> => {
     if (bot.state !== "running") return;
+    // Authoritative position/docked refresh. A library bot's cached system/poi/
+    // docked can be stale after a socket drop, and the game server auto-docks
+    // (and relocates) a ship that has been idle for ~30 minutes without commands.
+    // Trust get_status over the cache before deciding what to do — otherwise the
+    // bot "runs" forever at the wrong place doing nothing.
+    await bot.refreshStatus(true);
+    if (bot.docked) {
+      ctx.log("travel", `POI Ambush: docked at ${bot.poi || "a station"} — undocking to return to the safe POI`);
+      await ensureUndocked(ctx);
+    }
     if (!inAmbushSystem()) {
       ctx.log("travel", `POI Ambush: returning to ambush system ${ambushSystem}...`);
       const arrived = await navigateToSystem(ctx, ambushSystem, safetyOpts);
-      await bot.refreshLocation();
+      await bot.refreshStatus(true);
       if (!arrived || !inAmbushSystem()) {
         ctx.log("error", `POI Ambush: could not reach ${ambushSystem} — will retry`);
         return;
@@ -7286,6 +7296,21 @@ async function* poiAmbushRoutine(ctx: RoutineContext): AsyncGenerator<string, vo
         lastSupplyCheck = Date.now();
         await bot.refreshShip();
         await bot.refreshCargo();
+        // Re-validate position/docked state on the same throttle. During a long
+        // socket outage the routine sends nothing, so the server can auto-dock /
+        // relocate the idle ship; after recovery the cached state is stale and the
+        // bot would otherwise standby forever at the wrong POI ("running but doing
+        // nothing"). get_status is authoritative for docked/system/poi.
+        await bot.refreshStatus(true);
+        if (bot.docked || !inAmbushSystem() || bot.poi !== safePoi) {
+          ctx.log(
+            "system",
+            `POI Ambush: not at the safe POI (docked=${bot.docked}, location=${bot.system}/${bot.poi}) — repositioning`,
+          );
+          await goToSafePoi();
+          standbyLogged = false;
+          continue;
+        }
         // Keep shields topped up (to shieldRechargePct) and patch hull with repair
         // kits while standing by — same as the hunter does in and out of combat.
         // Only call topUpShields when actually below target so it doesn't spam

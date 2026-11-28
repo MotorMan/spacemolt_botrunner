@@ -1059,11 +1059,53 @@ export async function navigateToHomeBaseAndDock(
   return true;
 }
 
+/**
+ * If a battle is live, fight it out BEFORE continuing a return-home trip.
+ *
+ * The server rejects jump/dock/travel with `in_battle`, so a hunter that ignores
+ * an active fight and keeps trying to reach home just loops forever — logging
+ * "Could not reach home system" / "Could not dock" every cycle while the enemy
+ * (and the hunter's own drones) do all the fighting. A hunter FIGHTS; it does
+ * not sit there whining about fuel cells while being shot.
+ *
+ * Returns true when a battle was detected and handed to the combat routine, in
+ * which case the caller should pause the home trip and let the next loop
+ * iteration re-evaluate (the fight runs to completion inside
+ * handleNavigationBattleInterrupt → fightJoinedBattle).
+ */
+async function fightActiveBattleBeforeReturnHome(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<boolean> {
+  if (!ctx.bot.isInBattle()) return false;
+
+  // Validate against the API so a stale WebSocket flag can't strand us in a
+  // phantom fight (mirrors handleNavigationBattleInterrupt / ensureFueledEx).
+  const status = await getBattleStatus(ctx);
+  if (!status) {
+    ctx.log("combat", "Clearing stale WebSocket battle state (API reports no battle)");
+    ctx.bot.currentBattle.inBattle = false;
+    ctx.bot.currentBattle.battleId = null;
+    ctx.bot.currentBattle.participants = [];
+    return false;
+  }
+
+  ctx.log("combat", "In battle — fighting it out before returning home (jumps/docking are rejected in combat)");
+  await handleNavigationBattleInterrupt(ctx, settings);
+  return true;
+}
+
 async function returnToHomeAndResupply(
   ctx: RoutineContext,
   settings: ReturnType<typeof getHunterSettings>,
 ): Promise<void> {
   const { bot } = ctx;
+
+  // Never start a home trip while a fight is live — fight first, then resupply
+  // on the next cycle. Otherwise the in_battle jump rejection turns the return
+  // trip into an endless "could not reach home" loop while we're shot at.
+  if (await fightActiveBattleBeforeReturnHome(ctx, settings)) return;
+
   const homeSystem = settings.homeSystem || "";
   const homeStation = settings.homeStation || "";
   // Use a low fuel threshold (10%) when navigating home — we only need enough
@@ -1082,6 +1124,9 @@ async function returnToHomeAndResupply(
   try {
     const docked = await navigateToHomeBaseAndDock(ctx, homeSystem, homeStation, safetyOpts);
     if (!docked) {
+      // Navigation can fail because a battle started mid-trip (jumps are
+      // rejected with in_battle). Fight it instead of looping on the failure.
+      if (await fightActiveBattleBeforeReturnHome(ctx, settings)) return;
       ctx.log("error", "Could not dock at home base — loot not deposited");
       return;
     }
@@ -2668,12 +2713,19 @@ async function returnToCreatureFarmHome(
     joinBattles: true,
   };
 
+  // Fight first: an in_battle jump rejection would otherwise turn this into an
+  // endless "could not reach home" loop while the hunter is under fire.
+  if (await fightActiveBattleBeforeReturnHome(ctx, settings)) return;
+
   ctx.log("system", `Returning to home base ${homeStation || homeSystem || "(default)"} — depositing loot + restocking ammo...`);
   try {
     // Strict home-base navigation: never dock/dump loot at a random station
     // when the home base cannot be reached — keep the cargo aboard instead.
     const docked = await navigateToHomeBaseAndDock(ctx, homeSystem, homeStation, safetyOpts);
     if (!docked) {
+      // A battle that started mid-trip rejects the jump/dock — fight it out
+      // rather than spinning on the failed return.
+      if (await fightActiveBattleBeforeReturnHome(ctx, settings)) return;
       ctx.log("error", "Could not dock at home base — loot not deposited");
       return;
     }
